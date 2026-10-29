@@ -576,9 +576,14 @@ def build_sighet_call_fstat(sighet_comp, wdm_holder, *, xp, Tobs: float,
 
     f0_lo = float(f0_lims_hz[0])
     f0_hi = float(f0_lims_hz[-1])
-    node_f0 = np.arange(f0_lo - spacing_hz, f0_hi + 2.0 * spacing_hz,
-                        spacing_hz)
-    n_nodes = len(node_f0)
+    # np.arange(start, stop, step) fills start + i*delta with delta =
+    # (start + step) - start, which is itself rounded; over ~7e4 nodes that
+    # drifts ~1e-15 Hz from the lattice call_fstat buckets against, more than
+    # the guard's 1e-9 relative slack. Take only the node COUNT from arange
+    # and place the nodes as start + i*spacing.
+    _start = f0_lo - spacing_hz
+    n_nodes = len(np.arange(_start, f0_hi + 2.0 * spacing_hz, spacing_hz))
+    node_f0 = _start + np.arange(n_nodes) * spacing_hz
     n_blocks = (n_nodes + ref_block - 1) // ref_block
     logger.info(
         "[sighet-fstat] %d references over [%.4e, %.4e] Hz, spacing %.3e Hz "
@@ -652,13 +657,25 @@ def build_sighet_call_fstat(sighet_comp, wdm_holder, *, xp, Tobs: float,
         n_rows = int(f0_h.shape[0])
         k = np.clip(np.round((f0_h - node_f0[0]) / spacing_hz).astype(int),
                     0, n_nodes - 1)
-        worst = np.abs(f0_h - node_f0[k]).max() if n_rows else 0.0
+        dist = np.abs(f0_h - node_f0[k]) if n_rows else np.zeros(0)
+        worst = dist.max() if n_rows else 0.0
         if worst > 0.5 * spacing_hz * (1.0 + 1e-9):
+            iw = int(np.argmax(dist))
+            kw = int(k[iw])
+            side = ("above the comb top" if kw == n_nodes - 1
+                    and f0_h[iw] > node_f0[-1] else
+                    "below the comb bottom" if kw == 0
+                    and f0_h[iw] < node_f0[0] else "inside the comb")
             raise RuntimeError(
-                f"[sighet-fstat] candidate f0 {worst:.3e} Hz from its "
+                f"[sighet-fstat] candidate f0 {worst:.6e} Hz from its "
                 f"bucketed reference (> spacing/2 = "
                 f"{0.5 * spacing_hz:.3e}); the reference comb does not "
-                "cover the requested f0 range.")
+                f"cover the requested f0 range. Worst row {iw} of {n_rows}: "
+                f"f0={f0_h[iw]:.12e} Hz, bucket k={kw}/{n_nodes - 1} "
+                f"({side}); batch f0 in [{f0_h.min():.12e}, "
+                f"{f0_h.max():.12e}] Hz; node_f0[0]={node_f0[0]:.12e}, "
+                f"node_f0[-1]={node_f0[-1]:.12e}, spacing={spacing_hz:.6e} "
+                f"Hz, f0_lims_hz=({f0_lo:.12e}, {f0_hi:.12e}).")
         if n_rows == 0:
             return (xp.zeros((0, 4), dtype=xp.float64),
                     xp.zeros((0, 10), dtype=xp.float64))

@@ -344,6 +344,39 @@ class SigHetCallFstatTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             call(self._rows(np.array([9.0e-3])))
 
+    def test_out_of_range_error_names_the_comb(self):
+        # A failure hours into a run must be diagnosable from the log alone.
+        comp = self._Comp()
+        call = self._call(comp)
+        with self.assertRaises(RuntimeError) as cm:
+            call(self._rows(np.array([3.1e-3, 9.0e-3])))
+        msg = str(cm.exception)
+        self.assertIn("[sighet-fstat] candidate f0", msg)
+        for key in ("node_f0[0]", "node_f0[-1]", "spacing", "f0_lims_hz",
+                    "above the comb"):
+            self.assertIn(key, msg)
+
+    def test_midpoint_rows_high_in_a_long_comb_do_not_trip_the_guard(self):
+        # 12mo flagship comb: ~72.5k references at ~2.95e-7 Hz (K=128,
+        # Tobs=3.11e7). np.arange's accumulated delta drifts ~1e-15 Hz by the
+        # top of such a comb, more than the guard's 1e-9 relative slack, so a
+        # row just below a nominal midpoint is bucketed to a node that is
+        # really > spacing/2 away.
+        Tobs, f_lo, f_hi = 3.110e7, 5.5556e-4, 2.1945e-2
+        sp = G.sighet_fstat_ref_margin_hz(128, Tobs)
+        call = G.build_sighet_call_fstat(
+            self._Comp(), None, xp=np, Tobs=Tobs, f0_lims_hz=(f_lo, f_hi),
+            ref_block=512)
+        start = f_lo - sp
+        ks = np.arange(9000, 72000, 701)
+        # 1e-17 Hz either side of the nominal midpoint (well above float noise,
+        # ~4e-18 at 0.02 Hz): the row buckets to the nominal-nearest node, whose
+        # stored position is off by the comb drift. The drift's sign depends on
+        # the (start, step) rounding, so test both sides of the midpoint.
+        mid = start + (ks + 0.5) * sp
+        f0 = np.concatenate([mid - 1e-17, mid + 1e-17])
+        call(self._rows(f0))          # must not raise
+
 
 class PeakSelectionTest(unittest.TestCase):
     def test_floor_interior_and_cap(self):
