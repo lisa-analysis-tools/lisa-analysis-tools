@@ -1299,12 +1299,51 @@ class SubmissionWriter(BackendConsumer):
 
         super().__init__(curr=curr, backend=backend)
 
-        self.original_samples, self.samples, self.inds, self.log_prior, self.log_likelihood = self.process_samples(
-            ess=ess, return_inds=True
-        )
+        # samples are loaded lazily (see `load_samples`), so that the metadata can be written
+        # even if the sample post-processing fails
+        self._ess_submission = ess
 
         self.detection_criteria = detection_criteria or OccupancyDetectionCriteria()
         self.run_metadata = RunMetadata.from_curr(self.curr)
+
+    def load_samples(self):
+        """Thin, transform and cache the independent samples for all branches."""
+        (
+            self._original_samples,
+            self._samples,
+            self._inds,
+            self._log_prior,
+            self._log_likelihood,
+        ) = self.process_samples(ess=self._ess_submission, return_inds=True)
+
+    @property
+    def samples_loaded(self) -> bool:
+        return hasattr(self, "_samples")
+
+    def _get_loaded(self, name: str):
+        if not self.samples_loaded:
+            self.load_samples()
+        return getattr(self, name)
+
+    @property
+    def original_samples(self) -> dict:
+        return self._get_loaded("_original_samples")
+
+    @property
+    def samples(self) -> dict:
+        return self._get_loaded("_samples")
+
+    @property
+    def inds(self) -> dict:
+        return self._get_loaded("_inds")
+
+    @property
+    def log_prior(self) -> np.ndarray:
+        return self._get_loaded("_log_prior")
+
+    @property
+    def log_likelihood(self) -> np.ndarray:
+        return self._get_loaded("_log_likelihood")
 
     def prepare_samples_for_submission(self, acs: AnalysisContainerArray):
         """
@@ -1313,12 +1352,16 @@ class SubmissionWriter(BackendConsumer):
         """
 
         for branch in self.branches:
-            prepare_fn = self.prepare_samples_registry.get(branch, None)
-            if prepare_fn:
-                logger.info(f"Preparing samples for branch '{branch}' using '{prepare_fn.__name__}'")
-                self.samples[branch], self.inds[branch] = prepare_fn(
-                    acs, self.original_samples[branch], self.samples[branch], self.inds[branch]
-                )
+            self._prepare_branch_samples(acs, branch)
+
+    def _prepare_branch_samples(self, acs: AnalysisContainerArray, branch: str):
+        """Run the registered preparation function for a single branch, if any."""
+        prepare_fn = self.prepare_samples_registry.get(branch, None)
+        if prepare_fn:
+            logger.info(f"Preparing samples for branch '{branch}' using '{prepare_fn.__name__}'")
+            self.samples[branch], self.inds[branch] = prepare_fn(
+                acs, self.original_samples[branch], self.samples[branch], self.inds[branch]
+            )
 
     def _prepare_mbhb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Sort the MBHB samples according to the coalescence time, and cluster them if there are multiple sources in the same block."""
@@ -1530,22 +1573,80 @@ class SubmissionWriter(BackendConsumer):
 
             self._relative_folders[branch] = subfolder_name # we store the relative path to the posterior folder, to be included in the metadata and used in the output files
 
+    @property
+    def stochastic_branches(self) -> list[str]:
+        """Stochastic branches (psd and/or galfor) present in this run; they are saved together."""
+        return [b for b in _STOCHASTIC_BRANCHES if b in self.branches]
+
+    @property
+    def resolvable_branches(self) -> list[str]:
+        """Branches whose leaves are saved as individual resolvable sources."""
+        return [b for b in self.branches if b not in _STOCHASTIC_BRANCHES]
+
     def save_posteriors(self):
         """Save the posterior samples for each detected source in the required format."""
         from tqdm import tqdm
 
-        self._save_stochastic_posterior()  
-        branches_resolvable = self.branches.copy()
-
-        for key in _STOCHASTIC_BRANCHES:
-            if key in branches_resolvable:
-                branches_resolvable.remove(key)
+        self._save_stochastic_posterior()
 
         # todo need a way to have ids
-        for branch in tqdm(branches_resolvable, desc="Saving posteriors for resolvable sources"):
+        for branch in tqdm(self.resolvable_branches, desc="Saving posteriors for resolvable sources"):
             logger.info(f"Saving posteriors for branch {branch}")
 
             self._save_source_posterior(branch)
+
+    def _source_parameter_info(self, branch: str) -> Tuple[list[str], list[str]]:
+        """Return the L3C parameter names and units for a resolvable branch."""
+        parameter_info: list[ParameterInfo] = list(PARAMETER_INFO_REGISTRY[branch].values())
+        return [p.l3c_name for p in parameter_info], [p.unit for p in parameter_info]
+
+    def _write_source_metadata(
+        self,
+        branch: str,
+        metadata: SourceMetadata,
+        posterior_files_map: dict[str, str],
+        detections: list[dict],
+    ):
+        """Write the h5 and json metadata files for a resolvable branch."""
+
+        source_name = source_types_names[branch]
+        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_{self.run_metadata.submission_timestamp}"
+
+        metadata_h5_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
+        )
+        metadata_json_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
+        )
+
+        with h5py.File(metadata_h5_filepath, "w") as f:
+            source_group = f.create_group(name="sources")
+            posterior_group = source_group.create_group(name="posterior_files")
+
+            for j, (source_idx, posterior_file_path) in enumerate(posterior_files_map.items()):
+                posterior_group.create_dataset(source_idx, data=str(posterior_file_path))
+
+            source_group.create_dataset(
+                "detection", data=detections_to_structured_array(detections)
+            )
+
+            _save_metadata_attributes(f, metadata)
+
+        logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
+
+        metadata.to_json(metadata_json_filepath)
+        logger.info(f"Saved metadata for branch '{branch}' to {metadata_json_filepath}")
+
+    def _write_source_metadata_skeleton(self, branch: str):
+        """Write the sample-independent metadata for a resolvable branch, with no detections."""
+
+        metadata: SourceMetadata = self.curr.source_metadata[branch]
+        metadata.parameter_info, metadata.parameter_units = self._source_parameter_info(branch)
+        metadata.detection_statistic = []
+        metadata.detections = []
+        metadata.posterior_files = []
+
+        self._write_source_metadata(branch, metadata, {}, [])
 
     def _save_source_posterior(self, branch: str):
         """Save the posterior samples for a single detected source type, identified by `branch`."""
@@ -1554,11 +1655,7 @@ class SubmissionWriter(BackendConsumer):
         samples = self.samples[branch]
         inds = self.inds[branch]
 
-        parameter_info: list[ParameterInfo] = list(PARAMETER_INFO_REGISTRY[branch].values())
-
-        parameter_names = [p.l3c_name for p in parameter_info]
-        latex_names = [p.latex_name for p in parameter_info]
-        units = [p.unit for p in parameter_info]
+        parameter_names, units = self._source_parameter_info(branch)
 
         metadata: SourceMetadata = self.curr.source_metadata[branch]
 
@@ -1617,80 +1714,34 @@ class SubmissionWriter(BackendConsumer):
             })
 
         metadata.detection_statistic = list(label_to_statistic.values())
-        
+
         metadata.detections = detections
 
         metadata.posterior_files = list(posterior_files_map.values())
 
         # now save the metadata for this source
-        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_{self.run_metadata.submission_timestamp}"
+        self._write_source_metadata(branch, metadata, posterior_files_map, detections)
 
-        metadata_h5_filepath = os.path.join(
-            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
-        )
-        metadata_json_filepath = os.path.join(
-            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
-        )
+    def _build_stochastic_metadata(self, extra_comment: str = "") -> Tuple[StochasticMetadata, list[str]]:
+        """Build the combined StochasticMetadata (sample-independent) and the parameter names."""
 
-        with h5py.File(metadata_h5_filepath, "w") as f:
-            source_group = f.create_group(name="sources")
-            posterior_group = source_group.create_group(name="posterior_files")
-
-            for j, (source_idx, posterior_file_path) in enumerate(posterior_files_map.items()):
-                posterior_group.create_dataset(source_idx, data=str(posterior_file_path))
-
-            source_group.create_dataset(
-                "detection", data=detections_to_structured_array(detections)
-            )
-
-            _save_metadata_attributes(f, metadata)
-
-        logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
-
-        metadata.to_json(metadata_json_filepath)
-        logger.info(f"Saved metadata for branch '{branch}' to {metadata_json_filepath}")
-
-
-    def _save_stochastic_posterior(self):
-        """Save the posterior samples for the stochastic component, if applicable."""
-
-        if "psd" not in self.branches and "galfor" not in self.branches:
-            logger.info("No stochastic component detected in the branches. Skipping stochastic posterior saving.")
-            return
-
-        # check if both psd and galfor are present and store everything together
-        elif "psd" in self.branches and "galfor" in self.branches:
-            branches_here = ["psd", "galfor"]
-
-        # if only one of them is present, we save it as the stochastic posterior
-        else:
-            branch = "psd" if "psd" in self.branches else "galfor"
-            branches_here = [branch]
-        
-        samples, inds = [], []
+        branches_here = self.stochastic_branches
         parameter_info = []
         metadata_list = []
 
         for branch in branches_here:
-            _samples = self.samples[branch]
-            _inds = self.inds[branch]
             if branch == "psd":
                 _parameter_info = _noise_param_info(self.curr.general_info.sensitivity_backend)
             else:
                 _parameter_info = list(PARAMETER_INFO_REGISTRY[branch].values())
-            _metadata = self.curr.source_metadata[branch]
-
-            samples.append(_samples)
-            inds.append(_inds)
             parameter_info.extend(_parameter_info)
-            metadata_list.append(_metadata)
-            
-        samples = np.concatenate(samples, axis=-1)
-        inds = np.concatenate(inds, axis=-1)
+            metadata_list.append(self.curr.source_metadata[branch])
 
         parameter_names = [p.l3c_name for p in parameter_info]
-        latex_names = [p.latex_name for p in parameter_info]
         units = [p.unit for p in parameter_info]
+        comments = [m.comment for m in metadata_list if m.comment]
+        if extra_comment:
+            comments.append(extra_comment)
         metadata: StochasticMetadata = StochasticMetadata(
             model_config={branch: metadata_list[i].model_config for i, branch in enumerate(branches_here)},
             frequency_ranges=metadata_list[0].frequency_ranges,  # we assume the same frequency ranges for all stochastic branches; this can be relaxed if needed
@@ -1698,11 +1749,57 @@ class SubmissionWriter(BackendConsumer):
             prior_model_code_link=" ,".join(set(m.prior_model_code_link for m in metadata_list)),
             prior_model_config_file=" ,".join(set(m.prior_model_config_file for m in metadata_list)),
             prior_model_config={branch: metadata_list[i].prior_model_config for i, branch in enumerate(branches_here)},
-            comment=" ,".join(m.comment for m in metadata_list if m.comment)
+            comment=" ,".join(comments)
         )
 
         metadata.parameter_info = parameter_names
         metadata.parameter_units = units
+
+        return metadata, parameter_names
+
+    def _write_stochastic_metadata(self, metadata: StochasticMetadata, posterior_filepath: str):
+        """Write the h5 and json metadata files for the stochastic component."""
+
+        effective_branch_name = "noise" #todo or stochastic?
+        metadata.posterior_file = posterior_filepath # we store the relative path to the posterior file in the metadata
+        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{effective_branch_name}_{self.run_metadata.submission_timestamp}"
+        metadata_h5_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
+        )
+        metadata_json_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
+        )
+        with h5py.File(metadata_h5_filepath, "w") as f:
+            noise_group = f.create_group(name=effective_branch_name)
+            posterior_group = noise_group.create_group(name="posterior_file")
+            posterior_group.create_dataset("posterior", data=str(posterior_filepath))
+            _save_metadata_attributes(noise_group, metadata)
+
+        logger.info(f"Saved metadata for stochastic branch(es) to {metadata_h5_filepath}")
+
+        metadata.to_json(metadata_json_filepath)
+        logger.info(f"Saved metadata for  stochastic branch(es) to {metadata_json_filepath}")
+
+    def _write_stochastic_metadata_skeleton(self, extra_comment: str = ""):
+        """Write the sample-independent stochastic metadata, with no posterior file."""
+        if not self.stochastic_branches:
+            return
+        metadata, _ = self._build_stochastic_metadata(extra_comment=extra_comment)
+        self._write_stochastic_metadata(metadata, "")
+
+    def _save_stochastic_posterior(self):
+        """Save the posterior samples for the stochastic component, if applicable."""
+
+        if not self.stochastic_branches:
+            logger.info("No stochastic component detected in the branches. Skipping stochastic posterior saving.")
+            return
+
+        # if both psd and galfor are present, everything is stored together
+        branches_here = self.stochastic_branches
+
+        samples = np.concatenate([self.samples[branch] for branch in branches_here], axis=-1)
+
+        metadata, parameter_names = self._build_stochastic_metadata()
 
         if samples.shape[1] > 1:
             raise NotImplementedError("multiple leaves detected, not implemented yet")
@@ -1733,26 +1830,9 @@ class SubmissionWriter(BackendConsumer):
             posterior_samples = np.stack([samples_dict[param] for param in physical_param_names], axis=-1) # we extract the posterior samples as a 2D array of shape (nsamples, npars) for convenience. These do not include the logprior and loglikelihood, which are stored separately.
             group.create_dataset("p", data=posterior_samples)
             group.create_dataset("logprior", data=samples_dict["logprior"])
-            group.create_dataset("loglikelihood", data=samples_dict["loglikelihood"]) 
+            group.create_dataset("loglikelihood", data=samples_dict["loglikelihood"])
 
-        metadata.posterior_file = filepath # we store the relative path to the posterior file in the metadata        
-        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{effective_branch_name}_{self.run_metadata.submission_timestamp}"
-        metadata_h5_filepath = os.path.join(
-            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
-        )
-        metadata_json_filepath = os.path.join(
-            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
-        )
-        with h5py.File(metadata_h5_filepath, "w") as f:
-            noise_group = f.create_group(name=effective_branch_name)
-            posterior_group = noise_group.create_group(name="posterior_file")
-            posterior_group.create_dataset("posterior", data=str(filepath))
-            _save_metadata_attributes(noise_group, metadata)
-
-        logger.info(f"Saved metadata for stochastic branch(es) to {metadata_h5_filepath}")
-
-        metadata.to_json(metadata_json_filepath)
-        logger.info(f"Saved metadata for  stochastic branch(es) to {metadata_json_filepath}")
+        self._write_stochastic_metadata(metadata, filepath)
 
     def save_data_and_residuals(self, acs: AnalysisContainerArray):
         """Save the input data and residuals to h5 files in the submission folder."""
@@ -1768,17 +1848,87 @@ class SubmissionWriter(BackendConsumer):
         save_residuals(acs, residuals_filepath)
         logger.info(f"Saved residuals to {residuals_filepath}")
 
-    def write_submission(self, acs: AnalysisContainerArray):
-        """Run the full submission writing pipeline."""
-        self.create_folders()
-        self.save_data_and_residuals(acs)
-
+    def _write_run_metadata(self):
         run_metadata_filepath = os.path.join(self.submission_folder, "global_metadata.json")
         self.run_metadata.to_json(run_metadata_filepath)
         logger.info(f"Saved overall run metadata to {run_metadata_filepath}")
 
-        self.prepare_samples_for_submission(acs)
-        self.save_posteriors()
+    def write_metadata(self, acs: AnalysisContainerArray):
+        """
+        Phase A: write everything that does not depend on the posterior samples
+        (run metadata, per-branch metadata without detections, input data and residuals).
+        """
+        self.create_folders()
+        self._write_run_metadata()
+
+        for branch in self.resolvable_branches:
+            self._write_source_metadata_skeleton(branch)
+        self._write_stochastic_metadata_skeleton()
+
+        self.save_data_and_residuals(acs)
+
+    def write_posteriors(self, acs: AnalysisContainerArray):
+        """
+        Phase B: process the samples and save posteriors + full metadata, one unit at a time.
+
+        The stochastic branches form a single unit; each resolvable branch is its own unit.
+        A failing unit is logged and recorded in its metadata comment, and the remaining units are
+        still processed. A summary RuntimeError is raised at the end if any unit failed.
+        """
+        units = list(self.resolvable_branches)
+        if self.stochastic_branches:
+            units.append("stochastic")
+
+        failures: dict[str, str] = {}
+
+        def _record_failure(unit: str, exc: Exception):
+            logger.exception(f"Post-processing failed for '{unit}'")
+            msg = f"postprocessing failed: {type(exc).__name__}: {exc}"
+            failures[unit] = msg
+            if unit == "stochastic":
+                self._write_stochastic_metadata_skeleton(extra_comment=msg)
+            else:
+                metadata: SourceMetadata = self.curr.source_metadata[unit]
+                metadata.comment = f"{metadata.comment} {msg}".strip()
+                self._write_source_metadata_skeleton(unit)
+
+        try:
+            # thinning is shared across branches (joint ACT), so it cannot be split per unit
+            self.load_samples()
+        except Exception as exc:
+            for unit in units:
+                _record_failure(unit, exc)
+            units = []
+
+        for unit in units:
+            try:
+                if unit == "stochastic":
+                    self._save_stochastic_posterior()
+                else:
+                    self._prepare_branch_samples(acs, unit)
+                    logger.info(f"Saving posteriors for branch {unit}")
+                    self._save_source_posterior(unit)
+            except Exception as exc:
+                _record_failure(unit, exc)
+
+        # only list the source types whose posteriors were actually written
+        failed_branches = {b for b in self.resolvable_branches if b in failures}
+        if "stochastic" in failures:
+            failed_branches.update(self.stochastic_branches)
+        found = {source_types_names[b] for b in self.branches if b in source_types_names and b not in failed_branches}
+        self.run_metadata.found_source_types_list = [
+            s for s in self.run_metadata.found_source_types_list if s in found
+        ]
+        self._write_run_metadata()
+
+        if failures:
+            summary = "; ".join(f"{unit}: {msg}" for unit, msg in failures.items())
+            raise RuntimeError(f"Submission post-processing failed for {len(failures)} unit(s): {summary}")
+
+    def write_submission(self, acs: AnalysisContainerArray):
+        """Run the full submission writing pipeline: metadata first, then the posteriors."""
+        self.write_metadata(acs)
+        self.write_posteriors(acs)
 
 
 # === Save residuals ====

@@ -962,14 +962,19 @@ class GlobalFit:
 
             sampler_mix.run_mcmc(state, self.curr.general_info.num_iterations, thin_by=1, progress=True, store=True)
 
-            if self.curr.general_info.submission_parent_folder is not None:
-                self.logger.debug(f"saving submission to {self.curr.general_info.submission_parent_folder}")
-                submission_writer = SubmissionWriter(backend=backend, curr=self.curr, ess=20_000)
-                submission_writer.write_submission(acs)
+            try:
+                if self.curr.general_info.submission_parent_folder is not None:
+                    self.logger.debug(f"saving submission to {self.curr.general_info.submission_parent_folder}")
+                    submission_writer = SubmissionWriter(backend=backend, curr=self.curr, ess=20_000)
+                    submission_writer.write_submission(acs)
 
-            logger.info("Residuals saved.")
-
-            self.comm.send({"finish_run": True}, dest=self.results_rank)
+                logger.info("Residuals saved.")
+            except Exception:
+                logger.exception("Submission writing failed")
+                raise
+            finally:
+                # always release the results rank, otherwise it waits forever on a failed submission
+                self.comm.send({"finish_run": True}, dest=self.results_rank)
 
         elif self.rank == self.results_rank:
             save_to_backend_asynchronously_and_plot(
