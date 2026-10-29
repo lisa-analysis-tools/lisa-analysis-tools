@@ -316,6 +316,29 @@ public:
         array_type<std::complex<double>> c12_all,
         bool use_external_matrix = false, bool run_async = false);
 
+    // Fused likelihood from precomputed (window-convolved) covariance bases; see
+    // XYZSensitivityMatrix::psd_likelihood_basis_wrap (PSD.hpp / PSD.cu).
+    void psd_likelihood_basis_wrap(
+        array_type<double> like_contrib_final, array_type<std::complex<double>> data,
+        array_type<int> data_index_all, array_type<double> coeffs,
+        array_type<double> B00, array_type<double> B11, array_type<double> B22,
+        array_type<std::complex<double>> B01, array_type<std::complex<double>> B02,
+        array_type<std::complex<double>> B12,
+        bool use_galaxy, array_type<double> gal_conv, array_type<double> gal_ratios,
+        int n_gal, long long gal_psd_stride, long long gal_t_stride,
+        bool use_spline_weights, array_type<double> spline_weights,
+        long long spl_psd_stride, long long spl_noise_stride, long long spl_f_stride,
+        array_type<bool> dips_mask, double differential_component,
+        int num_freqs, int num_times, int num_psds, int num_data, int n_basis,
+        bool run_async = false);
+
+    // XX galactic rows (num_psds, num_freqs) on a frequency prefix of the active grid.
+    void get_galactic_row_wrap(
+        array_type<double> out, array_type<double> freqs,
+        array_type<double> Amp_all, array_type<double> alpha_all,
+        array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+        int num_freqs, int num_psds, int time_index, bool run_async = false);
+
     void get_noise_covariance_wrap(
         array_type<double> freqs, array_type<int> time_indices,
         array_type<double> Soms_d_in_all, array_type<double> Sa_a_in_all,
