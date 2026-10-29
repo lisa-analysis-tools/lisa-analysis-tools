@@ -175,6 +175,21 @@ def _on_device(arr, device: Optional[int]) -> bool:
     arr_device = getattr(arr, "device", None)
     return getattr(arr_device, "id", None) == int(device)
 
+
+def _move_attrs_to_device(obj, attrs, device: int) -> None:
+    """Rebind each cupy array attribute of ``obj`` in ``attrs`` onto GPU ``device``.
+
+    Routed through the host like the linear-buffer repack (no P2P copy). Missing,
+    ``None``, host and already-local attributes are left alone. Attributes are set
+    directly so property setters (dirty flags, ``can_redo``) are not triggered.
+    """
+    for attr in attrs:
+        arr = getattr(obj, attr, None)
+        if hasattr(arr, "get") and not _on_device(arr, device):
+            host = arr.get()
+            with cp.cuda.Device(int(device)):
+                setattr(obj, attr, cp.asarray(host))
+
 class AnalysisContainer:
     """Combinatorial container that combines sensitivity and data information.
 
@@ -1833,10 +1848,8 @@ class AnalysisContainerArray:
                 int(n_splits) if (gpus is None and n_splits is not None)
                 else (1 if gpus is None else len(gpus))
             )
-            split_num = int(np.ceil(self.acs_total_entries / num_machines))
-            split_inds = np.arange(split_num, self.acs_total_entries, split_num)
-            self.gpu_splits = gpu_splits = np.split(
-                np.arange(self.acs_total_entries), split_inds
+            self.gpu_splits = gpu_splits = self.contiguous_splits(
+                int(self.acs_total_entries), num_machines
             )
 
         self.gpu_map = np.zeros(self.acs_total_entries, dtype=int)
@@ -1901,9 +1914,39 @@ class AnalysisContainerArray:
         self.reset_linear_data_arr()
         self.reset_linear_psd_arr()
         if gpus is not None:
+            # The repack moves only invC; keep each container's covariance and
+            # determinant on the same GPU, or one full matrix per container stays on
+            # the GPU it was built on. Then release what the repack freed into each
+            # device's pool (the per-container free only covers the current device).
+            for ac, gpu in zip(self.acs.flatten(), self.gpu_map):
+                _move_attrs_to_device(ac.sens_mat, ("_sens_mat", "_detC"), gpu)
+            self.free_gpu_memory()
             # Restore whatever device the caller was on before __init__.
             self.xp.cuda.runtime.setDevice(self._main_device_at_init)
-    
+
+    @staticmethod
+    def contiguous_splits(n_entries: int, num_splits: int) -> list:
+        """Default partition: ``num_splits`` contiguous blocks of ``ceil(n_entries / num_splits)`` entries."""
+        split_num = int(np.ceil(n_entries / num_splits))
+        return np.split(np.arange(n_entries), np.arange(split_num, n_entries, split_num))
+
+    @staticmethod
+    def place_container(ac: "AnalysisContainer", device: int) -> None:
+        """Move one container's data residual and sensitivity arrays to GPU ``device``.
+
+        Lets a caller that builds containers on one GPU shard them as it goes,
+        instead of holding every container on the build GPU until ``__init__``
+        repacks them. A sensitivity whose inverse is still pending keeps it
+        pending, so ``invC``/``detC`` are computed on ``device`` at first read,
+        as the repack would do.
+        """
+        _move_attrs_to_device(ac.data_res_arr.data_res_arr, ("_arr",), device)
+        sens = ac.sens_mat
+        if getattr(sens, "_inv_det_dirty", False):
+            _move_attrs_to_device(sens, ("_sens_mat",), device)
+        else:
+            _move_attrs_to_device(sens, ("_sens_mat", "_invC", "_detC"), device)
+
     def synchronize(self):
         if self.gpus is not None:
             for gpu in self.gpus:

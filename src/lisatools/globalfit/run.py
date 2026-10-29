@@ -492,6 +492,17 @@ class GlobalFit:
             if callable(_gen):
                 signal_gen_map[name] = _gen
 
+        # Walkers are built on gpus[0] (the sensitivity backend's device) and moved
+        # to their shard as they are built, so gpus[0] never holds every walker at once.
+        walker_gpu = None
+        if _xp_is_cupy and general_info.gpus is not None and len(general_info.gpus) > 1:
+            walker_gpu = np.empty(self.nwalkers, dtype=int)
+            for gpu, split in zip(
+                general_info.gpus,
+                AnalysisContainerArray.contiguous_splits(self.nwalkers, len(general_info.gpus)),
+            ):
+                walker_gpu[split] = gpu
+
         acs_tmp = []
         for w in range(self.nwalkers):
             data_res_arr = deepcopy(general_info.input_data_residual_array)
@@ -523,15 +534,23 @@ class GlobalFit:
                     f"walker_{w}", **general_info.fixed_psd_kwargs
                 )
 
-            acs_tmp.append(
-                (
-                    _analysis_tmp := AnalysisContainer(
-                        deepcopy(data_res_arr),
-                        deepcopy(sens_here),
-                        signal_gen=dict(signal_gen_map) if signal_gen_map else None,
-                    )
-                )
+            sens_here = deepcopy(sens_here)
+            # The window-convolution caches (``_wconv_*``) are walker-independent but
+            # are built lazily on whichever copy first needs them, so each walker
+            # would keep its own copy (~1 GB each) on gpus[0]. sens_mat is already
+            # computed, so this walker no longer needs them.
+            for key in [k for k in getattr(sens_here, "__dict__", {}) if k.startswith("_wconv_")]:
+                delattr(sens_here, key)
+
+            _analysis_tmp = AnalysisContainer(
+                data_res_arr,
+                sens_here,
+                signal_gen=dict(signal_gen_map) if signal_gen_map else None,
             )
+            if walker_gpu is not None:
+                AnalysisContainerArray.place_container(_analysis_tmp, walker_gpu[w])
+                xp.get_default_memory_pool().free_all_blocks()
+            acs_tmp.append(_analysis_tmp)
 
         gpus = general_info.gpus
         complex_psd = not isinstance(acs_tmp[0].data.settings, WDMSettings)
