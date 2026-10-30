@@ -3072,7 +3072,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         """Arm unit vectors of the rigid cartwheel constellation (model of the closed-form response).
 
         Spacecraft phases ``beta_j = 2 pi j / 3 + beta0`` (j = 0, 1, 2 for SC1, SC2, SC3), orbital phase
-        ``alpha``; positions to first order in the eccentricity (Cornish & Rubbo 2003), ecliptic frame.
+        ``alpha``; positions to first order in the eccentricity, ecliptic frame.
 
         Returns:
             (..., 3, 3) arm unit vectors in the order of :meth:`_orbit_arms` (u12, u13, u23), up to sign.
