@@ -8,17 +8,17 @@ waveform:
       include_negative_modes: true
       t_low_fit: true
       coarse_grain: false
-      atol: 1e-12
-      rtol: 1e-12
+      atol: 1e-4
+      rtol: 1e-4
     tdi_generation: 2nd generation
     tdi_channels: XYZ
     order: 30
     Tobs: 2629845.8136287993  # 1 / 12 * YRSID_SI: waveform length only, not the data's
-    start_freq: 7e-5
+    start_freq: 5e-5
     use_reference_time: true
     buffer_time: 15000
-    fft_batch_size: 2
-num_prop_repeats: 100
+    fft_batch_size: 4
+num_prop_repeats: 50
 tempering: {ratio: 1.2}  # over sampler.ntemps
 inner_moves:
   - {class: StretchMove, weight: 0.55}
