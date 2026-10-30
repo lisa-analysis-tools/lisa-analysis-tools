@@ -238,6 +238,7 @@ class EmriMbhPsdTest(_Port):
         flow_names = [n for n in basis if n in params]  # the flow's columns are in basis order
         self.assertEqual(move.flow.data_transform.periodic, {flow_names.index("phi_ref"): (0.0, 2 * np.pi)})
         self.assertTrue(move.adapt_cov)
+        self.assertEqual(move.flow_prob, 0.5)  # random choice of half by default
         self.assertIsNone(move.gibbs_sampling_setup)
         self.assertIn("worker_device", move.executor_init_kwargs)
 

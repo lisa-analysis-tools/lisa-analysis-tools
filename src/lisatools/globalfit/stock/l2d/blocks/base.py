@@ -91,8 +91,9 @@ class FlowSpec(_Spec):
     """A normalizing-flow proposal (``ConditionalFlowMove``) trained online by a ``ProcessExecutor``.
 
     With ``parameters`` the flow covers only those columns of the prior's input basis and the other columns
-    take a Gaussian random walk in the same proposal (one ``FlowGaussianMove``); ``gaussian`` holds its
-    arguments (default: a per-leaf covariance adapted from the chain, ``{adapt_cov: true}``). The builder
+    take a Gaussian random walk, in one ``FlowGaussianMove`` (each proposal moves one half, the flow's with
+    probability ``flow_prob``); ``gaussian`` holds its arguments (default: ``flow_prob`` 0.5 and a per-leaf
+    covariance adapted from the chain, ``{adapt_cov: true}``). The builder
     fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer device (``compute.flow_gpu``)
     and output paths; the trainer is started by the setup function.
     """

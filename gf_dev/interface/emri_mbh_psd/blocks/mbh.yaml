@@ -29,9 +29,10 @@ inner_moves:
 flow:
   weight: 0.2
   # the flow on the unimodal parameters only, a Gaussian walk on the degenerate ones (one FlowGaussianMove;
-  # its covariance is adapted per leaf from the chain by default):
+  # each proposal moves one half: the flow columns with probability flow_prob, else the Gaussian ones,
+  # flow_prob: null moves both jointly; the Gaussian covariance is adapted per leaf from the chain by default):
   # parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
-  # gaussian: {adapt_cov: true}
+  # gaussian: {adapt_cov: true, flow_prob: 0.5}
   model:
     class: ZukoFlow
     kwargs: {flow_class: NSF, transforms: 8, hidden_features: [128, 128, 128], bins: 8}

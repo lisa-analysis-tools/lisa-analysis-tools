@@ -30,3 +30,22 @@ so every inner move proposes on all parameters.
 - LAT test baseline in this env (no data backend) already fails 41 l2d/addremove tests on the main checkout;
   per file, the worktree fails a subset of those and nothing new.
 - Not done: a GPU run of the MBH block with `parameters` + `gaussian` to look at acceptance.
+
+## Follow-up: random choice of half (`flow_prob`, default 0.5)
+- [x] Each active row moves its flow columns with probability `flow_prob`, else its Gaussian columns (a
+  state-independent random-scan mixture of two valid kernels); `flow_prob=None` keeps the joint proposal.
+  A half that cannot propose yet hands all rows to the other.
+- [x] Tests: one half per row, factor only on flow rows, fallbacks, sampler recovery in both modes; the
+  negative control (no flow factor) fails in random-choice mode too.
+- Toy 3-D target, 32 walkers x 600 steps, flow roughly on the A marginal, 1 Gaussian column:
+
+  | coupling | mode | acceptance | A columns move | B column moves |
+  |---|---|---|---|---|
+  | weak | joint | 0.172 | 0.172 | 0.172 |
+  | weak | flow_prob 0.5 | 0.386 | 0.166 | 0.220 |
+  | strong | joint | 0.094 | 0.094 | 0.094 |
+  | strong | flow_prob 0.5 | 0.197 | 0.087 | 0.110 |
+
+  Acceptance doubles, but per likelihood evaluation the flow columns move about as often as with the
+  joint move; the Gaussian columns gain ~25%. The gain should grow when the Gaussian half rejects
+  more (more or multimodal Gaussian columns) -- to be confirmed on the MBH run.
