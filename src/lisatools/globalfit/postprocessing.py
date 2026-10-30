@@ -927,11 +927,35 @@ class MetadataBase:
             k: getattr(self, k) for k in self.__dataclass_fields__.keys() if not k.startswith("_")
         }
 
+    def json_sanitize(self, obj: Any) -> Any:
+        """Recursively sanitize an object for JSON serialization."""
+        if isinstance(obj, dict):
+            return {k: self.json_sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.json_sanitize(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self.json_sanitize(v) for v in obj)
+        elif isinstance(obj, set):
+            return sorted([self.json_sanitize(i) for i in obj], key=str)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        else:
+            logger.warning(f"Unsupported type {type(obj)} for JSON serialization. Converting to string.")
+            return str(obj)
+
+
     def to_json(self, filepath: str):
         """Save the metadata to a JSON file at the specified path."""
+        dictionary = self.json_sanitize(self.to_dict())
+
         with open(filepath, "w") as f:
-            json.dump(self.to_dict(), f, indent=4)
+            json.dump(dictionary, f, indent=4)
         logger.info(f"Saved metadata to {filepath}")
+
 
 
 @dataclasses.dataclass

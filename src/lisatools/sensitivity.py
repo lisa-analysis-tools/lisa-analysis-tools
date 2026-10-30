@@ -2719,10 +2719,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
     def _setup_window(self):
         """Setup window values for the c++ backend."""
         if self.window_values is not None:
-            assert isinstance(self.window_values, np.ndarray) or isinstance(self.window_values, cp.ndarray)
-            assert self.window_values.ndim == 1
-
+            assert isinstance(self.window_values, np.ndarray) or isinstance(self.window_values, cp.ndarray) or isinstance(self.window_values, list)
             self.window_values = self.xp.asarray(self.window_values)
+            assert self.window_values.ndim == 1, "window_values must be a 1D array"
 
             num_points = self.window_values.shape[0]
 
