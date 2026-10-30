@@ -209,6 +209,53 @@ class EmriMbhPsdTest(_Port):
         self.assertEqual((g.start_freq, g.end_freq, g.random_seed), (1e-4, 2.9e-2, 103209))
         self.assertEqual(g.window_taper_duration, 1 / 1e-4)
 
+    def test_flow_on_a_parameter_subset_builds_a_flow_gaussian_move(self):
+        from types import SimpleNamespace
+
+        from eryn.moves import ConditionalFlowMove, FlowGaussianMove
+
+        from lisatools.globalfit.stock.l2d.blocks.base import BuildContext, make_flow_move
+
+        run = on_cpu(EMRI_MBH_PSD, self.root)
+        mbh_yaml = run / "blocks" / "mbh.yaml"
+        raw = yaml.safe_load(mbh_yaml.read_text())
+        params = ["logM", "logq", "s1z", "s2z", "d_L", "phi_ref", "t_c"]
+        raw["flow"].update(parameters=params, gaussian={"adapt_cov": True, "mode": "am"})
+        mbh_yaml.write_text(yaml.safe_dump(raw, sort_keys=False))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cfg = load_run(run)
+
+        # the flow move alone (the full build needs the data backend): a basis holding the flow's names
+        basis = ["logM", "logq", "s1z", "s2z", "d_L", "t_c", "phi_ref", "cos_i", "lam", "sin_beta", "psi"]
+        info = {"basis": basis, "periodic": {"mbh": {"phi_ref": 2 * np.pi, "lam": 2 * np.pi}}}
+        ctx = BuildContext(cfg=cfg, general=SimpleNamespace(artifacts_file_dir=str(self.root)))
+        move = make_flow_move(cfg.blocks["mbh"], ctx, info, nleaves=6)
+
+        self.assertIsInstance(move, FlowGaussianMove)
+        np.testing.assert_array_equal(move.flow_params, np.isin(basis, params))
+        self.assertEqual(move.flow.dims, len(params))
+        flow_names = [n for n in basis if n in params]  # the flow's columns are in basis order
+        self.assertEqual(move.flow.data_transform.periodic, {flow_names.index("phi_ref"): (0.0, 2 * np.pi)})
+        self.assertTrue(move.adapt_cov)
+        self.assertIsNone(move.gibbs_sampling_setup)
+        self.assertIn("worker_device", move.executor_init_kwargs)
+
+        # the flow on every parameter stays a plain ConditionalFlowMove
+        move = make_flow_move(cfg.blocks["emri"], ctx, {"basis": basis, "periodic": None}, nleaves=2)
+        self.assertIs(type(move), ConditionalFlowMove)
+        self.assertEqual(move.flow.dims, len(basis))
+
+    def test_flow_gaussian_needs_parameters(self):
+        from pydantic import ValidationError
+
+        from lisatools.globalfit.stock.l2d.blocks.base import FlowSpec
+
+        with self.assertRaisesRegex(ValidationError, "give parameters too"):
+            FlowSpec(weight=1.0, model={"class": "ZukoFlow"}, gaussian={"adapt_cov": True})
+        with self.assertRaisesRegex(ValidationError, "filled in by the builder"):
+            FlowSpec(weight=1.0, parameters=["a"], model={"class": "ZukoFlow"}, gaussian={"flow_params": [True]})
+
 
 if __name__ == "__main__":
     unittest.main()

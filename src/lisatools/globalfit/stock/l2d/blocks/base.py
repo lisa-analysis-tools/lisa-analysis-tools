@@ -34,7 +34,7 @@ FLOW_MODULES = ("eryn.flows",)
 FLOW_MODEL_FILLED = frozenset({"dims", "device", "conditioning", "data_transform", "seed"})
 FLOW_TRANSFORM_FILLED = frozenset({"ndim", "periodic"})
 FLOW_TRAINER_FILLED = frozenset({"flow", "worker_device", "seed", "save_path", "diagnostics_dir"})
-FLOW_COMPLEMENT_FILLED = frozenset({"gibbs_sampling_setup"})
+FLOW_GAUSSIAN_FILLED = frozenset({"flow", "branch_name", "flow_params", "executor", "harvest_every", "harvest_temp_index"})
 
 # PE move arguments the recipe fills (build_recipe.py); the YAML gives only the knobs.
 SPECIAL_SOURCE_MOVE_FILLED = frozenset({
@@ -90,15 +90,16 @@ class TemperingSpec(_Spec):
 class FlowSpec(_Spec):
     """A normalizing-flow proposal (``ConditionalFlowMove``) trained online by a ``ProcessExecutor``.
 
-    With ``parameters`` the flow covers only those columns of the prior's input basis; ``complement`` then
-    moves the other columns, and the two run as one ``CombineMove`` inner move (each step its own
-    accept/reject). The builder fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer
-    device (``compute.flow_gpu``) and output paths; the trainer is started by the setup function.
+    With ``parameters`` the flow covers only those columns of the prior's input basis and the other columns
+    take a Gaussian random walk in the same proposal (one ``FlowGaussianMove``); ``gaussian`` holds its
+    arguments (default: a per-leaf covariance adapted from the chain, ``{adapt_cov: true}``). The builder
+    fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer device (``compute.flow_gpu``)
+    and output paths; the trainer is started by the setup function.
     """
 
     weight: PositiveFloat  # among the block's inner moves
     parameters: list[str] | None = None  # names in the prior's input basis; None -> every column
-    complement: ClassSpec | None = None  # a stretch-type move on the columns outside parameters
+    gaussian: dict[str, Any] | None = None  # FlowGaussianMove kwargs for the columns outside parameters
     model: ClassSpec  # a Flow from eryn.flows, e.g. ZukoFlow
     data_transform: ClassSpec | None = None  # a DataTransform from eryn.flows; None -> the flow's default
     trainer: dict[str, Any] = Field(default_factory=dict)  # ProcessExecutor kwargs (incl. fit_kwargs)
@@ -106,12 +107,12 @@ class FlowSpec(_Spec):
     @model_validator(mode="after")
     def _classes_and_kwargs(self):
         from eryn.flows import DataTransform, Flow, ProcessExecutor
-        from eryn.moves import RedBlueMove
+        from eryn.moves import FlowGaussianMove
 
         if self.parameters is not None and (not self.parameters or len(set(self.parameters)) != len(self.parameters)):
             raise ValueError("flow.parameters must be distinct names, at least one.")
-        if self.complement is not None and self.parameters is None:
-            raise ValueError("flow.complement moves the columns outside flow.parameters; give parameters too.")
+        if self.gaussian is not None and self.parameters is None:
+            raise ValueError("flow.gaussian moves the columns outside flow.parameters; give parameters too.")
 
         model = resolve_class(self.model.class_name, FLOW_MODULES)
         if not issubclass(model, Flow):
@@ -125,13 +126,8 @@ class FlowSpec(_Spec):
                 raise ValueError(f"flow.data_transform {self.data_transform.class_name!r} is not a DataTransform.")
             check_kwargs(self.data_transform.kwargs, transform, FLOW_TRANSFORM_FILLED)
         check_kwargs(self.trainer, ProcessExecutor, FLOW_TRAINER_FILLED)
-        if self.complement is not None:
-            move = resolve_class(self.complement.class_name, MOVE_MODULES)
-            if not issubclass(move, RedBlueMove):
-                raise ValueError(
-                    f"flow.complement must be a stretch-type move (an eryn RedBlueMove), not {self.complement.class_name!r}."
-                )
-            check_kwargs(self.complement.kwargs, move, FLOW_COMPLEMENT_FILLED)
+        if self.gaussian is not None:
+            check_kwargs(self.gaussian, FlowGaussianMove, FLOW_GAUSSIAN_FILLED)
         return self
 
 
@@ -359,7 +355,7 @@ class SourceBlock(MoveBlock):
         check_kwargs(self.waveform.kwargs, cls, ENGINE_WAVEFORM_KWARGS)
         for move in self.inner_moves or []:
             cls = resolve_class(move.class_name, MOVE_MODULES)
-            if cls.__name__ == "ConditionalFlowMove":
+            if cls.__name__ in ("ConditionalFlowMove", "FlowGaussianMove"):
                 raise ValueError("flow moves are not supported yet (they come with the recipe step).")
             check_kwargs(move.kwargs, cls, ENGINE_MOVE_KWARGS.get(cls.__name__, frozenset()))
         return self
@@ -495,23 +491,23 @@ def make_inner_moves(block: BlockBase, filled: dict[str, dict]) -> list[tuple[An
     return moves
 
 def make_flow_move(block: SourceBlock, ctx: BuildContext, info: dict[str, Any], nleaves: int):
-    """The inner move for ``block.flow``: a ``ConditionalFlowMove``, or ``CombineMove([flow, complement])``.
+    """The inner move for ``block.flow``: a ``ConditionalFlowMove``, or a ``FlowGaussianMove`` with ``parameters``.
 
     The flow's columns are the ``parameters`` in prior-basis order; the trainer's arguments are kept on the
     move (``executor_init_kwargs``) and the trainer is started by the setup function
     (``build_recipe.attach_flow_trainers``): a live trainer does not survive ``CurrentInfoGlobalFit``'s deepcopy.
     """
     import eryn.flows
-    from eryn.moves import CombineMove, ConditionalFlowMove
+    from eryn.moves import ConditionalFlowMove, FlowGaussianMove
 
     spec, branch, basis = block.flow, block.type, info["basis"]
     unknown = sorted(set(spec.parameters or ()) - set(basis))
     if unknown:
         raise ValueError(f"flow.parameters {unknown} are not in the prior basis {basis}.")
     names = [n for n in basis if spec.parameters is None or n in spec.parameters]
-    if spec.complement is not None and len(names) == len(basis):
-        raise ValueError("flow.complement has no columns left: flow.parameters covers the whole prior basis.")
-    columns = np.tile(np.isin(basis, names), (nleaves, 1))
+    split = len(names) < len(basis)
+    if spec.gaussian is not None and not split:
+        raise ValueError("flow.gaussian has no columns left: flow.parameters covers the whole prior basis.")
     seed = {} if ctx.cfg.run.seed is None else {"seed": ctx.cfg.run.seed}
 
     transform = None
@@ -532,9 +528,14 @@ def make_flow_move(block: SourceBlock, ctx: BuildContext, info: dict[str, Any], 
         **seed,
         **deepcopy(spec.model.kwargs),
     )
-    gibbs = {} if spec.parameters is None else {"gibbs_sampling_setup": (branch, columns)}
     # fed by the PE move (one batch per leaf per iteration), not by harvesting
-    flow_move = ConditionalFlowMove(flow, branch, executor=None, harvest_every=None, **gibbs)
+    if split:
+        gaussian = {"adapt_cov": True} if spec.gaussian is None else deepcopy(spec.gaussian)
+        flow_move = FlowGaussianMove(
+            flow, branch, flow_params=np.isin(basis, names), executor=None, harvest_every=None, **gaussian
+        )
+    else:
+        flow_move = ConditionalFlowMove(flow, branch, executor=None, harvest_every=None)
     flow_gpu = ctx.cfg.compute.flow_gpu
     out_dir = os.path.join(ctx.general.artifacts_file_dir, f"{branch}_flow")
     flow_move.executor_init_kwargs = dict(
@@ -544,12 +545,7 @@ def make_flow_move(block: SourceBlock, ctx: BuildContext, info: dict[str, Any], 
         diagnostics_dir=out_dir,
         **seed,
     )
-    if spec.complement is None:
-        return flow_move
-    complement = find_class(spec.complement.class_name, MOVE_MODULES)(
-        **deepcopy(spec.complement.kwargs), gibbs_sampling_setup=(branch, ~columns)
-    )
-    return CombineMove([flow_move, complement])
+    return flow_move
 
 
 def make_priors(block: BlockBase, general) -> GFBasePrior:

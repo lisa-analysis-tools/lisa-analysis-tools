@@ -28,9 +28,10 @@ inner_moves:
   - {class: SkyMove, weight: 0.05, kwargs: {which: both}}
 flow:
   weight: 0.2
-  # the flow on the unimodal parameters only, a stretch on the degenerate ones (one CombineMove):
+  # the flow on the unimodal parameters only, a Gaussian walk on the degenerate ones (one FlowGaussianMove;
+  # its covariance is adapted per leaf from the chain by default):
   # parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
-  # complement: {class: StretchMove}
+  # gaussian: {adapt_cov: true}
   model:
     class: ZukoFlow
     kwargs: {flow_class: NSF, transforms: 8, hidden_features: [128, 128, 128], bins: 8}

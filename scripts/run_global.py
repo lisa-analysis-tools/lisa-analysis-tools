@@ -140,8 +140,8 @@ def dry_run_report(cfg, curr_info, snapshot):
         flow = getattr(block, "flow", None)
         if flow is not None:
             params = len(flow.parameters) if flow.parameters else setup.ndim
-            complement = f" + {flow.complement.class_name}" if flow.complement else ""
-            search += f", flow {flow.model.class_name} on {params} params{complement}"
+            gaussian = f" + Gaussian on {setup.ndim - params}" if params < setup.ndim else ""
+            search += f", flow {flow.model.class_name} on {params} params{gaussian}"
         move = f"pe_move {block.pe_move.class_name}" if hasattr(block, "pe_move") else "sampled by the psd move"
         lines.append(
             f"  {name}: {setup.nleaves_max} leaves x {setup.ndim} params, ladder {len(setup.betas)}, {search}, {move}"

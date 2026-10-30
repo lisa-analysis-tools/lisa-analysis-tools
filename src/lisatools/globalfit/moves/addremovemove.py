@@ -74,12 +74,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         inner_moves: list of moves and their corresponding weights to be used for proposing new sources for the leaf.
             Each repeat draws one entry by weight. A :class:`eryn.moves.CombineMove` entry runs its sub-moves in
             order, each with its own accept/reject (deterministic-scan Gibbs within the repeat).
-            A move's ``gibbs_sampling_setup`` restricts it to a subset of the parameters: one
-            ``(branch_name, mask)`` split with a boolean ``mask`` of shape ``(nleaves_max, ndim)``; the leaf's
-            row is used. Stretch-type moves propose on the full vector with ``gibbs_ndim`` = the number of
-            masked columns and the other columns are put back; a flow move only ever sees the masked columns
-            (its flow has ``dims`` = that number, and it is trained on those columns only). Other moves
-            cannot be masked.
+            Every inner move proposes on all parameters of the leaf, so none may set a
+            ``gibbs_sampling_setup``. To split parameters between proposals, do it inside one move,
+            e.g. :class:`eryn.moves.FlowGaussianMove` (a flow on some columns, a Gaussian walk on the rest;
+            it is given the full ring-buffer rows and trains its flow on its own columns).
         Tmax: maximum temperature for the temperature control.
         betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
         permute_every: gate for the walker-permuting (fancy) temperature swap: ``> 0`` enables it -- it fires exactly ONCE per leaf visit, on the final in-model repeat -- and ``<= 0`` disables it entirely (``{BRANCH}_PERMUTE_EVERY`` env override). The numeric value is no longer a cadence.
@@ -146,7 +144,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         for inner_move in self._proposing_moves:
             inner_move.accepted = np.zeros((self.ntemps, self.nwalkers))
             inner_move.num_proposals = 0
-            self._column_mask(inner_move)  # validate the Gibbs setups now, not mid-run
+            self._check_no_gibbs_setup(inner_move)
 
         self.temperature_controls = [None for _ in range(self.nleaves_max)]
         for i in range(self.nleaves_max):
@@ -249,32 +247,15 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         weights = np.where(self._has_flow, 0.0, self.move_weights)
         return weights / weights.sum()
 
-    def _column_mask(self, move) -> np.ndarray | None:
-        """``move``'s parameter mask, shape ``(nleaves_max, ndim)``, from its ``gibbs_sampling_setup``; None: all."""
-        setup = getattr(move, "gibbs_sampling_setup", None)
-        if setup is None:
-            return None
-        name = type(move).__name__
-        # eryn normalises the setup to a list of splits: a branch name, a (branch, mask) tuple, or a list of
-        # such tuples (from a dict)
-        if len(setup) != 1 or (isinstance(setup[0], list) and len(setup[0]) != 1):
-            raise ValueError(f"{name}: an inner move takes a single gibbs_sampling_setup split, got {setup}.")
-        split = setup[0][0] if isinstance(setup[0], list) else setup[0]
-        branch, mask = (split, None) if isinstance(split, str) else split
-        if branch != self.branch_name:
-            raise ValueError(f"{name}: gibbs_sampling_setup names branch {branch!r}, this move is {self.branch_name!r}.")
-        if mask is None:
-            return None
-        mask = np.asarray(mask, dtype=bool)
-        if mask.shape != (self.nleaves_max, self.ndim):
-            raise ValueError(f"{name}: gibbs mask shape {mask.shape}, expected {(self.nleaves_max, self.ndim)}.")
-        if _is_flow(move):
-            dims = getattr(move.flow, "dims", None)
-            if dims is not None and np.any(mask.sum(axis=1) != dims):
-                raise ValueError(f"{name}: every gibbs mask row must select flow.dims = {dims} columns.")
-        elif not isinstance(move, RedBlueMove):
-            raise ValueError(f"{name}: only stretch-type (RedBlueMove) and flow moves can take a gibbs mask here.")
-        return mask
+    @staticmethod
+    def _check_no_gibbs_setup(move):
+        """Inner moves propose on every parameter of the leaf: reject a ``gibbs_sampling_setup``."""
+        if getattr(move, "gibbs_sampling_setup", None) is not None:
+            raise ValueError(
+                f"{type(move).__name__}: inner moves of the add/remove move propose on every parameter and"
+                " cannot take a gibbs_sampling_setup; split the parameters inside one move instead"
+                " (e.g. eryn.moves.FlowGaussianMove)."
+            )
 
     def _validate_prior(self, prior: ProbDistContainer | list[ProbDistContainer]):
         """Check that the prior is compatible with the branch's coordinates.
@@ -667,11 +648,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         move_name = move.__class__.__name__
         accepted = np.zeros((ntemps_full, self.nwalkers), dtype=bool)
 
-        mask = self._column_mask(move)
-        cols = None if mask is None else mask[leaf]
-        if cols is not None and not cols.any():
-            return accepted  # nothing for this move to propose on this leaf
-
         if _is_flow(move):
             move.active_condition = leaf
             # Temperature-scaled base (see ConditionalFlowMove.active_betas):
@@ -707,33 +683,13 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             s = {self.branch_name: sets[split]}
             c = {self.branch_name: sets[:split] + sets[split + 1 :]}
 
-            # Get the move-specific proposal. A masked stretch-type move proposes on the full vector with the
-            # Gibbs dimension; a masked flow only sees its own columns. Either way, only the masked columns
-            # change.
+            # Get the move-specific proposal (on every parameter of the leaf)
             if isinstance(move, RedBlueMove):
-                gibbs = {} if cols is None else {"gibbs_ndim": int(cols.sum())}
-                # StretchMove's periodic lift ratio counts only the columns in its Gibbs split (``_inds_run``,
-                # normally set by its own Gibbs iterator, which never runs here); ``s`` holds one leaf
-                masked_lift = cols is not None and hasattr(move, "_inds_run")
-                if masked_lift:
-                    move._inds_run = {self.branch_name: cols[None, :]}
-                try:
-                    q, factors = move.get_proposal(s, c, model.random, **gibbs)
-                finally:
-                    if masked_lift:
-                        move._inds_run = {}
-
-            elif cols is not None:
-                q, factors = move.get_proposal({self.branch_name: s[self.branch_name][..., cols]}, model.random)
-
+                q, factors = move.get_proposal(s, c, model.random)
             else:
                 q, factors = move.get_proposal(s, model.random)
 
-            new_points = q[self.branch_name].reshape((self.ntemps, nwalkers_here, -1))
-            if cols is not None:
-                proposed = new_points[..., cols] if isinstance(move, RedBlueMove) else new_points
-                new_points = old_points.copy()
-                new_points[..., cols] = proposed
+            new_points = q[self.branch_name].reshape((self.ntemps, nwalkers_here, ndim))
 
             # Compute prior of the proposed position
             # new_inds_prior is adjusted if product-space is used
@@ -1070,12 +1026,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         if flow_move_available:
             for move in self._proposing_moves:
                 if _is_flow(move):
-                    # a masked flow is trained on its own columns only
-                    mask = self._column_mask(move)
-                    batch = ring_buffer if mask is None else {
-                        leaf: rows[:, mask[leaf]] for leaf, rows in ring_buffer.items()
-                    }
-                    move.submit_by_leaf(batch)
+                    # full rows: a FlowGaussianMove slices its flow columns (and adapts its Gaussian) itself
+                    move.submit_by_leaf(ring_buffer)
                     logger.info("Current repeats submitted to flow move")
         # new_state.log_like[(temp_inds_update, walker_inds_update)] = logl.flatten()
         # new_state.log_prior[(temp_inds_update, walker_inds_update)] = logp.flatten()
