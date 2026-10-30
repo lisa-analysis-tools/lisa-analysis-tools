@@ -535,6 +535,8 @@ class GeneralSetup(Setup, GeneralSettings):
                 **sensitivity_init_kwargs,
             )
 
+            self.logger.debug(f"Using sensitivity backend {type(self.sensitivity_backend).__name__} with kwargs: {self.sensitivity_backend.kwargs}")
+
     @property
     def stft_dt(self) -> Optional[float]:
         """STFT hop time, if applicable."""
