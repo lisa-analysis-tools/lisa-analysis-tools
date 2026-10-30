@@ -245,7 +245,8 @@ class AnalysisContainer:
         if data is None:
             raise TypeError("AnalysisContainer requires a ``data`` argument.")
         if sens_mat is None:
-            raise TypeError("AnalysisContainer requires a ``sens_mat`` argument.")
+            if not isinstance(data, domains.TDSignal):
+                raise TypeError("If not used to store TDSignal data, AnalysisContainer requires a ``sens_mat`` argument.")
 
         # 1. normalise data to a DomainBase
         self._data: DomainBase = _coerce_to_domain_base(data)

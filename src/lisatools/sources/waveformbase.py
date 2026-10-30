@@ -706,11 +706,18 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         left_edges, padded = self.build_common_grid(times, channels)
         return self.transform_to_domain(left_edges, padded)
 
-    def get_signals_for_residuals(self, *args, **kwargs) -> DomainBaseArray:
+    def get_signals_for_residuals(self, *args, output_domain: str | None = None, domain_kwargs: dict | None = None, **kwargs) -> DomainBaseArray:
         """Generate per-source domain-wrapped signals for residual operations.
 
         Sky/response parameters may be supplied either as explicit keyword
         arguments or as the last N positional arguments.
+
+        Args:
+            *args: Positional arguments for the waveform generation.
+            **kwargs: Keyword arguments for the waveform generation.
+            output_domain: Optional string specifying the target domain for the output signals. If None, defaults to the waveform's analysis domain.
+            domain_kwargs: Optional dictionary of additional keyword arguments for the domain settings constructor. If None, the domain settings will be derived from the input times and the chosen output domain.
+        
 
         Returns:
             :class:`DomainBaseArray` of per-source signals, or a single domain
@@ -719,10 +726,10 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         times, channels = self.compute_tdi_channels(*args, **kwargs)
         if times.ndim == 2:
             return DomainBaseArray([
-                self._td_to_output_domain(times_in=times[i], signal_in=channels[i])
+                self._td_to_output_domain(times_in=times[i], signal_in=channels[i], output_domain=output_domain, domain_kwargs=domain_kwargs)
                 for i in range(channels.shape[0])
             ])
-        return self._td_to_output_domain(times_in=times, signal_in=channels)
+        return self._td_to_output_domain(times_in=times, signal_in=channels, output_domain=output_domain, domain_kwargs=domain_kwargs)
 
 
 class TDPyResponseWaveformBase(TDWaveformBase):

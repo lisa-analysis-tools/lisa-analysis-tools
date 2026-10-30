@@ -463,7 +463,10 @@ class DomainBase:
         if copy:
             target = self.__class__(self.arr.copy(), self.settings)
 
-        t_settings = template.settings
+        # now bring the template on the same backend as the target (if needed) so the add/subtract works
+        template_same_backend = template.with_backend(target.backend)
+
+        t_settings = template_same_backend.settings
         s_settings = target.settings
         if type(t_settings) is not type(s_settings):
             raise ValueError(
@@ -472,13 +475,13 @@ class DomainBase:
             )
 
         if isinstance(s_settings, FDSettings):
-            _apply_fd_add(target, sign, template.arr, t_settings)
+            _apply_fd_add(target, sign, template_same_backend.arr, t_settings)
         elif isinstance(s_settings, TDSettings):
-            _apply_td_add(target, sign, template.arr, t_settings)
+            _apply_td_add(target, sign, template_same_backend.arr, t_settings)
         elif isinstance(s_settings, STFTSettings):
-            _apply_stft_add(target, sign, template.arr, t_settings)
+            _apply_stft_add(target, sign, template_same_backend.arr, t_settings)
         elif isinstance(s_settings, WDMSettings):
-            _apply_wdm_add(target, sign, template.arr, t_settings)
+            _apply_wdm_add(target, sign, template_same_backend.arr, t_settings)
         else:
             raise ValueError(
                 f"add_signal is not implemented for domain {type(s_settings).__name__}."
