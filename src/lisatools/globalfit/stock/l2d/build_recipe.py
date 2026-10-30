@@ -269,6 +269,8 @@ def psd_moves(block, cls, engine_info, curr, acs, priors, state, search: bool = 
         )
     else:
         galfor = curr.source_info.get("galfor")
+        if galfor is not None:
+            logger.info(f"psd move will sample galfor with and {galfor.ndim} parameters")
         common = dict(
             num_repeats=info.num_prop_repeats,
             psd_transform_fn=info.transform,
