@@ -1,4 +1,4 @@
-"""Agent 2: exact instrument bases + fused likelihood (``lisatools.sensitivity_window``).
+"""Agent 2: exact instrument bases + fused likelihood (``lisatools.convolution_helpers``).
 
     CUDA_VISIBLE_DEVICES=3 .venv/bin/python -m unittest -v test_agent2_instrument
 
@@ -24,7 +24,7 @@ import numpy as np
 import _use_worktree  # noqa: F401
 from compare import band_reldiff, golden_inputs, load_golden
 from fixtures import CONFIGS, make_backend
-from lisatools import sensitivity_window as sw
+from lisatools import convolution_helpers as sw
 
 try:
     import cupy as cp

@@ -22,7 +22,7 @@ import _use_worktree  # noqa: F401
 from bench_2yr import PeakTracker
 from fixtures import CONFIGS, FIDUCIAL, make_backend
 
-from lisatools import sensitivity_window as sw
+from lisatools import convolution_helpers as sw
 
 
 def timed(fn, cp, tracker, repeats):

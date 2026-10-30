@@ -1,10 +1,10 @@
-"""Agent 3: exact galaxy window convolution (``sensitivity_window.galaxy_convolved_rows``).
+"""Agent 3: exact galaxy window convolution (``convolution_helpers.galaxy_convolved_rows``).
 
     CUDA_VISIBLE_DEVICES=3 .venv/bin/python scripts/window_conv/test_agent3_galaxy.py [cpu|cuda12x ...] [--e2e]\n\n(``--e2e``: only the end-to-end ll check 7 -- fused_log_like + galaxy rows vs legacy.)
 
 Checks (per backend, every galaxy config):
-1. prefix evaluation of the compiled kernel == full-band evaluation (bitwise); the direct
-   elementwise XX row == kernel XX row (band-normalised <= 1e-14);
+1. prefix evaluation of the compiled kernel == full-band evaluation (bitwise); the compiled
+   ``get_galactic_row_wrap`` XX row == kernel XX row (band-normalised <= 1e-14);
 2. synthetic-row oracle: ``_gal_convolve`` vs legacy ``_convolve_matrix_components`` on a
    random real row (non-zero at column 0, zero above ``n_sup``), short circle forced;
 3. galaxy-only legacy ``_compute_matrix_elements(Soms=Sa=0, convolve_window=True)`` vs
@@ -27,7 +27,7 @@ import _use_worktree  # noqa: F401
 from compare import band_reldiff, golden_inputs
 from fixtures import CONFIGS, make_backend
 
-from lisatools import sensitivity_window as sw
+from lisatools import convolution_helpers as sw
 
 GAL_CONFIGS = [n for n, c in CONFIGS.items() if c["galaxy"]]
 TOL = 1e-14
@@ -106,14 +106,12 @@ def run(backend_name):
         d = max(float(np.nanmax(np.abs(host(a)[..., :m] - host(b)))) for a, b in zip(full, pre))
         check("prefix eval bitwise", d, 0.0, results)
 
-        # 1b. direct (elementwise) XX row vs the compiled kernel, whole band, random walkers
-        st = sw.get_galaxy_setup(sm, galaxy_fmax=None)
-        print(f"    direct eval: setup mismatch {st['direct_mismatch']:.2e}, used={st['direct']}")
-        mine = host(sw._gal_eval_direct(sm, st, int(sm.num_freqs), pl))
+        # 1b. compiled XX row (get_galactic_row_wrap) vs the covariance kernel, whole band
+        mine = host(sw._gal_row(sm, int(sm.num_freqs), pl))
         ref = host(full[0])[:, 0, :]
         fin = np.isfinite(ref)
-        check("direct eval finite pattern == kernel", float(np.any(fin != np.isfinite(mine))), 0.0, results)
-        check("direct eval vs kernel (band)", band_reldiff(np.where(fin, mine, 0), np.where(fin, ref, 0))[0], 1e-14, results)
+        check("galaxy row finite pattern == kernel", float(np.any(fin != np.isfinite(mine))), 0.0, results)
+        check("galaxy row vs kernel (band)", band_reldiff(np.where(fin, mine, 0), np.where(fin, ref, 0))[0], 1e-14, results)
 
         # 2. synthetic-row oracle vs legacy _convolve_matrix_components (short circle forced)
         st = sw.get_galaxy_setup(sm, galaxy_fmax=None)

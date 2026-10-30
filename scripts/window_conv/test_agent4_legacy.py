@@ -40,13 +40,17 @@ def check(ok, msg):
 _HEAD = []
 
 
+# the unmodified implementation the goldens were made from (make_golden.py provenance)
+REFERENCE_COMMIT = "673152b2"
+
+
 def head_class():
-    """HEAD's XYZSensitivityBackend (``git show HEAD:src/lisatools/sensitivity.py``)."""
+    """The reference XYZSensitivityBackend (``git show REFERENCE_COMMIT:src/lisatools/sensitivity.py``)."""
     if not _HEAD:
         import importlib.util, os, subprocess, tempfile
 
         src = subprocess.run(
-            ["git", "-C", _use_worktree.WORKTREE, "show", "HEAD:src/lisatools/sensitivity.py"],
+            ["git", "-C", _use_worktree.WORKTREE, "show", f"{REFERENCE_COMMIT}:src/lisatools/sensitivity.py"],
             capture_output=True, check=True,
         ).stdout
         path = os.path.join(tempfile.mkdtemp(), "sensitivity_head.py")

@@ -1,5 +1,9 @@
 # Factorized window convolution: error budget (agent 5)
 
+> The study code (`agent5_error_budget.py`, `agent5_summarize.py`, the moment bases and
+> `factorized_galaxy`) was removed after the study; it is in commit `6bebe8fe`. Only the
+> order-0 spline factorization was kept (`convolution_helpers.factorized_spline_weights`).
+
 **Question.** Is `window_convolution_mode="factorized"` accurate enough to offer as an opt-in?
 It uses zero per-walker FFTs and relies on `conv(m·T) ≈ m·conv(T)`. Is Δlog L ≪ 1, and for
 which components?

@@ -11,7 +11,7 @@ import numpy as np
 import _use_worktree  # noqa: F401
 from bench_2yr import PeakTracker, bench_case, make_bench_inputs
 from fixtures import CONFIGS, make_backend
-from lisatools import sensitivity_window as sw
+from lisatools import convolution_helpers as sw
 
 
 def bench_fused(sm, inp, repeats, warmup, cp, tracker):
