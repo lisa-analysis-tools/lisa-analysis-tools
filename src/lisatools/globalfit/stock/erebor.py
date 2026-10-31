@@ -536,7 +536,10 @@ def m1_m2_to_mT_Q(m1, m2):
     return (m1 + m2, m1 / m2)
 
 
-from bbhx.utils.transform import LISA_to_SSB, SSB_to_LISA, mT_q  # frame helpers kept for settings files; the stock MBH basis is direct ICRS
+try:  # frame helpers kept for settings files; the stock MBH basis is direct ICRS (optional: bbhx only needed for MBHs)
+    from bbhx.utils.transform import LISA_to_SSB, SSB_to_LISA, mT_q
+except ImportError:
+    LISA_to_SSB = SSB_to_LISA = mT_q = None
 from eryn.moves import Move
 
 

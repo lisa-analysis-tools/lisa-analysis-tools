@@ -31,7 +31,10 @@ except ModuleNotFoundError:
 from lisatools.domains import FDSettings, STFTSettings, WDMSettings
 from lisatools.response.tdiconfig import TDIConfig
 
-from bbhx.utils.transform import SSB_to_LISA
+try:  # optional: only MBH settings files need bbhx
+    from bbhx.utils.transform import SSB_to_LISA
+except ImportError:
+    SSB_to_LISA = None
 from gbgpu.gbgpu import GBGPU
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer

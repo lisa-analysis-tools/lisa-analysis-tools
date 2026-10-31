@@ -24,6 +24,10 @@
 #define SQRT3_GAL  1.7320508075688772935
 #define PI2_GAL    (M_PI / 2.0)
 #define OMEGA_LISA (2.0 * M_PI / 3.154e7)   // rad/s — matches galaxy_transfer.py
+// Population constant of the galaxy response R_ab = K [F+^a F+^b + Fx^a Fx^b]:
+//   K = <(1 + cos^2 i)^2> + 4 <cos^2 i> = 16/5 for inclinations uniform in cos(i).
+// Shared by the closed-form (analytic) and the orbit-based responses. Isotropic sky average of R_XX: K * 6/5.
+#define GAL_RESPONSE_K (16.0 / 5.0)
 
 
 // ============================================================================
@@ -47,7 +51,19 @@ struct GalacticGridSetup
     std::vector<double> R_vals_quad;   // (N_quad * N_sky)
     std::vector<double> z_vals_quad;   // (N_quad * N_sky)
 
-    void compute(int N_lambda_ = 90, int N_beta_ = 60);
+    /**
+     * Build the sky grid and the line-of-sight quadrature.
+     *
+     * @param los_center_half_width  If > 0, the line of sight is integrated piecewise:
+     *                               [0, R_sun - hw], [R_sun - hw, R_sun + hw] (split in
+     *                               los_center_sub pieces), [R_sun + hw, D_max], with a
+     *                               16-point Gauss-Legendre rule on each piece. Needed to
+     *                               resolve the bulge. If <= 0 (default), a single 16-point
+     *                               rule on [0, D_max] (legacy).
+     * @param los_center_sub         Number of pieces of the central interval.
+     */
+    void compute(int N_lambda_ = 90, int N_beta_ = 60,
+                 double los_center_half_width = 0.0, int los_center_sub = 1);
     void print_summary() const;
 };
 
@@ -67,7 +83,7 @@ struct GalacticGridSetup
 //      OR: access R_avg directly from the likelihood kernel (preferred,
 //          avoids storing the full (N_times, N_freqs, 6) tensor).
 //
-// R_d, z_d, alpha0, beta0 are NOT inferred — they are fixed at init.
+// R_d, z_d, f_b, r_b, alpha0, beta0 are NOT inferred — they are fixed at init.
 // Only spectral parameters (Amp, alpha, f_1, f_knee, f_2) vary.
 // ============================================================================
 
@@ -89,7 +105,15 @@ struct GalacticGrid {
     double beta0;
     double t0;
 
-    // ---- Sky weights — (N_sky,), computed once from R_d, z_d ----
+    // ---- Optional detector arms from the orbits — (N_times, 3 arms, 3), ecliptic ----
+    // Arm order: u12, u13, u23 (unit vectors SC1->SC2, SC1->SC3, SC2->SC3).
+    // When set (set_detector_arms), R_avg uses the low-frequency detector-tensor
+    // response built from these arms instead of the analytic galaxy_XX..ZZ formulas.
+    double *arms = nullptr;
+    int N_arms_times = 0;
+    bool use_orbit_response = false;
+
+    // ---- Sky weights — (N_sky,), computed once from R_d, z_d (and f_b, r_b) ----
     double *weights;
 
     // ---- Sky-averaged response — (N_times, 6), computed once ----
@@ -125,10 +149,25 @@ struct GalacticGrid {
     /** Free all device allocations. */
     void free_gpu();
 
+    /**
+     * Use the detector-tensor response from the orbits for R_avg.
+     *
+     * For each time and sky direction n (orthonormal p, q ⊥ n), with
+     * D_X = u12 u12 - u13 u13, D_Y = u23 u23 - u12 u12, D_Z = u13 u13 - u23 u23 and
+     * F+_I = D_I : (pp - qq), Fx_I = D_I : (pq + qp), the polarization- and
+     * inclination-averaged response is R_IJ ∝ F+_I F+_J + Fx_I Fx_J (low-frequency limit).
+     * It is scaled by GAL_RESPONSE_K, like the closed-form response: the two agree for
+     * rigid cartwheel orbits.
+     *
+     * @param arms_in  (N_times_in, 3, 3) arm unit vectors u12, u13, u23 in the ecliptic frame,
+     *                 at the same times as passed to initialize(). Copied.
+     */
+    void set_detector_arms(const double *arms_in, int N_times_in);
+
     // ------------------------------------------------------------------
     // Step 2a: compute normalized sky weights (called by initialize)
     // ------------------------------------------------------------------
-    void compute_sky_weights(double R_d, double z_d);
+    void compute_sky_weights(double R_d, double z_d, double f_b = 0.0, double r_b = 0.5);
 
     // ------------------------------------------------------------------
     // Step 2b: compute sky-averaged response R_avg[t, k] (called by initialize)
@@ -139,16 +178,25 @@ struct GalacticGrid {
     // Step 2 (combined): call once before inference begins
     // ------------------------------------------------------------------
     /**
-     * Compute and store sky weights + R_avg from fixed disk/orbit parameters.
+     * Compute and store sky weights + R_avg from fixed galaxy/orbit parameters.
      * Must be called after allocate_and_setup().
+     *
+     * The source density is a mass-normalized mixture of an exponential disk and a
+     * spherical Gaussian bulge:
+     *   rho = (1 - f_b) exp(-R/R_d) exp(-|z|/z_d) / (4 pi R_d^2 z_d)
+     *       +      f_b  exp(-r^2/r_b^2)            / (pi^{3/2} r_b^3),   r^2 = R^2 + z^2.
+     * With f_b = 0 this is the disk-only model.
      *
      * @param R_d      Disk radial scale length [kpc]
      * @param z_d      Disk vertical scale height [kpc]
      * @param d_times  Device array of segment centre times (N_times,)
      * @param N_times  Number of time segments
+     * @param f_b      Fraction of sources in the bulge (0 <= f_b <= 1)
+     * @param r_b      Bulge scale radius [kpc]
      */
     void initialize(double R_d, double z_d,
-                    const double *d_times, int N_times);
+                    const double *d_times, int N_times,
+                    double f_b = 0.0, double r_b = 0.5);
 
     // ------------------------------------------------------------------
     // Step 3: per-likelihood call (spectral params vary per walker)

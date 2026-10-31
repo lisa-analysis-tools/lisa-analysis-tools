@@ -194,13 +194,16 @@ public:
      * @param R_d     disk radial scale length [kpc]
      * @param z_d     disk vertical scale height [kpc]
      * @param N_times number of time segments
+     * @param f_b     fraction of sources in the bulge (0 = disk only)
+     * @param r_b     bulge scale radius [kpc]
      */
-    void initialize_wrap(array_type<double> times, double R_d, double z_d, int N_times)
+    void initialize_wrap(array_type<double> times, double R_d, double z_d, int N_times,
+                         double f_b = 0.0, double r_b = 0.5)
     {
         gal_grid->initialize(
             R_d, z_d,
             return_pointer_and_check_length(times, std::string("times"), N_times, 1),
-            N_times
+            N_times, f_b, r_b
         );
     }
 
@@ -220,6 +223,16 @@ public:
             N_freqs, N_times,
             Amp, alpha, f_1, f_knee, f_2, avg_d
         );
+    }
+
+    /**
+     * Use the detector-tensor response from the orbit arms for R_avg (call before
+     * initialize_wrap). arms: (N_times, 3, 3) unit vectors u12, u13, u23, ecliptic frame.
+     */
+    void set_detector_arms_wrap(array_type<double> arms, int N_times)
+    {
+        gal_grid->set_detector_arms(
+            return_pointer_and_check_length(arms, std::string("arms"), N_times * 9, 1), N_times);
     }
 
     /** Return device pointer to R_avg (N_times * 6 doubles). */
