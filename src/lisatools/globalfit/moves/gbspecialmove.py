@@ -126,6 +126,9 @@ from .gbbands import (
     BandSorter,
     Buffer,
     SubBandBuffer,
+    free_device_bytes,
+    split_rows_by_budget,
+    stft_batch_budget_bytes,
     _RoutedBandEngine,
     make_routed_band_engine,
     pack_special_index,
@@ -519,6 +522,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             xp=self.xp,
             gpus=kwargs.get("gpus", None),
         )
+
+        # * With store windows, a setting left at None is sized from the memory free at each build,
+        # * where the cell width is known. A given setting runs as it is; the estimate serves the rest.
+        self._size_proposal_batches = num_band_preload is None and stft_store_windows is not None
+        self._size_tempering_batches = num_bands_preload_temp is None and stft_store_windows is not None
+        if stft_store_windows is not None:
+            self._stft_bytes_per_bin = int(getattr(acs, "nchannels", 3)) * int(acs.settings.NT) * 16
+            if not SubBandBuffer.READ_PARENT_NOISE_ROWS:
+                # A cell then owns its noise window, and a new twin holds one until it is built.
+                self._stft_bytes_per_bin += (
+                    int(np.prod(acs.shape_sens)) * int(acs.settings.NT) * np.dtype(acs.noise_dtype).itemsize
+                )
 
         # Both arrive from GBSettings through recipe.py; the estimate is the fallback.
         if num_band_preload is None:
@@ -1183,6 +1198,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 self._run_band_unit(
                     model, band_sorter, subset, band_temps,
                     ll_change_log, prop_counts, acc_counts,
+                    **({"num_slots": self._proposal_num_slots()}
+                       if getattr(self, "_size_proposal_batches", False) else {}),
                 )
 
             # Close: re-subtract with (possibly updated) cold-chain coords.
@@ -1221,6 +1238,61 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """
         return max(1, int(setting) * int(self.stft_store_windows.buffer_width) // int(cell_width))
 
+    def _batch_budget_bytes(self) -> tuple:
+        """Bytes one device may give to buffers now, and the number of devices."""
+        gpus = getattr(self.gb, "gpus", None) if self.backend.uses_cupy else None
+        return stft_batch_budget_bytes(free_device_bytes(self.xp, gpus)), len(gpus) if gpus else 1
+
+    def _proposal_num_slots(self, cell_width=None) -> int:
+        """Cells of a proposal buffer: from the free memory, or from the setting when it is given.
+
+        ``None`` is the one width. A buffer shares its cells evenly between the devices.
+        """
+        if not self._size_proposal_batches:
+            if cell_width is None:
+                return self.num_band_preload
+            return self._class_num_slots(self.num_band_preload, cell_width)
+        width = int(self.stft_store_windows.buffer_width) if cell_width is None else int(cell_width)
+        budget_bytes, num_devices = self._batch_budget_bytes()
+        num_slots = max(1, num_devices * budget_bytes // (self._stft_bytes_per_bin * width))
+        logger.info(
+            f"{self.name}: {num_slots} proposal cells of {width} bins, from a budget of "
+            f"{budget_bytes / 1024**3:.2f} GiB per device."
+        )
+        return num_slots
+
+    def _sized_tempering_rows(self, class_widths, num_splits: int) -> dict:
+        """Rows per chunk over all splits for each tempering buffer, from the free memory.
+
+        Keyed by cell width, or by ``None`` alone for one width, which also serves when one row of
+        every class does not fit: a class buffer stays for the whole propose.
+        """
+        budget_bytes, _ = self._batch_budget_bytes()
+        # A row is one cell and its twin per temperature.
+        budget_bins = budget_bytes // (2 * int(self.ntemps) * self._stft_bytes_per_bin)
+        if class_widths is not None:
+            bands = np.arange(1) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+            widths, band_counts = np.unique(class_widths[bands], return_counts=True)
+            if int(widths.sum()) <= budget_bins:
+                rows = split_rows_by_budget(
+                    band_counts * int(self.nwalkers) // num_splits, widths, budget_bins
+                )
+                logger.info(
+                    f"{self.name}: tempering rows per chunk {dict(zip(widths.tolist(), rows.tolist()))} "
+                    f"by class width, from a budget of {budget_bytes / 1024**3:.2f} GiB per device."
+                )
+                return {width: row * num_splits for width, row in zip(widths.tolist(), rows.tolist())}
+            logger.warning(
+                f"{self.name}: one tempering row of every class needs {int(widths.sum())} bins, the "
+                f"budget holds {budget_bins}; tempering runs at one width."
+            )
+        rows = max(1, budget_bins // int(self.stft_store_windows.buffer_width))
+        logger.info(
+            f"{self.name}: {rows} tempering rows per chunk at one width, from a budget of "
+            f"{budget_bytes / 1024**3:.2f} GiB per device."
+        )
+        return {None: rows * num_splits}
+
     def _run_width_classes(self, model, band_sorter, subset, band_temps, ll_change_log, prop_counts,
                            acc_counts, class_widths, unit_selection):
         """Drive one parity unit's cells class by class, each with its own scheduler and buffer."""
@@ -1239,7 +1311,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 self._run_band_unit(
                     model, band_sorter, class_subset, band_temps, ll_change_log, prop_counts,
                     acc_counts, cell_width=int(cell_width),
-                    num_slots=self._class_num_slots(self.num_band_preload, cell_width),
+                    num_slots=self._proposal_num_slots(cell_width),
                 )
                 # The next build's first small allocation would split this class's freed block, and
                 # its own block would then take new device memory.
@@ -2759,6 +2831,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         class_widths = getattr(self, "_stft_band_class_widths", lambda switched_on: None)(
             getattr(self, "TEMPERING_WIDTH_CLASSES", False)
         )
+        # Sized once per propose, because the class buffers stay for all of it.
+        sized_rows = None
+        if getattr(self, "_size_tempering_batches", False):
+            sized_rows = self._sized_tempering_rows(class_widths, num_buffer_splits)
+            if None in sized_rows:
+                class_widths = None
         class_buffers = {}
         class_rows_per_split = {}
         buffer_obj = None
@@ -2797,7 +2875,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 if cell_width not in class_rows_per_split and num_rows > 0:
                     # * The first chunk must fill every split, so the contiguous blocks hold whole rows.
                     rows_setting = (
-                        self.num_bands_preload_temp if cell_width is None
+                        sized_rows[cell_width] if sized_rows is not None
+                        else self.num_bands_preload_temp if cell_width is None
                         else self._class_num_slots(self.num_bands_preload_temp, cell_width)
                     )
                     class_rows_per_split[cell_width] = max(1, min(
@@ -3187,8 +3266,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.name,
             context=dict(
                 num_proposals=int(self.num_proposals),
-                num_band_preload=int(self.num_band_preload),
-                num_bands_preload_temp=int(self.num_bands_preload_temp),
+                num_band_preload="sized" if self._size_proposal_batches else int(self.num_band_preload),
+                num_bands_preload_temp=(
+                    "sized" if self._size_tempering_batches else int(self.num_bands_preload_temp)
+                ),
             ),
             settings=self.debug_settings,
         )

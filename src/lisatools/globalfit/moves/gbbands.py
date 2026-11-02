@@ -19,6 +19,7 @@ This module owns the sub-band machinery that the GB proposal moves in
 
 from __future__ import annotations
 
+import gc
 import logging
 import warnings
 import copy as copy_module
@@ -175,6 +176,42 @@ def estimate_buffer_preload_limits(
         num_bands_preload_temp = max(1, max_cells // max(1, ntemps))
 
     return int(num_band_preload), int(num_bands_preload_temp)
+
+
+#: Free device memory that sized buffers leave for the transients around their blocks: the larger of the
+#: two. Measured on the full band with 4 and 12 GiB proposal blocks and 5.9 and 11.7 GiB tempering blocks: a
+#: proposal phase peaks up to 0.65 GiB above its block on the device, a tempering build 0.55 GiB, and scoring
+#: a chunk another 0.25 GiB. The fraction guards larger cards, which have not run yet.
+STFT_BATCH_HEADROOM_BYTES = 1024**3
+STFT_BATCH_HEADROOM_FRACTION = 0.05
+
+
+def stft_batch_budget_bytes(free_bytes: int) -> int:
+    """Bytes that buffers may take on a device: all its free memory except the headroom."""
+    headroom_bytes = max(STFT_BATCH_HEADROOM_BYTES, int(STFT_BATCH_HEADROOM_FRACTION * free_bytes))
+    return max(0, int(free_bytes) - headroom_bytes)
+
+
+def free_device_bytes(xp, gpus: Optional[List[int]] = None) -> int:
+    """Smallest free memory over ``gpus`` in bytes, after the pool hands back its free blocks.
+
+    ``gpus=None`` reads the current device; the CPU backend reads the host's available memory.
+    """
+    if getattr(xp, "__name__", "") != "cupy":
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    # Arrays in reference cycles hold their blocks until the collector happens to run: 2.64 GiB of
+    # garbage after the setup of a full-band run.
+    gc.collect()
+    pool = xp.get_default_memory_pool()
+    free_bytes = []
+    for gpu in gpus if gpus else [xp.cuda.runtime.getDevice()]:
+        with xp.cuda.Device(int(gpu)):
+            xp.cuda.runtime.deviceSynchronize()
+            pool.free_all_blocks()
+            free_bytes.append(int(xp.cuda.runtime.memGetInfo()[0]))
+    return min(free_bytes)
 
 
 def pack_special_index(temp_inds, walker_inds, band_inds, nwalkers: int):
@@ -2909,6 +2946,48 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
 # Back-compat alias: the pre-merge class name.
 Buffer = SubBandBuffer
+
+
+def split_slots_by_work(source_counts, cell_counts, cell_widths, budget_bins: int,
+                        at_least: int = 1) -> np.ndarray:
+    """Slots of class buffers that live together and share ``budget_bins`` bins of cells.
+
+    A class gets bins in proportion to its sources times its width, so with full batches all
+    classes need the same number of rounds. It never takes more slots than it has cells; what it
+    leaves goes to the other classes.
+    """
+    source_counts = np.asarray(source_counts, dtype=float)
+    cell_counts = np.asarray(cell_counts, dtype=float)
+    cell_widths = np.asarray(cell_widths, dtype=float)
+    slots = np.zeros(cell_widths.size)
+    still_open = cell_counts > 0
+    remaining = float(budget_bins)
+    while still_open.any():
+        work = source_counts[still_open] * cell_widths[still_open]
+        share = remaining * work / work.sum() / cell_widths[still_open]
+        full = share >= cell_counts[still_open]
+        if not full.any():
+            slots[still_open] = share
+            break
+        full_classes = np.flatnonzero(still_open)[full]
+        slots[full_classes] = cell_counts[full_classes]
+        remaining -= float(np.sum(cell_counts[full_classes] * cell_widths[full_classes]))
+        still_open[full_classes] = False
+    return np.maximum(at_least, np.floor(slots)).astype(int)
+
+
+def split_rows_by_budget(row_counts, cell_widths, budget_bins: int) -> np.ndarray:
+    """Rows per chunk of class buffers that live together, within ``budget_bins`` bins of rows.
+
+    Every class gets one row first, because it cannot run without one. The rest goes by work, so
+    the total stays within the budget whenever one row of every class fits.
+    """
+    row_counts = np.asarray(row_counts, dtype=int)
+    cell_widths = np.asarray(cell_widths, dtype=int)
+    spare_rows = row_counts - 1
+    return 1 + split_slots_by_work(
+        spare_rows, spare_rows, cell_widths, int(budget_bins) - int(cell_widths.sum()), at_least=0
+    )
 
 
 class BandSorter(LISAToolsParallelModule):
