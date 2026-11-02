@@ -48,11 +48,15 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 # Fitted mass-transfer constants
-_MT_AMPLITUDE_HZ_PER_S = 1.0e-20
+_MT_AMPLITUDE_HZ_PER_S = 2.0e-20
 _MT_PIVOT_HZ = 4.0e-4
 _MT_SLOPE = 16.0 / 3.0
 #: Above this no stably mass-transferring binary exists (weak tidal coupling)
 _MT_CUTOFF_HZ = 0.08283142425665438
+#: Chirp mass at which radiation reaction reaches the mojito prior's positive fdot bound
+#: (``get_fdot_mojito``: 3e-21 Hz/s at 0.1 mHz, slope 11/3, so 1.69201 Msun at every frequency),
+#: rounded up so the envelope covers the prior.
+_RADIATION_MC_MAX_MSUN = 1.6921
 
 # Fitted correction on the combined sideband-plus-window floor at 99% containment over (alpha, Tobs).
 _FC_ALPHA = np.array([0.0, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0])
@@ -131,7 +135,7 @@ def tukey_floor_bins(q: float = 0.99, alpha: float = 0.11574,
 def worst_case_fdot_hz_per_s(
     f0_hz,
     MT_fmax: Optional[float] = _MT_CUTOFF_HZ,
-    Mc_max_msun: float = 1.4
+    Mc_max_msun: float = _RADIATION_MC_MAX_MSUN
 ) -> np.ndarray:
     """Largest ``|fdot|`` either population branch allows, in Hz/s."""
     f0_hz = np.asarray(f0_hz, dtype=float)
@@ -390,7 +394,7 @@ def stft_reach_hz(f0_hz, tobs_s: float, epoch_offset_s: float = 0.0):
 def stft_store_windows(structure: GBBandStructure,
                        domain_settings: STFTSettings, *,
                        n_side_bins: int, epoch_offset_s: float,
-                       guard_low: int = 5, guard_high: int = 3,
+                       guard_bins: int = 3,
                        f0_limit_fraction: float = STFT_F0_LIMIT_FRACTION) -> tuple:
     """Inclusive ``(j_lo, j_hi)`` grid bins each band cell must hold.
 
@@ -401,9 +405,10 @@ def stft_store_windows(structure: GBBandStructure,
     Rounded strictly OUTWARD, so a source's worst-case reach can never fall
     outside the pixels its own band cell owns.
 
-    The guard absorbs error in the reach model, not window leakage. It is
-    larger below 1 mHz because the carrier track spikes near antenna-pattern
-    nulls there.
+    The guard absorbs error in the reach model, not window leakage, and is the
+    same at every frequency: the reach bounds the kinematic carrier that DFFR
+    uses. A carrier taken from the TDI phase can spike past it near
+    antenna-pattern nulls.
 
     ``n_side_bins`` and ``epoch_offset_s`` have no default, so a window cannot drift from the
     comp's stencil or its ``t_ref``. The f0 range is the band widened by ``f0_limit_fraction``
@@ -423,9 +428,7 @@ def stft_store_windows(structure: GBBandStructure,
     reach_hz = np.maximum(stft_reach_hz(f0_lo_hz, structure.tobs_s, epoch_offset_s),
                           stft_reach_hz(f0_hi_hz, structure.tobs_s, epoch_offset_s))
 
-    guard = np.where(band_lo_hz < 1.0e-3, guard_low, guard_high)
-
-    pad_hz = (n_side_bins + guard) * structure.grid_df_hz
+    pad_hz = (n_side_bins + guard_bins) * structure.grid_df_hz
 
     j_lo = np.floor((f0_lo_hz - reach_hz - pad_hz - f_grid_min_hz)
                     / structure.grid_df_hz)
