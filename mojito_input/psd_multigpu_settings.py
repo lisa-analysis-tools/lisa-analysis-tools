@@ -1,3 +1,5 @@
+import json
+import os
 import h5py
 import numpy as np
 import shutil
@@ -18,7 +20,7 @@ from lisatools.domaincomputation import DomainComputationGroupArray
 from lisatools.utils.constants import *
 from eryn.state import BranchSupplemental
 from lisatools.globalfit.run import CurrentInfoGlobalFit
-from lisatools.globalfit.stock.erebor import PSDSetup, PSDSettings, MBHSetup, MBHSettings
+from lisatools.globalfit.stock.erebor import PSDSetup, PSDSettings, MBHSetup, MBHSettings, make_psd_spline_setups
 
 
 from eryn.prior import uniform_dist, log_uniform
@@ -35,6 +37,7 @@ from lisatools.sensitivity import (
     make_tm_proxy_transform,
     tm_mosa_to_proxy,
 )
+from lisatools.noise_splines import make_spline_noise_model
 from lisatools.globalfit.moves import GFCombineMove, MultiGPUPSDMove, TDMBHSpecialMove
 from lisatools.globalfit.engine import GlobalFitSettings, GeneralSetup, GeneralSettings, RankInfo
 from lisatools.globalfit.recipe import subtract_initial_signal
@@ -63,11 +66,57 @@ MOJITO_REFERENCE_TIME = 97729089.327664
 #   "parametric-symmetric":  one OMS + one TM amplitude for all MOSAs (2 parameters)
 #   "parametric-asymmetric": one OMS + one TM amplitude per MOSA (12 parameters,
 #                            links 12, 23, 31, 13, 32, 21; expect degeneracies)
-NOISE_MODEL = "parametric-asymmetric" # "parametric-symmetric" "parametric-asymmetric"
+#   "spline-symmetric":      equal noises: levels fixed at the injection, one OMS and one
+#                            TM spline curve carry every deviation
+#   "spline-asymmetric":     unequal noises: levels fixed at the injection, curves on the 6
+#                            OMS combinations and on TM common + arm sums, a constant on
+#                            each TM arm difference (scripts/notes/SPLINE_NOISE_MODEL.md)
+NOISE_MODEL = "spline-asymmetric" # "parametric-symmetric" "parametric-asymmetric" "spline-symmetric" "spline-asymmetric"
 NOISE_SYMMETRY = {
     "parametric-symmetric": "symmetric",
     "parametric-asymmetric": "asymmetric",
+    "spline-symmetric": "symmetric",
+    "spline-asymmetric": "asymmetric",
 }[NOISE_MODEL]
+
+# Spline noise model (spline models only): deviations from the injected spectrum, with
+# edge knots at the band limits and interior knots per curve (SPLINE_NOISE_MODEL.md).
+SPLINE_AMPLITUDE_SIGMA = 0.3  # prior std of every knot amplitude [dex]
+SPLINE_MIN_SEPARATION = 0.2  # minimum distance between adjacent knots, edges included [dex]
+SPLINE_INTERPOLATION = "linear"  # between knots, in log10 f ("linear" or "cubic")
+SPLINE_N_INTERIOR = 3  # interior knots per curve, without reversible jump
+SPLINE_RJ = True  # reversible jump on the number of interior knots
+SPLINE_RJ_N_MIN = 0  # fewest interior knots per curve (reversible jump)
+SPLINE_RJ_N_MAX = 8  # most interior knots per curve (reversible jump)
+SPLINE_RJ_PROPOSALS = 1  # birth/death proposals per curve after each stretch iteration
+PSD_PRIOR_ONLY = True  # zero PSD likelihood, for prior-recovery tests
+PSD_FANCY_SWAP = False  # re-score swapped states on their new walker's residuals (source branches only)
+
+_SPLINE_MODELS = {}
+
+
+def get_spline_model(f_min: float, f_max: float):
+    """The run's SplineNoiseModel (None for the parametric models); one instance per band."""
+    if not NOISE_MODEL.startswith("spline"):
+        return None
+    key = (f_min, f_max)
+    if key not in _SPLINE_MODELS:
+        _SPLINE_MODELS[key] = make_spline_noise_model(
+            f_min,
+            f_max,
+            OMS_INJECTION,
+            TM_INJECTION,
+            noise_symmetry=NOISE_SYMMETRY,
+            rj=SPLINE_RJ,
+            n_interior=SPLINE_N_INTERIOR,
+            rj_n_min=SPLINE_RJ_N_MIN,
+            rj_n_max=SPLINE_RJ_N_MAX,
+            sigma=SPLINE_AMPLITUDE_SIGMA,
+            min_separation=SPLINE_MIN_SEPARATION,
+            interpolation=SPLINE_INTERPOLATION,
+        )
+        logger.info(_SPLINE_MODELS[key].describe())
+    return _SPLINE_MODELS[key]
 
 # TM parametrization for the asymmetric model (scripts/notes/TM_PROXY_PARAMS.md):
 #   "proxy": sample per-arm ASDs A_k = sqrt((P_ij + P_ji) / 2) and asymmetries
@@ -93,8 +142,15 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
     permute_every: int = 200
 
     psd_info = curr.source_info["psd"]
+    spline_model = get_spline_model(curr.general_info.start_freq, curr.general_info.end_freq)
 
     effective_ndim = engine_info.ndims["psd"]
+    extra_move_kwargs = {}
+    if spline_model is not None:
+        # all noise branches are sampled together, in Gibbs blocks (OMS edges, TM edges,
+        # one block per spline-knot branch)
+        effective_ndim = spline_model.n_sampled_params
+        extra_move_kwargs["gibbs_sampling_setup"] = spline_model.gibbs_sampling_setup(engine_info.ndims["psd"])
     temperature_control = TemperatureControl(
         effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
     )
@@ -107,7 +163,11 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         temperature_control=temperature_control,
         use_gpu=True,
         run_async=True,
-        run_threaded=False
+        run_threaded=False,
+        rj_proposals=SPLINE_RJ_PROPOSALS,
+        prior_only=PSD_PRIOR_ONLY,
+        fancy_swap=PSD_FANCY_SWAP,
+        **extra_move_kwargs,
     )
 
     psd_search_move = MultiGPUPSDMove(
@@ -133,7 +193,8 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> PSDSetup:
 
     frequency_ranges = [(general_set.start_freq, general_set.end_freq)]
     prior_model = "uniform"
-    model_config = dict(use_splines=False, noise_symmetry=NOISE_SYMMETRY, num_params=2 if NOISE_SYMMETRY == "symmetric" else 2 * len(MOSA_NAMES))
+    spline_model = get_spline_model(general_set.start_freq, general_set.end_freq)
+    model_config = dict(use_splines=spline_model is not None, noise_symmetry=NOISE_SYMMETRY, num_params=2 if NOISE_SYMMETRY == "symmetric" else 2 * len(MOSA_NAMES))
     if NOISE_SYMMETRY == "asymmetric":
         model_config["tm_parametrization"] = TM_PARAMETRIZATION
 
@@ -185,6 +246,23 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> PSDSetup:
     else:
         raise ValueError(f"Unsupported TM_PARAMETRIZATION: {TM_PARAMETRIZATION}")
 
+    spline_setups = {}
+    if spline_model is not None:
+        # levels fixed at the injection: the psd branch holds only the edge-knot amplitudes,
+        # the interior knots get one branch per spline curve. The injection has no deviation.
+        priors_psd = spline_model.edge_priors()
+        injection = spline_model.injection
+        transform = None
+        model_config.pop("tm_parametrization", None)
+        model_config.update(spline_model.metadata())
+        spline_setups = make_psd_spline_setups(
+            spline_model, general_set.Tobs, general_set.dt, log_dir=general_set.artifacts_file_dir
+        )
+        # the spline settings of the run, for the analysis notebook
+        os.makedirs(general_set.artifacts_file_dir, exist_ok=True)
+        with open(os.path.join(general_set.artifacts_file_dir, "spline_model.json"), "w") as fh:
+            json.dump(dict(noise_model=NOISE_MODEL, prior_only=PSD_PRIOR_ONLY, model=spline_model.to_dict()), fh, indent=1)
+
     priors = {"psd": ProbDistContainer(priors_psd)}
 
     psd_settings = PSDSettings(
@@ -207,7 +285,7 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> PSDSetup:
         prior_model_config=prior_model_config,
     )
 
-    return PSDSetup(psd_settings), psd_metadata
+    return PSDSetup(psd_settings), psd_metadata, spline_setups
 
 def get_general_erebor_settings() -> GeneralSetup:
     # limits on parameters
@@ -239,9 +317,12 @@ def get_general_erebor_settings() -> GeneralSetup:
     # base_file_name = "test_psd_processing7"
     # file_store_dir = head_dir
 
-    prefix = "proxy-params"
+    # own output directory per scheme (never write into another run's folder)
+    prefix = NOISE_MODEL
+    if NOISE_MODEL.startswith("spline"):
+        prefix += ("-rj" if SPLINE_RJ else "-static") + ("-prior-only" if PSD_PRIOR_ONLY else "")
     data_input_path = "/mnt/wd_hdd_6TB/nikos/DATA/global_fit/mojito_lite/"
-    base_file_name = f"unequal_noises_{prefix}"
+    base_file_name = f"noise_only_{prefix}"
     # file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/unequal_noises_{prefix}/"
     file_store_dir = f"/mnt/wd_hdd_6TB/nikos/DATA/global_fit/gf_output/{base_file_name}_fmax:{end_freq:.1e}/"
 
@@ -322,6 +403,7 @@ def get_general_erebor_settings() -> GeneralSetup:
     )
 
     sensitivity_init_kwargs = dict(
+        spline_model=get_spline_model(start_freq, end_freq),
         tdi_generation=2,
         mask_percentage=0.0,
         smoothing_sigma=0.0,
@@ -400,7 +482,7 @@ def get_global_fit_settings(copy_settings_file=False):
     ##################################
     ##################################
 
-    psd_setup, psd_metadata = get_psd_erebor_settings(general_setup)
+    psd_setup, psd_metadata, spline_setups = get_psd_erebor_settings(general_setup)
 
 
     ##############
@@ -410,6 +492,7 @@ def get_global_fit_settings(copy_settings_file=False):
     global_settings = GlobalFitSettings(
         source_info={
             "psd": psd_setup,
+            **spline_setups,  # spline-knot branches (spline noise models only)
         },
         general_info=general_setup,
         rank_info=rank_info,

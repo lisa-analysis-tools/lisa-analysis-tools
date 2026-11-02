@@ -49,6 +49,7 @@ from .stochastic import (
 from .utils.constants import *
 from .utils.parallelbase import LISAToolsParallelModule
 from .utils.utility import AET, get_array_module
+from .noise_splines import SplineNoiseModel
 
 if TYPE_CHECKING:
     from .utils.typing import NDArrayLike, ArrayModule
@@ -2185,7 +2186,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         use_splines: If ``True``, use Akima spline interpolation for the noise
             knots passed in :meth:`set_sensitivity_matrix`.
         spline_order: Order of the Akima interpolant (passed through to
-            :class:`cudakima.AkimaInterpolant1D`).
+            :class:`cudakima.AkimaInterpolant1D`). With ``spline_model`` it is taken from
+            the model (``SplineNoiseModel.interpolation``, linear by default).
         force_backend: Backend selector (``"cpu"`` or a CUDA name); see
             :class:`LISAToolsParallelModule`.
         mask_percentage: Fractional bandwidth around transfer-function dips that
@@ -2213,7 +2215,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             cross-spectra conjugated) or ``+(k fs' + f)``. The covariance then becomes
             ``C(f) = |H(f)|^2 S(f) + sum_a |H(|f_a|)|^2 S(f_a)``. Build both arrays with
             :meth:`~lisatools.globalfit.preprocessing.BaseProcessingStep.get_alias_response`.
-            Requires ``alias_filters_response``; not supported with ``use_splines``.
+            Requires ``alias_filters_response``. Spline deviations are evaluated at
+            ``|f_a|`` too, held at their edge values above the spline band.
         alias_filters_response: Filter power response ``|H(|f_a|)|^2`` at
             ``alias_frequencies``, same shape.
         average_transfer_functions: Whether to average the TDI transfer functions
@@ -2226,6 +2229,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             for all MOSAs. ``"asymmetric"`` uses one amplitude per MOSA (6 OMS + 6 TM,
             ordered as ``orbits.LINKS``: 12, 23, 31, 13, 32, 21) on the same
             spectral shapes. See :meth:`split_psd_params` for the parameter layout.
+        spline_model: Optional :class:`~lisatools.noise_splines.SplineNoiseModel` defining
+            spline deviations on MOSA combinations (implies ``use_splines=True``). The
+            spline part of the PSD parameters is then laid out as in that model (edges,
+            then interior knots). Without it, ``use_splines`` uses the legacy layout: one
+            OMS and one TM curve, shared by all MOSAs, interleaved (amplitude, position)
+            knots (see :meth:`build_spline_arrays`).
         fft_batch_size: Number of rows (one row = one PSD component in one time
             segment) per FFT batch in the window convolution. Batches are padded to
             this fixed size so a single cuFFT plan is reused. Default is ``512``.
@@ -2251,6 +2260,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         fft_batch_size: Optional[int] = 512,
         alias_frequencies: Optional[NDArrayLike] = None,
         alias_filters_response: Optional[NDArrayLike] = None,
+        spline_model: Optional["SplineNoiseModel"] = None,
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         if noise_symmetry not in NOISE_SYMMETRIES:
@@ -2269,6 +2279,14 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         _use_gpu = force_backend != "cpu"
 
+        if spline_model is not None:
+            if spline_model.noise_symmetry != noise_symmetry:
+                raise ValueError(
+                    f"spline_model is {spline_model.noise_symmetry} but noise_symmetry is {noise_symmetry}."
+                )
+            use_splines = True
+            spline_order = spline_model.interpolation
+        self.spline_model = spline_model
         self.use_splines = use_splines
         self.spline_order = spline_order
         self.spline_interpolant = AkimaInterpolant1D(
@@ -2284,8 +2302,6 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         self.filters_response = filters_response
         if (alias_frequencies is None) != (alias_filters_response is None):
             raise ValueError("alias_frequencies and alias_filters_response must be given together.")
-        if alias_frequencies is not None and use_splines:
-            raise NotImplementedError("Downsampling aliasing is not supported with use_splines.")
         self.alias_frequencies = alias_frequencies
         self.alias_filters_response = alias_filters_response
 
@@ -2321,6 +2337,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "fft_batch_size": self._fft_batch_size,
             "alias_frequencies": self.alias_frequencies,
             "alias_filters_response": self.alias_filters_response,
+            "spline_model": self.spline_model,
         }
 
     @property
@@ -2952,8 +2969,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         When ``use_splines`` is set, every PSD carries its own knots, as in
         :meth:`compute_log_like`: ``knots_position_all`` / ``knots_amplitude_all`` have
-        shape ``(2, num_psds, n_knots)`` (``(2, n_knots)`` for a single PSD), axis 0
-        being the (ISI/OMS, test-mass) pair. Knots are never shared across PSDs; a
+        shape ``(n_curves, num_psds, n_knots)`` (``(n_curves, n_knots)`` for a single
+        PSD), see :meth:`build_spline_arrays`. Knots are never shared across PSDs; a
         batch size that does not match ``num_psds`` raises ``ValueError``.
 
         With ``run_async=True`` the CUDA backend returns before the kernel finishes
@@ -2983,20 +3000,10 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         c02 = xp.empty(num_psds * total_terms, dtype=xp.complex128)
         c12 = xp.empty(num_psds * total_terms, dtype=xp.complex128)
 
-        # per-PSD spline weights, layout [psd_i * num_freqs + f_idx] (same as compute_log_like)
-        if self.use_splines:
-            assert knots_position_all is not None and knots_amplitude_all is not None
-            splines_out = self.spline_interpolant(xp.log10(freqs), knots_position_all, knots_amplitude_all)
-            if splines_out[0].size != num_psds * num_freqs:
-                raise ValueError(
-                    f"Spline knots must be given per PSD, shape (2, num_psds={num_psds}, n_knots); "
-                    f"got knots of shape {tuple(knots_position_all.shape)}."
-                )
-            splines_in_isi_oms = xp.ascontiguousarray(splines_out[0], dtype=xp.float64).ravel()
-            spline_in_testmass = xp.ascontiguousarray(splines_out[1], dtype=xp.float64).ravel()
-        else:
-            splines_in_isi_oms = xp.zeros(num_psds * num_freqs, dtype=xp.float64)
-            spline_in_testmass = xp.zeros(num_psds * num_freqs, dtype=xp.float64)
+        # per-PSD, per-MOSA spline deviations (empty without splines)
+        splines_in_isi_oms, spline_in_testmass = self._spline_deviations(
+            knots_position_all, knots_amplitude_all, num_psds, freqs
+        )
 
         if self.pycpp_sensitivity_matrix is None:
             raise RuntimeError("XYZBackend disabled (symbol issues on Linux): get_noise_covariance unavailable.")
@@ -3456,8 +3463,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             kn_in_all: Galactic foreground knee frequency parameter for each walker. Shape (num_psds)
             f_2_in_all: Second galactic foreground scale-frequency parameter for each walker. Shape (num_psds)
             knots_position_all: Log10-frequency positions of spline knots for noise modeling, one set
-                per walker (never shared). Shape (2, num_psds, num_knots), axis 0 = (ISI/OMS, test-mass).
-            knots_amplitude_all: Amplitudes of spline knots for noise modeling. Shape (2, num_psds, num_knots)
+                per walker (never shared). Shape (n_curves, num_psds, num_knots), see
+                :meth:`build_spline_arrays`.
+            knots_amplitude_all: Log10 deviations at the knots, same shape.
             run_async: Whether to run the CUDA computation asynchronously. Default is False.
 
         Returns:
@@ -3517,22 +3525,11 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             c00_all = c11_all = c22_all = empty_real
             c01_all = c02_all = c12_all = empty_cplx
 
-            if self.use_splines:
-                splines_weights = self.spline_interpolant(
-                    xp.log10(self.f_arr), knots_position_all, knots_amplitude_all
-                )
-                # the CUDA binding skips length checks: guard here so a mis-shaped
-                # knot batch cannot read past the end of the spline buffer
-                if splines_weights[0].size != num_psds * self.num_freqs:
-                    raise ValueError(
-                        f"Spline knots must be given per walker, shape (2, num_psds={num_psds}, n_knots); "
-                        f"got knots of shape {tuple(knots_position_all.shape)}."
-                    )
-                splines_weights_isi_oms = splines_weights[0].flatten()
-                splines_weights_testmass = splines_weights[1].flatten()
-            else:
-                splines_weights_isi_oms = xp.zeros(shape=(num_psds * self.num_freqs))
-                splines_weights_testmass = xp.zeros(shape=(num_psds * self.num_freqs))
+            # the CUDA binding skips length checks: _spline_deviations validates the
+            # knot batch so a mis-shaped one cannot read past the end of the buffer
+            splines_weights_isi_oms, splines_weights_testmass = self._spline_deviations(
+                knots_position_all, knots_amplitude_all, num_psds, self.f_arr
+            )
 
         
         self.pycpp_sensitivity_matrix.psd_likelihood_wrap(
@@ -3618,39 +3615,118 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         return smoothed_matrix
 
     def build_spline_arrays(self, spline_params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Unpack interleaved spline parameters into separate position and amplitude arrays.
+        """Turn the spline part of the PSD parameters into knot arrays for the Akima kernel.
 
-        The MCMC state stores spline parameters in an interleaved layout::
+        With a :attr:`spline_model`, the layout is the model's (edges, then interior
+        knots; see :meth:`~lisatools.noise_splines.SplineNoiseModel.knots`). Otherwise
+        the legacy interleaved layout is used::
 
             [amp₀, pos₀, amp₁, pos₁, ...,   # OMS knots
              amp₀, pos₀, amp₁, pos₁, ...]   # TM knots
 
-        This method splits that flat vector into two ``(2, n_walkers, n_knots)``
-        arrays ready for the C++ Akima spline kernel.
+        i.e. one OMS and one TM curve, shared by all MOSAs.
 
         Args:
-            spline_params: Interleaved spline parameters for one or more walkers.
-                Shape ``(n_walkers, 2 * n_knots_oms + 2 * n_knots_tm)`` or
-                ``(2 * n_knots_oms + 2 * n_knots_tm,)`` for a single walker.
+            spline_params: Spline parameters for one or more walkers, shape
+                ``(n_walkers, n_spline)`` or ``(n_spline,)``.
 
         Returns:
-            spline_knots_position: Log10-frequency positions of knots.
-                Shape ``(2, n_walkers, n_knots)`` — axis 0 indexes [OMS, TM].
-            spline_knots_amplitude: Knot amplitudes (multiplicative noise residuals).
-                Shape ``(2, n_walkers, n_knots)`` — axis 0 indexes [OMS, TM].
+            spline_knots_position: Log10-frequency positions of the knots, sorted.
+                Shape ``(n_curves, n_walkers, n_knots)`` (``n_curves = 2``, [OMS, TM],
+                in the legacy layout).
+            spline_knots_amplitude: Log10 PSD deviations at the knots, same shape.
         """
-        
-        spline_params = self.xp.atleast_2d(spline_params)
+        xp = self.xp
+        if self.spline_model is not None:
+            return self.spline_model.knots(xp.asarray(spline_params), xp=xp)
+
+        spline_params = xp.atleast_2d(xp.asarray(spline_params))
 
         spline_knots_position = spline_params[:, 1::2]
         spline_knots_amplitude = spline_params[:, 0:-1:2]
         half = spline_knots_position.shape[1] // 2
-        spline_knots_amplitude = self.xp.stack((spline_knots_amplitude[:, :half], spline_knots_amplitude[:, half:]))
-        spline_knots_position = self.xp.stack((spline_knots_position[:, :half], spline_knots_position[:, half:]))
+        spline_knots_amplitude = xp.stack((spline_knots_amplitude[:, :half], spline_knots_amplitude[:, half:]))
+        spline_knots_position = xp.stack((spline_knots_position[:, :half], spline_knots_position[:, half:]))
 
-        #todo should we sort the knots
+        # the Akima interpolant needs ordered knots
+        order = xp.argsort(spline_knots_position, axis=2)
+        spline_knots_position = xp.take_along_axis(spline_knots_position, order, axis=2)
+        spline_knots_amplitude = xp.take_along_axis(spline_knots_amplitude, order, axis=2)
 
         return spline_knots_position, spline_knots_amplitude
+
+    def _spline_log10_grid(self, freqs):
+        """log10 frequencies the spline deviations are evaluated on.
+
+        The data grid, followed by the alias grids (``|f_a|``) when aliasing is
+        modelled: the kernel reads them at grid index ``a * n_freqs + f_idx``. Clamped to
+        the spline band, so the curves stay at their edge values outside it (the Akima
+        interpolant does not extrapolate).
+        """
+        xp = self.xp
+        freqs = xp.asarray(freqs, dtype=xp.float64)
+        if self.n_alias > 0:
+            if freqs.shape != self.f_arr.shape or not bool(xp.all(freqs == self.f_arr)):
+                raise ValueError("With downsampling aliasing, splines can only be evaluated on the basis grid.")
+            freqs = self._tf_frequency_grid()
+        if self.spline_model is not None:
+            lo, hi = self.spline_model.log10_f_min, self.spline_model.log10_f_max
+        else:
+            f_pos = self.f_arr[self.f_arr > 0]
+            lo, hi = float(xp.log10(f_pos.min())), float(xp.log10(f_pos.max()))
+        log10_f = xp.log10(xp.maximum(freqs, 1e-300))
+        return xp.ascontiguousarray(xp.clip(log10_f, lo, hi))
+
+    def _spline_mixing(self, n_curves: int):
+        """``(2 n_noise_par, n_curves)`` map from spline curves to per-MOSA deviations."""
+        if self.spline_model is not None:
+            if n_curves != self.spline_model.n_curves:
+                raise ValueError(f"spline_model has {self.spline_model.n_curves} curves, got knots for {n_curves}.")
+            return self.spline_model.mixing
+        if n_curves != 2:
+            raise ValueError(f"The legacy spline layout has 2 curves (OMS, TM), got {n_curves}.")
+        # one OMS and one TM curve shared by all MOSAs
+        n = self.n_noise_par
+        mixing = np.zeros((2 * n, 2))
+        mixing[:n, 0] = mixing[n:, 1] = 1.0
+        return mixing
+
+    def _spline_deviations(self, knots_position_all, knots_amplitude_all, num_psds: int, freqs):
+        """Per-MOSA log10 spline deviations for the C++ kernels.
+
+        Returns ``(oms, tm)``, each flat with layout
+        ``[(psd_i * n_noise_par + m) * n_ext + g]``, ``n_ext = (1 + n_alias) * len(freqs)``;
+        both are empty without splines (the kernels then apply none).
+        """
+        xp = self.xp
+        if not self.use_splines:
+            empty = xp.empty(0, dtype=xp.float64)
+            return empty, empty
+        if knots_position_all is None or knots_amplitude_all is None:
+            raise ValueError("use_splines is set but no spline knots were given.")
+
+        pos = xp.asarray(knots_position_all, dtype=xp.float64)
+        amp = xp.asarray(knots_amplitude_all, dtype=xp.float64)
+        if pos.ndim == 2:  # single PSD: (n_curves, n_knots)
+            pos, amp = pos[:, None], amp[:, None]
+        n_curves, n_batch, n_knots = pos.shape
+        if n_batch != num_psds:
+            raise ValueError(
+                f"Spline knots must be given per PSD, shape (n_curves, num_psds={num_psds}, n_knots); "
+                f"got knots of shape {tuple(pos.shape)}."
+            )
+        mixing = xp.asarray(self._spline_mixing(n_curves))
+
+        log10_f = self._spline_log10_grid(freqs)
+        curves = self.spline_interpolant(
+            log10_f, xp.ascontiguousarray(pos.reshape(-1, n_knots)), xp.ascontiguousarray(amp.reshape(-1, n_knots))
+        ).reshape(n_curves, num_psds, -1)
+        dev = xp.einsum("mc,cnf->nmf", mixing, curves)
+
+        n = self.n_noise_par
+        oms = xp.ascontiguousarray(dev[:, :n], dtype=xp.float64).ravel()
+        tm = xp.ascontiguousarray(dev[:, n:], dtype=xp.float64).ravel()
+        return oms, tm
 
     def __call__(
         self,

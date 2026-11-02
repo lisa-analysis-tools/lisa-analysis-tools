@@ -1345,6 +1345,51 @@ class PSDSetup(Setup):
 
 
 @dataclasses.dataclass
+class PSDSplineSettings(Settings):
+    """Settings for one spline-knot branch of a :class:`~lisatools.noise_splines.SplineNoiseModel`.
+
+    Each leaf is one interior knot ``(log10 f, log10 deviation)``. The number of leaves is
+    fixed (``nleaves_min == nleaves_max``), or varies between the two under the PSD move's
+    reversible-jump step. The branch is sampled by the PSD move together with ``psd``; the
+    backend receives the active knots through
+    :meth:`~lisatools.noise_splines.SplineNoiseModel.flatten`.
+    """
+
+    nleaves_max: int = 1
+    nleaves_min: int = 1
+    ndim: int = 2
+    injection: Optional[np.ndarray] = None
+
+
+class PSDSplineSetup(Setup):
+    """:class:`Setup` for a spline-knot branch (see :class:`PSDSplineSettings`)."""
+
+    def __init__(self, spline_settings: PSDSplineSettings):
+        super().__init__(spline_settings)
+        if self.priors is None:
+            raise ValueError("A spline-knot branch needs priors (SplineNoiseModel.branch_priors()).")
+
+
+def make_psd_spline_setups(spline_model, Tobs: float, dt: float, log_dir: Optional[str] = None) -> dict:
+    """``{branch: PSDSplineSetup}`` for every spline component with interior knots."""
+    priors = spline_model.branch_priors()
+    return {
+        name: PSDSplineSetup(
+            PSDSplineSettings(
+                Tobs=Tobs,
+                dt=dt,
+                log_dir=log_dir,
+                priors={name: priors[name]},
+                nleaves_max=c.n_interior,
+                nleaves_min=c.nleaves_min,
+                ndim=2,
+            )
+        )
+        for name, c in spline_model.branches.items()
+    }
+
+
+@dataclasses.dataclass
 class GalForSettings(Settings):
     """Settings dataclass describing the galactic-foreground branch in an Erebor-style recipe.
 

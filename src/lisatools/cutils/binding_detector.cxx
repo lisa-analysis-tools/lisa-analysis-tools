@@ -160,6 +160,23 @@ void XYZSensitivityMatrixWrap::get_noise_tfs_wrap(
     );
 }
 
+// Spline deviation pointers for the kernels: nullptr without splines, otherwise the
+// log10 deviations laid out [(psd_i * n_noise_par + m) * (1 + n_alias) * num_freqs + g],
+// g = a * num_freqs + f_idx (a = 0 the data grid, a >= 1 the alias grids).
+void XYZSensitivityMatrixWrap::spline_pointers(
+    array_type<double> spline_oms_all, array_type<double> spline_tm_all,
+    int num_psds, int num_freqs, double **spline_oms, double **spline_tm)
+{
+    *spline_oms = nullptr;
+    *spline_tm = nullptr;
+    if (!sensitivity_matrix->noise_levels.use_splines)
+        return;
+    int n_spline = num_psds * sensitivity_matrix->n_noise_par
+                   * (1 + sensitivity_matrix->n_alias) * num_freqs;
+    *spline_oms = return_pointer_and_check_length(spline_oms_all, "spline_oms_all", n_spline, 1);
+    *spline_tm  = return_pointer_and_check_length(spline_tm_all,  "spline_tm_all",  n_spline, 1);
+}
+
 void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
     array_type<double> like_contrib_final, array_type<double> f_arr,
     array_type<std::complex<double>> data,
@@ -180,14 +197,13 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
     // External covariance entries, layout [psd_i * total_tf_pairs + t_idx * num_freqs + f_idx].
     // Only read by the kernel when use_external_matrix; otherwise callers may pass empty arrays.
     // Conversely, the spline weights are only read on the in-kernel path, so with an
-    // external matrix they may be empty.
+    // external matrix (or without splines) they may be empty.
     double *_c00 = nullptr, *_c11 = nullptr, *_c22 = nullptr;
     gcmplx::complex<double> *_c01 = nullptr, *_c02 = nullptr, *_c12 = nullptr;
-    double *_spline_in_isi_oms = nullptr, *_spline_in_testmass = nullptr;
+    double *_spline_oms = nullptr, *_spline_tm = nullptr;
     if (!use_external_matrix)
     {
-        _spline_in_isi_oms  = return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_psds * num_freqs, 1);
-        _spline_in_testmass = return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_psds * num_freqs, 1);
+        spline_pointers(spline_in_isi_oms_all, spline_in_testmass_all, num_psds, num_freqs, &_spline_oms, &_spline_tm);
     }
     else
     {
@@ -213,8 +229,8 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
         return_pointer_and_check_length(f_1_all,            "f_1_all",            num_psds,                  1),
         return_pointer_and_check_length(f_knee_all,         "f_knee_all",         num_psds,                  1),
         return_pointer_and_check_length(f_2_all,            "f_2_all",            num_psds,                  1),
-        _spline_in_isi_oms,
-        _spline_in_testmass,
+        _spline_oms,
+        _spline_tm,
         differential_component,
         num_freqs,
         num_times,
@@ -237,6 +253,8 @@ void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
     int num_freqs, int num_times, int num_psds, bool run_async)
 {
     int total_size = num_psds * num_freqs * num_times;
+    double *_spline_oms = nullptr, *_spline_tm = nullptr;
+    spline_pointers(spline_in_isi_oms_all, spline_in_testmass_all, num_psds, num_freqs, &_spline_oms, &_spline_tm);
     sensitivity_matrix->get_noise_covariance_arr(
         return_pointer_and_check_length(freqs,        "freqs",        num_freqs, 1),
         return_pointer_and_check_length(time_indices, "time_indices", num_times, 1),
@@ -247,8 +265,8 @@ void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
         return_pointer_and_check_length(f_1_all,       "f_1_all",       num_psds, 1),
         return_pointer_and_check_length(f_knee_all,    "f_knee_all",    num_psds, 1),
         return_pointer_and_check_length(f_2_all,       "f_2_all",       num_psds, 1),
-        return_pointer_and_check_length(spline_in_isi_oms_all,  "spline_in_isi_oms_all",  num_psds * num_freqs, 1),
-        return_pointer_and_check_length(spline_in_testmass_all, "spline_in_testmass_all", num_psds * num_freqs, 1),
+        _spline_oms,
+        _spline_tm,
         return_pointer_and_check_length(c00_arr, "c00_arr", total_size, 1),
         reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_arr, "c01_arr", total_size, 1)),
         reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_arr, "c02_arr", total_size, 1)),

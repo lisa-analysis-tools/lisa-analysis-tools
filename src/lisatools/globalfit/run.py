@@ -185,6 +185,12 @@ class CurrentInfoGlobalFit:
         }
 
 
+def _is_noise_branch(name: str) -> bool:
+    """``psd``, ``galfor`` and the spline-knot branches ``psd_<noise>_<combination>``:
+    branches that shape the noise model rather than add templates to the residuals."""
+    return name in ("psd", "galfor") or name.startswith("psd_")
+
+
 def _periodic_names_to_indices(per_dict: dict, transform) -> dict:
     """Translate a per-branch periodic dict to integer parameter indices.
 
@@ -340,10 +346,23 @@ class GlobalFit:
                 for key in self.engine_info.branch_names
             }
             # TODO: make this more generic to anything
-            if "psd" in inds:
-                inds["psd"][:] = True
+            for key in inds:
+                # psd edges and the spline-knot branches (psd_<noise>_<combination>; the
+                # active knots of reversible-jump branches are drawn below)
+                if _is_noise_branch(key) and key != "galfor":
+                    inds[key][:] = True
             if "galfor" in inds:
                 inds["galfor"][:] = True
+            # spline knots: prior draws that respect the minimum knot separation; with
+            # reversible jump the number of active knots is also drawn from its prior
+            spline_model = getattr(self.curr.general_info.sensitivity_backend, "spline_model", None)
+            if spline_model is not None:
+                for key in spline_model.branch_names:
+                    if key in coords:
+                        size = coords[key].shape[:2]
+                        coords[key], inds[key] = spline_model.draw_interior_knots(
+                            key, size, n_active=spline_model.draw_n_active(key, size)
+                        )
             if "mbh" in inds:
                 inds["mbh"][:] = True
                 self.logger.debug("initializing mbh inds to true")
@@ -486,7 +505,7 @@ class GlobalFit:
         # are converted.
         signal_gen_map = {}
         for name in self.curr.engine_info.branch_names:
-            if name in ("psd", "galfor") or name not in self.curr.source_info:
+            if _is_noise_branch(name) or name not in self.curr.source_info:
                 continue
             _gen = getattr(self.curr.source_info[name], "signal_gen", None)
             if callable(_gen):
@@ -497,6 +516,15 @@ class GlobalFit:
             data_res_arr = deepcopy(general_info.input_data_residual_array)
             if "psd" in state.branches_coords.keys():
                 psd_params = state.branches_coords["psd"][0, w, 0]
+                spline_model = getattr(general_info.sensitivity_backend, "spline_model", None)
+                if spline_model is not None:
+                    # append the active interior spline knots (one branch per spline
+                    # component) and prepend the fixed reference levels
+                    psd_params = spline_model.flatten(
+                        psd_params,
+                        {b: state.branches_coords[b][0, w] for b in spline_model.branch_names},
+                        {b: state.branches_inds[b][0, w] for b in spline_model.branch_names},
+                    )
                 psd_params = (
                     self.curr.source_info["psd"].transform.both_transforms(psd_params)
                     if self.curr.source_info["psd"].transform is not None
@@ -555,7 +583,7 @@ class GlobalFit:
                     continue  # this walker's branches use the fallback below
                 params = {}
                 for name in self.curr.engine_info.branch_names:
-                    if name in ("psd", "galfor") or name not in gen_map:
+                    if _is_noise_branch(name) or name not in gen_map:
                         continue
                     inds_w = state.branches_inds[name][0, w]
                     if not inds_w.any():
@@ -572,7 +600,7 @@ class GlobalFit:
             for name, source_info in self.curr.source_info.items():
                 if name not in self.curr.engine_info.branch_names:
                     continue
-                if name in ("psd", "galfor") or name in handled_by_signal_gen:
+                if _is_noise_branch(name) or name in handled_by_signal_gen:
                     continue
                 try:
                     get_templates = source_info["get_templates"]

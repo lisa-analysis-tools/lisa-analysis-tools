@@ -10,6 +10,7 @@ counterpart kernels land in domains.cu.
 """
 
 import time
+import types
 import warnings
 from copy import deepcopy
 import logging
@@ -20,7 +21,8 @@ try:
 except (ModuleNotFoundError, ImportError):
     import numpy as cp
 from eryn.model import Model
-from eryn.moves import RedBlueMove, StretchMove
+from eryn.moves import DistributionGenerateRJ, Move, RedBlueMove, StretchMove
+from eryn.state import BranchSupplemental
 from eryn.state import State as eryn_State
 from eryn.utils.transform import TransformContainer
 
@@ -30,7 +32,7 @@ from ...analysiscontainer import AnalysisContainerArray
 from ...domaincomputation import DomainComputationGroupArray
 from ...domains import FDSettings, STFTSettings
 from ...sensitivity import XYZSensitivityBackend
-from ...utils.utility import asnumpy
+from ...utils.utility import asnumpy, get_array_module
 from ..state import GFState
 from .globalfitmove import GlobalFitMove
 from .multigpumove import MultiGPUMoveBase
@@ -38,6 +40,79 @@ from .multigpumove import MultiGPUMoveBase
 logger = logging.getLogger(__name__)
 
 DEBUG_MODE = False
+
+
+class SplineKnotRJMove(DistributionGenerateRJ):
+    """Birth/death of spline knots, one spline branch at a time.
+
+    Births are drawn from the knot prior (:meth:`SplineNoiseModel.branch_priors`) and
+    deaths remove a random active knot, so the acceptance is the likelihood ratio (with
+    the separation part of the prior, :meth:`SplineNoiseModel.knot_log_prior`). eryn's
+    convention (no ``1/n`` factors) makes the prior on the number of knots uniform between
+    ``nleaves_min`` and ``nleaves_max``.
+
+    eryn sets the prior of a Gibbs block to ``-inf`` when it is left with no leaves while
+    other branches have some, which forbids deaths down to zero knots; a curve with only
+    its edge knots is a valid model here, so that rule is switched off.
+    """
+
+    def fix_logp_gibbs(self, branch_names_run, inds_run, logp, inds):
+        return
+
+
+def _fancy_swap_with_inds(self, dbeta, i, iperm, i1perm, x, logl, inds=None, blobs=None, supps=None,
+                          branch_supps=None, compute_log_like=None):
+    """``TemperatureControl.perform_fancy_swap_acceptance_fraction`` with active leaves.
+
+    eryn's fancy swap (each walker scores its own data stream, so the swapped coordinates are
+    re-evaluated) refuses ``inds``. Here the active leaves of the spline-knot branches are
+    swapped with the coordinates, and the swapped walkers are scored with them. Bound to the
+    PSD move's ``TemperatureControl`` instance.
+    """
+    old_like = logl[i - 1 : i + 1]
+    branch_supps_here, branch_supps_temp = {}, {}
+    for name in x:
+        bs = None if branch_supps is None else branch_supps.get(name)
+        branch_supps_here[name] = None if bs is None else deepcopy(bs[i - 1 : i + 1])
+        branch_supps_temp[name] = None if bs is None else deepcopy(bs[i - 1 : i + 1])
+    supps_here = None if supps is None else BranchSupplemental(supps[i - 1 : i + 1], base_shape=logl.shape)
+
+    x_temp = {name: np.copy(x[name][i - 1 : i + 1]) for name in x}
+    x_here = {name: np.copy(x[name][i - 1 : i + 1]) for name in x}
+    inds_here = None
+    if inds is not None:
+        inds_temp = {name: np.copy(inds[name][i - 1 : i + 1]) for name in inds}
+        inds_here = {name: np.copy(inds[name][i - 1 : i + 1]) for name in inds}
+    for name in x_here:
+        if name in self.skip_swap_branches:
+            continue
+        # walkers of rung i - 1 to rung i and back
+        x_here[name][1, iperm] = x_temp[name][0, i1perm]
+        x_here[name][0, i1perm] = x_temp[name][1, iperm]
+        if inds_here is not None and name in inds_here:
+            inds_here[name][1, iperm] = inds_temp[name][0, i1perm]
+            inds_here[name][0, i1perm] = inds_temp[name][1, iperm]
+        for here, src, to, frm in ((1, 0, iperm, i1perm), (0, 1, i1perm, iperm)):
+            if branch_supps_here[name] is not None:
+                tmp = branch_supps_temp[name][src, frm, :]
+                for key in self.skip_swap_supp_names:
+                    if key in tmp:
+                        tmp.pop(key)
+                branch_supps_here[name][here, to, :] = tmp
+
+    new_like = compute_log_like(x_here, inds=inds_here, supps=supps_here, branch_supps=branch_supps_here)[0]
+    return self.betas[i] * (new_like[1] - old_like[1]) + self.betas[i - 1] * (new_like[0] - old_like[0])
+
+
+def _check_eryn_active_leaf_stretch():
+    """The stretch move must count only the active leaves in its ``(d - 1) ln z`` factor
+    (eryn gf-dev 9d1ae54, ``Move.get_gibbs_ndim``); older versions count ``nleaves_max``
+    and break detailed balance once knots switch on and off."""
+    if not hasattr(Move, "get_gibbs_ndim"):
+        raise ImportError(
+            "Reversible jump on the spline knots needs eryn with the active-leaf stretch factor "
+            "(gf-dev >= 9d1ae54, Move.get_gibbs_ndim). Install eryn from the gf-dev branch."
+        )
 
 
 class PSDMove(GlobalFitMove, StretchMove):
@@ -56,6 +131,13 @@ class PSDMove(GlobalFitMove, StretchMove):
         galfor_transform_fn: TransformContainer for transforming the galactic foreground parameters.
         permute_every: number of repeats after which to permute the walkers during a temperature swap. This helps with the mixing of the chains.
         tolerance: minimum allowed distance between spline knot positions in the sensitivity model.
+        rj_proposals: birth/death proposals per spline branch after each stretch iteration,
+            when the spline model has reversible jump (``SplineNoiseModel.rj``).
+        prior_only: if True, the likelihood is zero (prior-recovery tests).
+        fancy_swap: if True, temperature swaps re-score each swapped state on its new
+            walker's data stream (needed when the walkers' residuals differ, i.e. with
+            source branches). If False (default), the standard swap on the stored
+            log-likelihoods, exact when all walkers see the same data (noise-only runs).
         **kwargs: additional keyword arguments for the Move class.
     """
 
@@ -72,6 +154,9 @@ class PSDMove(GlobalFitMove, StretchMove):
         galfor_transform_fn: TransformContainer = None,
         permute_every: int = 20,
         tolerance: float = 0.0,
+        rj_proposals: int = 1,
+        prior_only: bool = False,
+        fancy_swap: bool = False,
         **kwargs,
     ):
 
@@ -92,6 +177,75 @@ class PSDMove(GlobalFitMove, StretchMove):
 
         self.permute_every = permute_every
         self.tolerance = tolerance
+        self.prior_only = prior_only
+        if prior_only:
+            logger.warning("PSDMove runs with prior_only=True: the PSD likelihood is zero.")
+
+        self.fancy_swap = fancy_swap
+        if fancy_swap and self.spline_model is not None and self.temperature_control is not None:
+            # the fancy swaps must carry the active spline knots
+            self.temperature_control.perform_fancy_swap_acceptance_fraction = types.MethodType(
+                _fancy_swap_with_inds, self.temperature_control
+            )
+
+        # reversible jump on the spline knots
+        self.rj_proposals = rj_proposals
+        self.rj_move = None
+        if self.spline_model is not None and self.spline_model.rj:
+            _check_eryn_active_leaf_stretch()
+            names = self.spline_model.rj_branch_names
+            knot_priors = self.spline_model.branch_priors()
+            # every branch the PSD move carries needs an entry
+            fixed = {"psd": 1, "galfor": 1}
+            self.rj_move = SplineKnotRJMove(
+                {b: knot_priors[b] for b in names},
+                nleaves_max={**fixed, **self.spline_model.nleaves_max},
+                nleaves_min={**fixed, **self.spline_model.nleaves_min},
+                gibbs_sampling_setup=names,
+                temperature_control=self.temperature_control,
+                prevent_swaps=True,
+            )
+
+    @property
+    def spline_model(self):
+        """The backend's :class:`~lisatools.noise_splines.SplineNoiseModel`, if any."""
+        return getattr(self.sensitivity_backend, "spline_model", None)
+
+    @property
+    def psd_branch_names(self) -> list:
+        """Branches this move samples: ``psd``, ``galfor`` and the spline-knot branches."""
+        names = ["psd", "galfor"]
+        if self.spline_model is not None:
+            names += self.spline_model.branch_names
+        return names
+
+    def psd_rows(self, coords: dict, keep=None, inds: dict = None):
+        """Flat PSD rows (levels, edges, interior spline knots) for the backend.
+
+        With a spline model the rows go through :meth:`SplineNoiseModel.flatten`, which
+        prepends the fixed reference levels and blanks the inactive knots.
+
+        Args:
+            coords: Branch-keyed coordinates, ``(ntemps, nwalkers, nleaves, ndim)`` each.
+            keep: Optional boolean mask over ``(ntemps, nwalkers)``. Without it, all rows
+                are returned with the leading ``(ntemps, nwalkers)`` axes.
+            inds: Branch-keyed active leaves, ``(ntemps, nwalkers, nleaves)`` each; all
+                knots are active if ``None``.
+        """
+        sel = (lambda a: a[keep]) if keep is not None else (lambda a: a)
+        psd = sel(coords["psd"])[..., 0, :]
+        if self.spline_model is None:
+            return psd
+        names = self.spline_model.branch_names
+        branch_inds = None if inds is None else {b: sel(inds[b]) for b in names}
+        return self.spline_model.flatten(psd, {b: sel(coords[b]) for b in names}, branch_inds)
+
+    def invalid_knots(self, knots_position):
+        """``(num,)`` mask of rows whose spline knots are unusable (too close, out of band)."""
+        xp = get_array_module(knots_position)
+        if self.spline_model is not None:
+            return self.spline_model.invalid_knots(knots_position)
+        return xp.any(xp.diff(10**knots_position, axis=2) < self.tolerance, axis=(0, 2))
 
     # ------------------------------------------------------------------
     # stft_tof kernel fast path
@@ -157,27 +311,10 @@ class PSDMove(GlobalFitMove, StretchMove):
         Sa_a_in_all = Sa_a_in_all.copy()
 
         if self.sensitivity_backend.use_splines:
-            knots_positions = xp.asarray(spline_pars[:, 1::2])
-            knots_amplitudes = xp.asarray(spline_pars[:, 0:-1:2])
-            half = knots_positions.shape[1] // 2  # Get the mid of the array
-            # put the 2 noise levels on the batch axis
-            spline_knots_amplitude = xp.stack(
-                (knots_amplitudes[:, :half], knots_amplitudes[:, half:])
+            # (n_curves, num, n_knots), sorted; layout owned by the backend / spline model
+            spline_knots_position, spline_knots_amplitude = self.sensitivity_backend.build_spline_arrays(
+                xp.asarray(spline_pars)
             )
-            spline_knots_position = xp.stack(
-                (knots_positions[:, :half], knots_positions[:, half:])
-            )
-
-            # Sort
-            sort_indices = xp.argsort(spline_knots_position, axis=2)
-            # Apply the same indices to both arrays
-            spline_knots_position = xp.take_along_axis(
-                spline_knots_position, sort_indices, axis=2
-            )
-            spline_knots_amplitude = xp.take_along_axis(
-                spline_knots_amplitude, sort_indices, axis=2
-            )
-            # now check if any knot position is not too close together
         else:
             spline_knots_position = None
             spline_knots_amplitude = None
@@ -236,9 +373,7 @@ class PSDMove(GlobalFitMove, StretchMove):
         )
 
         if likelihood_args[-2] is not None and likelihood_args[-1] is not None:
-            invalid_knots = xp.any(
-                xp.diff(10 ** likelihood_args[-2], axis=2) < self.tolerance, axis=(0, 2)
-            )
+            invalid_knots = self.invalid_knots(likelihood_args[-2])
         else:
             invalid_knots = xp.zeros(psd_pars.shape[0], dtype=bool)
 
@@ -314,12 +449,16 @@ class PSDMove(GlobalFitMove, StretchMove):
             warnings.warn("All points entering likelihood have a log prior of minus inf.")
             return logl, None
 
+        if self.prior_only:
+            logl[logp_keep] = 0.0
+            return logl, None
+
         if supps is None:
             raise ValueError("Must provide supps to identify the data streams.")
 
         if self._kernel_fast_path_available():
             # stft_tof fast path: C++ shared-memory kernel.
-            psd_coords = coords["psd"][logp_keep][:, 0]
+            psd_coords = self.psd_rows(coords, logp_keep, inds)
             if "galfor" in coords:
                 input_args = [psd_coords, coords["galfor"][logp_keep][:, 0]]
             else:
@@ -338,7 +477,7 @@ class PSDMove(GlobalFitMove, StretchMove):
         walker_inds_all = np.asarray(supps.holder["walker_inds"]).reshape(logp.shape)
         walker_inds_keep = walker_inds_all[logp_keep]
 
-        psd_coords = coords["psd"][logp_keep][:, 0]
+        psd_coords = self.psd_rows(coords, logp_keep, inds)
         has_galfor = "galfor" in coords
         galfor_coords = coords["galfor"][logp_keep][:, 0] if has_galfor else None
 
@@ -369,29 +508,38 @@ class PSDMove(GlobalFitMove, StretchMove):
 
         return logl, None
 
-    def compute_log_prior(self, branches_coords, *args, **kwargs):
-        """Sum the per-branch log priors over PSD and (optional) galfor coordinates.
+    def compute_log_prior(self, branches_coords, *args, inds=None, **kwargs):
+        """Sum the per-branch log priors over PSD, (optional) galfor and spline-knot
+        coordinates.
+
+        Only active leaves count. Each spline branch adds the separation part of its knot
+        prior (:meth:`SplineNoiseModel.knot_log_prior`): ``-inf`` for knots closer than the
+        minimum separation, and the normalisation of the truncated position prior.
 
         Args:
             branches_coords: Branch-keyed dict of coordinates.
+            inds: Branch-keyed active leaves; every leaf is active if ``None``.
 
         Returns:
             ``(ntemps, nwalkers)`` array of prior log probabilities.
         """
         # wait to get ntemps, nwalkers
         logp = None
-        for key in ["psd", "galfor"]:
+        spline_branches = self.spline_model.branch_names if self.spline_model is not None else []
+        for key in self.psd_branch_names:
             if key not in branches_coords:
                 continue
-            ntemps, nwalkers, _, ndim = branches_coords[key].shape
+            ntemps, nwalkers, nleaves, ndim = branches_coords[key].shape
             if logp is None:
                 logp = np.zeros((ntemps, nwalkers))
 
-            logp[:] += (
-                self.priors[key]
-                .logpdf(branches_coords[key].reshape(-1, ndim))
-                .reshape(ntemps, nwalkers)
-            )
+            inds_here = None if inds is None or key not in inds else np.asarray(inds[key])
+            lp = self.priors[key].logpdf(branches_coords[key].reshape(-1, ndim)).reshape(ntemps, nwalkers, nleaves)
+            if inds_here is not None:
+                lp = np.where(inds_here, lp, 0.0)
+            logp[:] += lp.sum(axis=-1)
+            if key in spline_branches:
+                logp[:] += self.spline_model.knot_log_prior(key, branches_coords[key], inds_here)
         return logp
 
     def run_move(self, move_i, model, state):
@@ -408,6 +556,13 @@ class PSDMove(GlobalFitMove, StretchMove):
         """
         new_state, accepted = super(PSDMove, self).propose(model, state)
 
+        if self.rj_move is not None:
+            # birth/death of spline knots, one spline branch at a time
+            if getattr(self.rj_move, "_accepted", None) is None:
+                self.rj_move.accepted = np.zeros(new_state.log_like.shape)
+            for _ in range(self.rj_proposals):
+                new_state, _ = self.rj_move.propose(model, new_state)
+
         if move_i % self.permute_every == 0:
             x = new_state.branches_coords
             logl = new_state.log_like
@@ -422,17 +577,19 @@ class PSDMove(GlobalFitMove, StretchMove):
                     logP,
                     logl,
                     logp,
+                    inds=new_state.branches_inds,
                     supps=supps,
                     branch_supps=branch_supps,
                     compute_log_like=self.compute_log_like,
                     compute_log_prior=self.compute_log_prior,
-                    fancy_swap=True,
+                    fancy_swap=self.fancy_swap,
                     permute_here=True,
                 )
             )
 
             for name in x:
                 new_state.branches[name].coords[:] = x[name][:]
+                new_state.branches[name].inds[:] = inds[name][:]
                 new_state.branches[name].branch_supplemental = branch_supps[name]
 
             new_state.log_like[:] = logl[:]
@@ -454,6 +611,10 @@ class PSDMove(GlobalFitMove, StretchMove):
         consecutive iterations during which the cold-chain max log-likelihood
         no longer increases and exits after ``num_checks`` such iterations.
         """
+        if self.prior_only:
+            # the likelihood is zero: there is no maximum to search for
+            return self.run_move_for_loop(model, state, self.num_repeats)
+
         num_checks = 5
         num_so_far = 0
         max_logl = -np.inf
@@ -490,18 +651,24 @@ class PSDMove(GlobalFitMove, StretchMove):
         # setup model framework for passing necessary
         tmp_branches_coords = {
             key: state.branches_coords[key]
-            for key in ["psd", "galfor"]
+            for key in self.psd_branch_names
             if key in state.branches_coords
         }
+        tmp_branches_inds = {key: state.branches_inds[key] for key in tmp_branches_coords}
 
-        tmp_state = GFState(tmp_branches_coords, copy=True, supplemental=state.supplemental)
+        tmp_state = GFState(
+            tmp_branches_coords, inds=tmp_branches_inds, copy=True, supplemental=state.supplemental
+        )
 
         # ensuring it is up to date. Should not change anything.
         before_vals = model.analysis_container_arr.likelihood().copy()
 
-        tmp_state.log_prior = self.compute_log_prior(tmp_branches_coords)
+        tmp_state.log_prior = self.compute_log_prior(tmp_state.branches_coords, inds=tmp_state.branches_inds)
         tmp_state.log_like = self.compute_log_like(
-            tmp_branches_coords, logp=tmp_state.log_prior, supps=tmp_state.supplemental
+            tmp_state.branches_coords,
+            inds=tmp_state.branches_inds,
+            logp=tmp_state.log_prior,
+            supps=tmp_state.supplemental,
         )[0]
         self.starting_now = False
 
@@ -524,18 +691,20 @@ class PSDMove(GlobalFitMove, StretchMove):
         # CHECK THIS STATE SETUP
         new_state = GFState(state, copy=True)
 
-        for key in ["psd", "galfor"]:
+        for key in self.psd_branch_names:
             if key not in tmp_state.branches:
                 continue
             new_state.branches[key].coords[:] = tmp_state.branches[key].coords[:]
+            new_state.branches[key].inds[:] = tmp_state.branches[key].inds[:]
 
         new_state.log_like[:] = tmp_state.log_like[:]
         new_state.log_prior[:] = tmp_state.log_prior[:]
 
         # TODO: check speed of this? (needed?)
         nwalkers = len(self.acs)
+        psd_rows_cold = self.psd_rows(new_state.branches_coords, inds=new_state.branches_inds)[0]
         for w in range(nwalkers):
-            psd_params = new_state.branches_coords["psd"][0, w, 0]
+            psd_params = psd_rows_cold[w]
             psd_params = self.psd_transform_fn.both_transforms(psd_params) if self.psd_transform_fn is not None else psd_params
             if "galfor" in new_state.branches_coords:
                 galfor_params = new_state.branches_coords["galfor"][0, w, 0]
@@ -704,9 +873,7 @@ class MultiGPUPSDMove(PSDMove, MultiGPUMoveBase):
                     else likelihood_args[-2]
                 )
 
-                invalid_knots_mask[positions_per_split[i]] = np.any(
-                    np.diff(10**spline_knots_position, axis=2) < self.tolerance, axis=(0, 2)
-                )
+                invalid_knots_mask[positions_per_split[i]] = asnumpy(self.invalid_knots(spline_knots_position))
             ll[invalid_knots_mask] = -1e300
 
         self.acs.free_gpu_memory()

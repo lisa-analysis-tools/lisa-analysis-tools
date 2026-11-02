@@ -106,13 +106,25 @@ def _noise_param_info(sensitivity_backend) -> List[ParameterInfo]:
     (per-MOSA) model has 6 OMS + 6 TM amplitudes named ``S_oms_<mosa>`` / ``S_tm_<mosa>``.
     """
     names = getattr(sensitivity_backend, "psd_param_names", ["S_oms", "S_tm"])
-    if names == ["S_oms", "S_tm"]:
-        return list(_NOISE_PARAM_INFO.values())
-    out = []
-    for name in names:
-        base, mosa = name.rsplit("_", 1)
-        info = _NOISE_PARAM_INFO[base]
-        out.append(ParameterInfo(name, info.latex_name.replace(r"}\,", r",%s}\," % mosa, 1), info.unit))
+    spline_model = getattr(sensitivity_backend, "spline_model", None)
+    if spline_model is not None:
+        # levels fixed at the reference spectrum: the psd branch holds only the edges
+        names = []
+    if not names:
+        out = []
+    elif names == ["S_oms", "S_tm"]:
+        out = list(_NOISE_PARAM_INFO.values())
+    else:
+        out = []
+        for name in names:
+            base, mosa = name.rsplit("_", 1)
+            info = _NOISE_PARAM_INFO[base]
+            out.append(ParameterInfo(name, info.latex_name.replace(r"}\,", r",%s}\," % mosa, 1), info.unit))
+    # spline noise model: the psd branch holds the edge-knot amplitudes (log10 PSD
+    # deviations at f_min / f_max); the interior knots live in their own branches.
+    if spline_model is not None:
+        for key, latex in zip(spline_model.edge_param_keys, spline_model.edge_param_names):
+            out.append(ParameterInfo(f"spline_{key}", latex, "dex"))
     return out
 
 # todo add galactic foreground

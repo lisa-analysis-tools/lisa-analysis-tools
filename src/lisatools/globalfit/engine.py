@@ -244,8 +244,8 @@ class GeneralSetup(Setup, GeneralSettings):
 
         level = logging.DEBUG
         name = "GeneralSetup"
-        if not os.path.exists(self.artifacts_file_dir):
-            os.makedirs(self.artifacts_file_dir)
+        # exist_ok: every MPI rank builds the settings, and they race on a fresh output folder
+        os.makedirs(self.artifacts_file_dir, exist_ok=True)
         self.logger = init_logger(
             filename="general_setup.log", level=level, name=name, log_dir=self.artifacts_file_dir
         )
@@ -293,7 +293,7 @@ class GeneralSetup(Setup, GeneralSettings):
         self.logger.debug(f"Saving h5 backend to {self.main_file_path}")
         self.logger.debug(f"Saving artifacts to {self.artifacts_file_dir}")
         if not os.path.exists(self.artifacts_file_dir):
-            os.makedirs(self.artifacts_file_dir)
+            os.makedirs(self.artifacts_file_dir, exist_ok=True)
             self.logger.debug(f"Created artifacts directory")
 
         self.init_data_information()
@@ -510,7 +510,7 @@ class GeneralSetup(Setup, GeneralSettings):
         ):
             # Drop kwargs that are specific to the XYZ backend so a
             # settings file can be switched over without editing every kwarg.
-            xyz_only = ("mask_percentage", "use_splines", "spline_order", "galactic_grid_kwargs")
+            xyz_only = ("mask_percentage", "use_splines", "spline_order", "spline_model", "galactic_grid_kwargs")
             for k in xyz_only:
                 if k in sensitivity_init_kwargs:
                     self.logger.debug(

@@ -172,13 +172,17 @@ public:
         double f, double *mosa_auto, gcmplx::complex<double> *mosa_cross, int time_index);
 
     // ---- device: noise covariance ----
-    // Covariance at one frequency; grid_idx addresses noise_normalization and the
-    // averaged TFs (see the aliasing note above).
+    // Covariance at one frequency; grid_idx addresses noise_normalization, the
+    // averaged TFs (see the aliasing note above) and the spline deviations.
+    // spline_oms / spline_tm point to this PSD's log10 spline deviations, laid out
+    // [m * spline_stride + grid_idx] for m < n_noise_par (one curve per MOSA in the
+    // asymmetric model, one shared curve in the symmetric one), with
+    // spline_stride = (1 + n_alias) * n_grid. nullptr: no spline deviation.
     CUDA_DEVICE void get_noise_covariance_single(
         double f, int time_index, int grid_idx,
         const double *Soms_d_in, const double *Sa_a_in,
         double Amp, double alpha, double f_1, double f_knee, double f_2,
-        double spline_in_isi_oms, double spline_in_testmass,
+        const double *spline_oms, const double *spline_tm, int spline_stride,
         double *c00, gcmplx::complex<double> *c01, gcmplx::complex<double> *c02,
         double *c11, gcmplx::complex<double> *c12, double *c22);
 
@@ -189,7 +193,7 @@ public:
         double f, int time_index, int f_idx,
         const double *Soms_d_in, const double *Sa_a_in,
         double Amp, double alpha, double f_1, double f_knee, double f_2,
-        double spline_in_isi_oms, double spline_in_testmass,
+        const double *spline_oms, const double *spline_tm, int spline_stride,
         double *c00, gcmplx::complex<double> *c01, gcmplx::complex<double> *c02,
         double *c11, gcmplx::complex<double> *c12, double *c22);
 
@@ -214,7 +218,7 @@ public:
         int *data_index_all, int *time_index_all,
         double *Soms_d_in_all, double *Sa_a_in_all,
         double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
-        double *spline_in_isi_oms_all, double *spline_in_testmass_all,
+        double *spline_oms_all, double *spline_tm_all,
         double differential_component, int num_freqs, int num_times,
         bool *dips_mask, int num_psds, 
         double *c00_all, double *c11_all, double *c22_all, cmplx *c01_all, cmplx *c02_all, cmplx *c12_all,
@@ -224,7 +228,7 @@ public:
         double *freqs, int *time_indices,
         double *Soms_d_in_all, double *Sa_a_in_all,
         double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
-        double *spline_in_isi_oms_all, double *spline_in_testmass_all,
+        double *spline_oms_all, double *spline_tm_all,
         double *c00_arr, gcmplx::complex<double> *c01_arr, gcmplx::complex<double> *c02_arr,
         double *c11_arr, gcmplx::complex<double> *c12_arr, double *c22_arr,
         int num_freqs, int num_times, int num_psds, bool run_async = false);

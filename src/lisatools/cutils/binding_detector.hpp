@@ -301,6 +301,9 @@ public:
         int num_freqs, int num_times,
         array_type<int> time_indices);
 
+    void spline_pointers(array_type<double> spline_oms_all, array_type<double> spline_tm_all,
+                         int num_psds, int num_freqs, double **spline_oms, double **spline_tm);
+
     void psd_likelihood_wrap(
         array_type<double> like_contrib_final, array_type<double> f_arr,
         array_type<std::complex<double>> data,
