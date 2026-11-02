@@ -135,6 +135,13 @@ class DownsampleSpec(_Section):
 
     window: tuple[str, float] = ("kaiser", 31.0)
 
+class AafilterSpec(_Section):
+    """Anti-aliasing filter for downsampling."""
+    attenuation: float = 186.2 # [dB]
+    freq1: float = 0.09432 # [Hz]
+    freq2: float = 0.20585 # [Hz]
+    fs: float = 4.0 # [Hz]
+
 class L1OrbitsSpec(_Section):
     """Orbits read from the mojito L1 data folder (``lisatools.detector.L1Orbits``)."""
 
@@ -175,9 +182,11 @@ class DataSection(_Section):
     dt: Duration                      # seconds: `dt: 5.0` or `dt: 5 s`
     highpass: FilterSpec | None = None
     lowpass: FilterSpec | None = None
+    aafilter: AafilterSpec | None = None # attenuation, freq1, freq2, fs; used only for the downsampling done by L01
     downsample: DownsampleSpec | None = None
     trim: TrimSpec | None = None
     alias_correction: bool = True  # whether to apply the alias correction to the data (default: True)
+    
 
     @model_validator(mode="after")
     def _orbits_match_loader(self):
