@@ -94,8 +94,8 @@ class FlowSpec(_Spec):
     take a Gaussian random walk, in one ``FlowGaussianMove`` (each proposal moves one half, the flow's with
     probability ``flow_prob``); ``gaussian`` holds its arguments (default: ``flow_prob`` 0.5 and a per-leaf
     covariance adapted from the chain, ``{adapt_cov: true}``). The builder
-    fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer device (``compute.flow_gpu``)
-    and output paths; the trainer is started by the setup function.
+    fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer device (``compute.flow_gpu``,
+    the cpu without it) and output paths; the trainer is started by the setup function.
     """
 
     weight: PositiveFloat  # among the block's inner moves
@@ -523,7 +523,7 @@ def make_flow_move(block: SourceBlock, ctx: BuildContext, info: dict[str, Any], 
         )
     flow = find_class(spec.model.class_name, FLOW_MODULES)(
         dims=len(names),
-        device="cpu",  # the proposal side; the trainer runs on compute.flow_gpu
+        device="cpu",  # the proposal side; the trainer runs on compute.flow_gpu (or the cpu)
         conditioning=eryn.flows.OneHotLeafConditioning(nleaves_max=nleaves),
         data_transform=transform,
         **seed,

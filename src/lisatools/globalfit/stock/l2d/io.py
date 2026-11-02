@@ -85,7 +85,7 @@ class ComputeSection(_Section):
     backend: Literal["cpu", "cuda11x", "cuda12x", "cuda13x"] = "cpu"
     head_rank: int = 1
     main_rank: int = 0
-    flow_gpu: int | None = None  # where every flow trainer runs; never a sampling GPU (None on cpu -> "cpu")
+    flow_gpu: int | None = None  # where every flow trainer runs; never a sampling GPU (None -> the cpu)
 
     @model_validator(mode="after")
     def _cpu_means_no_gpus(self):
@@ -395,8 +395,6 @@ class RunConfig(_Section):
             if block.NEEDS_REFERENCE_TIME and data.reference_time is None:
                 raise ValueError(f"block {name!r} needs data.reference_time (absolute SSB time, in seconds).")
             if isinstance(block, SourceBlock):
-                if block.flow is not None and self.compute.backend != "cpu" and self.compute.flow_gpu is None:
-                    raise ValueError(f"block {name!r} has a flow: set compute.flow_gpu, the GPU its trainer runs on.")
                 key = block.SOURCE_IDS_KEY
                 if key not in source_types:
                     raise ValueError(f"block {name!r} needs {key!r} in data.source_types.")
