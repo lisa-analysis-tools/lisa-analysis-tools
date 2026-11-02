@@ -46,6 +46,7 @@ from ...analysiscontainer import (
     AnalysisContainer,
     AnalysisContainerArray,
     BandView,
+    NoiseRowSource,
     band_gpu_assignment,
 )
 from ...domains import DomainSettingsBase, FDSettings, STFTSettings, WDMSettings
@@ -1160,6 +1161,46 @@ def make_routed_band_engine(basis_settings, *, xp, gb_wdm_comp=None,
     return _RoutedBandEngine(prototype, engine_factory=_engine_factory)
 
 
+class _ParentNoiseWindows:
+    """Copies of a buffer's cell windows of the parent noise rows that its cells read.
+
+    Stands in for the noise rows of a buffer whose cells hold none. With ``split=None`` it is
+    indexed by cell id, like ``psd_buffer``; with a split, by position in that split, like
+    ``psd_shaped[split]``. ``get()`` returns every window on the host. Indexing returns copies, so
+    nothing written to them reaches the parent.
+    """
+
+    def __init__(self, buffer: "SubBandBuffer", split: Optional[int] = None):
+        self._buffer = buffer
+        self._split = split
+
+    @property
+    def shape(self) -> tuple:
+        if self._split is None:
+            num_cells = int(self._buffer.num_bands_now)
+        else:
+            num_cells = len(self._buffer.gpu_splits[self._split])
+        return (num_cells,) + tuple(self._buffer._per_band_sens_shape)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            positions = np.arange(self.shape[0])[index]
+        else:
+            positions = np.asarray(asnumpy(index))
+        if positions.dtype.kind not in "iu":
+            raise TypeError("cell windows of the parent noise rows take integer cell indices.")
+        flat = positions.reshape(-1).astype(np.int64)
+        if self._split is None:
+            windows = self._buffer.noise_windows(flat)
+        else:
+            ids = np.asarray(asnumpy(self._buffer.gpu_splits[self._split]), dtype=np.int64)
+            windows = self._buffer._noise_windows_on_split(self._split, ids[flat])
+        return windows.reshape(positions.shape + tuple(windows.shape[1:]))
+
+    def get(self) -> np.ndarray:
+        return asnumpy(self[np.arange(self.shape[0])])
+
+
 class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
     """Per-(temp, walker, band) scratch buffers for the GB special moves.
 
@@ -1187,6 +1228,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
     stft_store_windows = None
     track_counter = None
     _stft_cell_width_value = None
+    # * STFT cells read their inverse CSD from their walker's parent row, or from a copy of every
+    # * parent row on their device, instead of holding a copied window. False copies the windows.
+    READ_PARENT_NOISE_ROWS = True
 
     @property
     def xp(self) -> Union[ModuleType, numpy, cupy]:
@@ -1258,10 +1302,16 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         gb_stft_comp=None,
         stft_store_windows=None,
         track_counter: Optional[StoreWindowTrackCounter] = None,
+        parent_acs: Optional[AnalysisContainerArray] = None,
+        parent_noise_copies: Optional[dict] = None,
         *args,
         **kwargs,
     ):
         self.force_backend = force_backend
+        # Parent array whose noise rows the STFT cells read, and the copies of those rows on other
+        # devices for this GB move call (a dict the main band sorter owns).
+        self.parent_acs = parent_acs
+        self._parent_noise_copies = {} if parent_noise_copies is None else parent_noise_copies
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         assert self.backend.name.split("_")[-1] == gb.backend.name.split("_")[-1]
         self.gb = gb
@@ -1375,7 +1425,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 template_ac_list, **template_aca_kwargs
             )
             self._acs_template_buffer._skip_eager_dd = True
-            self._share_template_psd_blocks()
+            # Twins on the parent's rows read the same rows as the buffer and own no noise to share.
+            if not self.external_noise_rows:
+                self._share_template_psd_blocks()
 
         for _acs in (self, self._acs_template_buffer) if self.use_template_arr else (self,):
             for _ac in _acs.acs.flatten():
@@ -1514,15 +1566,60 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
     @property
     def psd_buffer_tmp(self):
         """Flat per-GPU inverse-PSD buffer (1D view; single-GPU only)."""
+        if getattr(self, "external_noise_rows", False):
+            raise RuntimeError(
+                "psd_buffer_tmp: the cells read the parent's noise rows and hold no flat noise buffer."
+            )
         return self._flat_or_raise(self, "psd")
 
     @property
     def psd_buffer(self):
         """Per-band inverse-PSD buffer indexable by global band id.
 
-        Same single-GPU / multi-GPU behaviour as :attr:`band_buffer`.
+        Same single-GPU / multi-GPU behaviour as :attr:`band_buffer`. When the cells read the
+        parent's noise rows, copies of their windows (checks and diagnostics only).
         """
+        if getattr(self, "external_noise_rows", False):
+            return _ParentNoiseWindows(self)
         return self._shaped_or_view(self, "psd")
+
+    def noise_windows(self, slots):
+        """Copies of the inverse-CSD windows of the cells ``slots``, on the buffer's first device.
+
+        For cells that read the parent's noise rows: each window is cut from the cell's row at the
+        cell's window start.
+        """
+        slots = np.asarray(asnumpy(slots), dtype=np.int64).reshape(-1)
+        xp = self.xp
+        first_device = None if self.gpus is None else int(self.gpus[0])
+        with device_context(xp, first_device):
+            out = xp.empty((slots.size,) + tuple(self._per_band_sens_shape), dtype=self.noise_dtype)
+        split_of_slot = np.asarray(self.split_map)[slots]
+        for split in np.unique(split_of_slot).tolist():
+            positions = np.nonzero(split_of_slot == split)[0]
+            windows = self._noise_windows_on_split(split, slots[positions])
+            with device_context(xp, first_device):
+                if self.gpus is not None and int(self.gpus[split]) != first_device:
+                    # Through the host, which also orders the two devices; checks only.
+                    windows = xp.asarray(asnumpy(windows))
+                out[xp.asarray(positions)] = windows
+        return out
+
+    def _noise_windows_on_split(self, split: int, slots):
+        """Copies of the inverse-CSD windows of ``slots``, all cells of ``split``, on its device."""
+        slots = np.asarray(slots, dtype=np.int64)
+        num_times = int(self._basis_settings.NT)
+        lead = int(np.prod(self.shape_sens)) * num_times
+        width = int(self._stft_cell_width)
+        device = None if self.gpus is None else int(self.gpus[split])
+        with device_context(self.xp, device):
+            windows = self.xp.empty(slots.size * lead * width, dtype=self.noise_dtype)
+        self._copy_stft_windows(
+            self.linear_psd_arr[split], windows, self.noise_row_of_ac[slots].astype(np.int64),
+            np.arange(slots.size, dtype=np.int64), self._stft_start_inds_host[slots].astype(np.int64),
+            lead, int(self.noise_row_shape[-1]), width, device, device,
+        )
+        return windows.reshape((slots.size,) + tuple(self.shape_sens) + (num_times, width))
 
     @property
     def template_buffer_tmp(self):
@@ -1815,7 +1912,69 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 use_midpoint=parent_group.use_midpoint,
                 linear_envelope=parent_group.linear_envelope,
             )
+            if self._reads_parent_noise_rows:
+                # * The cells read their walkers' parent rows: the array allocates no noise. 
+                # * Its splits follow the order of gpus_in.
+                aca_kwargs["noise_source"] = self._parent_noise_source(
+                    [int(gpu) for gpu in gpus_in] if gpus_in else [None]
+                )
         return ac_list, aca_kwargs
+
+    @property
+    def _reads_parent_noise_rows(self) -> bool:
+        """True when the STFT cells read the parent's noise rows rather than copied windows."""
+        return (
+            isinstance(self._basis_settings, STFTSettings)
+            and getattr(self, "parent_acs", None) is not None
+            and self.READ_PARENT_NOISE_ROWS
+        )
+
+    def _parent_noise_source(self, split_devices: list) -> NoiseRowSource:
+        """The noise array each split of this buffer reads, and the row of each cell.
+
+        A split reads the parent's own array when the parent holds every walker in one array on
+        the split's device, else a copy of every parent row on its device. Both hold the rows in
+        walker order, so a cell's row is its walker.
+        """
+        parent = self.parent_acs
+        parent_device = None if parent.gpus is None else int(parent.gpus[0])
+        arrays = []
+        for device in split_devices:
+            if len(parent.linear_psd_arr) == 1 and device == parent_device:
+                arrays.append(parent.linear_psd_arr[0])
+            else:
+                arrays.append(self._parent_noise_copy(device))
+        walkers = np.asarray(asnumpy(self.unique_band_combos[:, 1]), dtype=np.int32)
+        return NoiseRowSource(arrays, parent.end_shape, walkers)
+
+    def _parent_noise_copy(self, device):
+        """Every parent noise row in walker order, on ``device``; built once per GB move call.
+
+        The copies live in ``_parent_noise_copies``, which the main band sorter owns. The move
+        builds a new sorter in every ``propose``, so a copy never outlives the call, and the PSD
+        moves that change the parent rows run between calls.
+        """
+        parent = self.parent_acs
+        key = (id(parent), device)
+        rows_copy = self._parent_noise_copies.get(key)
+        if rows_copy is not None:
+            return rows_copy
+        row_size = int(np.prod(parent.shape_sens)) * int(parent.data_length)
+        num_rows = int(parent.acs_total_entries)
+        with device_context(self.xp, device):
+            rows_copy = self.xp.empty(num_rows * row_size, dtype=parent.noise_dtype)
+        for split, walkers in enumerate(parent.gpu_splits):
+            source_device = None if parent.gpus is None else int(parent.gpus[split])
+            if None not in (source_device, device) and source_device != device:
+                assert_peer_access(
+                    self.xp, [source_device, device], context="SubBandBuffer parent noise copy"
+                )
+            with device_context(self.xp, device):
+                rows_copy.reshape(num_rows, row_size)[self.xp.asarray(np.asarray(walkers))] = (
+                    parent.linear_psd_arr[split].reshape(-1, row_size)
+                )
+        self._parent_noise_copies[key] = rows_copy
+        return rows_copy
 
     def update_special_indices(self, new_special_indices, inds_fill=None):
         if inds_fill is None:
@@ -1899,6 +2058,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             self.start_freq_inds = self.buffer_start_index
             if getattr(self, "stft_split_start_inds", None) is not None:
                 self._refresh_stft_split_start_inds()
+            if getattr(self, "external_noise_rows", False):
+                self._refresh_noise_rows()
         else:
             raise NotImplementedError(
                 f"Buffer does not support basis domain {type(self._basis_settings).__name__}."
@@ -1958,6 +2119,22 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 else:
                     stores[split][...] = self.xp.asarray(values)
         self.stft_split_start_inds = stores
+
+    def _refresh_noise_rows(self) -> None:
+        """Point refilled cells at their walkers' parent noise rows, in place, here and in the twin.
+
+        A cell's row is its walker: the parent's own array and a device copy both hold the rows in
+        walker order.
+        """
+        rows = np.asarray(asnumpy(self.unique_band_combos[:, 1]), dtype=np.int32)
+        changed = np.nonzero(rows != self.noise_row_of_ac)[0]
+        if changed.size == 0:
+            return
+        for holder in (self, self._acs_template_buffer) if self.use_template_arr else (self,):
+            holder.set_noise_rows(changed, rows[changed])
+            # Keep sens_mat aliasing invC, as at construction.
+            for ac in holder.acs.flatten()[changed]:
+                ac.sens_mat._sens_mat = ac.sens_mat.invC
 
     def _compute_frequency_lims(self):
         lower_f_lim = self.band_edges[
@@ -2075,6 +2252,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         ac_to_intra = np.asarray(self.ac_to_intra)
         data_shards = self.data_shaped
         psd_shards = self.psd_shaped
+        if getattr(self, "external_noise_rows", False):
+            # The cells hold no noise: each shard serves copies of its cells' windows of the parent rows.
+            psd_shards = [_ParentNoiseWindows(self, split) for split in range(len(self.gpu_splits))]
         template_shards = self._acs_template_buffer.data_shaped if self.use_template_arr else None
 
         launched = []
@@ -2401,6 +2581,10 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         Writes straight into the buffer rows, with no full-grid temporary and no index array larger
         than one entry per cell. Cells are grouped by (parent split, buffer split).
         """
+        if getattr(self, "external_noise_rows", False):
+            # ! The noise arrays are the parent's rows (or their copy): only the residual windows move.
+            self._fill_stft_data_windows(acs, inds_fill)
+            return
         slots = np.asarray(asnumpy(inds_fill), dtype=int)
         walkers = np.asarray(asnumpy(self.unique_band_combos[inds_fill, 1]), dtype=int)
         starts = self._stft_start_inds_host[slots].astype(np.int64)
@@ -2430,6 +2614,31 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                         src, dst, parent_rows[cells], cell_rows[cells], starts[cells],
                         lead, nf_parent, nf_cell, device_src, device_dst,
                     )
+
+    def _fill_stft_data_windows(self, acs: AnalysisContainerArray, inds_fill) -> None:
+        """Copy each slot's store window of its walker's residual from the parent, as
+        :meth:`_fill_stft_windows` does, for cells that read their noise from the parent rows."""
+        slots = np.asarray(asnumpy(inds_fill), dtype=int)
+        walkers = np.asarray(asnumpy(self.unique_band_combos[inds_fill, 1]), dtype=int)
+        starts = self._stft_start_inds_host[slots].astype(np.int64)
+        lead_data = int(self.nchannels) * int(self._basis_settings.NT)
+
+        parent_split = np.asarray(acs.split_map)[walkers]
+        cell_split = np.asarray(self.split_map)[slots]
+        parent_rows = np.asarray(acs.ac_to_intra)[walkers].astype(np.int64)
+        cell_rows = np.asarray(self.ac_to_intra)[slots].astype(np.int64)
+        for split_src in np.unique(parent_split):
+            for split_dst in np.unique(cell_split):
+                cells = np.where((parent_split == split_src) & (cell_split == split_dst))[0]
+                if cells.size == 0:
+                    continue
+                self._copy_stft_windows(
+                    acs.linear_data_arr[split_src], self.linear_data_arr[split_dst],
+                    parent_rows[cells], cell_rows[cells], starts[cells], lead_data,
+                    int(self._basis_settings.NF_active), int(self._stft_cell_width),
+                    None if acs.gpus is None else int(acs.gpus[split_src]),
+                    None if self.gpus is None else int(self.gpus[split_dst]),
+                )
 
     def _copy_stft_windows(self, src, dst, src_rows, dst_rows, starts, lead, nf_src, nf_dst,
                            device_src, device_dst) -> None:
@@ -2704,6 +2913,7 @@ class BandSorter(LISAToolsParallelModule):
                         "gb_stft_comp",
                         "rj_prop",
                         "stft_store_windows",
+                        "parent_noise_copies",
                     ]:
                         continue
 
@@ -2750,6 +2960,9 @@ class BandSorter(LISAToolsParallelModule):
         self.gb_stft_comp = gb_stft_comp
         self.stft_store_windows = stft_store_windows
         self.verify_buffer = bool(verify_buffer)
+        # Copies of the parent noise rows on the buffers' devices, kept for this sorter's life: the
+        # move builds a sorter per propose, so a copy lives one GB move call.
+        self.parent_noise_copies = {}
         self.waveform_kwargs = waveform_kwargs
         self.gb_branch_orig = gb_branch
         self.num_bands = len(band_edges) - 1
@@ -3074,6 +3287,8 @@ class BandSorter(LISAToolsParallelModule):
                 gb_stft_comp=self.gb_stft_comp,
                 stft_store_windows=self.stft_store_windows,
                 force_backend=self.force_backend,
+                parent_acs=acs,
+                parent_noise_copies=getattr(self.main_band_sorter, "parent_noise_copies", None),
                 **kwargs,
             )
 
