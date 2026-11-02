@@ -72,6 +72,7 @@ class RunSection(_Section):
     num_iterations: PositiveInt = 500
     backup_iter: PositiveInt = 5
     submission_dir: RunPath | None = None
+    defer_posteriors: list[str] = []  # branches post-processed later by scripts/postprocess_submission.py
 
 
 class SamplerSection(_Section):

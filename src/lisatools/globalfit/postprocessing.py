@@ -180,6 +180,9 @@ _MOJITO_LIGHT_EMRI_ORDER = ["source_0", "source_1", "source_3", "source_2", "sou
 
 MAX_SOURCES_PER_BATCH = 500
 
+# comment of the per-branch metadata until its posteriors have been written
+_POSTERIORS_PENDING = "posteriors pending"
+
 def _apply_output_corrections(branch: str, samples_dict: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Apply branch-specific output corrections to a posterior mapping."""
 
@@ -1295,7 +1298,14 @@ class SubmissionWriter(BackendConsumer):
         backend: HDFBackend | str = None,
         ess: int = 10000,
         detection_criteria: DetectionCriteria = None,
+        run_metadata: RunMetadata = None,
     ):
+        """
+        Args:
+            run_metadata: RunMetadata of an existing submission (e.g. `RunMetadata.from_submission`), to
+                write the posteriors into that submission folder at a later time. If None, a new
+                submission is created from `curr`.
+        """
 
         super().__init__(curr=curr, backend=backend)
 
@@ -1304,7 +1314,7 @@ class SubmissionWriter(BackendConsumer):
         self._ess_submission = ess
 
         self.detection_criteria = detection_criteria or OccupancyDetectionCriteria()
-        self.run_metadata = RunMetadata.from_curr(self.curr)
+        self.run_metadata = run_metadata or RunMetadata.from_curr(self.curr)
 
     def load_samples(self):
         """Thin, transform and cache the independent samples for all branches."""
@@ -1637,10 +1647,11 @@ class SubmissionWriter(BackendConsumer):
         metadata.to_json(metadata_json_filepath)
         logger.info(f"Saved metadata for branch '{branch}' to {metadata_json_filepath}")
 
-    def _write_source_metadata_skeleton(self, branch: str):
+    def _write_source_metadata_skeleton(self, branch: str, extra_comment: str = _POSTERIORS_PENDING):
         """Write the sample-independent metadata for a resolvable branch, with no detections."""
 
-        metadata: SourceMetadata = self.curr.source_metadata[branch]
+        metadata: SourceMetadata = deepcopy(self.curr.source_metadata[branch])
+        metadata.comment = f"{metadata.comment} {extra_comment}".strip()
         metadata.parameter_info, metadata.parameter_units = self._source_parameter_info(branch)
         metadata.detection_statistic = []
         metadata.detections = []
@@ -1780,7 +1791,7 @@ class SubmissionWriter(BackendConsumer):
         metadata.to_json(metadata_json_filepath)
         logger.info(f"Saved metadata for  stochastic branch(es) to {metadata_json_filepath}")
 
-    def _write_stochastic_metadata_skeleton(self, extra_comment: str = ""):
+    def _write_stochastic_metadata_skeleton(self, extra_comment: str = _POSTERIORS_PENDING):
         """Write the sample-independent stochastic metadata, with no posterior file."""
         if not self.stochastic_branches:
             return
@@ -1859,6 +1870,8 @@ class SubmissionWriter(BackendConsumer):
         (run metadata, per-branch metadata without detections, input data and residuals).
         """
         self.create_folders()
+        # filled by `write_posteriors` as the posteriors of each source type are written
+        self.run_metadata.found_source_types_list = []
         self._write_run_metadata()
         self.save_data_and_residuals(acs)
 
@@ -1873,16 +1886,26 @@ class SubmissionWriter(BackendConsumer):
         except Exception:
             logger.exception("Could not write the metadata for the stochastic branch(es)")
 
-    def write_posteriors(self, acs: AnalysisContainerArray):
+    def write_posteriors(self, acs: AnalysisContainerArray, branches: list[str] | None = None):
         """
         Phase B: process the samples and save posteriors + full metadata, one unit at a time.
 
         The stochastic branches form a single unit; each resolvable branch is its own unit.
         A failing unit is logged and recorded in its metadata comment, and the remaining units are
         still processed. A summary RuntimeError is raised at the end if any unit failed.
+
+        Args:
+            acs: AnalysisContainerArray at the end of the run (used by the GB clustering).
+            branches: only post-process the units containing these branches (default: all). The
+                other units are left untouched, so they can be post-processed at a later time.
         """
-        units = list(self.resolvable_branches)
-        if self.stochastic_branches:
+        if not hasattr(self, "_relative_folders"):
+            self.create_folders()
+
+        units = [b for b in self.resolvable_branches if branches is None or b in branches]
+        if self.stochastic_branches and (
+            branches is None or any(b in branches for b in self.stochastic_branches)
+        ):
             units.append("stochastic")
 
         failures: dict[str, str] = {}
@@ -1895,21 +1918,21 @@ class SubmissionWriter(BackendConsumer):
                 if unit == "stochastic":
                     self._write_stochastic_metadata_skeleton(extra_comment=msg)
                 else:
-                    metadata: SourceMetadata = self.curr.source_metadata[unit]
-                    metadata.comment = f"{metadata.comment} {msg}".strip()
-                    self._write_source_metadata_skeleton(unit)
+                    self._write_source_metadata_skeleton(unit, extra_comment=msg)
             except Exception:
                 logger.exception(f"Could not record the failure in the metadata of '{unit}'")
 
-        try:
-            # thinning is shared across branches (joint ACT), so it cannot be split per unit
-            self.load_samples()
-        except Exception as exc:
-            for unit in units:
-                _record_failure(unit, exc)
-            units = []
+        to_process = list(units)
+        if to_process:
+            try:
+                # thinning is shared across branches (joint ACT), so it cannot be split per unit
+                self.load_samples()
+            except Exception as exc:
+                for unit in to_process:
+                    _record_failure(unit, exc)
+                to_process = []
 
-        for unit in units:
+        for unit in to_process:
             try:
                 if unit == "stochastic":
                     self._save_stochastic_posterior()
@@ -1920,13 +1943,20 @@ class SubmissionWriter(BackendConsumer):
             except Exception as exc:
                 _record_failure(unit, exc)
 
-        # only list the source types whose posteriors were actually written
-        failed_branches = [b for b in self.resolvable_branches if b in failures]
-        if "stochastic" in failures:
-            failed_branches.extend(self.stochastic_branches)
-        failed_types = {source_types_names.get(b) for b in failed_branches}
+        # only list the source types whose posteriors have been written, by this call or an earlier one
+        def _unit_types(unit_list):
+            unit_branches = [b for b in unit_list if b != "stochastic"]
+            if "stochastic" in unit_list:
+                unit_branches += self.stochastic_branches
+            return {source_types_names.get(b) for b in unit_branches}
+
+        failed_types = _unit_types([u for u in units if u in failures])
+        found = (
+            set(self.run_metadata.found_source_types_list)
+            | _unit_types([u for u in units if u not in failures])
+        ) - failed_types
         self.run_metadata.found_source_types_list = [
-            s for s in self.run_metadata.found_source_types_list if s not in failed_types
+            s for s in self.run_metadata.searched_source_types_list if s in found
         ]
         self._write_run_metadata()
 
@@ -1934,10 +1964,22 @@ class SubmissionWriter(BackendConsumer):
             summary = "; ".join(f"{unit}: {msg}" for unit, msg in failures.items())
             raise RuntimeError(f"Submission post-processing failed for {len(failures)} unit(s): {summary}")
 
-    def write_submission(self, acs: AnalysisContainerArray):
-        """Run the full submission writing pipeline: metadata first, then the posteriors."""
+    def write_submission(self, acs: AnalysisContainerArray, defer: list[str] | None = None):
+        """
+        Run the full submission writing pipeline: metadata first, then the posteriors.
+
+        Args:
+            defer: branches whose posteriors are not written now (their metadata says
+                "posteriors pending"); write them later with `write_posteriors(acs, branches=defer)`
+                on a writer built with `run_metadata=RunMetadata.from_submission(...)`, see
+                scripts/postprocess_submission.py.
+        """
         self.write_metadata(acs)
-        self.write_posteriors(acs)
+        if defer:
+            logger.info(f"Posteriors deferred for branches {defer}")
+            self.write_posteriors(acs, branches=[b for b in self.branches if b not in defer])
+        else:
+            self.write_posteriors(acs)
 
 
 # === Save residuals ====

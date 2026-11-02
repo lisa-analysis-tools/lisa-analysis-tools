@@ -83,6 +83,7 @@ def make_general_settings(cfg: RunConfig) -> GeneralSettings:
         base_file_name=run.name,
         file_store_dir=os.path.join(str(run.output_dir), ""),  # engine concatenates paths
         submission_parent_folder=None if run.submission_dir is None else str(run.submission_dir),
+        defer_posteriors=list(run.defer_posteriors),
         random_seed=run.seed,
         num_iterations=run.num_iterations,
         backup_iter=run.backup_iter,

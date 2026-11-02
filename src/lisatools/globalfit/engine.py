@@ -208,6 +208,9 @@ class GeneralSettings(Settings):
     global_fit_contact: Optional[str] = None
     global_fit_code_link: Optional[str] = None
     submission_parent_folder: Optional[str] = None
+    # branches whose posteriors are not written at the end of the run; produce them later with
+    # scripts/postprocess_submission.py (psd/galfor defer the whole stochastic component)
+    defer_posteriors: list[str] = dataclasses.field(default_factory=list)
     input_data_link: Optional[str] = None
     input_reference: Optional[str] = None
     noise_model: Optional[str] = None

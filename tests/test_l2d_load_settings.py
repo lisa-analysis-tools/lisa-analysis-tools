@@ -43,6 +43,7 @@ MAPPED = {
         "seed": "random_seed",
         "num_iterations": "num_iterations",
         "backup_iter": "backup_iter",
+        "defer_posteriors": "defer_posteriors",
     },
     "sampler": {"nwalkers": "nwalkers", "ntemps": "ntemps"},
     "compute": {"gpus": "gpus", "backend": "gpu_backend"},

@@ -41,7 +41,7 @@ def _fake_samples():
     return out, {b: s.copy() for b, s in out.items()}, inds, np.zeros(NSAMP), np.zeros(NSAMP)
 
 
-def _make_writer(parent):
+def _make_writer(parent, run_metadata=None):
     """Build a SubmissionWriter without an HDF backend or a full `curr`."""
     writer = object.__new__(SubmissionWriter)
     writer.backend = SimpleNamespace(branch_names=["mbh", "gb", "psd"])
@@ -55,11 +55,12 @@ def _make_writer(parent):
     )
     writer._ess_submission = NSAMP
     writer.detection_criteria = OccupancyDetectionCriteria()
-    writer.run_metadata = RunMetadata(
+    writer.run_metadata = run_metadata or RunMetadata(
         global_fit_version="test_v1",
         submission_parent_folder=parent,
         submission_timestamp="2026-01-01T000000",
         found_source_types_list=["GB", "MBHB", "NOISE"],
+        searched_source_types_list=["GB", "MBHB", "NOISE"],
     )
     writer.save_data_and_residuals = lambda acs: None
     writer.process_samples = lambda ess, return_inds: _fake_samples()
@@ -99,6 +100,62 @@ class SubmissionWriterDecouplingTest(unittest.TestCase):
         self.assertEqual(len(self._metadata_json(writer, "GB")["posterior_files"]), 3)
         with open(os.path.join(self._folder(writer), "global_metadata.json")) as f:
             self.assertEqual(json.load(f)["found_source_types_list"], ["GB", "MBHB", "NOISE"])
+        for name in ["MBHB", "GB", "noise"]:
+            self.assertNotIn("pending", self._metadata_json(writer, name)["comment"])
+
+    def _found(self, writer):
+        with open(os.path.join(self._folder(writer), "global_metadata.json")) as f:
+            return json.load(f)["found_source_types_list"]
+
+    def _offline_writer(self, writer):
+        """A new writer on the existing submission, as built by scripts/postprocess_submission.py."""
+        run_metadata = RunMetadata.from_submission(
+            os.path.join(self._folder(writer), "global_metadata.json")
+        )
+        return _make_writer(self.parent, run_metadata=run_metadata)
+
+    def test_deferred_branch_is_written_later(self):
+        writer = _make_writer(self.parent)
+        writer.write_submission(acs=None, defer=["gb"])
+
+        self.assertEqual(self._posterior_files(writer, "GB"), [])
+        self.assertIn("posteriors pending", self._metadata_json(writer, "GB")["comment"])
+        self.assertEqual(self._found(writer), ["MBHB", "NOISE"])
+        mbh_files = self._posterior_files(writer, "MBHB")
+        mbh_mtime = os.path.getmtime(mbh_files[0])
+        mbh_metadata = self._metadata_json(writer, "MBHB")
+
+        offline = self._offline_writer(writer)
+        offline._prepare_gb_samples = lambda acs, orig, samples, inds: (samples, inds)
+        offline.write_posteriors(acs=None, branches=["gb"])
+
+        self.assertEqual(offline.submission_folder, writer.submission_folder)
+        self.assertEqual(len(self._posterior_files(writer, "GB")), 1)
+        gb_metadata = self._metadata_json(writer, "GB")
+        self.assertEqual(len(gb_metadata["posterior_files"]), 3)
+        self.assertNotIn("pending", gb_metadata["comment"])
+        self.assertEqual(self._found(writer), ["GB", "MBHB", "NOISE"])
+        # the branches that were already written are left untouched
+        self.assertEqual(self._posterior_files(writer, "MBHB"), mbh_files)
+        self.assertEqual(os.path.getmtime(mbh_files[0]), mbh_mtime)
+        self.assertEqual(self._metadata_json(writer, "MBHB"), mbh_metadata)
+
+    def test_failed_rerun_drops_the_source_type(self):
+        writer = _make_writer(self.parent)
+        writer._prepare_gb_samples = lambda acs, orig, samples, inds: (samples, inds)
+        writer.write_submission(acs=None)
+        self.assertEqual(self._found(writer), ["GB", "MBHB", "NOISE"])
+
+        def _boom(*args, **kwargs):
+            raise ValueError("new clustering exploded")
+
+        offline = self._offline_writer(writer)
+        offline._prepare_gb_samples = _boom
+        with self.assertRaisesRegex(RuntimeError, "gb: postprocessing failed"):
+            offline.write_posteriors(acs=None, branches=["gb"])
+
+        self.assertEqual(self._found(writer), ["MBHB", "NOISE"])
+        self.assertIn("new clustering exploded", self._metadata_json(writer, "GB")["comment"])
 
     def test_branch_failure_is_isolated(self):
         writer = _make_writer(self.parent)

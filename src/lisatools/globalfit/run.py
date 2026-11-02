@@ -966,7 +966,13 @@ class GlobalFit:
                 if self.curr.general_info.submission_parent_folder is not None:
                     self.logger.debug(f"saving submission to {self.curr.general_info.submission_parent_folder}")
                     submission_writer = SubmissionWriter(backend=backend, curr=self.curr, ess=20_000)
-                    submission_writer.write_submission(acs)
+                    defer = list(getattr(self.curr.general_info, "defer_posteriors", None) or [])
+                    submission_writer.write_submission(acs, defer=defer)
+                    if defer:
+                        logger.info(
+                            f"Posteriors of {defer} deferred; write them with: python scripts/postprocess_submission.py "
+                            f"--config <run folder or run_config.yaml> --submission {submission_writer.submission_folder}"
+                        )
 
                 logger.info("Residuals saved.")
             except Exception:
