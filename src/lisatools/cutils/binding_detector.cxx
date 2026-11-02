@@ -513,6 +513,35 @@ void detector_part(nb::module_ &m) {
 
     ;
 
+    // ---- KinematicsTableWrap ----
+    // ! noconvert: the wrap keeps raw pointers, so a converted temporary would leave them dangling.
+#if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
+    nb::class_<KinematicsTableWrap>(m, "KinematicsTableWrapGPU")
+#else
+    nb::class_<KinematicsTableWrap>(m, "KinematicsTableWrapCPU")
+#endif
+    .def(nb::init<double, double, int,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type>(),
+         nb::arg("first_segment_midpoint"), nb::arg("segment_time"), nb::arg("num_time_segments"),
+         nb::arg("position_receiver").noconvert(), nb::arg("velocity_receiver").noconvert(),
+         nb::arg("acceleration_receiver").noconvert(), nb::arg("position_sender").noconvert(),
+         nb::arg("velocity_sender").noconvert(), nb::arg("acceleration_sender").noconvert(),
+         nb::arg("light_travel_time").noconvert(), nb::arg("light_travel_time_rate").noconvert(),
+         nb::arg("light_travel_time_acceleration").noconvert(),
+         nb::arg("unit_direction").noconvert(), nb::arg("unit_direction_rate").noconvert())
+    .def("build", &KinematicsTableWrap::build, nb::arg("orbits"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Fill the table at the segment midpoints from an OrbitsWrap on the same device.")
+    .def_prop_ro("first_segment_midpoint",
+                 [](const KinematicsTableWrap &self) { return self.table.first_segment_midpoint; })
+    .def_prop_ro("segment_time",
+                 [](const KinematicsTableWrap &self) { return self.table.segment_time; })
+    .def_prop_ro("num_time_segments",
+                 [](const KinematicsTableWrap &self) { return self.table.num_time_segments; });
+
     // ---- GalacticGridSetup (host-side quadrature/sky-grid builder) ----
     // The C++ type is per-backend aliased (GalacticGridSetupGPU/CPU) so the
     // CPU and GPU plugin .so's register distinct typeids; the Python-facing
@@ -753,6 +782,15 @@ void domains_part(nb::module_ &m) {
          "  moment = the same integral with an extra tau in the integrand.\n"
          "Both are the quantities the windowed evaluator sums over its seven Tukey terms, so they\n"
          "can be compared directly with the integrals rather than with another implementation.")
+    .def("compute_fresnel_functions", &STFTFresnelWrap::compute_fresnel_functions,
+         nb::arg("cosine_out"), nb::arg("sine_out"), nb::arg("aux_f_out"),
+         nb::arg("aux_g_out"), nb::arg("slope_f_out"), nb::arg("slope_g_out"),
+         nb::arg("arguments"), nb::arg("num"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Diagnostic: the shared Fresnel functions of lat_fresnel.hh at each argument x.\n\n"
+         "cosine_out and sine_out receive C(x) and S(x); aux_f_out and aux_g_out the auxiliary\n"
+         "functions f and g at |x|, and slope_f_out and slope_g_out their derivatives in |x|.\n"
+         "f, g and their derivatives come from the auxiliary branch and hold for |x| > 1.6.")
     .def("compute_fourier_values", &STFTFresnelWrap::compute_fourier_values,
          nb::arg("output"), nb::arg("amps"), nb::arg("phase0s"),
          nb::arg("f0s"), nb::arg("fdot0s"), nb::arg("t0s"),

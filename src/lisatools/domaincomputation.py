@@ -363,6 +363,23 @@ class DomainKernelStrategy(LISAToolsParallelModule):
 BaseDomainComputationGroup = DomainKernelStrategy
 
 
+#: Fields of the kinematics table and the leading shape of each. A field is stored flat with the
+#: segment index fastest, e.g. ``position_receiver[(spacecraft * 3 + xyz) * NT + segment]``.
+KINEMATICS_TABLE_FIELDS = (
+    ("position_receiver", (3, 3)),
+    ("velocity_receiver", (3, 3)),
+    ("acceleration_receiver", (3, 3)),
+    ("position_sender", (6, 3)),
+    ("velocity_sender", (6, 3)),
+    ("acceleration_sender", (6, 3)),
+    ("light_travel_time", (6,)),
+    ("light_travel_time_rate", (6,)),
+    ("light_travel_time_acceleration", (6,)),
+    ("unit_direction", (6, 3)),
+    ("unit_direction_rate", (6, 3)),
+)
+
+
 class STFTComputationGroup(DomainKernelStrategy):
     """Wraps C++ STFTDomainWrap for batched likelihood computation."""
 
@@ -374,7 +391,7 @@ class STFTComputationGroup(DomainKernelStrategy):
         force_backend: str = "cpu",
         window_alpha: float = 0.0,
         use_midpoint: bool = False,
-        linear_envelope: bool = False,
+        linear_envelope: bool = True,
     ):
         """
         Args:
@@ -391,7 +408,9 @@ class STFTComputationGroup(DomainKernelStrategy):
                 amplitude slope is derived for free from the estimator's
                 ``t +- D`` stencil samples, so this models the within-segment
                 TDI amplitude drift the const-envelope kernel otherwise freezes.
-                Defaults ``False`` (byte-identical to the const-envelope path).
+                Defaults ``True``; ``False`` gives the const-envelope path, byte for
+                byte the kernel of before. ``STFTGBComputations`` defaults to ``True``
+                as well and checks that the two agree.
         """
         from .domains import STFTSettings
 
@@ -485,6 +504,59 @@ class STFTComputationGroup(DomainKernelStrategy):
             yield
         finally:
             self._cpp_fresnel = saved
+
+    def cpp_kinematics(self, cpp_orbits):
+        """Kinematics table at this group's segment midpoints, built from ``cpp_orbits``.
+
+        The table holds the spacecraft states, light travel times and link vectors that the
+        DFFR response reads; it does not depend on the source. It is built on the group's
+        device on the first call and kept; a call with another orbits object rebuilds it.
+
+        Args:
+            cpp_orbits: ``OrbitsWrap`` of the response, with its arrays on this group's device.
+
+        Returns:
+            The backend's ``KinematicsTableWrap``.
+
+        Raises:
+            ValueError: If the segment midpoints, widened by the derivative stencils, leave
+                the position or light-travel-time grid of the orbits.
+        """
+        cached = getattr(self, "_kinematics", None)
+        if cached is not None and cached[0] is cpp_orbits:
+            return cached[2]
+
+        num_times = int(self.settings.NT)
+        with self.group_device_context():
+            arrays = {
+                name: self.xp.zeros(int(np.prod(shape)) * num_times, dtype=self.xp.float64)
+                for name, shape in KINEMATICS_TABLE_FIELDS
+            }
+            # * Midpoints of the windows whose starts the STFT kernels place at t0 + i dt.
+            table = self.backend.KinematicsTableWrap(
+                float(self.settings.t0) + 0.5 * float(self.settings.dt),
+                float(self.settings.dt),
+                num_times,
+                *arrays.values(),
+            )
+            table.build(cpp_orbits)
+        # ! The orbits object stays referenced, so the identity check above cannot match a new
+        # ! object that reuses its id.
+        self._kinematics = (cpp_orbits, arrays, table)
+        return table
+
+    def kinematics_fields(self, cpp_orbits) -> dict:
+        """The kinematics table of :meth:`cpp_kinematics` as arrays of shape ``(..., NT)``.
+
+        The arrays stay on the group's device; see ``KINEMATICS_TABLE_FIELDS`` for the
+        leading shape of each field.
+        """
+        self.cpp_kinematics(cpp_orbits)
+        num_times = int(self.settings.NT)
+        return {
+            name: self._kinematics[1][name].reshape(shape + (num_times,))
+            for name, shape in KINEMATICS_TABLE_FIELDS
+        }
 
     def compute_signal_likelihood_terms(
         self,

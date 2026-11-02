@@ -19,6 +19,7 @@ from eryn.state import BranchSupplemental
 from gbgpu.gbgpu import GBGPU
 from gbgpu.utils.utility import get_N, get_fdot
 from scipy import stats
+from scipy.special import gammaln
 
 from ... import sensitivity
 from ...detector import sangria
@@ -198,6 +199,69 @@ def _tspan(tm, name: str):
     return tm.span(name) if tm is not None else nullcontext()
 
 
+# * Currently only using uniform priors for which the variance is w^2 / 12 for width w
+PRIOR_PRECISION_FACTOR = 12.0
+
+# * Step of the numerical Jacobian of the transform container: 1e-6 of |x| with a floor of 1e-3 in
+# * |x|. It is exact for the linear f0 and fdot transforms, also for fdot sampled as fdot x Tobs^2.
+JACOBIAN_STEP_RELATIVE = 1e-6
+JACOBIAN_STEP_FLOOR = 1e-3
+
+# * Cached Fisher Information matrices in the gb branch supplemental, per leaf slot:
+# * FIM in the sampling basis, the prior widths, the blocks served, and whether the slot holds one.
+_FIM_STORE_KEYS = ("fim_matrix", "fim_widths", "fim_age", "fim_valid")
+
+
+def fisher_proposal_factor(info_sampling, prior_widths, beta, xp=np):
+    """Factor L with L L^T = (beta F + P)^-1 per source, P = diag(12 / w^2), in correlation form.
+
+    ``info_sampling`` (n_src, ndim, ndim) is the Fisher matrix F in the sampling basis,
+    ``prior_widths`` (n_src, ndim) or (ndim,) the widths w of the uniform prior box in the same
+    units and ``beta`` a scalar or (n_src,) inverse temperatures. The sum is whitened by its own
+    diagonal d: C = (beta F + P) / (d d^T) = V diag(lam) V^T and L = V diag(lam^-1/2) / d. No
+    eigenvalue floor is needed, since P holds every direction the data leave open. A source whose
+    matrix is not finite or not positive definite gets the prior factor diag(w / sqrt(12)).
+
+    Returns ``(factor, diagnostics)``. ``diagnostics`` holds per source ``fallback`` (the prior
+    factor was used), ``condition`` (largest over smallest eigenvalue of C, NaN for a fallback) and
+    ``prior_dominated`` (an eigenvector of C whose eigenvalue is more than half prior).
+    """
+    info = xp.asarray(info_sampling, dtype=xp.float64)
+    n_src, ndim = info.shape[0], info.shape[-1]
+    widths = xp.broadcast_to(xp.asarray(prior_widths, dtype=xp.float64), (n_src, ndim))
+    betas = xp.broadcast_to(xp.asarray(beta, dtype=xp.float64).reshape(-1), (n_src,))
+    precision = PRIOR_PRECISION_FACTOR / widths ** 2
+    identity = xp.eye(ndim)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        total = betas[:, None, None] * info + precision[:, :, None] * identity[None]
+        scale = xp.sqrt(xp.diagonal(total, axis1=1, axis2=2))
+        finite = xp.all(xp.isfinite(total), axis=(1, 2)) & xp.all(scale > 0.0, axis=1)
+        safe_scale = xp.where(finite[:, None], scale, 1.0)
+        # ! one non-finite matrix would make the batched eigh fail (numpy) or return NaN (cupy) for
+        # ! the whole batch, so it is replaced by the identity here and gets the prior factor below
+        corr = xp.where(
+            finite[:, None, None],
+            total / safe_scale[:, :, None] / safe_scale[:, None, :],
+            identity[None],
+        )
+        evals, evecs = xp.linalg.eigh(corr)
+        usable = finite & xp.all(evals > 0.0, axis=1)
+        safe_evals = xp.where(usable[:, None], evals, 1.0)
+        factor = evecs / xp.sqrt(safe_evals)[:, None, :] / safe_scale[:, :, None]
+        prior_factor = (widths / np.sqrt(PRIOR_PRECISION_FACTOR))[:, :, None] * identity[None]
+        factor = xp.where(usable[:, None, None], factor, prior_factor)
+        # * prior share of eigenvector v: v^T (d^-1 P d^-1) v / lam, between 0 and 1
+        prior_share = xp.einsum("nik,ni->nk", evecs ** 2, precision / safe_scale ** 2) / safe_evals
+        diagnostics = {
+            "fallback": ~usable,
+            "condition": xp.where(usable, safe_evals.max(axis=1) / safe_evals.min(axis=1), xp.nan),
+            # more than half of the eigenvalue from the prior
+            "prior_dominated": usable & xp.any(prior_share > 0.5, axis=1),
+        }
+
+    return factor, diagnostics
+
+
 
 @dataclass
 class GBSigHetSettings:
@@ -292,6 +356,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         gb_stft_comp: Optional :class:`gbgpu.gbcomps.STFTGBComputations`
             instance. Required when ``mgh.settings`` is an
             :class:`~lisatools.domains.STFTSettings`; ignored otherwise.
+        num_stationary_fim_steps: Blocks of in-model repeats a source's Fisher
+            matrix serves before it is recomputed at the source's position. 1
+            recomputes it at every block.
     """
 
     @property
@@ -334,7 +401,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         search_kwargs=None,
         stretch_probability=0.5,
         band_units=2,
-        gamma_base=0.84, # = 2.38 / sqrt(D) where D=4
+        gamma_base=0.84, # = 2.38 / sqrt(D) where D=8
+        num_stationary_fim_steps: int = 1,
         debug_settings: Optional[GBDebugSettings] = None,
         sighet_settings: Optional[GBSigHetSettings] = None,
         leaf_cap_settings: Optional[GBLeafCapSettings] = None,
@@ -347,6 +415,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         self.a = float(kwargs.get("a", 2.0))
         self.nfriends = int(kwargs.get("nfriends", 32))
+        self.lift_scale = float(kwargs.get("lift_scale", 2.0))
+        self.lift_kmax = int(kwargs.get("lift_kmax", 2))
+        self._lift = None
+        self._inds_run = {}
+        self._last_log_norm = None
+        self._turns = self.xp.arange(-self.lift_kmax, self.lift_kmax + 1)
+        self._periodic_cache = {}
         self.return_gpu = True
         self.use_gpu = self.backend.uses_cupy
 
@@ -442,7 +517,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.band_units = max(1, int(band_units))
         self.jump_scales = float(gamma_base) * self.xp.array([0.2, 1.0, 2.5])
         self.jump_scales_probs = self.xp.array([0.2, 0.6, 0.2])
-        self._fdot_scale = 1e-16
+        fim_interval = num_stationary_fim_steps
+        if int(fim_interval) != fim_interval or fim_interval < 1:
+            raise ValueError(
+                f"num_stationary_fim_steps must be a positive integer, got {fim_interval}"
+            )
+        self.num_stationary_fim_steps = int(num_stationary_fim_steps)
+        self._held_fim_rows = None
 
         # Parent binding: config-only FD comp + move-level engine. A user-
         # supplied gb_fd_comp is honored as-is; otherwise one is built from
@@ -926,8 +1007,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                     -> compute delta_ll = - < r| h > - 0.5 < h | h > 
                                 else (outside freq limits):
                                     -> curr_logp = -inf (fast rejection)
-                            -> compute acceptance ratio:
-                               accept = beta * delta_ll + delta_logp + factors >= log(rand)
+                            -> compute acceptance ratio (the picks of one walker in turn):
+                               accept = beta * delta_ll + delta_logp + factors + k_term >= log(rand)
                             if accept:
                                 kill/birth source and update residual
                             else (rejected):
@@ -963,6 +1044,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ll_change_log = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
         prop_counts = self.xp.zeros((2, self.ntemps, self.nwalkers, self.num_bands), dtype=int)
         acc_counts = self.xp.zeros_like(prop_counts)
+
+        self._jump_scale_counts = self.xp.zeros((2, len(self.jump_scales), self.ntemps), dtype=int)
+
+        # * Alive sources per (temp, walker) for the k prior term; _run_rj_step keeps it current
+        # * (it is the only step that flips ``inds`` in this pass).
+        if self.is_rj_prop:
+            walker_cell_all = band_sorter.temp_inds * self.nwalkers + band_sorter.walker_inds
+            alive_cells = walker_cell_all[band_sorter.inds]
+            # ! CuPy's bincount raises on an empty array (zero-leaf start)
+            self._k_walker = (
+                self.xp.bincount(alive_cells, minlength=self.ntemps * self.nwalkers)
+                if alive_cells.shape[0] > 0
+                else self.xp.zeros(self.ntemps * self.nwalkers, dtype=self.xp.int64)
+            )
 
         # Reset per-step debug state
         self.debugger.start_proposal_step()
@@ -1173,12 +1268,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         the pre-computed ±logpdf of the RJ proposal distribution. On accept,
         ``inds`` flips and the cell residual is updated through
         ``fill_template`` with the appropriate sign.
+
+        The prior on the number of sources k of a walker is uniform on
+        [0, N], N = nleaves_max. The slot flip alone (one birth proposal per
+        dead slot, one death per source) would weigh k by C(N, k), so a birth
+        adds ln((k + 1) / (N - k)) and a death ln((N - k + 1) / k), with k the
+        walker's count just before the flip. A round holds picks in several
+        bands of one walker, so those are decided in turn (random order) with
+        k updated after each accepted flip; the likelihood terms stay
+        vectorized, since a band's delta does not depend on flips in the other
+        bands of the unit.
         """
         xp = self.xp
         ids = picked["ids"]
         slots = picked["slot_index"]
         N_vals = picked["N_vals"]
         alive = band_sorter.inds[ids].copy()   # True -> death proposal
+        temp_idx, walker_idx, band_idx = picked["temp_inds"], picked["walker_inds"], picked["band_inds"]
 
         params = band_sorter.coords[ids].copy()
         params[:] = self.periodic.wrap({"gb": params[:, None, :]}, xp=xp)["gb"][:, 0]
@@ -1283,11 +1389,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         beta = band_temps[picked["band_inds"], picked["temp_inds"]]
         factors = band_sorter.factors[ids]
         lnpdiff = beta * delta_ll + (curr_logp - prev_logp) + factors
-        accept = lnpdiff >= self.xp.log(self.xp.random.rand(*lnpdiff.shape))
+        log_u = xp.log(xp.random.rand(*lnpdiff.shape))
 
         # Coordinates outside the prior can only be accepted at beta == 0;
         # everything else is a bug -> warn and reject.
         bad_mask = (delta_ll <= -1e299) | (curr_logp <= -1e229)
+
+        # * Uniform prior on k: each flip carries C(N, k) / C(N, k +- 1) at the walker's current k, so the
+        # * picks of one walker are decided in turn (rank = position within the walker, random order).
+        n_slots = band_sorter.nleaves_max
+        walker_cell = temp_idx * self.nwalkers + walker_idx
+        order = xp.lexsort(xp.stack([xp.random.rand(len(ids)), walker_cell]))
+        _, first, group = xp.unique(walker_cell[order], return_index=True, return_inverse=True)
+        rank = xp.empty(len(ids), dtype=xp.int64)
+        rank[order] = xp.arange(len(ids)) - first[group]
+        accept = xp.zeros(len(ids), dtype=bool)
+        for position in range(int(rank.max()) + 1):
+            rows = xp.flatnonzero(rank == position)
+            k_now = self._k_walker[walker_cell[rows]].astype(xp.float64)
+            # a birth has N - k >= 1 and a death k >= 1; the clamps only touch the unused branch
+            lnpdiff[rows] += xp.where(
+                alive[rows],
+                xp.log((n_slots - k_now + 1) / xp.maximum(k_now, 1)),
+                xp.log((k_now + 1) / xp.maximum(n_slots - k_now, 1)),
+            )
+            accept[rows] = lnpdiff[rows] >= log_u[rows]
+            flips = rows[accept[rows] & ~bad_mask[rows]]
+            self._k_walker[walker_cell[flips]] += xp.where(alive[flips], -1, 1)
+
         bad_accepts = accept & bad_mask
         if bool(xp.any(bad_accepts)):
             if bool(xp.any(beta[bad_accepts] != 0.0)) and not (
@@ -1338,6 +1467,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if bool(accept.any()):
             acc_ids = ids[accept]
             band_sorter.inds[acc_ids] = ~band_sorter.inds[acc_ids]
+
+            # a born source has no Fisher matrix yet and a dead one loses its own
+            rows = getattr(self, "_held_fim_rows", None)
+            if rows is not None:
+                row_ids = asnumpy(acc_ids)
+                rows["fim_valid"][row_ids] = False
+                rows["fim_age"][row_ids] = 0
+
             # Phase-maximised births carry the rotated phi0 forward.
             band_sorter.coords[acc_ids] = self.periodic.wrap(
                 {"gb": params[accept][:, None, :]}, xp=xp
@@ -1361,101 +1498,266 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     N_vals[death_acc] if N_vals is not None else None,
                 )
 
-    def _compute_proposal_cholesky(self, model, band_sorter, ids):
-        """Batched Cholesky of the inverse Fisher matrix for ``ids``.
+    def _prior_box(self, coords, cell_f0_lims):
+        """Uniform prior box (lower, upper) of every source, sampling basis, each (n_src, ndim).
 
-        Domain-symmetric through the fast computation objects:
-        FD -> :meth:`GBFDComputations.information_matrix`,
-        WDM -> :meth:`GBWDMComputations.information_matrix`,
-        STFT -> :meth:`STFTGBComputations.information_matrix` (all against
-        the parent inverse-covariance rows keyed by walker; the legacy
-        SharedMemory ``gb.information_matrix`` path is retired).
+        A one-column prior gives its ``minimum`` and ``maximum``. A joint (f0, fdot) prior gives f0
+        its ``f0_min`` and ``f0_max`` and fdot its bounds at each source's f0 (``fdot_bounds``).
+        f0 is narrowed to the cell's frequency range, which the in-model gate enforces:
+        ``cell_f0_lims`` holds the physical limits per source, mapped into the sampling basis
+        through the transform container. Periodic columns span their period, [0, period), the
+        range the periodic container wraps into.
+        """
+        xp = self.xp
+        coords = xp.asarray(coords)
+        n_src, ndim = coords.shape
+        lower = xp.full((n_src, ndim), xp.nan)
+        upper = xp.full((n_src, ndim), xp.nan)
+        prior_entries = getattr(self.gpu_priors["gb"], "priors", None)
+        if not isinstance(prior_entries, list):
+            raise TypeError(
+                "the prior box needs a ProbDistContainer, whose priors are "
+                "[columns, distribution] pairs"
+            )
+        for columns, dist in prior_entries:
+            columns = [int(column) for column in np.asarray(columns).reshape(-1)]
+            if len(columns) == 1 and hasattr(dist, "minimum") and hasattr(dist, "maximum"):
+                minimum, maximum = float(dist.minimum), float(dist.maximum)
+                if not (np.isfinite(minimum) and np.isfinite(maximum) and maximum > minimum):
+                    raise ValueError(
+                        f"the prior of column {columns[0]} ({type(dist).__name__}) has the range "
+                        f"[{minimum}, {maximum}]; the prior box needs finite bounds")
+                lower[:, columns[0]], upper[:, columns[0]] = minimum, maximum
+            elif len(columns) == 2 and hasattr(dist, "fdot_bounds"):
+                # * joint (f0, fdot) prior: f0 uniform, fdot uniform between f0-dependent bounds
+                f0_column, fdot_column = columns
+                lower[:, f0_column], upper[:, f0_column] = float(dist.f0_min), float(dist.f0_max)
+                fdot_low, fdot_high = dist.fdot_bounds(coords[:, f0_column])
+                lower[:, fdot_column] = xp.asarray(fdot_low)
+                upper[:, fdot_column] = xp.asarray(fdot_high)
+            else:
+                raise TypeError(
+                    f"the prior box cannot read {type(dist).__name__} over columns {columns}: "
+                    "it needs a one-column prior with minimum and maximum, or a joint (f0, fdot) "
+                    "prior with f0_min, f0_max and fdot_bounds(f0)")
 
-        The Fisher comes back in PHYSICAL parameter space; it is mapped to
-        the sampling basis with the (numerical, per-source diagonal)
-        Jacobian of the transform container, conditioned by the fdot
-        rescale, inverted, and factorized.
+        # * f0: the cell's physical limits mapped through the local slope of the transform
+        input_basis = list(getattr(self.transform_fn, "input_basis", []))
+        if "f0" not in input_basis:
+            raise ValueError("the prior box needs a sampling column named 'f0' for the cell limits")
+        f0_column = input_basis.index("f0")
+        f0_output = int(np.asarray(self.parameter_transforms.fill_dict["test_inds"])[f0_column])
+        step = JACOBIAN_STEP_RELATIVE * xp.maximum(
+            xp.abs(coords[:, f0_column]), JACOBIAN_STEP_FLOOR
+        )
+        shifted_up, shifted_down = coords.copy(), coords.copy()
+        shifted_up[:, f0_column] += step
+        shifted_down[:, f0_column] -= step
+        f0_here = self.transform_fn.both_transforms(coords, xp=xp)[:, f0_output]
+        f0_up = self.transform_fn.both_transforms(shifted_up, xp=xp)[:, f0_output]
+        f0_down = self.transform_fn.both_transforms(shifted_down, xp=xp)[:, f0_output]
+        slope = (f0_up - f0_down) / (2.0 * step)
+        cell_low = coords[:, f0_column] + (xp.asarray(cell_f0_lims[0]) - f0_here) / slope
+        cell_high = coords[:, f0_column] + (xp.asarray(cell_f0_lims[1]) - f0_here) / slope
+        lower[:, f0_column] = xp.maximum(lower[:, f0_column], xp.minimum(cell_low, cell_high))
+        upper[:, f0_column] = xp.minimum(upper[:, f0_column], xp.maximum(cell_low, cell_high))
 
-        TODO(known GBs): the fdot conditioning column (sampling index 2) and
-        the 8->9 test_inds layout are still GB-specific; revisit with the
-        known-GB branch.
+        periodic = getattr(self, "periodic", None)
+        if periodic is not None and "gb" in periodic.inds_periodic:
+            for column, period in zip(periodic.inds_periodic["gb"], periodic.periods["gb"]):
+                lower[:, int(column)] = 0.0
+                upper[:, int(column)] = float(period)
+        return lower, upper
+
+    def _sampling_jacobian(self, coords, lower, upper):
+        """Diagonal Jacobian d phys_i / d x_i of the transform container, and where it is taken.
+
+        Central differences with steps h = 1e-6 max(|x|, 1e-3). Within 2h of a prior edge the step
+        could leave the domain of arccos or arcsin (cos iota and sin delta reach +-1 in doubles),
+        so each column is clipped into [lower + 2h, upper - 2h] where the box is wider than 4h;
+        periodic columns are not clipped. The Fisher matrix is evaluated at the same point: a
+        Fisher matrix at the edge and a Jacobian 2h inside it would not belong together, since
+        dh/diota vanishes at iota = 0 while diota/dcos(iota) diverges there.
+
+        Returns ``(jacobian, point, clipped)``, clipped (n_src,) bool.
+        """
+        xp = self.xp
+        coords = xp.asarray(coords)
+        n_src, ndim = coords.shape
+        test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
+        steps = JACOBIAN_STEP_RELATIVE * xp.maximum(xp.abs(coords), JACOBIAN_STEP_FLOOR)
+        inner_low, inner_high = lower + 2.0 * steps, upper - 2.0 * steps
+        clip_columns = inner_low < inner_high
+        periodic = getattr(self, "periodic", None)
+        if periodic is not None and "gb" in periodic.inds_periodic:
+            clip_columns[:, xp.asarray(periodic.inds_periodic["gb"])] = False
+        point = xp.where(clip_columns, xp.clip(coords, inner_low, inner_high), coords)
+        clipped = xp.any(point != coords, axis=1)
+
+        steps = JACOBIAN_STEP_RELATIVE * xp.maximum(xp.abs(point), JACOBIAN_STEP_FLOOR)
+        jacobian = xp.zeros((n_src, ndim))
+        for column in range(ndim):
+            shifted_up, shifted_down = point.copy(), point.copy()
+            shifted_up[:, column] += steps[:, column]
+            shifted_down[:, column] -= steps[:, column]
+            output = int(test_inds[column])
+            phys_up = self.transform_fn.both_transforms(shifted_up, xp=xp)[:, output]
+            phys_down = self.transform_fn.both_transforms(shifted_down, xp=xp)[:, output]
+            jacobian[:, column] = (phys_up - phys_down) / (2.0 * steps[:, column])
+        return jacobian, point, clipped
+
+    def _information_matrix_phys(self, model, params_phys, walker_inds):
+        """Fisher matrix (n_src, ndim, ndim) in the physical basis from the domain's computation.
+
+        FD -> GBFDComputations, WDM -> GBWDMComputations, STFT -> STFTGBComputations, against the
+        parent inverse-covariance rows keyed by walker. The parent container is sharded across GPUs
+        on a multi-GPU run while every information_matrix is single-shard, so
+        route_information_matrix partitions the sources by the shard of their walker.
+        """
+        xp = self.xp
+        if isinstance(self._basis_settings, STFTSettings):
+            info_comp = self.gb_stft_comp
+        elif isinstance(self._basis_settings, FDSettings):
+            info_comp = self.gb_fd_comp
+        else:
+            info_comp = self.gb_wdm_comp
+        test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
+        return _RoutedBandEngine.route_information_matrix(
+            info_comp, model.analysis_container_arr, params_phys,
+            inds=test_inds, noise_index=xp.asarray(walker_inds).astype(xp.int32),
+        )
+
+    def _compute_fisher_sampling(self, model, band_sorter, ids, cell_f0_lims):
+        """Fisher matrix in the sampling basis and the prior widths for the sources ``ids``.
+
+        F is the Fisher matrix of the domain's computation object at the point of
+        _sampling_jacobian, mapped to the sampling basis with that Jacobian. The widths are those of
+        each source's prior box (_prior_box, with the cell limits ``cell_f0_lims``). Both are
+        independent of the cell's temperature, so a held pair can be turned into a factor at any
+        beta with fisher_proposal_factor.
+
+        Returns ``(info_sampling, prior_widths, clipped)``: (n_src, ndim, ndim), (n_src, ndim) and
+        (n_src,) bool for sources evaluated at a clipped point.
         """
         xp = self.xp
         coords = band_sorter.coords[ids]
-        n_src, ndim = coords.shape
-        params_phys = self.transform_fn.both_transforms(coords, xp=self.xp)
-        _test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
-        walker_inds = band_sorter.walker_inds[ids].astype(xp.int32)
+        n_src = coords.shape[0]
+        timer = getattr(self, "_prop_timer", None)
+        if timer is not None:
+            timer.count("fisher_sources", int(n_src))
 
-        # Routed per shard: this runs against the PARENT residual ACA, which
-        # is sharded across GPUs on a multi-GPU run (``run.py`` builds it with
-        # ``gpus=``), while every ``information_matrix`` implementation is
-        # single-shard by contract -- the FD binding and
-        # ``STFTGBComputations._resolve_info_group`` both raise on a
-        # multi-split holder, and the WDM one would read shard 0's rows with
-        # global indices. ``route_information_matrix`` partitions the sources
-        # by the owning shard of their walker (each source's Fisher depends
-        # only on its walker's PSD), runs each group inside its owning device
-        # context against a device-local comp replica, and reassembles the
-        # ``(num_bin, nd, nd)`` stack. Single-shard holders pass straight
-        # through, byte-identical.
-        if isinstance(self._basis_settings, STFTSettings):
-            _info_comp = self.gb_stft_comp
-        elif isinstance(self._basis_settings, FDSettings):
-            _info_comp = self.gb_fd_comp
-        else:
-            _info_comp = self.gb_wdm_comp
-
-        _timer = getattr(self, "_prop_timer", None)
-        if _timer is not None:
-            _timer.count("fisher_sources", int(n_src))
-
-        with _tspan(_timer, "fisher_matrix"):
-            info_phys = _RoutedBandEngine.route_information_matrix(
-                _info_comp, model.analysis_container_arr, params_phys,
-                inds=_test_inds, noise_index=walker_inds,
+        with _tspan(timer, "fisher_jacobian"):
+            lower, upper = self._prior_box(coords, cell_f0_lims)
+            jacobian, point, clipped = self._sampling_jacobian(coords, lower, upper)
+        with _tspan(timer, "fisher_matrix"):
+            info_phys = self._information_matrix_phys(
+                model,
+                self.transform_fn.both_transforms(point, xp=xp),
+                band_sorter.walker_inds[ids],
             )
-
-        # Conditioning scales for the sampling basis (fdot spans ~1e-13 in
-        # sampled units; without the rescale the Fisher inversion is
-        # ill-conditioned). The proposal draws in the rescaled coordinates
-        # y = x / s and maps back with * s (see in_model_proposal).
-        s = xp.ones(ndim)
-        s[2] = self._fdot_scale
-        self._proposal_param_scales = s
-
-        # Numerical diagonal Jacobian d(phys[test_inds[i]]) / d(y_i) through
-        # the transform container -- generic in the container's transforms.
-        with _tspan(_timer, "fisher_jacobian"):
-            J = xp.zeros((n_src, ndim))
-            for i in range(ndim):
-                h = 1e-6 * xp.maximum(xp.abs(coords[:, i]), 1e-3)
-                up = coords.copy()
-                dn = coords.copy()
-                up[:, i] += h
-                dn[:, i] -= h
-                dphys = (
-                    self.transform_fn.both_transforms(up, xp=self.xp)[:, _test_inds[i]]
-                    - self.transform_fn.both_transforms(dn, xp=self.xp)[:, _test_inds[i]]
-                )
-                J[:, i] = dphys / (2.0 * h) * s[i]
-
-            info_y = info_phys * J[:, :, None] * J[:, None, :]
-
-        with _tspan(_timer, "fisher_mempool"):
+        with _tspan(timer, "fisher_mempool"):
             self.mempool.free_all_blocks()
-        # Robust inverse-Fisher factor: near-zero-SNR (prior-drawn) sources
-        # give (numerically) singular Fishers. Eigendecompose and clamp the
-        # spectrum to a relative floor; B = V diag(lambda^-1/2) satisfies
-        # B B^T = inv(info) and is all the Gaussian proposal needs (the
-        # proposal shape only -- M-H corrects).
-        with _tspan(_timer, "fisher_eigh"):
-            evals, evecs = xp.linalg.eigh(info_y)
-            floor = 1e-10 * xp.maximum(
-                xp.abs(evals).max(axis=-1, keepdims=True), 1e-300
+        info_sampling = info_phys * jacobian[:, :, None] * jacobian[:, None, :]
+        return info_sampling, upper - lower, clipped
+
+    def _ensure_fim_store(self, branch):
+        """The held Fisher matrices of the gb ``branch``, created empty when missing.
+
+        Four host arrays over the leaf slots (ntemps, nwalkers, nleaves_max) in the branch
+        supplemental: the matrix in the sampling basis (..., ndim, ndim), the prior widths
+        (..., ndim), the blocks served and a flag for a held matrix. The HDF5 backends do not save
+        branch supplementals, so after a restart the store starts empty and every source gets a
+        matrix at its next block. A supplemental with other keys gets the four keys added.
+        """
+        ntemps, nwalkers, nleaves_max, ndim = branch.shape
+        base_shape = (ntemps, nwalkers, nleaves_max)
+        supplemental = branch.branch_supplemental
+        if supplemental is not None and all(key in supplemental for key in _FIM_STORE_KEYS):
+            return supplemental
+        empty = {
+            "fim_matrix": np.zeros(base_shape + (ndim, ndim)),
+            "fim_widths": np.zeros(base_shape + (ndim,)),
+            "fim_age": np.zeros(base_shape, dtype=np.int64),
+            "fim_valid": np.zeros(base_shape, dtype=bool),
+        }
+        if supplemental is None:
+            branch.branch_supplemental = BranchSupplemental(empty, base_shape=base_shape)
+        else:
+            supplemental.add_objects(
+                {key: value for key, value in empty.items() if key not in supplemental}
             )
-            evals = xp.maximum(xp.abs(evals), floor)
-            chol = evecs / xp.sqrt(evals)[:, None, :]
+        return branch.branch_supplemental
+
+    def _load_fim_rows(self, branch, band_sorter):
+        """Held Fisher matrices of the sorter rows, copied from the rows' slots at the start.
+
+        Accepted tempering swaps exchange the (temperature, walker) labels of the rows, so the
+        per-row copy follows them; _write_back_state puts the rows back at their new slots.
+        """
+        store = self._ensure_fim_store(branch)
+        start_slots = (
+            band_sorter.orig_temp_inds, band_sorter.orig_walker_inds, band_sorter.orig_leaf_inds
+        )
+        slots = tuple(asnumpy(index) for index in start_slots)
+        rows = {key: store.holder[key][slots] for key in _FIM_STORE_KEYS}
+        # a dead slot holds no matrix, so a birth always starts without one
+        rows["fim_valid"] &= asnumpy(band_sorter.inds)
+        return rows
+
+    def _compute_proposal_cholesky(self, model, band_sorter, ids, beta, cell_f0_lims):
+        """Factor of the proposal covariance (beta F + P)^-1 for the sources ``ids`` (sorter rows).
+
+        Each source holds its Fisher matrix in the sampling basis and its prior widths for
+        ``num_stationary_fim_steps`` blocks: a source without a held pair, or whose pair has served
+        that many blocks, gets a new pair from _compute_fisher_sampling at its current position.
+        The factor is rebuilt every block from the held pair with the cell's current ``beta``, so a
+        source that changed temperature keeps its matrix and takes the new beta. Between refreshes
+        the factor does not depend on the current position, so the proposal is symmetric.
+        """
+        xp = self.xp
+        rows = self._held_fim_rows
+        if rows is None:
+            raise RuntimeError("the held Fisher matrices are loaded by propose (_load_fim_rows)")
+        row_ids = asnumpy(ids)
+        due = ~rows["fim_valid"][row_ids] | (
+            rows["fim_age"][row_ids] >= self.num_stationary_fim_steps
+        )
+        clipped_count = 0
+        if due.any():
+            due_device = xp.asarray(due)
+            info_sampling, prior_widths, clipped = self._compute_fisher_sampling(
+                model, band_sorter, ids[due_device],
+                (cell_f0_lims[0][due_device], cell_f0_lims[1][due_device]),
+            )
+            due_rows = row_ids[due]
+            rows["fim_matrix"][due_rows] = asnumpy(info_sampling)
+            rows["fim_widths"][due_rows] = asnumpy(prior_widths)
+            rows["fim_age"][due_rows] = 0
+            rows["fim_valid"][due_rows] = True
+            clipped_count = int(clipped.sum())
+        timer = getattr(self, "_prop_timer", None)
+        with _tspan(timer, "fisher_eigh"):
+            chol, diagnostics = fisher_proposal_factor(
+                xp.asarray(rows["fim_matrix"][row_ids]), xp.asarray(rows["fim_widths"][row_ids]),
+                beta, xp=xp,
+            )
+        rows["fim_age"][row_ids] += 1
+
+        if logger.isEnabledFor(logging.DEBUG):
+            n_src = len(row_ids)
+            condition = diagnostics["condition"]
+            largest = (
+                float(xp.max(xp.where(xp.isfinite(condition), condition, 0.0)))
+                if n_src else float("nan")
+            )
+            logger.debug(
+                "%s: Fisher factor of %d sources (%d new matrices, %d at a clipped point): %d with "
+                "a prior-dominated direction, largest condition number of C %.3e, %d given the "
+                "prior factor.",
+                self.name, n_src, int(due.sum()), clipped_count,
+                int(diagnostics["prior_dominated"].sum()), largest,
+                int(diagnostics["fallback"].sum()),
+            )
         return chol
 
     def in_model_proposal(self, coords, chol, band_sorter, source_ids, model):
@@ -1489,15 +1791,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
             new_coords = q["gb"][0, :, 0, :]
             factors = factors.reshape(-1)
-        else:                      
-            # Draw jump_factor per batch/walker at proposal time:
-            jump_factor = xp.random.choice(self.jump_scales, p=self.jump_scales_probs, size=1)
-            
-            # Gaussian jump through the Fisher Cholesky (drawn in the
-            # conditioned coordinates y = x / s; mapped back with * s).
+        else:
+            scale_inds = xp.random.choice(
+                len(self.jump_scales), size=coords.shape[0], p=self.jump_scales_probs
+            )
+            self._last_jump_scale_inds = scale_inds
             _rand = xp.random.randn(*coords.shape)
-            dy = xp.einsum("...ij,...j->...i", chol, _rand)
-            new_coords = coords + jump_factor * dy * self._proposal_param_scales[None, :]
+            dx = xp.einsum("...ij,...j->...i", chol, _rand)
+            new_coords = coords + self.jump_scales[scale_inds][:, None] * dx
             factors = xp.zeros(coords.shape[0])   # symmetric draw
 
         return new_coords, factors
@@ -1628,7 +1929,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 buffer_obj, seq["slot"])
 
         with _tspan(getattr(self, "_prop_timer", None), "inmodel_fisher"):
-            chol = self._compute_proposal_cholesky(model, band_sorter, ids)
+            # * the cell's beta and f0 range enter the proposal factor
+            chol = self._compute_proposal_cholesky(
+                model, band_sorter, ids, beta,
+                (buffer_obj.frequency_lims[0][slots], buffer_obj.frequency_lims[1][slots]),
+            )
         # Per-source likelihood setup for the repeat block (same stage as
         # the proposal cholesky / friend table). Chunked-het / FD engines
         # no-op; a sig-het computation builds its heterodyne reference
@@ -1689,6 +1994,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             hi_bin = (buffer_obj.frequency_lims[1][slots] / self.df).astype(int)
 
         for move_i in range(self.num_repeat_proposals):
+            # * a Fisher jump records its scale indices here; a stretch jump leaves None
+            self._last_jump_scale_inds = None
             new, factors = self.in_model_proposal(curr, chol, band_sorter, ids, model)
             new[:] = self.periodic.wrap({"gb": new[:, None, :]}, xp=xp)["gb"][:, 0]
 
@@ -1765,6 +2072,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 curr_prior[accept] = new_logp[accept]
                 ll_change_log[t_i[accept], w_i[accept], b_i[accept]] += delta_ll[accept]
                 acc_counts[1][t_i[accept], w_i[accept], b_i[accept]] += 1
+
+            # * To log Fisher jumps proposed and accepted per (scale, temperature)
+            scale_inds = getattr(self, "_last_jump_scale_inds", None)
+            scale_counts = getattr(self, "_jump_scale_counts", None)
+            if scale_inds is not None and scale_counts is not None:
+                n_temps = scale_counts.shape[2]
+                cells = scale_inds * n_temps + t_i
+                scale_counts[0] += xp.bincount(
+                    cells, minlength=scale_counts[0].size
+                ).reshape(scale_counts[0].shape)
+                # weights instead of cells[accept]: older CuPy raises on an empty bincount input
+                scale_counts[1] += xp.bincount(
+                    cells, weights=accept.astype(xp.float64), minlength=scale_counts[1].size
+                ).astype(scale_counts.dtype).reshape(scale_counts[1].shape)
 
             self._debug_verify_in_model(
                 buffer_obj, curr, new, slots, N_vals, delta_ll, keep,
@@ -1977,10 +2298,43 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         band_temps += self.xp.asarray(dbetas.T)
 
     def run_tempering(self, model, state, band_sorter, band_temps):
+        """Band-wise swaps between adjacent temperatures.
+
+        A swap exchanges the sources of one band between a walker at
+        temperature t and one at t - 1, so the number of sources k of both
+        walkers changes. Under the uniform prior on k a walker with k sources
+        carries the weight k! against its set of sources (the write-back
+        repacks the leaves, so the slot labels carry no information), so a
+        swap adds the change of ln k! of both walkers, and a swap that would
+        give a walker more than nleaves_max sources is rejected. The bands of
+        a chunk are decided in turn, so that the totals stay current.
+        """
         ll_change_log_temp = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
 
         band_swaps_accepted = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
         band_swaps_proposed = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
+
+        # * Alive sources per (temp, walker, band) cell and per walker, kept current through the swaps.
+        # * Sources outside the band range count for their walker but sit in no cell.
+        n_slots = band_sorter.nleaves_max
+        num_walker_cells = self.ntemps * self.nwalkers
+        walker_cell_all = band_sorter.temp_inds * self.nwalkers + band_sorter.walker_inds
+        in_band = (
+            band_sorter.inds & (band_sorter.band_inds >= 0) & (band_sorter.band_inds < self.num_bands)
+        )
+        band_cell_all = walker_cell_all * self.num_bands + band_sorter.band_inds
+        # ! CuPy's bincount raises on an empty array
+        cell_alive = (
+            self.xp.bincount(band_cell_all[in_band], minlength=num_walker_cells * self.num_bands)
+            if bool(in_band.any())
+            else self.xp.zeros(num_walker_cells * self.num_bands, dtype=self.xp.int64)
+        ).reshape(self.ntemps, self.nwalkers, self.num_bands)
+        walker_alive = (
+            self.xp.bincount(walker_cell_all[band_sorter.inds], minlength=num_walker_cells)
+            if bool(band_sorter.inds.any())
+            else self.xp.zeros(num_walker_cells, dtype=self.xp.int64)
+        ).reshape(self.ntemps, self.nwalkers)
+        log_factorial = self.xp.asarray(gammaln(np.arange(n_slots + 1) + 1.0))   # ln k!
 
         units = 2
         tmp_start = np.random.randint(units)
@@ -2056,7 +2410,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     # paccept = bi * (band_here_i1->swapped_like - band_here_i->current_like) + bi1 * (band_here_i->swapped_like - band_here_i1->current_like);
 
                     raccept = self.xp.log(self.xp.random.uniform(size=paccept.shape))
-                    sel = paccept > raccept
+
+                    # * Uniform prior on k: add the change of ln k! of both walkers, reject swaps past
+                    # * nleaves_max. Rows of one band pair distinct walkers; bands go in turn.
+                    hot_walkers, cold_walkers = walker_inds_now[:, i1], walker_inds_now[:, i2]
+                    row_bands = band_inds_now[:, i1]
+                    n_hot = cell_alive[i1, hot_walkers, row_bands]
+                    n_cold = cell_alive[i2, cold_walkers, row_bands]
+                    sel = self.xp.zeros(paccept.shape, dtype=bool)
+                    for band in self.xp.unique(row_bands).tolist():
+                        rows = self.xp.flatnonzero(row_bands == band)
+                        k_hot = walker_alive[i1, hot_walkers[rows]]
+                        k_cold = walker_alive[i2, cold_walkers[rows]]
+                        k_hot_new = k_hot - n_hot[rows] + n_cold[rows]
+                        k_cold_new = k_cold - n_cold[rows] + n_hot[rows]
+                        fits = (k_hot_new <= n_slots) & (k_cold_new <= n_slots)
+                        log_weight_change = (
+                            log_factorial[self.xp.minimum(k_hot_new, n_slots)]
+                            + log_factorial[self.xp.minimum(k_cold_new, n_slots)]
+                            - log_factorial[k_hot]
+                            - log_factorial[k_cold]
+                        )
+                        sel[rows] = fits & (paccept[rows] + log_weight_change > raccept[rows])
+                        taken = rows[sel[rows]]
+                        walker_alive[i1, hot_walkers[taken]] = k_hot_new[sel[rows]]
+                        walker_alive[i2, cold_walkers[taken]] = k_cold_new[sel[rows]]
+                    # * the accepted cells now hold each other's sources
+                    cell_alive[i1, hot_walkers[sel], row_bands[sel]] = n_cold[sel]
+                    cell_alive[i2, cold_walkers[sel], row_bands[sel]] = n_hot[sel]
 
                     current_lls[sel, i2 : i1 + 1] = new_lls[sel]
 
@@ -2139,8 +2520,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         (all ``False``, then ``True`` at the repacked leaves), so RJ
         births/deaths and tempering walker reassignments all land here.
 
-        TODO: NEED TO PROPERLY MOVE SUPPLEMENTAL INFO BASED ON OLD LEAVES
-        (``inds_old`` below is the source-side index for that move).
+        The held Fisher matrices of the live rows (``_held_fim_rows``) move to
+        the same new slots of the gb branch supplemental; every other slot ends
+        without one.
         """
         alive = band_sorter.inds
         special_indices_finish = (
@@ -2178,7 +2560,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         new_state.branches["gb"].inds[:] = False
         # turn on all the ones that are there
         new_state.branches["gb"].inds[inds_new] = True
-        # new_state.branches["gb"].branch_supplemental[inds_new] = state.branches["gb"].branch_supplemental[inds_old]
+        # * held Fisher matrices: an empty store, then the live rows at their new slots
+        rows = getattr(self, "_held_fim_rows", None)
+        if rows is not None:
+            store = self._ensure_fim_store(new_state.branches["gb"]).holder
+            alive_rows = asnumpy(alive)
+            for key in _FIM_STORE_KEYS:
+                store[key][...] = 0
+                store[key][inds_new] = rows[key][alive_rows]
+            self._held_fim_rows = None
 
     def _band_residual_lls(self, acs):
         """Per-band cold-walker residual ll ``-1/2 <r|r>`` from the parent ACA.
@@ -2462,6 +2852,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 stft_store_windows=self.stft_store_windows,
                 verify_buffer=self.debug_settings.verify_buffer,
             )
+        # * held Fisher matrices of the sorter rows, read at each row's start-of-propose slot
+        self._held_fim_rows = self._load_fim_rows(new_state.branches["gb"], band_sorter)
 
         # Cold-chain friend table for the group-stretch half of the in-model
         # mix (rebuilt every proposal; cheap sort of the cold-chain f0s).
@@ -2715,6 +3107,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "[GB_ACCEPT %s] rj cold %.4f (n=%.0f) all %.4f (n=%.0f) | "
                 "in-model cold %.4f (n=%.0f) all %.4f (n=%.0f)",
                 self.name, rj_c, rj_cn, rj_a, rj_an, im_c, im_cn, im_a, im_an,
+            )
+            # * acceptance of the Fisher jumps per jump scale, cold chain and all temperatures
+            scale_counts = asnumpy(self._jump_scale_counts)
+            scale_parts = []
+            for scale_index, scale in enumerate(asnumpy(self.jump_scales)):
+                proposed = scale_counts[0, scale_index]
+                accepted_jumps = scale_counts[1, scale_index]
+                cold = accepted_jumps[0] / proposed[0] if proposed[0] else float("nan")
+                total = accepted_jumps.sum() / proposed.sum() if proposed.sum() else float("nan")
+                scale_parts.append(
+                    f"{scale:.3f}: cold {cold:.4f} (n={proposed[0]}) "
+                    f"all {total:.4f} (n={proposed.sum()})"
+                )
+            logger.info(
+                "[GB_ACCEPT_SCALES %s] Fisher jump scale %s", self.name, "; ".join(scale_parts)
             )
         except Exception as exc:  # never break a propose for a log line
             logger.debug("[GB_ACCEPT %s] skipped: %r", self.name, exc)
@@ -3526,9 +3933,15 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
         fdot_max = get_fdot_mojito(f0_max, sign="+")
         fdot_min = get_fdot_mojito(f0_max, sign="-")
 
-        priors_in = deepcopy(priors_global)["gb"].priors_in
-        priors_in["f0"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
-        priors_in["fdot"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
+        # * The search samples f0 and fdot on the unit cube. The run prior may hold them as one
+        # * joint entry, so the dictionary is rebuilt in order rather than updated in place.
+        priors_in = {}
+        for prior_key, prior_here in deepcopy(priors_global)["gb"].priors_in.items():
+            if prior_key in ("f0", ("f0", "fdot")):
+                priors_in["f0"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
+                priors_in["fdot"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
+            elif prior_key != "fdot":
+                priors_in[prior_key] = prior_here
         priors = {
             "gb": ProbDistContainer(priors_in, return_gpu=True, use_cupy=self.backend.uses_cupy)
         }

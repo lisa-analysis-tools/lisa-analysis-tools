@@ -16,13 +16,14 @@
 // device primitives already live in domains.{hpp,cu} -- this header only adds the
 // GB-on-the-fly glue.
 //
-// Column-producer seam (2026-07): the per-column source evaluation + per-pixel
-// Fourier value live behind a compile-time ColumnT policy (see the
-// "Column-producer policy seam" block below; FresnelColumn is the production
-// policy and the default template argument everywhere, so per-source packages
-// instantiate `stft_*_impl<TheirSource>` exactly as before). An alternative
-// column producer (e.g. a heterodyned per-segment FFT) plugs in as a second
-// policy without touching the consumers.
+// Two seams. The per-column source evaluation and per-pixel Fourier value live
+// behind a compile-time ColumnT policy (the "Column-producer policy seam" block
+// below; FresnelColumn is the production policy). The consumers see a tile
+// (the "Tile seam" block): ColumnTile<ColumnT> adapts a column policy, and a
+// response that builds its pixels from shared-memory tables plugs in as a
+// second tile without touching the consumers. FresnelColumn is the default
+// everywhere, so per-source packages instantiate `stft_*_impl<TheirSource>`
+// exactly as before.
 //
 // Conventions (must match domains.cu so the on-the-fly likelihood equals the
 // template-based STFTComputationGroup path):
@@ -44,6 +45,9 @@
 #include "lat_tdi_on_the_fly.hh"  // LISATDIonTheFly base (SourceT) + Vec / Orbits / TDIConfig
 #include <cstring>                // std::memcmp / std::memcpy for the per-device launch structs
 #include <stdexcept>              // std::runtime_error
+#include <string>                 // std::to_string in the launch errors
+#include <type_traits>            // std::is_same
+#include <vector>                 // host arena of a tile launch on the CPU
 
 // blockDim.x for these kernels (GPU) / single-thread CPU mirror. Normally
 // already defined by lat_chunked_het_kernels.hh (pulled in ahead of this header
@@ -65,6 +69,16 @@
 // header self-contained in any translation unit.
 #ifndef N_PARAMS_MAX
 #define N_PARAMS_MAX 20
+#endif
+
+// * For tile methods called once per pixel. GBGPU's CPU module compiles with -Os, where GCC would
+// * keep them out of line and add a call per pixel; nvcc inlines them anyway.
+#ifndef STFT_TILE_PIXEL_INLINE
+#ifdef __CUDACC__
+#define STFT_TILE_PIXEL_INLINE
+#else
+#define STFT_TILE_PIXEL_INLINE __attribute__((always_inline))
+#endif
 #endif
 
 // ---------------------------------------------------------------------------
@@ -129,6 +143,34 @@ inline const STFTDeviceStructs& stft_device_structs(
     if (new_stft)       stft_upload_struct(held.stft,       held.stft_bytes,       stft);
     return held;
 }
+
+// The device copy of a domain alone, for tiles that read no other struct (DFFR), with the same rule:
+// a launch uploads the domain only when its bytes differ from the device's copy.
+struct STFTDeviceDomain
+{
+    STFTDomain* stft = nullptr;
+    unsigned char stft_bytes[sizeof(STFTDomain)];
+};
+
+inline STFTDomain* stft_device_domain(STFTDomain* stft)
+{
+    static STFTDeviceDomain per_device[STFT_MAX_DEVICES];
+    int device = 0;
+    gpuErrchk(cudaGetDevice(&device));
+    if (device < 0 || device >= STFT_MAX_DEVICES)
+        throw std::runtime_error("stft_device_domain: device id is not below STFT_MAX_DEVICES.");
+    STFTDeviceDomain& held = per_device[device];
+
+    const bool first = (held.stft == nullptr);
+    if (first)
+        gpuErrchk(cudaMalloc(&held.stft, sizeof(STFTDomain)));
+    if (first || std::memcmp(held.stft_bytes, stft, sizeof(STFTDomain)) != 0)
+    {
+        cudaDeviceSynchronize();
+        stft_upload_struct(held.stft, held.stft_bytes, stft);
+    }
+    return held.stft;
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -159,7 +201,7 @@ static CUDA_DEVICE cmplx stft_block_reduce_cmplx(cmplx* sdata)
 //     f0    = f_astro + arg( conj(z+) * z- * e^{-i 4 pi f_astro D} ) / (4 pi D)
 //     fdot0 = fdot_astro - f0 * (k . a_sc / c)
 //
-// Rate fdot0 is analytic via orbit acceleration differencing across DT_ORB = 2000 s.
+// Rate fdot0 is analytic, with the spacecraft acceleration from Orbits::get_acceleration.
 // Carrier demodulation shifts the first difference to baseband (|arg| < 1e-3 rad),
 // enabling wide baseline D = 2000 s and suppressing frequency noise as 1/D.
 // ---------------------------------------------------------------------------
@@ -170,33 +212,6 @@ constexpr double STFT_DT_STENCIL_DEMOD = 2000.0;         ///< demodulated half-w
 // exceeds the chirp itself (the production step 1e-19 does so below ~1 mHz). At this floor the phase
 // it costs over a segment is pi |dfdot| tau^2 ~ 6e-13 rad, far below every other error here.
 constexpr double STFT_FDOT_FLOOR = 1.0e-22;              ///< [Hz/s]
-
-// Spacecraft acceleration for the analytic Doppler rate. DT_ORB spans 4x the 500 s
-// linear interpolation grid to prevent node aliasing.
-template <class SourceT>
-CUDA_DEVICE inline Vec stft_get_spacecraft_acc(SourceT& src, double t, int sc)
-{
-    constexpr double DT_ORB = 2000.0; // [s] Spans 4x the 500 s position grid
-    constexpr double DT_ORB2_INV = 1.0 / (DT_ORB * DT_ORB);
-
-    double t_lo = src.orbits->sc_t0;
-    double t_hi = src.orbits->sc_t0
-                + (double)(src.orbits->sc_N - 2) * src.orbits->sc_dt;
-
-    double t_anchor = t;
-    if (t_anchor < t_lo + DT_ORB)
-        t_anchor = t_lo + DT_ORB;
-    if (t_anchor > t_hi - DT_ORB)
-        t_anchor = t_hi - DT_ORB;
-
-    Vec x_p = src.orbits->get_pos(t_anchor + DT_ORB, sc);
-    Vec x_0 = src.orbits->get_pos(t_anchor, sc);
-    Vec x_m = src.orbits->get_pos(t_anchor - DT_ORB, sc);
-
-    return Vec((x_p.x - 2.0 * x_0.x + x_m.x) * DT_ORB2_INV,
-               (x_p.y - 2.0 * x_0.y + x_m.y) * DT_ORB2_INV,
-               (x_p.z - 2.0 * x_0.z + x_m.z) * DT_ORB2_INV);
-}
 
 // Astro-model degradation shared by the guards below: fires only where the
 // TDI has no differentiable phase (identically-zero response samples at the
@@ -323,7 +338,7 @@ CUDA_DEVICE void stft_freq_fdot_from_tdi_phase(
 
         // Vertex spacecraft of each channel (X, Y, Z -> SC 1, 2, 3).
         int sc_id = ch + 1;
-        Vec a_sc = stft_get_spacecraft_acc(src, t, sc_id);
+        Vec a_sc = src.orbits->get_acceleration(t, sc_id);
         double k_dot_a = k.dot(a_sc);
 
         // fdot_0 = fdot_astro - f_0 * (k . a_sc / c)
@@ -403,7 +418,8 @@ CUDA_DEVICE void stft_pixel_freq_fdot(
 // ===========================================================================
 // One "column" = one (source, STFT time bin). A ColumnT policy owns the
 // per-column SOURCE evaluation and produces the per-(frequency-bin, channel)
-// pixel Fourier values; the CONSUMERS (the ll / swap / fill kernels below)
+// pixel Fourier values; the CONSUMERS (the ll / swap / fill kernels below,
+// through ColumnTile; the information-matrix kernel directly)
 // keep the frequency loop, the bounds masks, the 0.5 real-signal convention,
 // any fill `factor`, and all accumulation/reduction logic. Compile-time
 // (static) polymorphism only -- every method CUDA_DEVICE inline, no
@@ -437,6 +453,8 @@ CUDA_DEVICE void stft_pixel_freq_fdot(
 template <class SourceT>
 struct FresnelColumn
 {
+    using Source = SourceT;
+
     struct State
     {
         STFTFresnel* fresnel;   // non-const: the evaluator methods are not const-qualified
@@ -553,76 +571,375 @@ struct FresnelColumn
 };
 
 // ===========================================================================
+// Tile seam
+// ===========================================================================
+// A tile evaluates the pixels of one template. The consumers below (get_ll, fill_global,
+// swap_ll, the F-statistic and both gradients) keep the pixel loop, the window mask, the 0.5
+// real-signal factor, the fill factor and every accumulation. The contract and its pixel maps
+// are described in docs/response/dffr/README.md. A tile type TileT supplies:
+//   Inputs                          plain launch inputs; kernels and consumers pass them by value
+//   BlockShared                     the block's static shared memory
+//   table_bytes()                   dynamic shared memory of one template (host and device)
+//   Map                             which thread evaluates which (row, bin) of a pass
+//   Context(inputs, stft, shared)   per-thread view of the block; every thread constructs it
+//     rows_per_pass()               rows (STFT segments) built per pass
+//   Template(context, table)        one template; `table` is its dynamic shared memory
+//     load(context, params, bin_i)  once per evaluation, from the shared parameters
+//     build(context, inputs, base, rows)   once per pass, called by every thread
+//     carrier_bin(row)              the row's band is carrier_bin -+ n_side_bins
+//     values(row, bin, f, out)      raw pixel values of the three channels
+// ===========================================================================
+
+// Pixel map of a tile. Per pass every thread calls, in this order: first_row, row_stride and
+// set_band for the rows whose band it sets; finish_bands; its pixels (first_pixel, end_pixel,
+// pixel_stride, locate); finish_pass.
+// * One row per thread: thread tid owns row tid of each pass and walks its band in increasing
+// * frequency.
+// ! Needs rows_per_pass equal to the block size.
+struct StftRowPerThreadMap
+{
+    int row;        // this thread's row in the pass; -1 when it has none
+    int band_lo;    // first and last active bin of that row's band
+    int band_hi;
+
+    template <class ContextT>
+    CUDA_DEVICE StftRowPerThreadMap(const ContextT& context, int rows_here)
+        : row(-1), band_lo(0), band_hi(-1)
+    {
+        (void) context;
+        (void) rows_here;
+    }
+
+    CUDA_DEVICE int first_row() const { return THREAD_START_X; }
+    CUDA_DEVICE int row_stride() const { return BLOCK_INCR_X; }
+
+    CUDA_DEVICE void set_band(int row_in_pass, int lo, int hi)
+    {
+        row = row_in_pass;
+        band_lo = lo;
+        band_hi = hi;
+    }
+
+    CUDA_DEVICE void finish_bands() const {}
+
+    // A pixel is its active frequency bin.
+    CUDA_DEVICE int first_pixel() const { return band_lo; }
+    CUDA_DEVICE int end_pixel() const { return band_hi + 1; }
+    CUDA_DEVICE int pixel_stride() const { return 1; }
+
+    CUDA_DEVICE bool locate(int pixel, int* row_out, int* freq_j_out) const
+    {
+        *row_out = row;
+        *freq_j_out = pixel;
+        return true;
+    }
+
+    CUDA_DEVICE void finish_pass() const {}
+};
+
+// * Band bin first: the pixels of a pass run band bin by band bin, each over the rows of the pass,
+// * so with Rows the warp size the 32 threads of a warp take one band bin of 32 segments. Which
+// * Fresnel branch an endpoint takes depends on its distance from the carrier, about the same for
+// * one band bin in every segment, so the branch stays the same within a warp. A row's band may be
+// * wider than 2 n_side_bins + 1 (the union band of swap_ll); the pass covers the widest.
+// ! The bands live in the tile's static shared memory: finish_bands publishes them, and
+// ! finish_pass keeps the next pass from overwriting them while a thread still reads them.
+template <int Rows>
+struct StftBandBinMap
+{
+    struct Shared
+    {
+        int band_lo[Rows];     // first active bin of each row's band
+        int band_width[Rows];  // its number of bins
+    };
+
+    Shared* bands;
+    int rows_here;
+    int widest;  // widest band of the pass, after finish_bands
+
+    template <class ContextT>
+    CUDA_DEVICE StftBandBinMap(const ContextT& context, int rows_here_in)
+        : bands(context.band_shared()), rows_here(rows_here_in), widest(0)
+    {
+    }
+
+    CUDA_DEVICE int first_row() const { return THREAD_START_X; }
+    CUDA_DEVICE int row_stride() const { return BLOCK_INCR_X; }
+
+    CUDA_DEVICE void set_band(int row_in_pass, int lo, int hi)
+    {
+        bands->band_lo[row_in_pass] = lo;
+        bands->band_width[row_in_pass] = hi - lo + 1;
+    }
+
+    CUDA_DEVICE void finish_bands()
+    {
+        CUDA_SYNC_THREADS;
+        int width = 0;
+        for (int row = 0; row < rows_here; row += 1)
+            width = (bands->band_width[row] > width) ? bands->band_width[row] : width;
+        widest = width;
+    }
+
+    // A pixel is band_bin * rows_here + row.
+    CUDA_DEVICE int first_pixel() const { return THREAD_START_X; }
+    CUDA_DEVICE int end_pixel() const { return rows_here * widest; }
+    CUDA_DEVICE int pixel_stride() const { return BLOCK_INCR_X; }
+
+    CUDA_DEVICE bool locate(int pixel, int* row_out, int* freq_j_out) const
+    {
+        const int band_bin = pixel / rows_here;
+        const int row = pixel - band_bin * rows_here;
+        if (band_bin >= bands->band_width[row])
+            return false;
+        *row_out = row;
+        *freq_j_out = bands->band_lo[row] + band_bin;
+        return true;
+    }
+
+    CUDA_DEVICE void finish_pass() const { CUDA_SYNC_THREADS; }
+};
+
+// A column policy (above) as a tile. Thread tid builds and evaluates the columns tid,
+// tid + blockDim.x, ... in turn, each over its whole band; the column states stay in registers.
+template <class ColumnT>
+struct ColumnTile
+{
+    using SourceT = typename ColumnT::Source;
+    using Map = StftRowPerThreadMap;
+
+    struct Inputs
+    {
+        Orbits* orbits;
+        TDIConfig* tdi_config;
+        STFTFresnel* fresnel;
+        double T;
+        double t_ref;
+        double window_factor;
+        bool freq_from_tdi_phase;
+    };
+
+    struct BlockShared
+    {
+        int link_space_craft_rec[NLINKS];
+        int link_space_craft_em[NLINKS];
+    };
+
+    CUDA_CALLABLE_MEMBER static size_t table_bytes() { return 0; }
+
+    // * The launch settings reach build() as arguments, not as members: copied into the context,
+    // * they cost the gradient kernel its fourth block per SM on sm_80 (129 registers).
+    struct Context
+    {
+        SourceT src;
+        STFTDomain* stft;
+        int* link_space_craft_rec;
+        int* link_space_craft_em;
+
+        // ! Every thread must construct it: fill_link_arrays ends with a barrier.
+        CUDA_DEVICE Context(const Inputs& inputs, STFTDomain* stft_in, BlockShared& shared)
+            : src(inputs.orbits, inputs.tdi_config, inputs.T, inputs.t_ref),
+              stft(stft_in),
+              link_space_craft_rec(shared.link_space_craft_rec),
+              link_space_craft_em(shared.link_space_craft_em)
+        {
+            src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+        }
+
+        CUDA_DEVICE int rows_per_pass() const { return BLOCK_INCR_X; }
+    };
+
+    struct Template
+    {
+        typename ColumnT::State col;   // the column of this thread's row
+        Vec k;
+        Vec u;
+        Vec v;
+        double* params;
+        int bin_i;
+
+        CUDA_DEVICE Template(Context& context, unsigned char* table)
+            : k(0.0, 0.0, 0.0), u(0.0, 0.0, 0.0), v(0.0, 0.0, 0.0), params(nullptr), bin_i(0)
+        {
+            (void) context;
+            (void) table;
+        }
+
+        // Sky vectors, recomputed per evaluation so that a perturbed parameter reaches them.
+        CUDA_DEVICE void load(Context& context, double* params_in, int bin_i_in)
+        {
+            params = params_in;
+            bin_i = bin_i_in;
+            context.src.get_sky_vectors(&k, &u, &v, params);
+        }
+
+        CUDA_DEVICE void build(Context& context, const Inputs& inputs, int row_base, int rows_here)
+        {
+            int row = THREAD_START_X;
+            if (row >= rows_here)
+                return;
+            // Midpoint anchoring: sample the source and (f0, fdot0) at the bin midpoint, but pass
+            // the WINDOW START to the Fresnel evaluator, which re-anchors internally.
+            double t_anchor_shift = inputs.fresnel->use_midpoint ? 0.5 * context.stft->dt : 0.0;
+            int time_i = row_base + row;
+            double t_seg = context.stft->t0 + time_i * context.stft->dt;   // window start
+            ColumnT::setup(col, context.src, inputs.fresnel, context.stft, params, k, u, v,
+                           context.link_space_craft_rec, context.link_space_craft_em, bin_i,
+                           t_seg, t_anchor_shift, inputs.window_factor,
+                           inputs.freq_from_tdi_phase);
+        }
+
+        // * The map hands each thread its own row only, so `row` is the row of `col`.
+        CUDA_DEVICE int carrier_bin(int row) const
+        {
+            (void) row;
+            return col.carrier_j;
+        }
+
+        CUDA_DEVICE STFT_TILE_PIXEL_INLINE void values(int row, int freq_j_here, double freq_here,
+                                                       cmplx* out) const
+        {
+            (void) row;
+            for (int j = 0; j < 3; j += 1)
+                out[j] = ColumnT::value(col, j, freq_j_here, freq_here);
+        }
+    };
+};
+
+// Dynamic shared memory of a tile launch; on the CPU the launcher passes a host buffer instead.
+#ifdef __CUDACC__
+static CUDA_DEVICE unsigned char* stft_tile_arena(unsigned char* host_arena)
+{
+    extern __shared__ __align__(16) unsigned char stft_tile_dynamic_shared[];
+    (void) host_arena;
+    return stft_tile_dynamic_shared;
+}
+
+// A launch gets 48 kB of dynamic shared memory; a tile that needs more raises the kernel's limit,
+// within what the current device allows a block: cudaDevAttrMaxSharedMemoryPerBlockOptin, 163 kB on
+// an A100 and 227 kB on an H100, static shared memory included. The two DFFR tables of swap_ll
+// (64.8 kB at 32 rows) then fit 2 blocks per SM on an A100 and 3 on an H100.
+// ? Set at every such launch: the attribute belongs to the kernel and the device, and the calls cost
+// ? microseconds against kernels of milliseconds.
+// ! Raises std::runtime_error when the device cannot hold the launch.
+template <class KernelT>
+inline void stft_prepare_dynamic_shared(KernelT kernel, size_t dynamic_bytes)
+{
+    constexpr size_t default_limit = 48 * 1024;
+    if (dynamic_bytes <= default_limit)
+        return;
+    int device = 0, optin_limit = 0;
+    gpuErrchk(cudaGetDevice(&device));
+    gpuErrchk(cudaDeviceGetAttribute(&optin_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    cudaFuncAttributes attributes;
+    gpuErrchk(cudaFuncGetAttributes(&attributes, kernel));
+    if (dynamic_bytes + attributes.sharedSizeBytes > static_cast<size_t>(optin_limit))
+        throw std::runtime_error("stft tile launch: " + std::to_string(dynamic_bytes) +
+                                 " bytes of dynamic and " +
+                                 std::to_string(attributes.sharedSizeBytes) +
+                                 " bytes of static shared memory exceed the " +
+                                 std::to_string(optin_limit) + " bytes a block gets on device " +
+                                 std::to_string(device) + ".");
+    gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(dynamic_bytes)));
+}
+#else
+inline unsigned char* stft_tile_arena(unsigned char* host_arena)
+{
+    return host_arena;
+}
+#endif
+
+// Launch inputs of a column tile; on the GPU they point to the device copies of the structs, and
+// *stft_launch receives the domain pointer the kernel reads.
+template <class SourceT, class ColumnT>
+inline typename ColumnTile<ColumnT>::Inputs stft_column_tile_inputs(
+    Orbits* orbits, TDIConfig* tdi_config, STFTFresnel* fresnel, STFTDomain* stft,
+    double T, double t_ref, double window_factor, bool freq_from_tdi_phase,
+    STFTDomain** stft_launch)
+{
+    static_assert(std::is_same<typename ColumnT::Source, SourceT>::value,
+                  "the column policy must evaluate the source class of the entry point");
+#ifdef __CUDACC__
+    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
+    *stft_launch = dev.stft;
+    return {dev.orbits, dev.tdi_config, dev.fresnel, T, t_ref, window_factor, freq_from_tdi_phase};
+#else
+    *stft_launch = stft;
+    return {orbits, tdi_config, fresnel, T, t_ref, window_factor, freq_from_tdi_phase};
+#endif
+}
+
+// ===========================================================================
 // Per-binary (d|h),(h|h) evaluation for one parameter vector (already loaded
-// into the shared `params`). Zeroes the supplied scratch, runs the time x
-// side-freq x channel Fresnel loop, reduces, and writes the 4*diff_comp-scaled
+// into the shared `params`). Zeroes the supplied scratch, runs the pass x
+// pixel x channel loop of the tile, reduces, and writes the 4*diff_comp-scaled
 // (d|h),(h|h) into *d_h_val,*h_h_val (broadcast to all threads on GPU; on CPU
-// tid==0 holds the sum). Recomputes the sky vectors from `params` each call so
-// it is reusable after a parameter perturbation (the get_ll gradient path).
+// tid==0 holds the sum). Loads the template from `params` each call so it is
+// reusable after a parameter perturbation (the get_ll gradient path).
 // Shared by stft_get_ll_kernel and stft_get_ll_grad_kernel so the gradient's
 // forward evaluation is byte-identical to get_ll.
 // ===========================================================================
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_DEVICE void stft_eval_block_ll(
-    SourceT& src, STFTFresnel* fresnel, STFTDomain* stft,
-    double* params,
-    int* link_space_craft_rec, int* link_space_craft_em, int bin_i,
-    int data_index, int noise_index, int start_j,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    typename TileT::Context& context, typename TileT::Inputs inputs,
+    unsigned char* table, STFTDomain* stft,
+    double* params, int bin_i,
+    int data_index, int noise_index, int start_j, int n_side_bins,
     cmplx* d_h_tmp, cmplx* h_h_tmp, int tid,
     cmplx* d_h_val, cmplx* h_h_val)
 {
+    // * Local to one evaluation, so its state is dead between the repeated calls of a kernel.
+    typename TileT::Template tpl(context, table);
     cmplx fresnel_val[3];
-    typename ColumnT::State col;
-    Vec k(0.0, 0.0, 0.0);
-    Vec u(0.0, 0.0, 0.0);
-    Vec v(0.0, 0.0, 0.0);
 
-    double t0 = stft->t0;
-    double dt = stft->dt;
     double df = stft->df;
     double f_min = stft->f_min;
     int num_times = stft->num_times;
     int num_freqs = stft->num_freqs;
-
-    // Midpoint anchoring: sample the source and (f0, fdot0) at the expansion
-    // anchor (bin midpoint when use_midpoint), but keep passing the WINDOW
-    // START to the Fresnel evaluator -- it re-anchors internally
-    // (t_ref = t0 + dt/2) and keeps the Fourier origin at the window start.
-    double t_anchor_shift = fresnel->use_midpoint ? 0.5 * dt : 0.0;
+    int rows_per_pass = context.rows_per_pass();
 
     d_h_tmp[tid] = cmplx(0.0, 0.0);
     h_h_tmp[tid] = cmplx(0.0, 0.0);
     CUDA_SYNC_THREADS;
 
-    src.get_sky_vectors(&k, &u, &v, params);
-    for (int time_i = THREAD_START_X; time_i < num_times; time_i += BLOCK_INCR_X)
+    tpl.load(context, params, bin_i);
+    for (int row_base = 0; row_base < num_times; row_base += rows_per_pass)
     {
-        double t_seg = t0 + time_i * dt;         // window start
-        ColumnT::setup(col, src, fresnel, stft, params, k, u, v,
-                       link_space_craft_rec, link_space_craft_em, bin_i,
-                       t_seg, t_anchor_shift, window_factor, freq_from_tdi_phase);
+        int rows_here = num_times - row_base;
+        if (rows_here > rows_per_pass)
+            rows_here = rows_per_pass;
+        tpl.build(context, inputs, row_base, rows_here);
 
-        int freq_j = col.carrier_j;
-        for (int diff = -n_side_bins; diff <= +n_side_bins; diff += 1)
+        typename TileT::Map map(context, rows_here);
+        for (int row = map.first_row(); row < rows_here; row += map.row_stride())
+        {
+            int carrier_j = tpl.carrier_bin(row);
+            map.set_band(row, carrier_j - n_side_bins, carrier_j + n_side_bins);
+        }
+        map.finish_bands();
+
+        for (int pixel = map.first_pixel(); pixel < map.end_pixel(); pixel += map.pixel_stride())
         {
             //  Two indices from here on: freq_j_here is the ACTIVE bin (0 at the domain's
             //  f_min) and sets the frequency; freq_j_local is where this cell STORES it.
             //  They differ by the cell's window start; start_j = 0 is the full grid.
-            int freq_j_here = freq_j + diff;
+            int row, freq_j_here;
+            if (!map.locate(pixel, &row, &freq_j_here))
+                continue;
+            int time_i = row_base + row;
             int freq_j_local = freq_j_here - start_j;
             if ((freq_j_local >= 0) && (freq_j_local <= num_freqs - 1))
             {
                 double freq_here = f_min + freq_j_here * df;
+                tpl.values(row, freq_j_here, freq_here, fresnel_val);
                 for (int j = 0; j < 3; j += 1)
-                {
-                    fresnel_val[j] = 0.5 * ColumnT::value(col, j, freq_j_here,
-                                                          freq_here);
-                }
+                    fresnel_val[j] = 0.5 * fresnel_val[j];
                 stft->add_ip_contrib(d_h_tmp, h_h_tmp, fresnel_val,
                                      time_i, freq_j_local, data_index, noise_index);
             }
         }
+        map.finish_pass();
     }
     CUDA_SYNC_THREADS;
 #ifdef __CUDACC__
@@ -641,27 +958,23 @@ CUDA_DEVICE void stft_eval_block_ll(
 // ===========================================================================
 // get_ll : (d|h) and (h|h) per binary.
 // ===========================================================================
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_KERNEL
 void stft_get_ll_kernel(
     cmplx* d_h_out, cmplx* h_h_out,
-    Orbits* orbits, TDIConfig* tdi_config,
-    STFTFresnel* fresnel, STFTDomain* stft,
+    typename TileT::Inputs inputs, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
-    int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
-    int* start_freq_inds)
+    int num_bin, int nparams, int n_side_bins,
+    int* start_freq_inds, unsigned char* host_arena)
 {
     CUDA_SHARED cmplx d_h_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx h_h_tmp[NUM_THREADS_HERE];
     CUDA_SHARED double params[N_PARAMS_MAX];
+    CUDA_SHARED typename TileT::BlockShared tile_shared;
 
-    SourceT src(orbits, tdi_config, T, t_ref);
-
-    CUDA_SHARED int link_space_craft_rec[NLINKS];
-    CUDA_SHARED int link_space_craft_em[NLINKS];
-    src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+    typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
+    unsigned char* arena = stft_tile_arena(host_arena);
 
 #ifdef __CUDACC__
     int tid = threadIdx.x;
@@ -680,11 +993,9 @@ void stft_get_ll_kernel(
         CUDA_SYNC_THREADS;
 
         cmplx d_h_val, h_h_val;
-        stft_eval_block_ll<SourceT, ColumnT>(
-            src, fresnel, stft, params,
-            link_space_craft_rec, link_space_craft_em, bin_i,
-            data_index, noise_index, start_j,
-            n_side_bins, window_factor, freq_from_tdi_phase,
+        stft_eval_block_ll<TileT>(
+            context, inputs, arena, stft, params, bin_i,
+            data_index, noise_index, start_j, n_side_bins,
             d_h_tmp, h_h_tmp, tid, &d_h_val, &h_h_val);
 
         if (tid == 0)
@@ -694,6 +1005,31 @@ void stft_get_ll_kernel(
         }
         CUDA_SYNC_THREADS;
     }
+}
+
+template <class TileT>
+inline void stft_get_ll_launch(
+    cmplx* d_h_out, cmplx* h_h_out,
+    const typename TileT::Inputs& inputs, STFTDomain* stft,
+    double* params_all, int* data_index_all, int* noise_index_all,
+    int num_bin, int nparams, int n_side_bins, int* start_freq_inds)
+{
+    const size_t shared_bytes = TileT::table_bytes();
+#ifdef __CUDACC__
+    stft_prepare_dynamic_shared(stft_get_ll_kernel<TileT>, shared_bytes);
+    dim3 grid((unsigned) num_bin, 1u, 1u);
+    stft_get_ll_kernel<TileT><<<grid, NUM_THREADS_HERE, shared_bytes>>>(
+        d_h_out, h_h_out, inputs, stft,
+        params_all, data_index_all, noise_index_all,
+        num_bin, nparams, n_side_bins, start_freq_inds, nullptr);
+    gpuErrchk(cudaGetLastError());
+#else
+    std::vector<unsigned char> host_arena(shared_bytes);
+    stft_get_ll_kernel<TileT>(
+        d_h_out, h_h_out, inputs, stft,
+        params_all, data_index_all, noise_index_all,
+        num_bin, nparams, n_side_bins, start_freq_inds, host_arena.data());
+#endif
 }
 
 template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
@@ -706,23 +1042,14 @@ inline void stft_get_ll_impl(
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
     int* start_freq_inds = nullptr)
 {
-#ifdef __CUDACC__
-    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
-
-    dim3 grid((unsigned) num_bin, 1u, 1u);
-    stft_get_ll_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        d_h_out, h_h_out, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
+    STFTDomain* stft_launch = nullptr;
+    const auto inputs = stft_column_tile_inputs<SourceT, ColumnT>(
+        orbits, tdi_config, fresnel, stft, T, t_ref, window_factor, freq_from_tdi_phase,
+        &stft_launch);
+    stft_get_ll_launch<ColumnTile<ColumnT>>(
+        d_h_out, h_h_out, inputs, stft_launch,
         params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-    gpuErrchk(cudaGetLastError());
-#else
-    stft_get_ll_kernel<SourceT, ColumnT>(
-        d_h_out, h_h_out, orbits, tdi_config, fresnel, stft,
-        params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-#endif
+        num_bin, nparams, n_side_bins, start_freq_inds);
 }
 
 // ===========================================================================
@@ -737,77 +1064,72 @@ inline void stft_get_ll_impl(
 // the domain's num_freqs already IS the active band, so the active-band layout
 // is the implemented path.
 // ===========================================================================
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_KERNEL
 void stft_fill_global_kernel(
     cmplx* template_fill,
-    Orbits* orbits, TDIConfig* tdi_config,
-    STFTFresnel* fresnel, STFTDomain* stft,
+    typename TileT::Inputs inputs, STFTDomain* stft,
     double* params_all, int* data_index_all, double* factors_all,
-    int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band,
-    int* start_freq_inds)
+    int num_bin, int nparams, int n_side_bins, bool active_band,
+    int* start_freq_inds, unsigned char* host_arena)
 {
     (void) active_band;  // STFT grid == active band; layout is (.., num_times, num_freqs)
     CUDA_SHARED double params[N_PARAMS_MAX];
+    CUDA_SHARED typename TileT::BlockShared tile_shared;
 
-    SourceT src(orbits, tdi_config, T, t_ref);
-
-    typename ColumnT::State col;
-
-    CUDA_SHARED int link_space_craft_rec[NLINKS];
-    CUDA_SHARED int link_space_craft_em[NLINKS];
-    src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+    typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
+    unsigned char* arena = stft_tile_arena(host_arena);
+    cmplx tile_val[3];
 
-    int data_index;
-    Vec k(0.0, 0.0, 0.0);
-    Vec u(0.0, 0.0, 0.0);
-    Vec v(0.0, 0.0, 0.0);
-
-    double t0 = stft->t0;
-    double dt = stft->dt;
     double df = stft->df;
     double f_min = stft->f_min;
     int num_times = stft->num_times;
     int num_freqs = stft->num_freqs;
     int nchannels = stft->num_channels;
-    int freq_j = 0;
-
-    // Midpoint anchoring: sample at the anchor, evaluate at the window start
-    // (see stft_eval_block_ll).
-    double t_anchor_shift = fresnel->use_midpoint ? 0.5 * dt : 0.0;
+    int rows_per_pass = context.rows_per_pass();
 
     for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
     {
-        data_index = data_index_all[bin_i];
+        int data_index = data_index_all[bin_i];
         int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
         double factor = factors_all[bin_i];
         for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
             params[i] = params_all[bin_i * nparams + i];
         CUDA_SYNC_THREADS;
 
-        src.get_sky_vectors(&k, &u, &v, params);
-        for (int time_i = THREAD_START_X; time_i < num_times; time_i += BLOCK_INCR_X)
+        // * One template per source, so its state is dead between the sources of a block.
+        typename TileT::Template tpl(context, arena);
+        tpl.load(context, params, bin_i);
+        for (int row_base = 0; row_base < num_times; row_base += rows_per_pass)
         {
-            double t_seg = t0 + time_i * dt;     // window start
-            ColumnT::setup(col, src, fresnel, stft, params, k, u, v,
-                           link_space_craft_rec, link_space_craft_em, bin_i,
-                           t_seg, t_anchor_shift, window_factor,
-                           freq_from_tdi_phase);
+            int rows_here = num_times - row_base;
+            if (rows_here > rows_per_pass)
+                rows_here = rows_per_pass;
+            tpl.build(context, inputs, row_base, rows_here);
 
-            freq_j = col.carrier_j;
-            for (int diff = -n_side_bins; diff <= +n_side_bins; diff += 1)
+            typename TileT::Map map(context, rows_here);
+            for (int row = map.first_row(); row < rows_here; row += map.row_stride())
             {
-                int freq_j_here = freq_j + diff;
+                int carrier_j = tpl.carrier_bin(row);
+                map.set_band(row, carrier_j - n_side_bins, carrier_j + n_side_bins);
+            }
+            map.finish_bands();
+
+            for (int pixel = map.first_pixel(); pixel < map.end_pixel(); pixel += map.pixel_stride())
+            {
+                int row, freq_j_here;
+                if (!map.locate(pixel, &row, &freq_j_here))
+                    continue;
+                int time_i = row_base + row;
                 int freq_j_local = freq_j_here - start_j;
                 if ((freq_j_local >= 0) && (freq_j_local <= num_freqs - 1))
                 {
                     double freq_here = f_min + freq_j_here * df;
+                    tpl.values(row, freq_j_here, freq_here, tile_val);
                     for (int j = 0; j < 3; j += 1)
                     {
-                        cmplx val = factor * 0.5 * ColumnT::value(col, j, freq_j_here,
-                                                                  freq_here);
+                        cmplx val = factor * 0.5 * tile_val[j];
                         // template_fill[(((data_index*nch + j)*num_times + time_i)*num_freqs) + freq_j_local]
                         size_t idx = ((((size_t) data_index * nchannels + j) * num_times
                                        + time_i) * num_freqs) + freq_j_local;
@@ -820,9 +1142,35 @@ void stft_fill_global_kernel(
                     }
                 }
             }
+            map.finish_pass();
         }
         CUDA_SYNC_THREADS;
     }
+}
+
+template <class TileT>
+inline void stft_fill_global_launch(
+    cmplx* template_fill,
+    const typename TileT::Inputs& inputs, STFTDomain* stft,
+    double* params_all, int* data_index_all, double* factors_all,
+    int num_bin, int nparams, int n_side_bins, bool active_band, int* start_freq_inds)
+{
+    const size_t shared_bytes = TileT::table_bytes();
+#ifdef __CUDACC__
+    stft_prepare_dynamic_shared(stft_fill_global_kernel<TileT>, shared_bytes);
+    dim3 grid((unsigned) num_bin, 1u, 1u);
+    stft_fill_global_kernel<TileT><<<grid, NUM_THREADS_HERE, shared_bytes>>>(
+        template_fill, inputs, stft,
+        params_all, data_index_all, factors_all,
+        num_bin, nparams, n_side_bins, active_band, start_freq_inds, nullptr);
+    gpuErrchk(cudaGetLastError());
+#else
+    std::vector<unsigned char> host_arena(shared_bytes);
+    stft_fill_global_kernel<TileT>(
+        template_fill, inputs, stft,
+        params_all, data_index_all, factors_all,
+        num_bin, nparams, n_side_bins, active_band, start_freq_inds, host_arena.data());
+#endif
 }
 
 template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
@@ -835,23 +1183,14 @@ inline void stft_fill_global_impl(
     int n_side_bins, double window_factor, bool freq_from_tdi_phase, bool active_band,
     int* start_freq_inds = nullptr)
 {
-#ifdef __CUDACC__
-    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
-
-    dim3 grid((unsigned) num_bin, 1u, 1u);
-    stft_fill_global_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        template_fill, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
+    STFTDomain* stft_launch = nullptr;
+    const auto inputs = stft_column_tile_inputs<SourceT, ColumnT>(
+        orbits, tdi_config, fresnel, stft, T, t_ref, window_factor, freq_from_tdi_phase,
+        &stft_launch);
+    stft_fill_global_launch<ColumnTile<ColumnT>>(
+        template_fill, inputs, stft_launch,
         params_all, data_index_all, factors_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase, active_band, start_freq_inds);
-    gpuErrchk(cudaGetLastError());
-#else
-    stft_fill_global_kernel<SourceT, ColumnT>(
-        template_fill, orbits, tdi_config, fresnel, stft,
-        params_all, data_index_all, factors_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor,
-        freq_from_tdi_phase, active_band, start_freq_inds);
-#endif
+        num_bin, nparams, n_side_bins, active_band, start_freq_inds);
 }
 
 // ===========================================================================
@@ -872,42 +1211,36 @@ inline void stft_fill_global_impl(
 // (h_add|h_remove)=(h|h).
 // ===========================================================================
 // Per-binary 5-term swap evaluation for one (params_add, params_remove) pair
-// (both already in shared memory). Same per-pixel convention as
-// stft_eval_block_ll; sums over the UNION of the add/remove carriers' side
-// bands and defers to STFTDomain::add_ip_swap_contrib. Writes the five
-// 4*diff_comp-scaled terms (broadcast to all threads on GPU). Recomputes both
-// tracks' sky vectors from their params each call so it is reusable after a
+// (both already in shared memory), with one tile template per track. Same
+// per-pixel convention as stft_eval_block_ll; sums over the UNION of the
+// add/remove carriers' side bands and defers to STFTDomain::add_ip_swap_contrib.
+// Writes the five 4*diff_comp-scaled terms (broadcast to all threads on GPU).
+// Loads both templates from their params each call so it is reusable after a
 // parameter perturbation (the swap gradient path). Shared by
 // stft_swap_ll_kernel and stft_swap_ll_grad_kernel.
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_DEVICE void stft_eval_block_swap(
-    SourceT& src, STFTFresnel* fresnel, STFTDomain* stft,
-    double* params_add, double* params_remove,
-    int* link_space_craft_rec, int* link_space_craft_em, int bin_i,
-    int data_index, int noise_index, int start_j,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
+    typename TileT::Context& context, typename TileT::Inputs inputs,
+    unsigned char* table_add, unsigned char* table_remove,
+    STFTDomain* stft,
+    double* params_add, double* params_remove, int bin_i,
+    int data_index, int noise_index, int start_j, int n_side_bins,
     cmplx* d_h_add_tmp, cmplx* d_h_remove_tmp, cmplx* add_add_tmp,
     cmplx* remove_remove_tmp, cmplx* add_remove_tmp, int tid,
     cmplx* d_h_add_val, cmplx* d_h_remove_val, cmplx* add_add_val,
     cmplx* remove_remove_val, cmplx* add_remove_val)
 {
+    // * Local to one evaluation, so their state is dead between the repeated calls of a kernel.
+    typename TileT::Template tpl_add(context, table_add);
+    typename TileT::Template tpl_remove(context, table_remove);
     cmplx fresnel_val_add[3];
     cmplx fresnel_val_remove[3];
-    typename ColumnT::State col_add;
-    typename ColumnT::State col_remove;
-    Vec k_add(0.0, 0.0, 0.0), u_add(0.0, 0.0, 0.0), v_add(0.0, 0.0, 0.0);
-    Vec k_remove(0.0, 0.0, 0.0), u_remove(0.0, 0.0, 0.0), v_remove(0.0, 0.0, 0.0);
 
-    double t0 = stft->t0;
-    double dt = stft->dt;
     double df = stft->df;
     double f_min = stft->f_min;
     int num_times = stft->num_times;
     int num_freqs = stft->num_freqs;
-
-    // Midpoint anchoring: sample at the anchor, evaluate at the window start
-    // (see stft_eval_block_ll).
-    double t_anchor_shift = fresnel->use_midpoint ? 0.5 * dt : 0.0;
+    int rows_per_pass = context.rows_per_pass();
 
     d_h_add_tmp[tid] = cmplx(0.0, 0.0);
     d_h_remove_tmp[tid] = cmplx(0.0, 0.0);
@@ -916,42 +1249,45 @@ CUDA_DEVICE void stft_eval_block_swap(
     add_remove_tmp[tid] = cmplx(0.0, 0.0);
     CUDA_SYNC_THREADS;
 
-    src.get_sky_vectors(&k_add, &u_add, &v_add, params_add);
-    src.get_sky_vectors(&k_remove, &u_remove, &v_remove, params_remove);
-    for (int time_i = THREAD_START_X; time_i < num_times; time_i += BLOCK_INCR_X)
+    tpl_add.load(context, params_add, bin_i);
+    tpl_remove.load(context, params_remove, bin_i);
+    for (int row_base = 0; row_base < num_times; row_base += rows_per_pass)
     {
-        double t_seg = t0 + time_i * dt;         // window start
+        int rows_here = num_times - row_base;
+        if (rows_here > rows_per_pass)
+            rows_here = rows_per_pass;
         // (f0, fdot0) from each track's own TDI phase (Doppler-corrected
         // when freq_from_tdi_phase; else astrophysical get_f/get_fdot).
-        ColumnT::setup(col_add, src, fresnel, stft, params_add,
-                       k_add, u_add, v_add,
-                       link_space_craft_rec, link_space_craft_em, bin_i,
-                       t_seg, t_anchor_shift, window_factor,
-                       freq_from_tdi_phase);
-        ColumnT::setup(col_remove, src, fresnel, stft, params_remove,
-                       k_remove, u_remove, v_remove,
-                       link_space_craft_rec, link_space_craft_em, bin_i,
-                       t_seg, t_anchor_shift, window_factor,
-                       freq_from_tdi_phase);
+        tpl_add.build(context, inputs, row_base, rows_here);
+        tpl_remove.build(context, inputs, row_base, rows_here);
 
-        int freq_j_add = col_add.carrier_j;
-        int freq_j_remove = col_remove.carrier_j;
-        int freq_j_min = (freq_j_add < freq_j_remove) ? freq_j_add : freq_j_remove;
-        int freq_j_max = (freq_j_add > freq_j_remove) ? freq_j_add : freq_j_remove;
-
-        for (int freq_j_here = freq_j_min - n_side_bins;
-             freq_j_here <= freq_j_max + n_side_bins; freq_j_here += 1)
+        typename TileT::Map map(context, rows_here);
+        for (int row = map.first_row(); row < rows_here; row += map.row_stride())
         {
+            int freq_j_add = tpl_add.carrier_bin(row);
+            int freq_j_remove = tpl_remove.carrier_bin(row);
+            int freq_j_min = (freq_j_add < freq_j_remove) ? freq_j_add : freq_j_remove;
+            int freq_j_max = (freq_j_add > freq_j_remove) ? freq_j_add : freq_j_remove;
+            map.set_band(row, freq_j_min - n_side_bins, freq_j_max + n_side_bins);
+        }
+        map.finish_bands();
+
+        for (int pixel = map.first_pixel(); pixel < map.end_pixel(); pixel += map.pixel_stride())
+        {
+            int row, freq_j_here;
+            if (!map.locate(pixel, &row, &freq_j_here))
+                continue;
+            int time_i = row_base + row;
             int freq_j_local = freq_j_here - start_j;
             if ((freq_j_local >= 0) && (freq_j_local <= num_freqs - 1))
             {
                 double freq_here = f_min + freq_j_here * df;
+                tpl_add.values(row, freq_j_here, freq_here, fresnel_val_add);
+                tpl_remove.values(row, freq_j_here, freq_here, fresnel_val_remove);
                 for (int j = 0; j < 3; j += 1)
                 {
-                    fresnel_val_add[j] = 0.5 * ColumnT::value(
-                        col_add, j, freq_j_here, freq_here);
-                    fresnel_val_remove[j] = 0.5 * ColumnT::value(
-                        col_remove, j, freq_j_here, freq_here);
+                    fresnel_val_add[j] = 0.5 * fresnel_val_add[j];
+                    fresnel_val_remove[j] = 0.5 * fresnel_val_remove[j];
                 }
                 stft->add_ip_swap_contrib(
                     d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp,
@@ -959,6 +1295,7 @@ CUDA_DEVICE void stft_eval_block_swap(
                     time_i, freq_j_local, data_index, noise_index);
             }
         }
+        map.finish_pass();
     }
     CUDA_SYNC_THREADS;
 #ifdef __CUDACC__
@@ -986,18 +1323,16 @@ CUDA_DEVICE void stft_eval_block_swap(
 #endif
 }
 
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_KERNEL
 void stft_swap_ll_kernel(
     cmplx* d_h_add_out, cmplx* d_h_remove_out,
     cmplx* add_add_out, cmplx* remove_remove_out, cmplx* add_remove_out,
-    Orbits* orbits, TDIConfig* tdi_config,
-    STFTFresnel* fresnel, STFTDomain* stft,
+    typename TileT::Inputs inputs, STFTDomain* stft,
     double* params_add_all, double* params_remove_all,
     int* data_index_all, int* noise_index_all,
-    int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
-    int* start_freq_inds)
+    int num_bin, int nparams, int n_side_bins,
+    int* start_freq_inds, unsigned char* host_arena)
 {
     CUDA_SHARED cmplx d_h_add_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx d_h_remove_tmp[NUM_THREADS_HERE];
@@ -1006,13 +1341,11 @@ void stft_swap_ll_kernel(
     CUDA_SHARED cmplx add_remove_tmp[NUM_THREADS_HERE];
     CUDA_SHARED double params_add[N_PARAMS_MAX];
     CUDA_SHARED double params_remove[N_PARAMS_MAX];
+    CUDA_SHARED typename TileT::BlockShared tile_shared;
 
-    SourceT src(orbits, tdi_config, T, t_ref);
-
-    CUDA_SHARED int link_space_craft_rec[NLINKS];
-    CUDA_SHARED int link_space_craft_em[NLINKS];
-    src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+    typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
+    unsigned char* arena = stft_tile_arena(host_arena);
 
 #ifdef __CUDACC__
     int tid = threadIdx.x;
@@ -1033,10 +1366,10 @@ void stft_swap_ll_kernel(
         CUDA_SYNC_THREADS;
 
         cmplx d_h_add_val, d_h_remove_val, add_add_val, remove_remove_val, add_remove_val;
-        stft_eval_block_swap<SourceT, ColumnT>(
-            src, fresnel, stft, params_add, params_remove,
-            link_space_craft_rec, link_space_craft_em, bin_i,
-            data_index, noise_index, start_j, n_side_bins, window_factor, freq_from_tdi_phase,
+        stft_eval_block_swap<TileT>(
+            context, inputs, arena, arena + TileT::table_bytes(), stft,
+            params_add, params_remove, bin_i,
+            data_index, noise_index, start_j, n_side_bins,
             d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
             &d_h_add_val, &d_h_remove_val, &add_add_val, &remove_remove_val, &add_remove_val);
 
@@ -1052,6 +1385,33 @@ void stft_swap_ll_kernel(
     }
 }
 
+template <class TileT>
+inline void stft_swap_ll_launch(
+    cmplx* d_h_add_out, cmplx* d_h_remove_out,
+    cmplx* add_add_out, cmplx* remove_remove_out, cmplx* add_remove_out,
+    const typename TileT::Inputs& inputs, STFTDomain* stft,
+    double* params_add_all, double* params_remove_all,
+    int* data_index_all, int* noise_index_all,
+    int num_bin, int nparams, int n_side_bins, int* start_freq_inds)
+{
+    const size_t shared_bytes = 2 * TileT::table_bytes();   // add and remove templates
+#ifdef __CUDACC__
+    stft_prepare_dynamic_shared(stft_swap_ll_kernel<TileT>, shared_bytes);
+    dim3 grid((unsigned) num_bin, 1u, 1u);
+    stft_swap_ll_kernel<TileT><<<grid, NUM_THREADS_HERE, shared_bytes>>>(
+        d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
+        inputs, stft, params_add_all, params_remove_all, data_index_all, noise_index_all,
+        num_bin, nparams, n_side_bins, start_freq_inds, nullptr);
+    gpuErrchk(cudaGetLastError());
+#else
+    std::vector<unsigned char> host_arena(shared_bytes);
+    stft_swap_ll_kernel<TileT>(
+        d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
+        inputs, stft, params_add_all, params_remove_all, data_index_all, noise_index_all,
+        num_bin, nparams, n_side_bins, start_freq_inds, host_arena.data());
+#endif
+}
+
 template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
 inline void stft_swap_ll_impl(
     cmplx* d_h_add_out, cmplx* d_h_remove_out,
@@ -1064,25 +1424,14 @@ inline void stft_swap_ll_impl(
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
     int* start_freq_inds = nullptr)
 {
-#ifdef __CUDACC__
-    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
-
-    dim3 grid((unsigned) num_bin, 1u, 1u);
-    stft_swap_ll_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
+    STFTDomain* stft_launch = nullptr;
+    const auto inputs = stft_column_tile_inputs<SourceT, ColumnT>(
+        orbits, tdi_config, fresnel, stft, T, t_ref, window_factor, freq_from_tdi_phase,
+        &stft_launch);
+    stft_swap_ll_launch<ColumnTile<ColumnT>>(
         d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
-        dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
-        params_add_all, params_remove_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-    gpuErrchk(cudaGetLastError());
-#else
-    stft_swap_ll_kernel<SourceT, ColumnT>(
-        d_h_add_out, d_h_remove_out, add_add_out, remove_remove_out, add_remove_out,
-        orbits, tdi_config, fresnel, stft,
-        params_add_all, params_remove_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-#endif
+        inputs, stft_launch, params_add_all, params_remove_all, data_index_all, noise_index_all,
+        num_bin, nparams, n_side_bins, start_freq_inds);
 }
 
 // ===========================================================================
@@ -1106,17 +1455,15 @@ inline void stft_swap_ll_impl(
 // identically 0 as in real-valued WDM). M upper-triangle flatten:
 //   m_idx(i,j) = i*4 - i*(i+1)/2 + j   for i <= j.
 // ===========================================================================
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_KERNEL
 void stft_get_fstat_ll_kernel(
     double* N_re_out, double* N_im_out,   // (num_bin, 4)
     double* M_re_out, double* M_im_out,   // (num_bin, 10) upper triangle
-    Orbits* orbits, TDIConfig* tdi_config,
-    STFTFresnel* fresnel, STFTDomain* stft,
+    typename TileT::Inputs inputs, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
-    int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
-    int* start_freq_inds)
+    int num_bin, int nparams, int n_side_bins,
+    int* start_freq_inds, unsigned char* host_arena)
 {
     constexpr int N_FILTERS = 4;
     constexpr int N_M = (N_FILTERS * (N_FILTERS + 1)) / 2;   // = 10
@@ -1145,13 +1492,11 @@ void stft_get_fstat_ll_kernel(
     CUDA_SHARED cmplx tmp4[NUM_THREADS_HERE];
     CUDA_SHARED double params_i[N_PARAMS_MAX];
     CUDA_SHARED double params_j[N_PARAMS_MAX];
+    CUDA_SHARED typename TileT::BlockShared tile_shared;
 
-    SourceT src(orbits, tdi_config, T, t_ref);
-
-    CUDA_SHARED int link_space_craft_rec[NLINKS];
-    CUDA_SHARED int link_space_craft_em[NLINKS];
-    src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+    typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
+    unsigned char* arena = stft_tile_arena(host_arena);
 
 #ifdef __CUDACC__
     int tid = threadIdx.x;
@@ -1181,11 +1526,9 @@ void stft_get_fstat_ll_kernel(
             CUDA_SYNC_THREADS;
 
             cmplx d_h_val, h_h_val;
-            stft_eval_block_ll<SourceT, ColumnT>(
-                src, fresnel, stft, params_i,
-                link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, start_j,
-                n_side_bins, window_factor, freq_from_tdi_phase,
+            stft_eval_block_ll<TileT>(
+                context, inputs, arena, stft, params_i, bin_i,
+                data_index, noise_index, start_j, n_side_bins,
                 tmp0, tmp1, tid, &d_h_val, &h_h_val);
 
             if (tid == 0)
@@ -1220,11 +1563,10 @@ void stft_get_fstat_ll_kernel(
                 CUDA_SYNC_THREADS;
 
                 cmplx d_h_add_val, d_h_remove_val, add_add_val, remove_remove_val, add_remove_val;
-                stft_eval_block_swap<SourceT, ColumnT>(
-                    src, fresnel, stft, params_i, params_j,
-                    link_space_craft_rec, link_space_craft_em, bin_i,
-                    data_index, noise_index, start_j,
-                    n_side_bins, window_factor, freq_from_tdi_phase,
+                stft_eval_block_swap<TileT>(
+                    context, inputs, arena, arena + TileT::table_bytes(), stft,
+                    params_i, params_j, bin_i,
+                    data_index, noise_index, start_j, n_side_bins,
                     tmp0, tmp1, tmp2, tmp3, tmp4, tid,
                     &d_h_add_val, &d_h_remove_val, &add_add_val, &remove_remove_val,
                     &add_remove_val);
@@ -1241,6 +1583,32 @@ void stft_get_fstat_ll_kernel(
     }
 }
 
+template <class TileT>
+inline void stft_get_fstat_ll_launch(
+    double* N_re_out, double* N_im_out,
+    double* M_re_out, double* M_im_out,
+    const typename TileT::Inputs& inputs, STFTDomain* stft,
+    double* params_all, int* data_index_all, int* noise_index_all,
+    int num_bin, int nparams, int n_side_bins, int* start_freq_inds)
+{
+    const size_t shared_bytes = 2 * TileT::table_bytes();   // two filters at a time
+#ifdef __CUDACC__
+    stft_prepare_dynamic_shared(stft_get_fstat_ll_kernel<TileT>, shared_bytes);
+    dim3 grid((unsigned) num_bin, 1u, 1u);
+    stft_get_fstat_ll_kernel<TileT><<<grid, NUM_THREADS_HERE, shared_bytes>>>(
+        N_re_out, N_im_out, M_re_out, M_im_out, inputs, stft,
+        params_all, data_index_all, noise_index_all,
+        num_bin, nparams, n_side_bins, start_freq_inds, nullptr);
+    gpuErrchk(cudaGetLastError());
+#else
+    std::vector<unsigned char> host_arena(shared_bytes);
+    stft_get_fstat_ll_kernel<TileT>(
+        N_re_out, N_im_out, M_re_out, M_im_out, inputs, stft,
+        params_all, data_index_all, noise_index_all,
+        num_bin, nparams, n_side_bins, start_freq_inds, host_arena.data());
+#endif
+}
+
 template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
 inline void stft_get_fstat_ll_impl(
     double* N_re_out, double* N_im_out,
@@ -1252,25 +1620,14 @@ inline void stft_get_fstat_ll_impl(
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
     int* start_freq_inds = nullptr)
 {
-#ifdef __CUDACC__
-    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
-
-    dim3 grid((unsigned) num_bin, 1u, 1u);
-    stft_get_fstat_ll_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        N_re_out, N_im_out, M_re_out, M_im_out,
-        dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
+    STFTDomain* stft_launch = nullptr;
+    const auto inputs = stft_column_tile_inputs<SourceT, ColumnT>(
+        orbits, tdi_config, fresnel, stft, T, t_ref, window_factor, freq_from_tdi_phase,
+        &stft_launch);
+    stft_get_fstat_ll_launch<ColumnTile<ColumnT>>(
+        N_re_out, N_im_out, M_re_out, M_im_out, inputs, stft_launch,
         params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-    gpuErrchk(cudaGetLastError());
-#else
-    stft_get_fstat_ll_kernel<SourceT, ColumnT>(
-        N_re_out, N_im_out, M_re_out, M_im_out,
-        orbits, tdi_config, fresnel, stft,
-        params_all, data_index_all, noise_index_all,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-#endif
+        num_bin, nparams, n_side_bins, start_freq_inds);
 }
 
 // ===========================================================================
@@ -1279,33 +1636,30 @@ inline void stft_get_fstat_ll_impl(
 // each param k with eps_k > 0 we perturb the shared params[k] by +-eps_k,
 // re-evaluate (d|h),(h|h) via stft_eval_block_ll (so the forward model is
 // byte-identical to get_ll), form q_+- = Re(d|h) - 0.5*Re(h|h), and write
-// grad[k] = (q_+ - q_-) / (2*eps_k). eps_k <= 0 freezes parameter k (grad 0).
+// grad[k] = (q_+ - q_-) / (p_+ - p_-), with p_+- the shifted values as they were
+// rounded (not the nominal 2*eps_k). eps_k <= 0 freezes parameter k (grad 0).
 // The constant -0.5*(d|d) term cancels in the difference, so the data
 // self-term is never needed. grad_out layout: grad_out[bin*nparams + k].
 // (Mirrors the FD/signal-het central-difference gradients.)
 // ===========================================================================
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_KERNEL
 void stft_get_ll_grad_kernel(
     double* grad_out,
-    Orbits* orbits, TDIConfig* tdi_config,
-    STFTFresnel* fresnel, STFTDomain* stft,
+    typename TileT::Inputs inputs, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
     double* param_eps,
-    int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
-    int* start_freq_inds)
+    int num_bin, int nparams, int n_side_bins,
+    int* start_freq_inds, unsigned char* host_arena)
 {
     CUDA_SHARED cmplx d_h_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx h_h_tmp[NUM_THREADS_HERE];
     CUDA_SHARED double params[N_PARAMS_MAX];
+    CUDA_SHARED typename TileT::BlockShared tile_shared;
 
-    SourceT src(orbits, tdi_config, T, t_ref);
-
-    CUDA_SHARED int link_space_craft_rec[NLINKS];
-    CUDA_SHARED int link_space_craft_em[NLINKS];
-    src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+    typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
+    unsigned char* arena = stft_tile_arena(host_arena);
 
 #ifdef __CUDACC__
     int tid = threadIdx.x;
@@ -1334,36 +1688,59 @@ void stft_get_ll_grad_kernel(
             // Only tid 0 mutates / restores the shared params slot; the eval
             // reads it after the sync below, so no read-before-write race.
             double saved = (tid == 0) ? params[kk] : 0.0;
+            // * Exact 2 eps term to divide by, including the floating-point error of the shifts.
+            double shifted_up = saved + eps_k;
+            double shifted_down = saved - eps_k;
 
-            if (tid == 0) params[kk] = saved + eps_k;
+            if (tid == 0) params[kk] = shifted_up;
             CUDA_SYNC_THREADS;
             cmplx d_h_p, h_h_p;
-            stft_eval_block_ll<SourceT, ColumnT>(
-                src, fresnel, stft, params,
-                link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, start_j,
-                n_side_bins, window_factor, freq_from_tdi_phase,
+            stft_eval_block_ll<TileT>(
+                context, inputs, arena, stft, params, bin_i,
+                data_index, noise_index, start_j, n_side_bins,
                 d_h_tmp, h_h_tmp, tid, &d_h_p, &h_h_p);
             double q_p = d_h_p.real() - 0.5 * h_h_p.real();
 
-            if (tid == 0) params[kk] = saved - eps_k;
+            if (tid == 0) params[kk] = shifted_down;
             CUDA_SYNC_THREADS;
             cmplx d_h_m, h_h_m;
-            stft_eval_block_ll<SourceT, ColumnT>(
-                src, fresnel, stft, params,
-                link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, start_j,
-                n_side_bins, window_factor, freq_from_tdi_phase,
+            stft_eval_block_ll<TileT>(
+                context, inputs, arena, stft, params, bin_i,
+                data_index, noise_index, start_j, n_side_bins,
                 d_h_tmp, h_h_tmp, tid, &d_h_m, &h_h_m);
             double q_m = d_h_m.real() - 0.5 * h_h_m.real();
 
             if (tid == 0) params[kk] = saved;
             CUDA_SYNC_THREADS;
             if (tid == 0)
-                grad_out[bin_i * nparams + kk] = (q_p - q_m) / (2.0 * eps_k);
+                grad_out[bin_i * nparams + kk] = (q_p - q_m) / (shifted_up - shifted_down);
             CUDA_SYNC_THREADS;
         }
     }
+}
+
+template <class TileT>
+inline void stft_get_ll_grad_launch(
+    double* grad_out,
+    const typename TileT::Inputs& inputs, STFTDomain* stft,
+    double* params_all, int* data_index_all, int* noise_index_all,
+    double* param_eps,
+    int num_bin, int nparams, int n_side_bins, int* start_freq_inds)
+{
+    const size_t shared_bytes = TileT::table_bytes();
+#ifdef __CUDACC__
+    stft_prepare_dynamic_shared(stft_get_ll_grad_kernel<TileT>, shared_bytes);
+    dim3 grid((unsigned) num_bin, 1u, 1u);
+    stft_get_ll_grad_kernel<TileT><<<grid, NUM_THREADS_HERE, shared_bytes>>>(
+        grad_out, inputs, stft, params_all, data_index_all, noise_index_all, param_eps,
+        num_bin, nparams, n_side_bins, start_freq_inds, nullptr);
+    gpuErrchk(cudaGetLastError());
+#else
+    std::vector<unsigned char> host_arena(shared_bytes);
+    stft_get_ll_grad_kernel<TileT>(
+        grad_out, inputs, stft, params_all, data_index_all, noise_index_all, param_eps,
+        num_bin, nparams, n_side_bins, start_freq_inds, host_arena.data());
+#endif
 }
 
 template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
@@ -1377,23 +1754,13 @@ inline void stft_get_ll_grad_impl(
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
     int* start_freq_inds = nullptr)
 {
-#ifdef __CUDACC__
-    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
-
-    dim3 grid((unsigned) num_bin, 1u, 1u);
-    stft_get_ll_grad_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        grad_out, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
-        params_all, data_index_all, noise_index_all, param_eps,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-    gpuErrchk(cudaGetLastError());
-#else
-    stft_get_ll_grad_kernel<SourceT, ColumnT>(
-        grad_out, orbits, tdi_config, fresnel, stft,
-        params_all, data_index_all, noise_index_all, param_eps,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-#endif
+    STFTDomain* stft_launch = nullptr;
+    const auto inputs = stft_column_tile_inputs<SourceT, ColumnT>(
+        orbits, tdi_config, fresnel, stft, T, t_ref, window_factor, freq_from_tdi_phase,
+        &stft_launch);
+    stft_get_ll_grad_launch<ColumnTile<ColumnT>>(
+        grad_out, inputs, stft_launch, params_all, data_index_all, noise_index_all, param_eps,
+        num_bin, nparams, n_side_bins, start_freq_inds);
 }
 
 // ===========================================================================
@@ -1407,18 +1774,16 @@ inline void stft_get_ll_grad_impl(
 // S is re-evaluated each perturbation via stft_eval_block_swap so the forward
 // model is byte-identical to swap_ll. Layout: grad[bin*nparams + k].
 // ===========================================================================
-template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
+template <class TileT>
 CUDA_KERNEL
 void stft_swap_ll_grad_kernel(
     double* grad_add_out, double* grad_remove_out,
-    Orbits* orbits, TDIConfig* tdi_config,
-    STFTFresnel* fresnel, STFTDomain* stft,
+    typename TileT::Inputs inputs, STFTDomain* stft,
     double* params_add_all, double* params_remove_all,
     int* data_index_all, int* noise_index_all,
     double* param_eps_add, double* param_eps_remove,
-    int num_bin, int nparams, double T, double t_ref,
-    int n_side_bins, double window_factor, bool freq_from_tdi_phase,
-    int* start_freq_inds)
+    int num_bin, int nparams, int n_side_bins,
+    int* start_freq_inds, unsigned char* host_arena)
 {
     CUDA_SHARED cmplx d_h_add_tmp[NUM_THREADS_HERE];
     CUDA_SHARED cmplx d_h_remove_tmp[NUM_THREADS_HERE];
@@ -1427,13 +1792,12 @@ void stft_swap_ll_grad_kernel(
     CUDA_SHARED cmplx add_remove_tmp[NUM_THREADS_HERE];
     CUDA_SHARED double params_add[N_PARAMS_MAX];
     CUDA_SHARED double params_remove[N_PARAMS_MAX];
+    CUDA_SHARED typename TileT::BlockShared tile_shared;
 
-    SourceT src(orbits, tdi_config, T, t_ref);
-
-    CUDA_SHARED int link_space_craft_rec[NLINKS];
-    CUDA_SHARED int link_space_craft_em[NLINKS];
-    src.fill_link_arrays(link_space_craft_rec, link_space_craft_em);
+    typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
+    unsigned char* arena = stft_tile_arena(host_arena);
+    unsigned char* arena_remove = arena + TileT::table_bytes();
 
 #ifdef __CUDACC__
     int tid = threadIdx.x;
@@ -1464,28 +1828,27 @@ void stft_swap_ll_grad_kernel(
                 continue;
             }
             double saved = (tid == 0) ? params_add[kk] : 0.0;
+            // * Exact 2 eps term to divide by, including the floating-point error of the shifts.
+            double shifted_up = saved + eps_k;
+            double shifted_down = saved - eps_k;
 
-            if (tid == 0) params_add[kk] = saved + eps_k;
+            if (tid == 0) params_add[kk] = shifted_up;
             CUDA_SYNC_THREADS;
             cmplx dha_p, dhr_p, aa_p, rr_p, ar_p;
-            stft_eval_block_swap<SourceT, ColumnT>(
-                src, fresnel, stft, params_add, params_remove,
-                link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, start_j,
-                n_side_bins, window_factor, freq_from_tdi_phase,
+            stft_eval_block_swap<TileT>(
+                context, inputs, arena, arena_remove, stft, params_add, params_remove, bin_i,
+                data_index, noise_index, start_j, n_side_bins,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_p, &dhr_p, &aa_p, &rr_p, &ar_p);
             double S_p = dha_p.real() - dhr_p.real()
                          - 0.5 * aa_p.real() - 0.5 * rr_p.real() + ar_p.real();
 
-            if (tid == 0) params_add[kk] = saved - eps_k;
+            if (tid == 0) params_add[kk] = shifted_down;
             CUDA_SYNC_THREADS;
             cmplx dha_m, dhr_m, aa_m, rr_m, ar_m;
-            stft_eval_block_swap<SourceT, ColumnT>(
-                src, fresnel, stft, params_add, params_remove,
-                link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, start_j,
-                n_side_bins, window_factor, freq_from_tdi_phase,
+            stft_eval_block_swap<TileT>(
+                context, inputs, arena, arena_remove, stft, params_add, params_remove, bin_i,
+                data_index, noise_index, start_j, n_side_bins,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_m, &dhr_m, &aa_m, &rr_m, &ar_m);
             double S_m = dha_m.real() - dhr_m.real()
@@ -1494,7 +1857,7 @@ void stft_swap_ll_grad_kernel(
             if (tid == 0) params_add[kk] = saved;
             CUDA_SYNC_THREADS;
             if (tid == 0)
-                grad_add_out[bin_i * nparams + kk] = (S_p - S_m) / (2.0 * eps_k);
+                grad_add_out[bin_i * nparams + kk] = (S_p - S_m) / (shifted_up - shifted_down);
             CUDA_SYNC_THREADS;
         }
 
@@ -1509,28 +1872,27 @@ void stft_swap_ll_grad_kernel(
                 continue;
             }
             double saved = (tid == 0) ? params_remove[kk] : 0.0;
+            // * Exact 2 eps term to divide by, including the floating-point error of the shifts.
+            double shifted_up = saved + eps_k;
+            double shifted_down = saved - eps_k;
 
-            if (tid == 0) params_remove[kk] = saved + eps_k;
+            if (tid == 0) params_remove[kk] = shifted_up;
             CUDA_SYNC_THREADS;
             cmplx dha_p, dhr_p, aa_p, rr_p, ar_p;
-            stft_eval_block_swap<SourceT, ColumnT>(
-                src, fresnel, stft, params_add, params_remove,
-                link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, start_j,
-                n_side_bins, window_factor, freq_from_tdi_phase,
+            stft_eval_block_swap<TileT>(
+                context, inputs, arena, arena_remove, stft, params_add, params_remove, bin_i,
+                data_index, noise_index, start_j, n_side_bins,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_p, &dhr_p, &aa_p, &rr_p, &ar_p);
             double S_p = dha_p.real() - dhr_p.real()
                          - 0.5 * aa_p.real() - 0.5 * rr_p.real() + ar_p.real();
 
-            if (tid == 0) params_remove[kk] = saved - eps_k;
+            if (tid == 0) params_remove[kk] = shifted_down;
             CUDA_SYNC_THREADS;
             cmplx dha_m, dhr_m, aa_m, rr_m, ar_m;
-            stft_eval_block_swap<SourceT, ColumnT>(
-                src, fresnel, stft, params_add, params_remove,
-                link_space_craft_rec, link_space_craft_em, bin_i,
-                data_index, noise_index, start_j,
-                n_side_bins, window_factor, freq_from_tdi_phase,
+            stft_eval_block_swap<TileT>(
+                context, inputs, arena, arena_remove, stft, params_add, params_remove, bin_i,
+                data_index, noise_index, start_j, n_side_bins,
                 d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp, add_remove_tmp, tid,
                 &dha_m, &dhr_m, &aa_m, &rr_m, &ar_m);
             double S_m = dha_m.real() - dhr_m.real()
@@ -1539,10 +1901,39 @@ void stft_swap_ll_grad_kernel(
             if (tid == 0) params_remove[kk] = saved;
             CUDA_SYNC_THREADS;
             if (tid == 0)
-                grad_remove_out[bin_i * nparams + kk] = (S_p - S_m) / (2.0 * eps_k);
+                grad_remove_out[bin_i * nparams + kk] = (S_p - S_m) / (shifted_up - shifted_down);
             CUDA_SYNC_THREADS;
         }
     }
+}
+
+template <class TileT>
+inline void stft_swap_ll_grad_launch(
+    double* grad_add_out, double* grad_remove_out,
+    const typename TileT::Inputs& inputs, STFTDomain* stft,
+    double* params_add_all, double* params_remove_all,
+    int* data_index_all, int* noise_index_all,
+    double* param_eps_add, double* param_eps_remove,
+    int num_bin, int nparams, int n_side_bins, int* start_freq_inds)
+{
+    const size_t shared_bytes = 2 * TileT::table_bytes();   // add and remove templates
+#ifdef __CUDACC__
+    stft_prepare_dynamic_shared(stft_swap_ll_grad_kernel<TileT>, shared_bytes);
+    dim3 grid((unsigned) num_bin, 1u, 1u);
+    stft_swap_ll_grad_kernel<TileT><<<grid, NUM_THREADS_HERE, shared_bytes>>>(
+        grad_add_out, grad_remove_out, inputs, stft,
+        params_add_all, params_remove_all, data_index_all, noise_index_all,
+        param_eps_add, param_eps_remove,
+        num_bin, nparams, n_side_bins, start_freq_inds, nullptr);
+    gpuErrchk(cudaGetLastError());
+#else
+    std::vector<unsigned char> host_arena(shared_bytes);
+    stft_swap_ll_grad_kernel<TileT>(
+        grad_add_out, grad_remove_out, inputs, stft,
+        params_add_all, params_remove_all, data_index_all, noise_index_all,
+        param_eps_add, param_eps_remove,
+        num_bin, nparams, n_side_bins, start_freq_inds, host_arena.data());
+#endif
 }
 
 template <class SourceT, class ColumnT = FresnelColumn<SourceT>>
@@ -1557,25 +1948,15 @@ inline void stft_swap_ll_grad_impl(
     int n_side_bins, double window_factor, bool freq_from_tdi_phase,
     int* start_freq_inds = nullptr)
 {
-#ifdef __CUDACC__
-    const STFTDeviceStructs& dev = stft_device_structs(orbits, tdi_config, fresnel, stft);
-
-    dim3 grid((unsigned) num_bin, 1u, 1u);
-    stft_swap_ll_grad_kernel<SourceT, ColumnT><<<grid, NUM_THREADS_HERE>>>(
-        grad_add_out, grad_remove_out, dev.orbits, dev.tdi_config, dev.fresnel, dev.stft,
+    STFTDomain* stft_launch = nullptr;
+    const auto inputs = stft_column_tile_inputs<SourceT, ColumnT>(
+        orbits, tdi_config, fresnel, stft, T, t_ref, window_factor, freq_from_tdi_phase,
+        &stft_launch);
+    stft_swap_ll_grad_launch<ColumnTile<ColumnT>>(
+        grad_add_out, grad_remove_out, inputs, stft_launch,
         params_add_all, params_remove_all, data_index_all, noise_index_all,
         param_eps_add, param_eps_remove,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-    gpuErrchk(cudaGetLastError());
-#else
-    stft_swap_ll_grad_kernel<SourceT, ColumnT>(
-        grad_add_out, grad_remove_out, orbits, tdi_config, fresnel, stft,
-        params_add_all, params_remove_all, data_index_all, noise_index_all,
-        param_eps_add, param_eps_remove,
-        num_bin, nparams, T, t_ref, n_side_bins, window_factor, freq_from_tdi_phase,
-        start_freq_inds);
-#endif
+        num_bin, nparams, n_side_bins, start_freq_inds);
 }
 
 // ===========================================================================

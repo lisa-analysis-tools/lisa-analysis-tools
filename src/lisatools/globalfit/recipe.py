@@ -1364,7 +1364,11 @@ def build_gb_moves(
             freq_from_tdi_phase=gb_info.gb_stft_kwargs["freq_from_tdi_phase"],
             window_alpha=general_info.window_alpha,
             use_midpoint=gb_info.gb_stft_kwargs["use_midpoint"],
-            linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"]
+            linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"],
+            # * Optional keys: the response and the DFFR settings; without them the comp's defaults hold.
+            **{key: gb_info.gb_stft_kwargs[key]
+               for key in ("response", "first_order_delays")
+               if key in gb_info.gb_stft_kwargs},
         )
         gb_info.gb_stft_comp = gb_stft_comp
 
@@ -1643,8 +1647,6 @@ def build_gb_moves(
         stft_store_windows=gb_info.stft_store_windows,
     )
 
-    _rj_phase_max = bool(int(os.environ.get("GB_RJ_PHASE_MAXIMIZE", "0")))
-
     # Check aliases in kwargs if any
     if "pe_search_names" in kwargs and pe_move_names is None:
         pe_move_names = kwargs.pop("pe_search_names")
@@ -1704,15 +1706,21 @@ def build_gb_moves(
             )
 
     def _create_move(name: str) -> GBSpecialBase:
+        # * the search moves recompute each source's Fisher matrix at every block, since a source
+        # * climbing onto its signal needs one at its current position
+        fim_interval = (
+            1 if name.endswith("_search") else int(getattr(gb_info, "num_stationary_fim_steps", 1))
+        )
         if name == "rj_prior_search":
             move = GBSpecialRJPriorMove(
                 *gb_move_args,
                 rj_proposal_distribution=gpu_priors,
                 name="rj_prior_search",
                 use_prior_removal=True,
-                phase_maximize=_rj_phase_max,
+                phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc_search":
@@ -1722,8 +1730,9 @@ def build_gb_moves(
                 is_rj_prop=True,
                 run_swaps=False,
                 name="rj_fstat_mcmc_search",
-                phase_maximize=True,
+                phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit_search":
@@ -1734,8 +1743,9 @@ def build_gb_moves(
                 run_swaps=False,
                 name="rj_refit_search",
                 fp=_refit_fp,
-                phase_maximize=True,
+                phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_prior":
@@ -1744,9 +1754,10 @@ def build_gb_moves(
                 rj_proposal_distribution=gpu_priors,
                 name="rj_prior",
                 use_prior_removal=False,
-                phase_maximize=_rj_phase_max,
+                phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc":
@@ -1757,6 +1768,7 @@ def build_gb_moves(
                 name="rj_fstat_mcmc",
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit":
@@ -1768,6 +1780,7 @@ def build_gb_moves(
                 fp=_refit_fp,
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         else:
