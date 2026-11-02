@@ -18,6 +18,7 @@
 #include <nanobind/stl/string.h>
 #include "binding_detector.hpp"
 #include "binding_domains.hpp"       // STFTDomainWrap, FDDomainForStftWrap, STFTFresnelWrap
+#include "stft_cross_terms.hpp"      // stft_cross_terms_wrap (for tempering)
 
 // Phase 3J: this binding TU is the SOLE registration site for the shared
 // wrapper classes (OrbitsWrap, LISAResponseWrap, TDIConfigWrap, ...).
@@ -618,6 +619,63 @@ void detector_part(nb::module_ &m) {
 // 1/2/3 values).
 // ============================================================================
 
+// The lengths are checked in both builds: they are host metadata, and a short array would be read
+// past its end on the device.
+template <typename T>
+static T* cross_terms_pointer(array_type<T> input, const char* name, size_t expected) {
+    if (input.size() != expected)
+        throw std::invalid_argument(
+            std::string("compute_cross_terms: ") + name + " has length " +
+            std::to_string(input.size()) + ", expected " + std::to_string(expected) + ".");
+    return input.data();
+}
+
+// STFTDomainWrap.compute_cross_terms. A function here rather than a member of the wrap class,
+// because downstream packages compile binding_domains.hpp without stft_cross_terms.cu.
+static void stft_domain_compute_cross_terms(
+    STFTDomainWrap& self, array_type<double> cross_out, array_type<double> template_out,
+    array_type<double> residual_out, array_type<std::complex<double>> template_vals,
+    int num_freqs_template, array_type<int> residual_index, array_type<int> noise_index,
+    array_type<int> residual_start, array_type<int> template_index,
+    array_type<int> template_start, array_type<int> window_lo, array_type<int> window_hi,
+    int num_tables, int num_residuals, int num_templates, int max_window_width,
+    bool run_async)
+{
+    if ((num_tables < 0) || (num_residuals <= 0) || (num_templates <= 0) ||
+        (num_freqs_template <= 0))
+        throw std::invalid_argument(
+            "compute_cross_terms: needs num_tables >= 0 and at least one residual, one template "
+            "and one template bin.");
+    size_t tables = static_cast<size_t>(num_tables);
+    size_t residual_entries = tables * num_residuals;
+    size_t template_entries = tables * num_templates;
+    size_t template_row = static_cast<size_t>(self.domain->num_channels) *
+                          self.domain->num_times * num_freqs_template;
+    if (template_vals.size() % template_row != 0)
+        throw std::invalid_argument(
+            "compute_cross_terms: template_vals is not a whole number of template rows.");
+    int num_template_rows = static_cast<int>(template_vals.size() / template_row);
+
+    double* cross_ptr = cross_terms_pointer(cross_out, "cross_out", residual_entries * num_templates);
+    double* template_ptr =
+        cross_terms_pointer(template_out, "template_out", residual_entries * num_templates);
+    double* residual_ptr = cross_terms_pointer(residual_out, "residual_out", residual_entries);
+    int* residual_index_ptr = cross_terms_pointer(residual_index, "residual_index", residual_entries);
+    int* noise_index_ptr = cross_terms_pointer(noise_index, "noise_index", residual_entries);
+    int* residual_start_ptr = cross_terms_pointer(residual_start, "residual_start", residual_entries);
+    int* template_index_ptr = cross_terms_pointer(template_index, "template_index", template_entries);
+    int* template_start_ptr = cross_terms_pointer(template_start, "template_start", template_entries);
+    int* window_lo_ptr = cross_terms_pointer(window_lo, "window_lo", tables);
+    int* window_hi_ptr = cross_terms_pointer(window_hi, "window_hi", tables);
+
+    stft_cross_terms_wrap(
+        *self.domain, cross_ptr, template_ptr, residual_ptr,
+        reinterpret_cast<cmplx*>(template_vals.data()), num_template_rows, num_freqs_template,
+        residual_index_ptr, noise_index_ptr, residual_start_ptr, template_index_ptr,
+        template_start_ptr, window_lo_ptr, window_hi_ptr, num_tables, num_residuals,
+        num_templates, max_window_width, run_async);
+}
+
 void domains_part(nb::module_ &m) {
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
@@ -641,7 +699,18 @@ void domains_part(nb::module_ &m) {
          nb::arg("n_t_template"), nb::arg("n_f_template"),
          nb::arg("run_async") = false,
          nb::call_guard<nb::gil_scoped_release>(),
-         "Compute (d|h) and (h|h) likelihood terms for a batch of binaries.");
+         "Compute (d|h) and (h|h) likelihood terms for a batch of binaries.")
+    .def("compute_cross_terms", &stft_domain_compute_cross_terms,
+         nb::arg("cross_out"), nb::arg("template_out"), nb::arg("residual_out"),
+         nb::arg("template_vals"), nb::arg("num_freqs_template"),
+         nb::arg("residual_index"), nb::arg("noise_index"), nb::arg("residual_start"),
+         nb::arg("template_index"), nb::arg("template_start"),
+         nb::arg("window_lo"), nb::arg("window_hi"),
+         nb::arg("num_tables"), nb::arg("num_residuals"), nb::arg("num_templates"),
+         nb::arg("max_window_width"), nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Cross terms per table: (r_i|t_j), (t_j|t_j) and (r_i|r_i), each under the noise row\n"
+         "of residual i, summed over the table's bin window (see stft_cross_terms.hpp).");
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
     nb::class_<FDDomainForStftWrap>(m, "FDDomainForStftWrapGPU")
