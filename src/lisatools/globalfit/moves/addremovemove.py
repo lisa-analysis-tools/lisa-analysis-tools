@@ -80,7 +80,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             it is given the full ring-buffer rows and trains its flow on its own columns).
         Tmax: maximum temperature for the temperature control.
         betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
-        permute_every: gate for the walker-permuting (fancy) temperature swap: ``> 0`` enables it -- it fires exactly ONCE per leaf visit, on the final in-model repeat -- and ``<= 0`` disables it entirely (``{BRANCH}_PERMUTE_EVERY`` env override). The numeric value is no longer a cadence.
+        permute_every: gate for the walker-permuting (fancy) temperature swap: if bool, True enables, False disables. Fired once per leaf visit, on the final repeat. If int, > 0 is the cadence (in repeats) for the swap, <= 0 disables. Env override for a running config: ``{BRANCH_NAME}_PERMUTE_EVERY``.
         pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point.
         flow_buffer_thin: keep only every ``flow_buffer_thin``-th repeat's cold-chain snapshot
             (plus the final one) in the ring buffer submitted to the flow trainer. Appending
@@ -111,7 +111,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         inner_moves: list,
         Tmax: float = np.inf,
         betas_all: np.ndarray = None,
-        permute_every: int = 20,
+        permute_every: int | bool = 20,
         pad_out_of_prior: bool = False,
         flow_buffer_thin: int = 5,
         flow_burnin: int = 20,
@@ -168,9 +168,16 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # walker-permuting swap once per leaf visit (on the final repeat),
         # <= 0 disables it. Env override for a running config.
         _p = self.branch_name.upper()
-        self.permute_every = int(
-            os.environ.get(f"{_p}_PERMUTE_EVERY", permute_every)
-        )
+        env_permute_every = os.environ.get(f"{_p}_PERMUTE_EVERY", None)
+        if env_permute_every is not None:
+            if env_permute_every.lower() in ("true", "1"):
+                permute_every = True
+            elif env_permute_every.lower() in ("false", "0"):
+                permute_every = False
+        
+        assert isinstance(permute_every, (int, bool)), f"{_p}_PERMUTE_EVERY must be int or bool, got {type(permute_every)}"
+        
+        self.permute_every = permute_every
 
         # Expose-invariant check (``_verify_entry_vs_acs``): "1" warn (default),
         # "strict" raise, "0" off. ``_CHECK_LL_EVERY`` thins its cost.
@@ -503,14 +510,11 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
     def _fancy_swap_now(self, repeat):
         """Whether the walker-permuting (fancy) temperature swap fires now.
 
-        It fires exactly ONCE per leaf visit, on the FINAL in-model repeat:
+        if ``permute_every`` is a boolean, the swap fires on the final in-model repeat.
+        If ``permute_every`` is an integer, the swap fires every ``permute_every`` repeats.
+        It fires exactly ONCE per leaf visit:
         the in-model stretch repeats run undisturbed, then the ensemble
         permutes across the ladder before the updated sources fold back.
-        :attr:`permute_every` is a pure gate -- ``> 0`` enables, ``<= 0``
-        disables -- not a cadence. The old ``repeat % permute_every`` trigger
-        made the swap unreachable at stock settings (``num_repeats=10`` vs
-        ``permute_every=20`` -> it never fired in any production run) and
-        raised ``ZeroDivisionError`` at ``permute_every == 0``.
 
         Args:
             repeat: index of the current in-model repeat.
@@ -518,7 +522,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         Returns:
             ``True`` if the swap should permute walkers on this repeat.
         """
-        return self.permute_every > 0 and repeat == self.num_repeats - 1
+        if isinstance(self.permute_every, bool):
+            return self.permute_every and repeat == self.num_repeats - 1
+        
+        return self.permute_every > 0 and (repeat % self.permute_every == 0 or repeat == self.num_repeats - 1)
 
     def _verify_entry_vs_acs(self, prev_logl, cold_ref, leaf):
         """The expose invariant: the cold-chain ``prev_logl`` scored against the
@@ -1136,7 +1143,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
     inner_moves: list of moves and their corresponding weights to be used for proposing new sources for each leaf.
     Tmax: maximum temperature for the temperature control.
     betas_all: array of betas for all leaves and temperatures. Shape is (nleaves_max, ntemps). If None, betas will be initialized as in TemperatureControl.
-    permute_every: gate for the walker-permuting (fancy) temperature swap: ``> 0`` enables it -- once per leaf visit, on the final in-model repeat -- ``<= 0`` disables it. Not a cadence.
+    permute_every:  gate for the walker-permuting (fancy) temperature swap: if bool, True enables, False disables. Fired once per leaf visit, on the final repeat. If int, > 0 is the cadence (in repeats) for the swap, <= 0 disables. Env override for a running config: ``{BRANCH_NAME}_PERMUTE_EVERY``.
     pad_out_of_prior: whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues. If True, proposed sources that are out of the prior bounds will be replaced with the first in-prior point. 
     run_async: whether to run the waveform generation and likelihood computation asynchronously for each GPU. If True, the synchronization will happen on the python side after the kernel calls. 
     run_threaded: whether to run the waveform generation and likelihood computation in separate threads for each GPU.
@@ -1157,7 +1164,7 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
         inner_moves: list,
         Tmax: float = np.inf,
         betas_all: np.ndarray = None,
-        permute_every: int = 20,
+        permute_every: int | bool = 20,
         pad_out_of_prior: bool = False,
         run_async: bool = False,
         run_threaded: bool = False,
