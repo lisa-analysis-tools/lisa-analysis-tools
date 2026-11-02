@@ -582,3 +582,21 @@ def get_optimisation_test_3_settings():
     """Test 2 with tempering width classes on, the one difference between the two."""
     GBSpecialBase.TEMPERING_WIDTH_CLASSES = True
     return build_settings("optimisation_test_3", mem_probe=True)
+
+
+def get_optimisation_test_4_settings():
+    """Two iterations with tempering width classes on and the pool not emptied before the proposal."""
+    global NUM_PE_ITERATIONS
+    NUM_PE_ITERATIONS = 2
+    GBSpecialBase.TEMPERING_WIDTH_CLASSES = True
+    GBSpecialBase.EMPTY_POOL_BEFORE_PROPOSAL = False
+    return build_settings("optimisation_test_4", mem_probe=True)
+
+
+def get_optimisation_test_5_settings():
+    """Two iterations at one tempering width with the pool emptied before the proposal."""
+    global NUM_PE_ITERATIONS
+    NUM_PE_ITERATIONS = 2
+    GBSpecialBase.TEMPERING_WIDTH_CLASSES = False
+    GBSpecialBase.EMPTY_POOL_BEFORE_PROPOSAL = True
+    return build_settings("optimisation_test_5", mem_probe=True)

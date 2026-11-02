@@ -442,6 +442,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # * The same for the tempering cells of DFFR rows. A switch of its own, so that the classes of
     # * the two phases can be measured apart.
     TEMPERING_WIDTH_CLASSES = True
+    # * Empty the pool just before a proposal phase. Its band sorter subsets live for the whole propose: in a
+    # * free block they pin it, 1.6 GiB of a 2.6 GiB block from the second propose on.
+    EMPTY_POOL_BEFORE_PROPOSAL = True
 
     @property
     def xp(self) -> Union[ModuleType, numpy , cupy]:
@@ -3409,6 +3412,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # assert np.all(start_diffs < 2.0)
         num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1) # cold chain only
         logger.info(f"Number of active leaves before proposal: {num_active_leaves}")
+
+        if self.EMPTY_POOL_BEFORE_PROPOSAL:
+            with tm.span("mempool_free"):
+                if self.backend.uses_cupy:
+                    self.xp.cuda.runtime.deviceSynchronize()
+                self.mempool.free_all_blocks()
 
         st_prop = time.perf_counter()
         with tm.span("run_proposal"):
