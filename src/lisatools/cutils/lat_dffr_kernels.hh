@@ -1947,7 +1947,8 @@ CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs
 
   const int num_derivs = layout.num_derivs;
   const int num_times = inputs.settings.num_time_segments;
-  const int num_freqs = stft->num_freqs;
+  // The Fisher matrix contracts with the inverse CSD only, so its bins are those of the noise row.
+  const int num_freqs_noise = stft->num_freqs_noise;
   const double df = stft->df;
   const double f_min = stft->f_min;
 
@@ -1956,8 +1957,10 @@ CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs
 
   for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X) {
     const int noise_index = noise_index_all[bin_i];
-    // The window start belongs to the invC row this source is contracted against.
-    const int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[noise_index];
+    // The window start belongs to the invC row this source is contracted against;
+    // a full-grid noise row starts at bin 0.
+    const int start_j = (start_freq_inds == nullptr || stft->noise_full_grid)
+                            ? 0 : start_freq_inds[noise_index];
     CUDA_SYNC_THREADS;
     for (int index = THREAD_START_X; index < nparams; index += BLOCK_INCR_X)
       params[index] = params_all[(size_t)bin_i * nparams + index];
@@ -2007,7 +2010,7 @@ CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs
         if (!map.locate(pixel, &row, &freq_j_here)) continue;
         const int time_i = row_base + row;
         const int freq_j_local = freq_j_here - start_j;
-        if ((freq_j_local < 0) || (freq_j_local > num_freqs - 1)) continue;
+        if ((freq_j_local < 0) || (freq_j_local > num_freqs_noise - 1)) continue;
         const double freq_here = f_min + freq_j_here * df;
 
         cmplx dh[STFT_FISHER_NDERIV_MAX][DFFR_NUM_CHANNELS];  // derivative templates, per channel

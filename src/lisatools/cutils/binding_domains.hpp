@@ -43,8 +43,14 @@ public:
                    double dt, double df,
                    array_type<std::complex<double>> data_arr,
                    array_type<std::complex<double>> invC_arr,
-                   int num_data, int num_noise, int tdi_type)
+                   int num_data, int num_noise, int tdi_type,
+                   int num_freqs_noise = -1, bool noise_full_grid = false)
     {
+        // ! A full-grid noise row must hold every window of the data rows, or the kernels read past it.
+        if (noise_full_grid && num_freqs_noise < num_freqs)
+            throw std::invalid_argument(
+                "STFTDomainWrap: full-grid noise rows (num_freqs_noise) must be at least as "
+                "wide as the data rows (num_freqs).");
         cmplx *data_ptr = reinterpret_cast<cmplx*>(
             return_pointer_no_check(data_arr));
         cmplx *invC_ptr = reinterpret_cast<cmplx*>(
@@ -53,7 +59,8 @@ public:
         domain = new STFTDomain(num_times, num_freqs, num_channels,
                                 t0, f_min, f_max, dt, df,
                                 data_ptr, invC_ptr,
-                                num_data, num_noise, tdi_type);
+                                num_data, num_noise, tdi_type,
+                                num_freqs_noise, noise_full_grid);
     }
 
     ~STFTDomainWrap() {

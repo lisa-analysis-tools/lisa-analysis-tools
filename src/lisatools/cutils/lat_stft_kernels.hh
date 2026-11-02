@@ -935,8 +935,9 @@ CUDA_DEVICE void stft_eval_block_ll(
                 tpl.values(row, freq_j_here, freq_here, fresnel_val);
                 for (int j = 0; j < 3; j += 1)
                     fresnel_val[j] = 0.5 * fresnel_val[j];
-                stft->add_ip_contrib(d_h_tmp, h_h_tmp, fresnel_val,
-                                     time_i, freq_j_local, data_index, noise_index);
+                stft->add_ip_contrib(d_h_tmp, h_h_tmp, fresnel_val, time_i, freq_j_local,
+                                     stft->noise_bin(freq_j_here, freq_j_local),
+                                     data_index, noise_index);
             }
         }
         map.finish_pass();
@@ -1292,7 +1293,8 @@ CUDA_DEVICE void stft_eval_block_swap(
                 stft->add_ip_swap_contrib(
                     d_h_add_tmp, d_h_remove_tmp, add_add_tmp, remove_remove_tmp,
                     add_remove_tmp, fresnel_val_add, fresnel_val_remove,
-                    time_i, freq_j_local, data_index, noise_index);
+                    time_i, freq_j_local, stft->noise_bin(freq_j_here, freq_j_local),
+                    data_index, noise_index);
             }
         }
         map.finish_pass();
@@ -2035,7 +2037,8 @@ CUDA_DEVICE void stft_eval_block_information(
     double df = stft->df;
     double f_min = stft->f_min;
     int num_times = stft->num_times;
-    int num_freqs = stft->num_freqs;
+    // The Fisher matrix contracts with the inverse CSD only, so its bins are those of the noise row.
+    int num_freqs_noise = stft->num_freqs_noise;
     bool cross_channel = (stft->tdi_type == TDI_XYZ);
     int num_contract_channels = cross_channel ? 3 : stft->num_channels;
     double t_anchor_shift = fresnel->use_midpoint ? 0.5 * dt : 0.0;
@@ -2136,7 +2139,7 @@ CUDA_DEVICE void stft_eval_block_information(
         int freq_j_first = carrier_lo - n_side_bins;
         int freq_j_last  = carrier_hi + n_side_bins;
         if (freq_j_first < start_j) freq_j_first = start_j;
-        if (freq_j_last > start_j + num_freqs - 1) freq_j_last = start_j + num_freqs - 1;
+        if (freq_j_last > start_j + num_freqs_noise - 1) freq_j_last = start_j + num_freqs_noise - 1;
 
         for (int freq_j_here = freq_j_first; freq_j_here <= freq_j_last; freq_j_here += 1)
         {
@@ -2305,8 +2308,10 @@ void stft_information_matrix_kernel(
     for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X)
     {
         int noise_index = noise_index_all[bin_i];
-        // The window start belongs to the invC row this source is contracted against.
-        int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[noise_index];
+        // The window start belongs to the invC row this source is contracted against; a
+        // full-grid noise row starts at bin 0.
+        int start_j = (start_freq_inds == nullptr || stft->noise_full_grid)
+                          ? 0 : start_freq_inds[noise_index];
         for (int i = THREAD_START_X; i < nparams; i += BLOCK_INCR_X)
             params[i] = params_all[bin_i * nparams + i];
         CUDA_SYNC_THREADS;
