@@ -206,15 +206,20 @@ def return_x(x):
 class StoreWindowTrackCounter:
     """Kernel rows whose predicted carrier span leaves their cell's store window.
 
-    Counts only: nothing is rejected, so the posterior is unchanged. Rows are kept on the device
-    until :meth:`summary`, which synchronises once.
+    Counts only: nothing is rejected, so the posterior is unchanged. Rows wait on the device, and
+    the counter synchronises to count them at :meth:`summary` or once they pass ``MAX_PENDING_ROWS``.
     """
+
+    # ! Waiting rows take device memory that no batch budget counts, 8 B each: 1.81 GiB over one
+    # ! full-band propose if they all wait, which ran sized buffers out of memory. This is 8 MiB.
+    MAX_PENDING_ROWS = 2**20
 
     def __init__(self):
         self.rows_evaluated = 0
         self.rows_outside = 0
         self._cells_outside = set()
         self._pending = []
+        self._pending_rows = 0
 
     def record(self, outside, cell_specials) -> None:
         """Queue one launch: ``outside`` per row, and the special index of each row's cell."""
@@ -222,6 +227,9 @@ class StoreWindowTrackCounter:
         self.rows_evaluated += int(outside.shape[0])
         # ? -1 marks rows inside their window; special indices are never negative.
         self._pending.append(xp.where(outside, cell_specials, -1))
+        self._pending_rows += int(outside.shape[0])
+        if self._pending_rows >= self.MAX_PENDING_ROWS:
+            self._flush()
 
     def _flush(self) -> None:
         if not self._pending:
@@ -229,6 +237,7 @@ class StoreWindowTrackCounter:
         xp = get_array_module(self._pending[0])
         marked = xp.concatenate(self._pending)
         self._pending = []
+        self._pending_rows = 0
         outside = marked[marked >= 0]
         self.rows_outside += int(outside.shape[0])
         self._cells_outside.update(asnumpy(xp.unique(outside)).tolist())
