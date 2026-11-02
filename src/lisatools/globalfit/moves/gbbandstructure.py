@@ -371,6 +371,9 @@ def stft_band_structure(domain_settings: STFTSettings, alpha: float, *,
 STFT_F0_LIMIT_FRACTION = 1/4
 #: Bands whose lower edge is below this frequency are Tier 1, the others Tier 2.
 STFT_TIER_SPLIT_HZ = 1.0e-2
+#: Smallest cell width of a width class, in bins. The 89 full-band bands that would form a 32-bin
+#: class take 2.5 % more memory per cell here, and the schedulers run one class fewer.
+STFT_MIN_CLASS_WIDTH = 64
 
 
 def stft_reach_hz(f0_hz, tobs_s: float, epoch_offset_s: float = 0.0):
@@ -458,6 +461,16 @@ class STFTStoreWindows:
     def buffer_width(self) -> int:
         """Width of every band buffer until the schedulers split by tier."""
         return int(max(self.tier_width.values()))
+
+    @property
+    def class_width(self) -> np.ndarray:
+        """Cell width of each band's width class: the smallest power of two that holds its window.
+
+        At least ``STFT_MIN_CLASS_WIDTH`` and at most the grid.
+        """
+        own_width = self.j_hi - self.j_lo + 1
+        power_of_two = 2 ** np.ceil(np.log2(own_width)).astype(np.int64)
+        return np.minimum(np.maximum(power_of_two, STFT_MIN_CLASS_WIDTH), self.n_grid_bins)
 
     def window_starts(self, band_inds, width: int) -> np.ndarray:
         """First active bin of the window of each cell in ``band_inds``, for ``width``-bin cells."""

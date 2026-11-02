@@ -1308,6 +1308,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         parent_acs: Optional[AnalysisContainerArray] = None,
         parent_noise_copies: Optional[dict] = None,
         contiguous_splits: bool = False,
+        stft_cell_width: Optional[int] = None,
         *args,
         **kwargs,
     ):
@@ -1376,7 +1377,16 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                         f"store windows index a {stft_store_windows.n_grid_bins}-bin grid, the parent "
                         f"has NF_active={int(basis_settings.NF_active)}."
                     )
-                self._stft_cell_width_value = stft_store_windows.buffer_width
+                if stft_cell_width is None:
+                    self._stft_cell_width_value = stft_store_windows.buffer_width
+                elif not 0 < int(stft_cell_width) <= stft_store_windows.n_grid_bins:
+                    raise ValueError(
+                        f"a cell of {stft_cell_width} bins does not fit the "
+                        f"{stft_store_windows.n_grid_bins}-bin grid."
+                    )
+                else:
+                    # A width class: window_starts refuses a band whose window is wider.
+                    self._stft_cell_width_value = int(stft_cell_width)
 
         self._parent_ind_min = None
         self._parent_stored_len = None

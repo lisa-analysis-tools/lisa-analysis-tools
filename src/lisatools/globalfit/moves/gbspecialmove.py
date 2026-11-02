@@ -433,6 +433,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # Sum the DFFR cross terms over each band's store window (True) or over the whole cell. TDI on
     # the fly always takes the whole cell: its carrier can spike out of the window near antenna nulls.
     TEMPERING_BAND_WINDOW = True
+    # * DFFR proposal cells take the width of their band's class (a power of two) instead of the
+    # * widest window, and the classes of a band unit run one after another.
+    STFT_WIDTH_CLASSES = True
+    # * The same for the tempering cells of DFFR rows. A switch of its own, so that the classes of
+    # * the two phases can be measured apart.
+    TEMPERING_WIDTH_CLASSES = False
 
     @property
     def xp(self) -> Union[ModuleType, numpy , cupy]:
@@ -1163,7 +1169,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 apply_inds=apply_inds,
                 extra_bool=extra_bool,
             )
-            if subset is not None:
+            # Read with getattr: run_proposal also runs on stand-in moves without these attributes.
+            class_widths = getattr(self, "_stft_band_class_widths", lambda switched_on: None)(
+                getattr(self, "STFT_WIDTH_CLASSES", False)
+            )
+            if subset is not None and class_widths is not None:
+                self._run_width_classes(
+                    model, band_sorter, subset, band_temps, ll_change_log, prop_counts, acc_counts,
+                    class_widths, dict(units=units, remainder=remainder, apply_inds=apply_inds,
+                                       extra_bool=extra_bool),
+                )
+            elif subset is not None:
                 self._run_band_unit(
                     model, band_sorter, subset, band_temps,
                     ll_change_log, prop_counts, acc_counts,
@@ -1186,12 +1202,64 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         return ll_change_log, prop_counts, acc_counts
 
+    def _stft_band_class_widths(self, switched_on: bool):
+        """Cell width of each band's class when the caller's phase uses classes, else None (one width).
+
+        DFFR only: a TDI-on-the-fly carrier can spike out of the store window, and a class cell
+        leaves it a smaller margin than the widest window does.
+        """
+        store_windows = getattr(self, "stft_store_windows", None)
+        if (not switched_on or store_windows is None
+                or getattr(getattr(self, "gb_stft_comp", None), "response", None) != "dffr"):
+            return None
+        return store_windows.class_width
+
+    def _class_num_slots(self, setting: int, cell_width: int) -> int:
+        """Cells of a class buffer for a batch setting, which counts cells of the widest window.
+
+        The buffer then takes the bytes the setting means with one width.
+        """
+        return max(1, int(setting) * int(self.stft_store_windows.buffer_width) // int(cell_width))
+
+    def _run_width_classes(self, model, band_sorter, subset, band_temps, ll_change_log, prop_counts,
+                           acc_counts, class_widths, unit_selection):
+        """Drive one parity unit's cells class by class, each with its own scheduler and buffer."""
+        xp = self.xp
+        # ! Cut from the main sorter: a subset of a subset deep-copies the main sorter it points at.
+        source_widths = xp.asarray(class_widths)[xp.clip(band_sorter.band_inds, 0, self.num_bands - 1)]
+        unit_widths = np.unique(class_widths[np.unique(asnumpy(subset.band_inds))])
+        extra_bool = unit_selection.pop("extra_bool")
+        for cell_width in unit_widths.tolist():
+            class_bool = source_widths == cell_width
+            class_subset = band_sorter.get_subset(
+                **unit_selection,
+                extra_bool=class_bool if extra_bool is None else class_bool & extra_bool,
+            )
+            if class_subset is not None:
+                self._run_band_unit(
+                    model, band_sorter, class_subset, band_temps, ll_change_log, prop_counts,
+                    acc_counts, cell_width=int(cell_width),
+                    num_slots=self._class_num_slots(self.num_band_preload, cell_width),
+                )
+                # The next build's first small allocation would split this class's freed block, and
+                # its own block would then take new device memory.
+                with _tspan(getattr(self, "_prop_timer", None), "mempool_free"):
+                    if self.backend.uses_cupy:
+                        self.xp.cuda.runtime.deviceSynchronize()
+                    self.mempool.free_all_blocks()
+
     def _run_band_unit(self, model, band_sorter, subset, band_temps,
-                       ll_change_log, prop_counts, acc_counts):
-        """Drive one parity unit's cells through the sub-band buffer."""
+                       ll_change_log, prop_counts, acc_counts, cell_width=None, num_slots=None):
+        """Drive one parity unit's cells through the sub-band buffer.
+
+        ``cell_width`` and ``num_slots`` size the buffer of one width class; by default it takes the
+        widest window and ``num_band_preload`` cells.
+        """
         tm = getattr(self, "_prop_timer", None)
         scheduler = BandScheduler(
-            subset.special_band_inds, self.num_band_preload, xp=self.xp
+            subset.special_band_inds,
+            self.num_band_preload if num_slots is None else num_slots,
+            xp=self.xp,
         )
         probe = getattr(self, "_mem_probe", None)
         if probe is not None:
@@ -1200,6 +1268,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             buffer_obj = subset.get_buffer(
                 model.analysis_container_arr, scheduler.slot_specials.copy(),
                 track_counter=self._track_counter,
+                **({} if cell_width is None else {"stft_cell_width": cell_width}),
             )
         if tm is not None:
             tm.count("cells", int(scheduler.n_cells))
@@ -2685,8 +2754,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             and getattr(getattr(self, "gb_stft_comp", None), "response", None) == "dffr"
         )
 
+        # One buffer and chunk size per width class, kept for the whole propose; None is the one width.
+        # Read with getattr: run_tempering also runs on stand-in moves without this method.
+        class_widths = getattr(self, "_stft_band_class_widths", lambda switched_on: None)(
+            getattr(self, "TEMPERING_WIDTH_CLASSES", False)
+        )
+        class_buffers = {}
+        class_rows_per_split = {}
         buffer_obj = None
-        rows_per_split = None
         units = 2
         tmp_start = np.random.randint(units)
         for tmp in range(units):
@@ -2712,60 +2787,78 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             else:
                 row_group = group_of_walker[row_walkers[:, 0]]
                 queues = [np.flatnonzero(row_group == split) for split in range(num_buffer_splits)]
-            if rows_per_split is None and num_rows > 0:
-                # * The first chunk must fill every split, so the contiguous blocks hold whole rows.
-                rows_per_split = max(1, min(
-                    self.num_bands_preload_temp // num_buffer_splits,
-                    min(queue.size for queue in queues),
-                ))
-
             values = np.empty((num_rows, ntemps, ntemps))
-            positions = [0] * len(queues)
-            while any(position < queue.size for position, queue in zip(positions, queues)):
-                chunk_rows, chunk_row_slots = [], []
-                for split, queue in enumerate(queues):
-                    taken = queue[positions[split]:positions[split] + rows_per_split]
-                    positions[split] += taken.size
-                    chunk_rows.append(taken)
-                    chunk_row_slots.append(split * rows_per_split + np.arange(taken.size))
-                chunk_rows = np.concatenate(chunk_rows)
-                # Row k of split s owns the ntemps slots from (s * rows_per_split + k) * ntemps.
-                chunk_slots = (
-                    np.concatenate(chunk_row_slots)[:, None] * ntemps + temps_range[None, :]
-                )
-                chunk_specials = xp.asarray(row_specials[chunk_rows].reshape(-1))
+            # * The rows of a pass are all scored before the sweep, so their order does not matter.
+            cell_widths = [None] if class_widths is None else np.unique(class_widths[row_bands]).tolist()
+            for cell_width in cell_widths:
+                class_queues = queues if cell_width is None else [
+                    queue[class_widths[row_bands[queue]] == cell_width] for queue in queues
+                ]
+                if cell_width not in class_rows_per_split and num_rows > 0:
+                    # * The first chunk must fill every split, so the contiguous blocks hold whole rows.
+                    rows_setting = (
+                        self.num_bands_preload_temp if cell_width is None
+                        else self._class_num_slots(self.num_bands_preload_temp, cell_width)
+                    )
+                    class_rows_per_split[cell_width] = max(1, min(
+                        rows_setting // num_buffer_splits,
+                        min(queue.size for queue in class_queues),
+                    ))
+                rows_per_split = class_rows_per_split.get(cell_width)
+                buffer_obj = class_buffers.get(cell_width)
 
-                with _tspan(timer, "temper_buffer"):
-                    if buffer_obj is None:
-                        if probe is not None:
-                            probe.check_released("temper_buffer")
-                        # The first chunk fills every slot, in slot order.
-                        buffer_obj = band_sorter.get_buffer(
-                            acs, chunk_specials, use_template_arr=True,
-                            track_counter=self._track_counter, contiguous_splits=True,
-                        )
+                positions = [0] * len(class_queues)
+                while any(position < queue.size for position, queue in zip(positions, class_queues)):
+                    chunk_rows, chunk_row_slots = [], []
+                    for split, queue in enumerate(class_queues):
+                        taken = queue[positions[split]:positions[split] + rows_per_split]
+                        positions[split] += taken.size
+                        chunk_rows.append(taken)
+                        chunk_row_slots.append(split * rows_per_split + np.arange(taken.size))
+                    chunk_rows = np.concatenate(chunk_rows)
+                    # Row k of split s owns the ntemps slots from (s * rows_per_split + k) * ntemps.
+                    chunk_slots = (
+                        np.concatenate(chunk_row_slots)[:, None] * ntemps + temps_range[None, :]
+                    )
+                    chunk_specials = xp.asarray(row_specials[chunk_rows].reshape(-1))
+
+                    with _tspan(timer, "temper_buffer"):
+                        if buffer_obj is None:
+                            if probe is not None:
+                                probe.check_released("temper_buffer")
+                            if cell_width is not None:
+                                # ! A new buffer reads its parent group from the comp, which still
+                                # ! points at the group of the class scored last.
+                                self._release_stft_comp_groups()
+                            # The first chunk fills every slot, in slot order.
+                            buffer_obj = band_sorter.get_buffer(
+                                acs, chunk_specials, use_template_arr=True,
+                                track_counter=self._track_counter, contiguous_splits=True,
+                                **({} if cell_width is None else {"stft_cell_width": cell_width}),
+                            )
+                            class_buffers[cell_width] = buffer_obj
+                        else:
+                            band_sorter.get_buffer(
+                                acs, chunk_specials, inds_fill=xp.asarray(chunk_slots.reshape(-1)),
+                                buffer_obj=buffer_obj,
+                            )
+
+                    starts = buffer_obj._stft_start_inds_host[chunk_slots[:, 0]].astype(np.int64)
+                    if band_window:
+                        window_lo = store_windows.j_lo[row_bands[chunk_rows]]
+                        window_hi = store_windows.j_hi[row_bands[chunk_rows]] + 1
                     else:
-                        band_sorter.get_buffer(
-                            acs, chunk_specials, inds_fill=xp.asarray(chunk_slots.reshape(-1)),
-                            buffer_obj=buffer_obj,
-                        )
-
-                starts = buffer_obj._stft_start_inds_host[chunk_slots[:, 0]].astype(np.int64)
-                if band_window:
-                    window_lo = store_windows.j_lo[row_bands[chunk_rows]]
-                    window_hi = store_windows.j_hi[row_bands[chunk_rows]] + 1
-                else:
-                    window_lo = starts
-                    window_hi = starts + int(buffer_obj._stft_cell_width)
-                with _tspan(timer, "temper_swap_score"):
-                    cross, template, _ = buffer_obj.cross_terms(chunk_slots, window_lo, window_hi)
-                values[chunk_rows] = cross - 0.5 * template
-                if window_totals is not None:
-                    with _tspan(timer, "temper_verify_window"):
-                        self._check_tempering_band_window(
-                            buffer_obj, chunk_slots, starts, row_bands[chunk_rows], store_windows,
-                            window_totals,
-                        )
+                        window_lo = starts
+                        window_hi = starts + int(buffer_obj._stft_cell_width)
+                    with _tspan(timer, "temper_swap_score"):
+                        cross, template, _ = buffer_obj.cross_terms(chunk_slots, window_lo, window_hi)
+                    values[chunk_rows] = cross - 0.5 * template
+                    if window_totals is not None:
+                        with _tspan(timer, "temper_verify_window"):
+                            self._check_tempering_band_window(
+                                buffer_obj, chunk_slots, starts, row_bands[chunk_rows], store_windows,
+                                window_totals,
+                            )
 
             with _tspan(timer, "temper_sweep"):
                 source_counts = cell_alive[temps_range[None, :], row_walkers, row_bands[:, None]]
@@ -2798,10 +2891,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     model, band_sorter, extra_bool=in_pass_bands
                 )
 
-        if buffer_obj is not None:
+        if class_buffers:
             if probe is not None:
+                # The tag holds one buffer; with width classes that is the class built last.
                 probe.watch("temper_buffer", buffer_obj, span_name="temper_buffer")
             del buffer_obj
+            class_buffers.clear()
             self._release_stft_comp_groups()
             if probe is not None:
                 probe.check_released("temper_buffer")
