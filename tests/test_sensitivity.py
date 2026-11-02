@@ -328,3 +328,87 @@ class CompositeSensitivityMatrixTest(unittest.TestCase):
             + new_sgwb.covariance(self.settings)
         )
         np.testing.assert_allclose(composite.sens_mat, expected)
+
+
+class SharedGalacticGridTest(unittest.TestCase):
+    """A backend and the copies made from its kwargs hold one galactic grid per device.
+
+    Band buffers build such copies, and a grid takes device memory outside the pool: 87 MiB on the
+    full band, four times per tempering buffer before the grid was shared.
+    """
+
+    GRID_KWARGS = dict(R_d=2.18, z_d=0.48, t0=1.0e6, N_lambda=12, N_beta=8)
+    FOREGROUND = dict(Amp=1.0e-40, alpha=1.8, f_1=1.0e-3, kn=2.0e-3, f_2=1.0e-3)
+
+    def backends(self):
+        import lisatools
+
+        # Named backends: has_backend does not know the "cuda" and "gpu" aliases.
+        return [name for name in ("cpu", "cuda13x", "cuda12x", "cuda11x") if lisatools.has_backend(name)]
+
+    def make_backend(self, backend):
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.domains import STFTSettings
+        from lisatools.sensitivity import XYZSensitivityBackend
+
+        # The default 50 s orbit grid takes several GiB per configure; sharing does not depend on it.
+        orbits = EqualArmlengthOrbits(force_backend=backend, linear_interp_setup=False, dt=1000.0)
+        settings = STFTSettings(
+            t0=1.0e6, dt=5.0, df=1.0 / 86400.0, NT=4, NF=8641, min_freq=1.0e-3, max_freq=1.1e-3,
+            force_backend=backend,
+        )
+        return XYZSensitivityBackend(
+            orbits=orbits, settings=settings, force_backend=backend, galactic_grid_kwargs=dict(self.GRID_KWARGS)
+        )
+
+    def test_copy_from_kwargs_shares_the_grid(self):
+        for backend in self.backends():
+            with self.subTest(backend=backend):
+                source = self.make_backend(backend)
+                copy_of_source = type(source)(**source.kwargs)
+                self.assertIs(copy_of_source._galactic_grid, source._galactic_grid)
+                self.assertIs(copy_of_source.device_galactic_grids, source.device_galactic_grids)
+
+    def test_deep_copy_shares_the_grid(self):
+        from copy import deepcopy
+
+        for backend in self.backends():
+            with self.subTest(backend=backend):
+                source = self.make_backend(backend)
+                self.assertIs(deepcopy(source).device_galactic_grids, source.device_galactic_grids)
+
+    def test_separate_backends_do_not_share(self):
+        for backend in self.backends():
+            with self.subTest(backend=backend):
+                self.assertIsNot(self.make_backend(backend)._galactic_grid, self.make_backend(backend)._galactic_grid)
+
+    def test_shared_grid_gives_the_covariance_of_a_new_grid(self):
+        from lisatools.utils.utility import asnumpy
+
+        for backend in self.backends():
+            with self.subTest(backend=backend):
+                source = self.make_backend(backend)
+                copy_of_source = type(source)(**source.kwargs)
+                new_grid = self.make_backend(backend)
+                no_foreground = self.make_backend(backend)
+                for sensitivity in (copy_of_source, new_grid):
+                    sensitivity.set_sensitivity_matrix(**self.FOREGROUND)
+                no_foreground.set_sensitivity_matrix()
+                shared = asnumpy(copy_of_source.sens_mat)
+                self.assertTrue(np.array_equal(shared, asnumpy(new_grid.sens_mat)))
+                # * The comparison means nothing unless the grid reaches the covariance.
+                self.assertFalse(np.array_equal(shared, asnumpy(no_foreground.sens_mat)))
+
+    def test_second_device_builds_its_own_grid(self):
+        from lisatools.utils.devicereplicas import device_local_orbits
+
+        gpu_backends = [name for name in self.backends() if name != "cpu"]
+        if not gpu_backends or cp.cuda.runtime.getDeviceCount() < 2:
+            self.skipTest("needs two devices")
+        source = self.make_backend(gpu_backends[0])
+        with cp.cuda.Device(1):
+            kwargs_second_device = dict(source.kwargs, orbits=device_local_orbits(source.orbits, cp, 1))
+            first_copy = type(source)(**kwargs_second_device)
+            second_copy = type(source)(**kwargs_second_device)
+        self.assertIsNot(first_copy._galactic_grid, source._galactic_grid)
+        self.assertIs(second_copy._galactic_grid, first_copy._galactic_grid)
