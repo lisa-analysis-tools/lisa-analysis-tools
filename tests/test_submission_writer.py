@@ -140,6 +140,15 @@ class SubmissionWriterDecouplingTest(unittest.TestCase):
         self.assertEqual(os.path.getmtime(mbh_files[0]), mbh_mtime)
         self.assertEqual(self._metadata_json(writer, "MBHB"), mbh_metadata)
 
+    def test_deferring_psd_defers_the_stochastic_component(self):
+        writer = _make_writer(self.parent)
+        writer._prepare_gb_samples = lambda acs, orig, samples, inds: (samples, inds)
+        writer.write_submission(acs=None, defer=["psd"])
+
+        self.assertEqual(self._posterior_files(writer, "noise"), [])
+        self.assertIn("posteriors pending", self._metadata_json(writer, "noise")["comment"])
+        self.assertEqual(self._found(writer), ["GB", "MBHB"])
+
     def test_failed_rerun_drops_the_source_type(self):
         writer = _make_writer(self.parent)
         writer._prepare_gb_samples = lambda acs, orig, samples, inds: (samples, inds)

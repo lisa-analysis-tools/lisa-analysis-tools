@@ -28,11 +28,9 @@ def make_parser():
 def main(argv=None):
     args = make_parser().parse_args(argv)
 
-    from mpi4py import MPI
-
     from lisatools.globalfit.hdfbackend import GFHDFBackend
     from lisatools.globalfit.postprocessing import RunMetadata, SubmissionWriter
-    from lisatools.globalfit.run import GlobalFit
+    from lisatools.globalfit.run import build_acs
     from lisatools.globalfit.stock.l2d.io import load_run
     from lisatools.globalfit.stock.l2d.load_settings import build_curr_info
 
@@ -51,13 +49,18 @@ def main(argv=None):
 
     curr = build_curr_info(cfg)
     engine_info = curr.engine_info
+    unknown = set(branches) - set(engine_info.branch_names)
+    if unknown:
+        raise SystemExit(f"Unknown branches {sorted(unknown)}; the run has {engine_info.branch_names}.")
+
     state = GFHDFBackend(
         curr.general_info.main_file_path,
         sub_backend=engine_info.branch_backends,
         sub_state_bases=engine_info.branch_states,
     ).get_last_sample()
     # the end-of-run analysis containers, needed by the GB clustering
-    acs = GlobalFit(curr, MPI.COMM_SELF).setup_acs(state, rebuild_residuals=True)
+    # (branches without a signal_gen / get_templates hook are not subtracted, see build_acs)
+    acs = build_acs(curr, state, rebuild_residuals=True)
 
     writer = SubmissionWriter(curr=curr, ess=args.ess, run_metadata=run_metadata)
     writer.write_posteriors(acs, branches=branches)

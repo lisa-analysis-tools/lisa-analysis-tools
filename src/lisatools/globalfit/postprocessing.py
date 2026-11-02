@@ -1976,6 +1976,9 @@ class SubmissionWriter(BackendConsumer):
         """
         self.write_metadata(acs)
         if defer:
+            # the stochastic branches are written together, so deferring one defers all of them
+            if any(b in defer for b in self.stochastic_branches):
+                defer = list(defer) + [b for b in self.stochastic_branches if b not in defer]
             logger.info(f"Posteriors deferred for branches {defer}")
             self.write_posteriors(acs, branches=[b for b in self.branches if b not in defer])
         else:
