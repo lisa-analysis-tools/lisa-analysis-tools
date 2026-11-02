@@ -590,6 +590,7 @@ def get_optimisation_test_4_settings():
     NUM_PE_ITERATIONS = 2
     GBSpecialBase.TEMPERING_WIDTH_CLASSES = True
     GBSpecialBase.EMPTY_POOL_BEFORE_PROPOSAL = False
+    GBSpecialBase.PARALLEL_GIBBS = False
     return build_settings("optimisation_test_4", mem_probe=True)
 
 
@@ -599,4 +600,18 @@ def get_optimisation_test_5_settings():
     NUM_PE_ITERATIONS = 2
     GBSpecialBase.TEMPERING_WIDTH_CLASSES = False
     GBSpecialBase.EMPTY_POOL_BEFORE_PROPOSAL = True
+    GBSpecialBase.PARALLEL_GIBBS = False
     return build_settings("optimisation_test_5", mem_probe=True)
+
+
+def get_parallel_gibbs_test_settings():
+    """Two iterations at the defaults, the full-band test of the parent closed during a pass."""
+    global NUM_PE_ITERATIONS
+    NUM_PE_ITERATIONS = 2
+    GBSpecialBase.PARALLEL_GIBBS = True
+    return build_settings("parallel_gibbs_test", mem_probe=True)
+
+
+def get_optimisation_test_6_settings():
+    """The full run with the probe at the defaults, with every switch of the GB moves on."""
+    return build_settings("optimisation_test_6", mem_probe=True)

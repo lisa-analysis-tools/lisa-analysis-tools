@@ -3052,6 +3052,7 @@ class BandSorter(LISAToolsParallelModule):
                         "rj_prop",
                         "stft_store_windows",
                         "parent_noise_copies",
+                        "cold_class_at_open",
                     ]:
                         continue
 
@@ -3484,6 +3485,20 @@ class BandSorter(LISAToolsParallelModule):
             buffer_obj.add_sources_to_template_buffer(*inj_args)
         else:
             buffer_obj.add_sources_to_band_buffer(*inj_args)
+
+        # * Set only during a pass under the move's PARALLEL_GIBBS.
+        cold_class = getattr(self.main_band_sorter, "cold_class_at_open", None)
+        if cold_class is not None:
+            # Each cell adds back the cold sources of its walker and band, at any temperature.
+            for temp in xp.unique(temp_inds_now).tolist():
+                cell_specials = self.get_special_band_index(temp, cold_class.walker_inds, cold_class.band_inds)
+                rows = xp.isin(cell_specials, special_indices_unique)
+                if rows.any():
+                    buffer_obj.remove_sources_from_band_buffer(
+                        cold_class.coords[rows],
+                        buffer_obj.get_index(cell_specials[rows]),
+                        cold_class.N_vals[rows] if cold_class.N_vals is not None else None,
+                    )
 
         return buffer_obj
 

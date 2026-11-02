@@ -445,6 +445,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     # * Empty the pool just before a proposal phase. Its band sorter subsets live for the whole propose: in a
     # * free block they pin it, 1.6 GiB of a 2.6 GiB block from the second propose on.
     EMPTY_POOL_BEFORE_PROPOSAL = True
+    # * True keeps the parent closed during a pass: a cell adds back only its own band's cold sources, and the
+    # * other bands of its class stay subtracted at their values from the start of the pass. The cells of a
+    # * class still run in parallel. False first adds the class back to the parent, as before.
+    PARALLEL_GIBBS = True
 
     @property
     def xp(self) -> Union[ModuleType, numpy , cupy]:
@@ -818,6 +822,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def remove_cold_chain_sources_from_residual(self, *args, **kwargs) -> None:
         kwargs["temp"] = 0
         kwargs["apply_inds"] = True
+        if self.PARALLEL_GIBBS and ("remainder" in kwargs or "extra_bool" in kwargs):
+            # Nothing goes into the parent. The cells and the close read the class as it is now.
+            band_sorter = args[1]
+            band_sorter.cold_class_at_open = band_sorter.get_subset(**kwargs)
+            return
         self.remove_sources_from_residual(*args, **kwargs)
 
     def remove_sources_from_residual(self, *args, **kwargs) -> None:
@@ -826,6 +835,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def add_cold_chain_sources_to_residual(self, *args, **kwargs) -> None:
         kwargs["temp"] = 0
         kwargs["apply_inds"] = True
+        if self.PARALLEL_GIBBS and ("remainder" in kwargs or "extra_bool" in kwargs):
+            # The parent still holds the class as it was at the open: those sources go back, the new ones come off below.
+            model, band_sorter = args
+            cold_class = band_sorter.cold_class_at_open
+            band_sorter.cold_class_at_open = None
+            if cold_class is not None:
+                self._likelihood_engine.fill_template(
+                    model.analysis_container_arr,
+                    cold_class.coords_in,
+                    cold_class.walker_inds.astype(self.xp.int32),
+                    cold_class.N_vals,
+                    factor=+1,
+                    waveform_kwargs=self.waveform_kwargs,
+                )
         self.add_sources_to_residual(*args, **kwargs)
 
     def add_sources_to_residual(self, *args, **kwargs) -> None:
