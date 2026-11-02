@@ -999,7 +999,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     )
 
             # ll_tmp1 = -1/2 * 4 * self.df * xp.sum(data_residuals[:2].conj() * data_residuals[:2] / psd[:2], axis=(0, 2)).get()
-            ring_buffer[leaf] = np.array(leaf_buffer).reshape(-1, ndim)
+            # (n_snapshots, nwalkers, ndim): the walker axis lets a FlowGaussianMove estimate within-mode spreads
+            ring_buffer[leaf] = np.array(leaf_buffer)
             # add back cold chain sources
             _free_pool()
 
@@ -1026,7 +1027,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         if flow_move_available:
             for move in self._proposing_moves:
                 if _is_flow(move):
-                    # full rows: a FlowGaussianMove slices its flow columns (and adapts its Gaussian) itself
+                    # full rows per walker: the flow move flattens them for its trainer, and a
+                    # FlowGaussianMove slices its flow columns and adapts its Gaussian itself
                     move.submit_by_leaf(ring_buffer)
                     logger.info("Current repeats submitted to flow move")
         # new_state.log_like[(temp_inds_update, walker_inds_update)] = logl.flatten()

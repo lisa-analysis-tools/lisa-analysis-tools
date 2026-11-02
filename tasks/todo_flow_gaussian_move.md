@@ -49,3 +49,26 @@ so every inner move proposes on all parameters.
   Acceptance doubles, but per likelihood evaluation the flow columns move about as often as with the
   joint move; the Gaussian columns gain ~25%. The gain should grow when the Gaussian half rejects
   more (more or multimodal Gaussian columns) -- to be confirmed on the MBH run.
+
+## Follow-up: within-mode covariance for multimodal Gaussian columns (2026-11-02)
+Why: the non-flow MBH parameters are multimodal; the marginal covariance spans the modes.
+- [x] The add/remove ring buffer keeps the walker axis, `(n_snapshots, nwalkers, ndim)`;
+  `ConditionalFlowMove.submit_by_leaf` flattens for the trainer, and `submit` (harvest) keeps the walker axis.
+- [x] `FlowGaussianMove` adapts from the last `adapt_window` (5) submits: walker trajectories are cut
+  at jumps, which gives a length scale, then walkers are grouped into modes per snapshot by single linkage
+  (`adapt_trim` = 10 scales) and the spread about group means is pooled. Periodic columns are wrapped.
+- [x] First design (pooled per-walker spread, trimming whole walkers) failed in the toy: with frequent
+  jumps every walker hopped, and the estimate came out ~400x too wide. A segment-only version was ~7x too
+  narrow (autocorrelation). The final version clusters walkers per snapshot.
+- Bimodal toy (B ~ two modes 8 apart, within var 0.04 / 0.02; local move 0.5, reflection 0.15,
+  FlowGaussianMove 0.35 starting without cov):
+
+  | estimate | adapted B var | FlowGaussianMove acceptance |
+  |---|---|---|
+  | marginal (flat rows) | 16.3 / 15.8 | 0.19 |
+  | within-mode (walker axis) | 0.041 / 0.019 | 0.36 |
+
+  Both modes sample correctly (mode fraction 0.50, within-mode var right); only efficiency differs.
+- [x] Tests: two modes, a walker that jumps, sticky AR(1) walkers jumping every ~5 snapshots (within 20%),
+  periodic boundary, window accumulation and reset, flattening for the executor.
+- Note: the LAT branch now needs the Eryn branch (3-D ring-buffer rows are flattened by Eryn's `submit_by_leaf`).
