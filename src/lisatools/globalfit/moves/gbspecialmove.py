@@ -441,7 +441,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     STFT_WIDTH_CLASSES = True
     # * The same for the tempering cells of DFFR rows. A switch of its own, so that the classes of
     # * the two phases can be measured apart.
-    TEMPERING_WIDTH_CLASSES = False
+    TEMPERING_WIDTH_CLASSES = True
 
     @property
     def xp(self) -> Union[ModuleType, numpy , cupy]:
