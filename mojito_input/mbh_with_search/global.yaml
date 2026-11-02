@@ -1,6 +1,6 @@
 schema_version: 1
 run:
-  name: mbh_from_catalog_lowtol
+  name: mbh_from_search_lowtol
   output_dir: /data/asantini/globalfit/erebor_org_setup/mojito_runs/
   seed: 103209
   num_iterations: 500
@@ -8,7 +8,7 @@ run:
 
 sampler:
   nwalkers: 20
-  ntemps: 6
+  ntemps: 12
 
 compute:
   gpus: [0, 1]
@@ -30,6 +30,7 @@ data:
   lowpass: {cutoff: 1e-1, order: 2, zero_phase: true}
   downsample: {window: [kaiser, 5.0]}
   trim: {duration: 200 h, trimming_type: from_each_end}
+  aafilter: {attenuation: 186.2, freq1: 0.09432, freq2: 0.20585, fs: 4.0}
   alias_correction: true 
 
 domain:
