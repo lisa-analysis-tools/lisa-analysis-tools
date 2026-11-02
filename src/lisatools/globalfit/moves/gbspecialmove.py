@@ -309,6 +309,65 @@ class GBLeafCapSettings:
         return self.start is not None
 
 
+def sweep_tempering_rows(values, betas, log_uniforms, bands, walkers, source_counts,
+                         walker_totals, nleaves_max, log_factorial):
+    """Swap decisions of the tempering loop, made on the host from each grid row's value table.
+
+    Row ``r`` holds one cell of band ``bands[r]`` per temperature: column ``t`` is walker
+    ``walkers[r, t]``, whose cell holds ``source_counts[r, t]`` sources. ``values[r, t, j]`` is the
+    ln L of column ``t`` holding the template of column ``j``, up to a term of column ``t`` alone.
+    The decisions go band after band (ascending), pair after pair from the top, the rows of a band
+    together: the order of the swap loop, whose chunks never mix bands. The rows of one band touch
+    distinct walker totals, so their decisions do not interact.
+
+    The rule is the swap loop's. For the pair ``(t, t - 1)``, ``betas[r, t]`` and ``betas[r, t - 1]``
+    weight the ln L changes of the two columns; the change of ln k! of both walkers is added, with
+    ``walker_totals[t, w]`` the sources of walker ``w`` at temperature ``t`` over all bands (updated
+    in place on acceptance); a swap that gives a walker more than ``nleaves_max`` sources is refused;
+    ``log_uniforms[r, t - 1]`` is the log of the uniform draw. A template keeps moving down the
+    ladder when the next pair accepts it again.
+
+    Returns:
+        ``template_column[r, t]``, the column whose template ends at column ``t``, and
+        ``accepted[r, t - 1]``, whether the swap of the pair ``(t, t - 1)`` was accepted.
+    """
+    num_rows, num_temps = betas.shape
+    template_column = np.tile(np.arange(num_temps), (num_rows, 1))
+    accepted = np.zeros((num_rows, num_temps - 1), dtype=bool)
+    for band in np.unique(bands):
+        rows = np.flatnonzero(bands == band)
+        for hot in range(num_temps - 1, 0, -1):
+            cold = hot - 1
+            from_hot = template_column[rows, hot]
+            from_cold = template_column[rows, cold]
+            paccept = (
+                betas[rows, hot] * (values[rows, hot, from_cold] - values[rows, hot, from_hot])
+                + betas[rows, cold] * (values[rows, cold, from_hot] - values[rows, cold, from_cold])
+            )
+            hot_walkers = walkers[rows, hot]
+            cold_walkers = walkers[rows, cold]
+            sources_hot = source_counts[rows, from_hot]
+            sources_cold = source_counts[rows, from_cold]
+            k_hot = walker_totals[hot, hot_walkers]
+            k_cold = walker_totals[cold, cold_walkers]
+            k_hot_new = k_hot - sources_hot + sources_cold
+            k_cold_new = k_cold - sources_cold + sources_hot
+            fits = (k_hot_new <= nleaves_max) & (k_cold_new <= nleaves_max)
+            log_weight_change = (
+                log_factorial[np.minimum(k_hot_new, nleaves_max)]
+                + log_factorial[np.minimum(k_cold_new, nleaves_max)]
+                - log_factorial[k_hot]
+                - log_factorial[k_cold]
+            )
+            take = fits & (paccept + log_weight_change > log_uniforms[rows, cold])
+            walker_totals[hot, hot_walkers[take]] = k_hot_new[take]
+            walker_totals[cold, cold_walkers[take]] = k_cold_new[take]
+            template_column[rows[take], hot] = from_cold[take]
+            template_column[rows[take], cold] = from_hot[take]
+            accepted[rows, cold] = take
+    return template_column, accepted
+
+
 # MHMove needs to be to the left here to overwrite GBBruteRejectionRJ RJ proposal method
 class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModule):
     """Base class for GB-specific stretch / reversible-jump moves.
@@ -367,6 +426,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             matrix serves before it is recomputed at the source's position. 1
             recomputes it at every block.
     """
+
+    # * STFT tempering decides its swaps from the cross terms of each grid row; False runs the swap
+    # * loop.
+    TEMPERING_CROSS_TERMS = True
+    # Sum the DFFR cross terms over each band's store window (True) or over the whole cell. TDI on
+    # the fly always takes the whole cell: its carrier can spike out of the window near antenna nulls.
+    TEMPERING_BAND_WINDOW = True
 
     @property
     def xp(self) -> Union[ModuleType, numpy , cupy]:
@@ -2264,6 +2330,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         )
         return band_index, temp_index, walkers_permuted, special_index, num_bands_unit
 
+    def _tempering_cross_term_grid(self, start, walker_groups):
+        """Grid rows of one tempering parity pass and their uniforms, drawn with NumPy.
+
+        The bands are those of :meth:`_tempering_swap_grid`. For every band, temperature and walker
+        group, the group's walkers are permuted by sorting uniform numbers, and row ``k`` of a band
+        and group holds the ``k``-th walker of each temperature's permutation; swaps therefore pair
+        walkers of one group. Then one uniform per row and temperature pair. The draws depend on
+        the global seed and the groups only, not on the chunks or the devices.
+
+        Returns:
+            ``(bands, walkers, log_uniforms)`` of shapes ``(rows,)``, ``(rows, ntemps)`` and
+            ``(rows, ntemps - 1)``, rows ordered by band, then group, then ``k``. Column ``p`` of
+            ``log_uniforms`` serves the pair ``(p + 1, p)``.
+        """
+        band_ids = np.arange(1) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+        band_ids = band_ids[start::2]
+        rows_per_group = []
+        for group in walker_groups:
+            keys = np.random.random((band_ids.size, self.ntemps, group.size))
+            permuted = group[np.argsort(keys, axis=-1, kind="stable")]
+            rows_per_group.append(permuted.transpose(0, 2, 1))
+        walkers = np.concatenate(rows_per_group, axis=1).reshape(-1, self.ntemps)
+        bands = np.repeat(band_ids, walkers.shape[0] // max(band_ids.size, 1))
+        log_uniforms = np.log(np.random.random((walkers.shape[0], self.ntemps - 1)))
+        return bands, walkers, log_uniforms
+
     def _adapt_band_temps(self, band_temps, band_swaps_accepted, band_swaps_proposed):
         """Per-band temperature-ladder adaptation, in place on ``band_temps``.
 
@@ -2316,6 +2408,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         give a walker more than nleaves_max sources is rejected. The bands of
         a chunk are decided in turn, so that the totals stay current.
         """
+        # Read with getattr: harnesses borrow this method onto stand-ins without the new attributes.
+        if getattr(self, "TEMPERING_CROSS_TERMS", False) and isinstance(
+            getattr(self, "_basis_settings", None), STFTSettings
+        ):
+            return self._run_tempering_cross_terms(model, state, band_sorter, band_temps)
         ll_change_log_temp = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
 
         band_swaps_accepted = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
@@ -2516,6 +2613,240 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         ll_change_sum_temp = ll_change_log_temp.sum(axis=-1)
 
         return ll_change_sum_temp, band_swaps_accepted, band_swaps_proposed
+
+    def _run_tempering_cross_terms(self, model, state, band_sorter, band_temps):
+        """The swaps of :meth:`run_tempering`, decided from the cross terms of each grid row (STFT).
+
+        Per parity pass, every grid row (the cells of one band, one per temperature) gets the table
+        ``values[t, j] = (r_t|t_j) - (t_j|t_j) / 2`` from :meth:`SubBandBuffer.cross_terms`: column
+        ``t`` taking the template of column ``j`` changes its ln L by ``values[t, j] - values[t, t]``.
+        No ln L depends on a decision (each cell sits in one row and the residuals stay fixed), so
+        every row of the pass is scored first and :func:`sweep_tempering_rows` then makes the swap
+        loop's decisions on the host; the sources move once per pass. One buffer with its template
+        twin serves the whole propose and is refilled per chunk of rows. The draws come from NumPy at
+        the start of each pass and swaps pair walkers of one parent split, so the results repeat with
+        the seed for any chunk size. DFFR rows sum over their band's store window and TDI-on-the-fly
+        rows over the whole cell (``TEMPERING_BAND_WINDOW``).
+        """
+        acs = model.analysis_container_arr
+        xp = self.xp
+        ntemps, nwalkers, num_bands = self.ntemps, self.nwalkers, self.num_bands
+        timer = getattr(self, "_prop_timer", None)
+        probe = getattr(self, "_mem_probe", None)
+        temps_range = np.arange(ntemps)
+
+        ll_change_log_temp = np.zeros((ntemps, nwalkers, num_bands))
+        band_swaps_accepted = np.zeros((len(self.band_edges) - 1, ntemps - 1), dtype=int)
+        band_swaps_proposed = np.zeros((len(self.band_edges) - 1, ntemps - 1), dtype=int)
+
+        # * Alive sources per (temp, walker, band) cell and per walker, as in the swap loop. A pass
+        # * moves sources between cells of its own bands only, so the other pass's counts stay valid.
+        nleaves_max = int(band_sorter.nleaves_max)
+        temp_all = asnumpy(band_sorter.temp_inds).astype(np.int64)
+        walker_all = asnumpy(band_sorter.walker_inds).astype(np.int64)
+        band_all = asnumpy(band_sorter.band_inds).astype(np.int64)
+        alive_all = asnumpy(band_sorter.inds).astype(bool)
+        walker_cell_all = temp_all * nwalkers + walker_all
+        in_band = alive_all & (band_all >= 0) & (band_all < num_bands)
+        cell_alive = np.bincount(
+            (walker_cell_all * num_bands + band_all)[in_band],
+            minlength=ntemps * nwalkers * num_bands,
+        ).reshape(ntemps, nwalkers, num_bands)
+        walker_alive = np.bincount(
+            walker_cell_all[alive_all], minlength=ntemps * nwalkers
+        ).reshape(ntemps, nwalkers)
+        log_factorial = gammaln(np.arange(nleaves_max + 1) + 1.0)
+        betas_all = asnumpy(band_temps)
+
+        # Swaps pair walkers of one parent split (one group on one device). A buffer with one split
+        # takes every group's rows; one with a split per group takes each group's rows on its device.
+        walker_groups = [np.asarray(asnumpy(walkers), dtype=np.int64) for walkers in acs.gpu_splits]
+        group_of_walker = np.empty(nwalkers, dtype=np.int64)
+        for group, walkers in enumerate(walker_groups):
+            group_of_walker[walkers] = group
+        buffer_gpus = getattr(self.gb, "gpus", None) if self.backend.uses_cupy else None
+        num_buffer_splits = len(buffer_gpus) if buffer_gpus else 1
+        if num_buffer_splits > 1 and (
+            num_buffer_splits != len(walker_groups) or list(buffer_gpus) != list(acs.gpus)
+        ):
+            raise ValueError(
+                f"tempering buffer devices {list(buffer_gpus)} must equal the parent's walker "
+                f"splits on {acs.gpus}."
+            )
+        # Verify runs measure what a band-window sum would drop.
+        window_totals = None
+        if (getattr(getattr(self, "debug_settings", None), "verify_buffer", False)
+                and getattr(self, "stft_store_windows", None) is not None):
+            window_totals = dict(rows=0, rows_outside=0, max_energy=0.0, max_swap_change=0.0)
+        store_windows = getattr(self, "stft_store_windows", None)
+        # Only DFFR places its pixels around the kinematic carrier, which the store windows bound.
+        band_window = (
+            getattr(self, "TEMPERING_BAND_WINDOW", False) and store_windows is not None
+            and getattr(getattr(self, "gb_stft_comp", None), "response", None) == "dffr"
+        )
+
+        buffer_obj = None
+        rows_per_split = None
+        units = 2
+        tmp_start = np.random.randint(units)
+        for tmp in range(units):
+            start = (tmp_start + tmp) % units
+            # start == 0 pairs with bool_remainder 1 because tempering begins at band 1.
+            bool_remainder = 1 if start == 0 else 0
+            in_pass_bands = band_sorter.band_inds % 2 == bool_remainder
+
+            with _tspan(timer, "temper_open_close"):
+                self.remove_cold_chain_sources_from_residual(
+                    model, band_sorter, extra_bool=in_pass_bands
+                )
+
+            row_bands, row_walkers, log_uniforms = self._tempering_cross_term_grid(
+                start, walker_groups
+            )
+            num_rows = row_bands.size
+            row_specials = band_sorter.get_special_band_index(
+                temps_range[None, :], row_walkers, row_bands[:, None]
+            )
+            if num_buffer_splits == 1:
+                queues = [np.arange(num_rows)]
+            else:
+                row_group = group_of_walker[row_walkers[:, 0]]
+                queues = [np.flatnonzero(row_group == split) for split in range(num_buffer_splits)]
+            if rows_per_split is None and num_rows > 0:
+                # * The first chunk must fill every split, so the contiguous blocks hold whole rows.
+                rows_per_split = max(1, min(
+                    self.num_bands_preload_temp // num_buffer_splits,
+                    min(queue.size for queue in queues),
+                ))
+
+            values = np.empty((num_rows, ntemps, ntemps))
+            positions = [0] * len(queues)
+            while any(position < queue.size for position, queue in zip(positions, queues)):
+                chunk_rows, chunk_row_slots = [], []
+                for split, queue in enumerate(queues):
+                    taken = queue[positions[split]:positions[split] + rows_per_split]
+                    positions[split] += taken.size
+                    chunk_rows.append(taken)
+                    chunk_row_slots.append(split * rows_per_split + np.arange(taken.size))
+                chunk_rows = np.concatenate(chunk_rows)
+                # Row k of split s owns the ntemps slots from (s * rows_per_split + k) * ntemps.
+                chunk_slots = (
+                    np.concatenate(chunk_row_slots)[:, None] * ntemps + temps_range[None, :]
+                )
+                chunk_specials = xp.asarray(row_specials[chunk_rows].reshape(-1))
+
+                with _tspan(timer, "temper_buffer"):
+                    if buffer_obj is None:
+                        if probe is not None:
+                            probe.check_released("temper_buffer")
+                        # The first chunk fills every slot, in slot order.
+                        buffer_obj = band_sorter.get_buffer(
+                            acs, chunk_specials, use_template_arr=True,
+                            track_counter=self._track_counter, contiguous_splits=True,
+                        )
+                    else:
+                        band_sorter.get_buffer(
+                            acs, chunk_specials, inds_fill=xp.asarray(chunk_slots.reshape(-1)),
+                            buffer_obj=buffer_obj,
+                        )
+
+                starts = buffer_obj._stft_start_inds_host[chunk_slots[:, 0]].astype(np.int64)
+                if band_window:
+                    window_lo = store_windows.j_lo[row_bands[chunk_rows]]
+                    window_hi = store_windows.j_hi[row_bands[chunk_rows]] + 1
+                else:
+                    window_lo = starts
+                    window_hi = starts + int(buffer_obj._stft_cell_width)
+                with _tspan(timer, "temper_swap_score"):
+                    cross, template, _ = buffer_obj.cross_terms(chunk_slots, window_lo, window_hi)
+                values[chunk_rows] = cross - 0.5 * template
+                if window_totals is not None:
+                    with _tspan(timer, "temper_verify_window"):
+                        self._check_tempering_band_window(
+                            buffer_obj, chunk_slots, starts, row_bands[chunk_rows], store_windows,
+                            window_totals,
+                        )
+
+            with _tspan(timer, "temper_sweep"):
+                source_counts = cell_alive[temps_range[None, :], row_walkers, row_bands[:, None]]
+                template_column, accepted = sweep_tempering_rows(
+                    values, betas_all[row_bands], log_uniforms, row_bands, row_walkers,
+                    source_counts, walker_alive, nleaves_max, log_factorial,
+                )
+                # Every row proposes each temperature pair once.
+                np.add.at(band_swaps_proposed, row_bands, 1)
+                np.add.at(band_swaps_accepted, row_bands, accepted.astype(int))
+                row_ids = np.arange(num_rows)[:, None]
+                ll_change_log_temp[temps_range[None, :], row_walkers, row_bands[:, None]] = (
+                    values[row_ids, temps_range[None, :], template_column]
+                    - values[row_ids, temps_range[None, :], temps_range[None, :]]
+                )
+
+            with _tspan(timer, "temper_relabel"):
+                # * The sources of the cell whose template ends at column t take column t's label.
+                moved_rows, moved_columns = np.nonzero(template_column != temps_range[None, :])
+                if moved_rows.size:
+                    band_sorter.move_cell_labels(
+                        row_specials[moved_rows, template_column[moved_rows, moved_columns]],
+                        moved_columns,
+                        row_walkers[moved_rows, moved_columns],
+                        row_specials[moved_rows, moved_columns],
+                    )
+
+            with _tspan(timer, "temper_open_close"):
+                self.add_cold_chain_sources_to_residual(
+                    model, band_sorter, extra_bool=in_pass_bands
+                )
+
+        if buffer_obj is not None:
+            if probe is not None:
+                probe.watch("temper_buffer", buffer_obj, span_name="temper_buffer")
+            del buffer_obj
+            self._release_stft_comp_groups()
+            if probe is not None:
+                probe.check_released("temper_buffer")
+
+        if window_totals is not None:
+            logger.info(
+                "[VERIFY_TEMPER_WINDOW] scores summed over %s. %d rows: %d with template signal "
+                "outside the band window (largest (t|t) outside %.3e); largest change of a swap "
+                "value between the whole cell and the band window %.3e",
+                "the band windows" if band_window else "the whole cells",
+                window_totals["rows"], window_totals["rows_outside"], window_totals["max_energy"],
+                window_totals["max_swap_change"],
+            )
+
+        band_swaps_accepted = xp.asarray(band_swaps_accepted)
+        band_swaps_proposed = xp.asarray(band_swaps_proposed)
+        self._adapt_band_temps(band_temps, band_swaps_accepted, band_swaps_proposed)
+        ll_change_sum_temp = xp.asarray(ll_change_log_temp.sum(axis=-1))
+        return ll_change_sum_temp, band_swaps_accepted, band_swaps_proposed
+
+    def _check_tempering_band_window(self, buffer_obj, chunk_slots, starts, bands, store_windows,
+                                     totals):
+        """What a band-window sum drops from the whole cell, for one chunk of rows (verify runs).
+
+        Two cross-term calls over the cell bins left and right of each band's store window give
+        exactly the template signal outside the window, as ``(t_j|t_j)`` under the noise of the
+        template's own column, and the part of every swap value that the band window leaves out.
+        ``totals`` accumulates over the propose.
+        """
+        band_lo = store_windows.j_lo[bands]
+        band_hi = store_windows.j_hi[bands] + 1
+        cell_hi = starts + int(buffer_obj._stft_cell_width)
+        outside_values = 0.0
+        outside_energy = 0.0
+        for window_lo, window_hi in ((starts, band_lo), (band_hi, cell_hi)):
+            cross, template, _ = buffer_obj.cross_terms(chunk_slots, window_lo, window_hi)
+            outside_values = outside_values + cross - 0.5 * template
+            outside_energy = outside_energy + np.einsum("rjj->rj", template)
+        swap_change = outside_values - np.einsum("rii->ri", outside_values)[:, :, None]
+        totals["rows"] += int(chunk_slots.shape[0])
+        totals["rows_outside"] += int((outside_energy > 0.0).any(axis=1).sum())
+        totals["max_energy"] = max(totals["max_energy"], float(outside_energy.max(initial=0.0)))
+        totals["max_swap_change"] = max(
+            totals["max_swap_change"], float(np.abs(swap_change).max(initial=0.0))
+        )
 
     def _write_back_state(self, new_state, band_sorter) -> None:
         """Repack the sorter's live sources into ``new_state.branches['gb']``.

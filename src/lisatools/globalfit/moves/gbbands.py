@@ -1304,6 +1304,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         track_counter: Optional[StoreWindowTrackCounter] = None,
         parent_acs: Optional[AnalysisContainerArray] = None,
         parent_noise_copies: Optional[dict] = None,
+        contiguous_splits: bool = False,
         *args,
         **kwargs,
     ):
@@ -1312,6 +1313,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         # devices for this GB move call (a dict the main band sorter owns).
         self.parent_acs = parent_acs
         self._parent_noise_copies = {} if parent_noise_copies is None else parent_noise_copies
+        # Cells in contiguous blocks per device rather than striped (the tempering buffer).
+        self.contiguous_splits = contiguous_splits
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         assert self.backend.name.split("_")[-1] == gb.backend.name.split("_")[-1]
         self.gb = gb
@@ -1834,6 +1837,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             band_gpu_assignment(self.num_bands_now, list(gpus_in))
             if gpus_in else None
         )
+        if gpus_in and getattr(self, "contiguous_splits", False):
+            # * Contiguous blocks keep each tempering row (consecutive slots) in one split.
+            gpu_assignment = band_gpu_assignment(self.num_bands_now, list(gpus_in), mode="block")
         primary_device = int(gpus_in[0]) if gpus_in else None
 
         sens_prototypes = {}
@@ -2313,6 +2319,23 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             * self.xp.sum((num_flat.conj() * num_flat) * psd_flat, axis=(1, 2)).real
         )
 
+    def cross_terms(self, cells, window_lo, window_hi):
+        """``(r_i|t_j)``, ``(t_j|t_j)`` and ``(r_i|r_i)`` of the cell tables ``cells``, on the host.
+
+        Table ``b`` holds the cells ``cells[b]``: residual ``i`` is the residual window of cell
+        ``cells[b, i]`` and template ``j`` the twin's template of cell ``cells[b, j]``, each product
+        under the noise row of residual ``i`` and over the active bins
+        ``[window_lo[b], window_hi[b])``. The value of cell ``i`` holding the template of cell ``j``
+        is then ``(r_i|t_j) - (t_j|t_j) / 2`` up to ``-(r_i|r_i) / 2``, the source term of
+        :meth:`likelihood` over the same bins. STFT buffers with a template twin only; every cell
+        of a table must sit in one split.
+        """
+        if not (self.use_template_arr and isinstance(self._basis_settings, STFTSettings)):
+            raise NotImplementedError("cross_terms needs an STFT buffer with a template twin.")
+        return self._likelihood_engine.cross_terms(
+            self, self._acs_template_buffer, cells, cells, window_lo, window_hi
+        )
+
     # Explicit alias while callers migrate off the ``likelihood`` name (which
     # shadows the inherited per-AC ACA dispatch).
     band_likelihoods = likelihood
@@ -2533,6 +2556,12 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         if inds_fill is None:
             inds_fill = self.xp.arange(self.num_bands_now)
         self.psd_buffer[inds_fill] = 0.0
+
+    def reset_template_buffers(self, inds_fill=None):
+        """Zero the template twin's rows ``inds_fill``, before a refill adds the new templates."""
+        if inds_fill is None:
+            inds_fill = self.xp.arange(self.num_bands_now)
+        self.template_buffer[inds_fill] = 0.0
 
     def fill_buffer_residual_and_psd_from_acs(
         self, acs: AnalysisContainerArray, inds_fill: Optional[cp.ndarray] = None
@@ -3121,6 +3150,25 @@ class BandSorter(LISAToolsParallelModule):
         self.temp_inds[keep_b] = temp_a
         self.walker_inds[keep_b] = walkers_a[take_b]
 
+    def move_cell_labels(self, specials_from, temps_to, walkers_to, specials_to) -> None:
+        """Relabel every source of cell ``specials_from[k]`` to ``(temps_to[k], walkers_to[k])``.
+
+        ``specials_to[k]`` is the special index of the target cell, in the same band. The cells
+        may form any permutation, so one call makes the moves that a sequence of
+        :meth:`exchange_cell_labels` calls makes. Every source is matched before any label
+        changes, inactive leaves included.
+        """
+        xp = self.xp
+        specials_from = xp.asarray(specials_from)
+        order = xp.argsort(specials_from)
+        keep = xp.isin(self.special_band_inds, specials_from)
+        take = order[
+            xp.searchsorted(specials_from[order], self.special_band_inds[keep], side="left")
+        ]
+        self.special_band_inds[keep] = xp.asarray(specials_to)[take]
+        self.temp_inds[keep] = xp.asarray(temps_to)[take]
+        self.walker_inds[keep] = xp.asarray(walkers_to)[take]
+
     @property
     def N_vals(self) -> Optional[np.ndarray]:
         if self.band_N_vals is None:
@@ -3297,6 +3345,9 @@ class BandSorter(LISAToolsParallelModule):
             assert inds_fill.max() <= buffer_obj.num_bands_now
             # THIS NEEDS TO HAPPEN before updating data
             buffer_obj.update_special_indices(special_indices_unique, inds_fill=inds_fill)
+            if buffer_obj.use_template_arr:
+                # ! The templates below are added to the twin, which still holds the old cells' ones.
+                buffer_obj.reset_template_buffers(inds_fill)
 
         buffer_obj.fill_buffer_residual_and_psd_from_acs(acs, inds_fill=inds_fill)
         buffer_obj.parent_acs = acs
