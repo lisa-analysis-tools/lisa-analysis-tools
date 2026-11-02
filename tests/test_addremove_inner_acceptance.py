@@ -103,3 +103,12 @@ def test_recording_survives_a_foreign_owner_replacing_the_buffer():
     assert inner.accepted.shape == (NTEMPS, NWALKERS)
     assert inner.accepted[0, 0] == 1.0
     assert inner.num_proposals == 1
+
+
+def test_inner_moves_cannot_take_a_gibbs_setup():
+    # inner moves propose on every parameter of the leaf; a split belongs inside one move
+    mask = np.ones((NLEAVES, NDIM), dtype=bool)
+    mask[:, 0] = False
+    with pytest.raises(ValueError, match="gibbs_sampling_setup"):
+        ResidualAddOneRemoveOneMove._check_no_gibbs_setup(StretchMove(gibbs_sampling_setup=("gb", mask)))
+    ResidualAddOneRemoveOneMove._check_no_gibbs_setup(StretchMove())  # no setup: fine
