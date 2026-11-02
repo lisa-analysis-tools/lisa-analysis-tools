@@ -194,13 +194,16 @@ public:
      * @param R_d     disk radial scale length [kpc]
      * @param z_d     disk vertical scale height [kpc]
      * @param N_times number of time segments
+     * @param f_b     fraction of sources in the bulge (0 = disk only)
+     * @param r_b     bulge scale radius [kpc]
      */
-    void initialize_wrap(array_type<double> times, double R_d, double z_d, int N_times)
+    void initialize_wrap(array_type<double> times, double R_d, double z_d, int N_times,
+                         double f_b = 0.0, double r_b = 0.5)
     {
         gal_grid->initialize(
             R_d, z_d,
             return_pointer_and_check_length(times, std::string("times"), N_times, 1),
-            N_times
+            N_times, f_b, r_b
         );
     }
 
@@ -220,6 +223,16 @@ public:
             N_freqs, N_times,
             Amp, alpha, f_1, f_knee, f_2, avg_d
         );
+    }
+
+    /**
+     * Use the detector-tensor response from the orbit arms for R_avg (call before
+     * initialize_wrap). arms: (N_times, 3, 3) unit vectors u12, u13, u23, ecliptic frame.
+     */
+    void set_detector_arms_wrap(array_type<double> arms, int N_times)
+    {
+        gal_grid->set_detector_arms(
+            return_pointer_and_check_length(arms, std::string("arms"), N_times * 9, 1), N_times);
     }
 
     /** Return device pointer to R_avg (N_times * 6 doubles). */
@@ -315,6 +328,29 @@ public:
         array_type<std::complex<double>> c01_all, array_type<std::complex<double>> c02_all,
         array_type<std::complex<double>> c12_all,
         bool use_external_matrix = false, bool run_async = false);
+
+    // Fused likelihood from precomputed (window-convolved) covariance bases; see
+    // XYZSensitivityMatrix::psd_likelihood_basis_wrap (PSD.hpp / PSD.cu).
+    void psd_likelihood_basis_wrap(
+        array_type<double> like_contrib_final, array_type<std::complex<double>> data,
+        array_type<int> data_index_all, array_type<double> coeffs,
+        array_type<double> B00, array_type<double> B11, array_type<double> B22,
+        array_type<std::complex<double>> B01, array_type<std::complex<double>> B02,
+        array_type<std::complex<double>> B12,
+        bool use_galaxy, array_type<double> gal_conv, array_type<double> gal_ratios,
+        int n_gal, long long gal_psd_stride, long long gal_t_stride,
+        bool use_spline_weights, array_type<double> spline_weights,
+        long long spl_psd_stride, long long spl_noise_stride, long long spl_f_stride,
+        array_type<bool> dips_mask, double differential_component,
+        int num_freqs, int num_times, int num_psds, int num_data, int n_basis,
+        bool run_async = false);
+
+    // XX galactic rows (num_psds, num_freqs) on a frequency prefix of the active grid.
+    void get_galactic_row_wrap(
+        array_type<double> out, array_type<double> freqs,
+        array_type<double> Amp_all, array_type<double> alpha_all,
+        array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+        int num_freqs, int num_psds, int time_index, bool run_async = false);
 
     void get_noise_covariance_wrap(
         array_type<double> freqs, array_type<int> time_indices,

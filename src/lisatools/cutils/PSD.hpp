@@ -158,6 +158,16 @@ public:
     CUDA_DEVICE double tm_xx_unequal_armlength(double f, double avg_d_ij, double avg_d_ik);
     CUDA_DEVICE gcmplx::complex<double> tm_xy_unequal_armlength(double f, double avg_d_ij, double avg_d_ik, double avg_d_jk, double delta_d_ij);
     CUDA_DEVICE double galaxy_common_tdi_factor(double f);
+    // S_gal(f) * galaxy_common_tdi_factor(f): the walker-dependent galactic PSD shape
+    // shared by every covariance entry (entry k is gal_R_avg[t * 6 + k] times this).
+    CUDA_DEVICE double galaxy_shape_tdi(double f, double Amp, double alpha, double f_1,
+                                        double f_knee, double f_2);
+    // XX galactic entry R00 * S_gal * common_tdi * noise_normalization at grid index
+    // f_idx, plus the alias copies (as get_noise_covariance); R00 = gal_R_avg[time_index * 6]
+    // (time_index < 0: R00 = 1, the unit shape). f = 0 gives NaN, as the covariance kernel.
+    CUDA_DEVICE double get_galactic_row_single(double f, int time_index, int f_idx,
+                                               double Amp, double alpha, double f_1,
+                                               double f_knee, double f_2);
 
     CUDA_DEVICE void get_noise_tfs(
         double f,
@@ -219,6 +229,31 @@ public:
         bool *dips_mask, int num_psds, 
         double *c00_all, double *c11_all, double *c22_all, cmplx *c01_all, cmplx *c02_all, cmplx *c12_all,
         bool use_external_matrix = false, bool run_async = false);
+
+    // Fused likelihood from precomputed (window-convolved) bases, see PSD.cu
+    // psd_likelihood_basis_kernel. Per PSD p and bin idx = t * num_freqs + f:
+    //   c_k = sum_b coeffs[p * n_basis + b] * w_b(p, f) * B_k[b * total + idx]
+    //       + gal_ratios[t * 6 + k'] * gal_conv[p * gal_psd_stride + t * gal_t_stride + f]  (f < n_gal)
+    // w_b = spline_weights[p * spl_psd_stride + (b / n_noise_par) * spl_noise_stride
+    //                      + f * spl_f_stride] (strides in elements) or 1 when nullptr.
+    // gal_conv == nullptr or n_gal == 0: no galaxy. data: (num_data, 3, total) blocks.
+    void psd_likelihood_basis_wrap(
+        double *like_contrib_final, cmplx *data, int *data_index_all, double *coeffs, int n_basis,
+        double *B00, double *B11, double *B22, cmplx *B01, cmplx *B02, cmplx *B12,
+        double *gal_conv, int n_gal, long long gal_psd_stride, long long gal_t_stride,
+        double *gal_ratios,
+        double *spline_weights, long long spl_psd_stride, long long spl_noise_stride,
+        long long spl_f_stride,
+        bool *dips_mask, double differential_component,
+        int num_freqs, int num_times, int num_psds, bool run_async = false);
+
+    // XX galactic rows out[psd_i * num_freqs + f_idx] = get_galactic_row_single(freqs[f_idx],
+    // time_index, f_idx, ...): freqs must be a PREFIX of the active grid (f_idx addresses
+    // noise_normalization and the alias grids).
+    void get_galactic_row_arr(
+        double *out, double *freqs,
+        double *Amp_all, double *alpha_all, double *f_1_all, double *f_knee_all, double *f_2_all,
+        int num_freqs, int num_psds, int time_index, bool run_async = false);
 
     void get_noise_covariance_arr(
         double *freqs, int *time_indices,
