@@ -77,10 +77,16 @@ class DomainKernelStrategy(LISAToolsParallelModule):
         self.split_index = split_index
         self.data_arr = acs.linear_data_arr[split_index]
         self.invC_arr = acs.linear_psd_arr[split_index]
+        self.settings = acs.settings
         self.num_channels = acs.nchannels
         self.num_data = len(acs.gpu_splits[split_index])
         self.num_noise = len(acs.gpu_splits[split_index])
-        self.settings = acs.settings
+        # Shape of one row of an external noise array; None while every AC holds its own row.
+        self.noise_row_shape = None
+        if getattr(acs, "external_noise_rows", False):
+            # The ACs read the rows of an external noise array, so the row count is its own.
+            self.num_noise = acs.num_noise_rows(split_index)
+            self.noise_row_shape = tuple(acs.noise_row_shape)
 
         all_acs = acs.acs.flatten()
         split_container_ids = acs.gpu_splits[split_index]
@@ -449,7 +455,15 @@ class STFTComputationGroup(DomainKernelStrategy):
             self.num_data,
             self.num_noise,
             self.backend.TDITypeDict[self.tdi_type],
+            *self._noise_layout_args(),
         ]
+
+    def _noise_layout_args(self) -> list:
+        """Trailing wrapper arguments for external noise rows; none while every AC holds its own row."""
+        if getattr(self, "noise_row_shape", None) is None:
+            return []
+        # The rows hold the full active grid, so the kernels read them at a pixel's active bin.
+        return [int(self.noise_row_shape[-1]), True]
 
     def _create_cpp_domain(self):
         self._cpp_domain = self.backend.STFTDomainWrap(*self.domain_args)
