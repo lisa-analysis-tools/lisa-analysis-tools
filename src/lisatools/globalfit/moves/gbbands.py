@@ -1231,6 +1231,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
     # * STFT cells read their inverse CSD from their walker's parent row, or from a copy of every
     # * parent row on their device, instead of holding a copied window. False copies the windows.
     READ_PARENT_NOISE_ROWS = True
+    # * STFT cells start on one zero block per device instead of a zero array each, so the array's
+    # * own block is the only full copy of the buffer while it is built. False allocates per cell.
+    SHARE_ZERO_DATA_AT_BUILD = True
 
     @property
     def xp(self) -> Union[ModuleType, numpy, cupy]:
@@ -1844,6 +1847,8 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
         sens_prototypes = {}
         zero_sens_blocks = {}
+        # The array copies each cell's start block into the cell's slot, so all cells can share one.
+        zero_data_blocks = {} if is_stft and self.SHARE_ZERO_DATA_AT_BUILD else None
 
         ac_list = []
         for _b in range(self.num_bands_now):
@@ -1856,7 +1861,13 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             # backend object is kept as-is -- its C++ orbit tables are never
             # migrated.
             with device_context(self.xp, band_device):
-                res_data = self.xp.zeros(data_shape, dtype=data_dtype)
+                if zero_data_blocks is None:
+                    res_data = self.xp.zeros(data_shape, dtype=data_dtype)
+                else:
+                    res_data = zero_data_blocks.get(band_device)
+                    if res_data is None:
+                        res_data = zero_data_blocks[band_device] = self.xp.zeros(
+                            data_shape, dtype=data_dtype)
                 data_domain = per_band_settings.associated_class(
                     res_data, per_band_settings)
                 if is_stft:
