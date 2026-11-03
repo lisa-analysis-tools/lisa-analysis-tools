@@ -1887,7 +1887,9 @@ class AnalysisContainerArray:
                 int(n_splits) if (gpus is None and n_splits is not None)
                 else (1 if gpus is None else len(gpus))
             )
-            self.gpu_splits = gpu_splits = self.contiguous_splits(
+            # ! Through the class: SubBandBuffer holds an instance flag of the same name, which hides
+            # ! the method on self.
+            self.gpu_splits = gpu_splits = AnalysisContainerArray.contiguous_splits(
                 int(self.acs_total_entries), num_machines
             )
 
