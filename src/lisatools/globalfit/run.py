@@ -40,6 +40,7 @@ from .loginfo import dump_settings, init_logger, setup_root_file_handler
 from .moves import GFCombineMove, GlobalFitMove
 from .postprocessing import GlobalFitPlotter, RunMetadata, SubmissionWriter, save_residuals
 from .recipe import Recipe
+from .searches import seed_from_search_interfaces
 from .state import GFState
 from .stock.erebor import Setup
 from .utils import BasicResidualacsLikelihood
@@ -210,6 +211,33 @@ def _periodic_names_to_indices(per_dict: dict, transform) -> dict:
     return out
 
 
+def subtract_state_templates(acs: AnalysisContainerArray, state: GFState, signal_gen_map: dict) -> None:
+    """Subtract every walker's cold-chain active leaves from its residual, through the branch generators.
+
+    ``signal_gen_map`` is ``{branch name: fn(*sampling_params) -> DomainBase}`` (``Settings.signal_gen``).
+    One leaf at a time, with the domain-aware ``DomainBase.add_signal`` (a template may cover only part of
+    the data), as ``subtract_initial_signal`` does; a generator with ``supports_batch`` is called once per
+    leaf with 1-D params over the walkers (one template per walker).
+    """
+    acs_flat = acs.flatten()
+    for name, gen in signal_gen_map.items():
+        inds0 = state.branches_inds[name][0]  # (nwalkers, nleaves)
+        coords0 = state.branches_coords[name][0]
+        for leaf in range(inds0.shape[-1]):
+            walkers = np.flatnonzero(inds0[:, leaf])
+            if walkers.size == 0:
+                continue
+            if getattr(gen, "supports_batch", False):
+                templates = gen(*coords0[walkers, leaf].T)
+            else:
+                templates = [gen(*coords0[w, leaf]) for w in walkers]
+            for w, template in zip(walkers, templates):
+                acs_flat[w].data.add_signal(template, sign=-1)
+            del templates
+            acs.free_gpu_memory()
+        logger.info(f"rebuilt {name} residuals from {int(inds0.sum())} active leaves (cold chain).")
+
+
 def build_acs(
     curr: CurrentInfoGlobalFit, state: GFState, rebuild_residuals: bool = False
 ) -> AnalysisContainerArray:
@@ -320,34 +348,18 @@ def build_acs(
 
     if rebuild_residuals:
         # Residual rebuild, replicating the stft_tof ``get_templates``
-        # process. Preferred route (2026-06 merge direction): drive the
-        # template generation from the state's coords/inds through each
-        # container's dictionary-based ``signal_gen``
-        # ({branch_name -> generator}) and
-        # :meth:`AnalysisContainer.build_template` -- no model callables
-        # passed through ``source_info``. Branches whose generators are
-        # not (yet) registered on ``signal_gen`` fall back to the
-        # stft_tof ``source_info[...]["get_templates"]`` process so the
-        # rebuild always works during the migration.
-        handled_by_signal_gen = set()
-        for w, ac in enumerate(acs.flatten()):
-            gen_map = getattr(ac, "_signal_gen", None)
-            if not isinstance(gen_map, dict):
-                continue  # this walker's branches use the fallback below
-            params = {}
-            for name in curr.engine_info.branch_names:
-                if name in ("psd", "galfor") or name not in gen_map:
-                    continue
-                inds_w = state.branches_inds[name][0, w]
-                if not inds_w.any():
-                    continue
-                params[name] = state.branches_coords[name][0, w][inds_w]
-            handled_by_signal_gen.update(params.keys())
-            if not params:
-                continue
-            template = ac.build_template(params)
-            # breakpoint()  # debug hook: inspect template vs ac.data here
-            ac.data.add_signal(template, sign=-1)
+        # process: each walker's cold-chain active leaves are generated from
+        # the state's coords through the branch's ``Settings.signal_gen``
+        # (``fn(*sampling_params) -> DomainBase``) and subtracted one leaf at
+        # a time with the domain-aware ``DomainBase.add_signal`` (templates
+        # may cover only part of the data: an MBH merger, a source-span STFT
+        # grid), as ``subtract_initial_signal`` does. A generator with
+        # ``supports_batch`` is called once per leaf with 1-D params over the
+        # walkers (-> one template per walker). Branches without a
+        # registered generator fall back to the stft_tof
+        # ``source_info[...]["get_templates"]`` process.
+        subtract_state_templates(acs, state, signal_gen_map)
+        handled_by_signal_gen = set(signal_gen_map)
 
         # stft_tof fallback for branches without a registered generator.
         for name, source_info in curr.source_info.items():
@@ -511,92 +523,97 @@ class GlobalFit:
                 )
                 for key in self.engine_info.branch_names
             }
-            # TODO: make this more generic to anything
-            if "psd" in inds:
-                inds["psd"][:] = True
-            if "galfor" in inds:
-                inds["galfor"][:] = True
-            if "mbh" in inds:
-                inds["mbh"][:] = True
-                self.logger.debug("initializing mbh inds to true")
-                if (
-                    "mbh" in self.curr.source_info
-                    and self.curr.source_info["mbh"].injection is not None
-                ):
-                    self.logger.debug(
-                        "override mbh starting coords to be close to the injection"
-                    )
-                    factor = 1e-5
-                    inj = np.asarray(self.curr.source_info["mbh"].injection)
-                    if inj.ndim == 1:
-                        inj = inj[None, :]
-                    nleaves_mbh = self.engine_info.nleaves_max["mbh"]
-                    ndim_mbh = inj.shape[-1]
-                    if inj.shape[0] == 1:
-                        inj = np.broadcast_to(inj, (nleaves_mbh, ndim_mbh))
-                    assert inj.shape == (nleaves_mbh, ndim_mbh), (
-                        f"MBH injection shape {inj.shape} doesn't match "
-                        f"(nleaves_max={nleaves_mbh}, ndim={ndim_mbh})."
-                    )
-                    coords["mbh"] = inj[None, None] + factor * np.random.randn(
-                        self.ntemps, self.nwalkers, nleaves_mbh, ndim_mbh
-                    ) 
+            # Branches with a search interface are seeded by it (coords + on-indices, "prior" = prior
+            # draws) once the state exists; the others stay off. Without any interface (settings-file
+            # runs) the hard-coded defaults below apply, unchanged.
+            interfaces = self.search_interfaces()
+            if not interfaces:
+                # TODO: make this more generic to anything
+                if "psd" in inds:
+                    inds["psd"][:] = True
+                if "galfor" in inds:
+                    inds["galfor"][:] = True
+                if "mbh" in inds:
+                    inds["mbh"][:] = True
+                    self.logger.debug("initializing mbh inds to true")
+                    if (
+                        "mbh" in self.curr.source_info
+                        and self.curr.source_info["mbh"].injection is not None
+                    ):
+                        self.logger.debug(
+                            "override mbh starting coords to be close to the injection"
+                        )
+                        factor = 1e-5
+                        inj = np.asarray(self.curr.source_info["mbh"].injection)
+                        if inj.ndim == 1:
+                            inj = inj[None, :]
+                        nleaves_mbh = self.engine_info.nleaves_max["mbh"]
+                        ndim_mbh = inj.shape[-1]
+                        if inj.shape[0] == 1:
+                            inj = np.broadcast_to(inj, (nleaves_mbh, ndim_mbh))
+                        assert inj.shape == (nleaves_mbh, ndim_mbh), (
+                            f"MBH injection shape {inj.shape} doesn't match "
+                            f"(nleaves_max={nleaves_mbh}, ndim={ndim_mbh})."
+                        )
+                        coords["mbh"] = inj[None, None] + factor * np.random.randn(
+                            self.ntemps, self.nwalkers, nleaves_mbh, ndim_mbh
+                        ) 
 
-            if "emri" in inds:
-                inds["emri"][:] = True
-                self.logger.debug("initializing emri inds to true")
-                if (
-                    "emri" in self.curr.source_info
-                    and self.curr.source_info["emri"].injection is not None
-                ):
-                    
-                    self.logger.debug("override emri starting coords to be close to the injection")
-                    factor = 0.0
+                if "emri" in inds:
+                    inds["emri"][:] = True
+                    self.logger.debug("initializing emri inds to true")
+                    if (
+                        "emri" in self.curr.source_info
+                        and self.curr.source_info["emri"].injection is not None
+                    ):
+                        
+                        self.logger.debug("override emri starting coords to be close to the injection")
+                        factor = 0.0
 
-                    # Multi-leaf safe: accepts either a flat ``(ndim,)`` injection
-                    # (broadcast across all leaves) or a per-leaf ``(nleaves, ndim)``
-                    # injection. The trailing axis is always ``ndim`` so the
-                    # randn matches the engine's ``(ntemps, nwalkers, nleaves, ndim)``
-                    # coord layout.
-                    inj = np.asarray(self.curr.source_info["emri"].injection)
-                    if inj.ndim == 1:
-                        inj = inj[None, :]
-                    nleaves_emri = self.engine_info.nleaves_max["emri"]
-                    ndim_emri = inj.shape[-1]
-                    if inj.shape[0] == 1:
-                        inj = np.broadcast_to(inj, (nleaves_emri, ndim_emri))
-                    assert inj.shape == (nleaves_emri, ndim_emri), (
-                        f"EMRI injection shape {inj.shape} doesn't match "
-                        f"(nleaves_max={nleaves_emri}, ndim={ndim_emri})."
-                    )
-                    coords["emri"] = inj[None, None] + factor * np.random.randn(
-                        self.ntemps, self.nwalkers, nleaves_emri, ndim_emri
-                    )
-            if "sobbh" in inds:
-                inds["sobbh"][:] = True
-                self.logger.debug("initializing sobbh inds to true")
-                if (
-                    "sobbh" in self.curr.source_info
-                    and self.curr.source_info["sobbh"].injection is not None
-                ):
-                    self.logger.debug(
-                        "override sobbh starting coords to be close to the injection"
-                    )
-                    factor = 1e-5
-                    inj = np.asarray(self.curr.source_info["sobbh"].injection)
-                    if inj.ndim == 1:
-                        inj = inj[None, :]
-                    nleaves_sobbh = self.engine_info.nleaves_max["sobbh"]
-                    ndim_sobbh = inj.shape[-1]
-                    if inj.shape[0] == 1:
-                        inj = np.broadcast_to(inj, (nleaves_sobbh, ndim_sobbh))
-                    assert inj.shape == (nleaves_sobbh, ndim_sobbh), (
-                        f"SOBBH injection shape {inj.shape} doesn't match "
-                        f"(nleaves_max={nleaves_sobbh}, ndim={ndim_sobbh})."
-                    )
-                    coords["sobbh"] = inj[None, None] + factor * np.random.randn(
-                        self.ntemps, self.nwalkers, nleaves_sobbh, ndim_sobbh
-                    )
+                        # Multi-leaf safe: accepts either a flat ``(ndim,)`` injection
+                        # (broadcast across all leaves) or a per-leaf ``(nleaves, ndim)``
+                        # injection. The trailing axis is always ``ndim`` so the
+                        # randn matches the engine's ``(ntemps, nwalkers, nleaves, ndim)``
+                        # coord layout.
+                        inj = np.asarray(self.curr.source_info["emri"].injection)
+                        if inj.ndim == 1:
+                            inj = inj[None, :]
+                        nleaves_emri = self.engine_info.nleaves_max["emri"]
+                        ndim_emri = inj.shape[-1]
+                        if inj.shape[0] == 1:
+                            inj = np.broadcast_to(inj, (nleaves_emri, ndim_emri))
+                        assert inj.shape == (nleaves_emri, ndim_emri), (
+                            f"EMRI injection shape {inj.shape} doesn't match "
+                            f"(nleaves_max={nleaves_emri}, ndim={ndim_emri})."
+                        )
+                        coords["emri"] = inj[None, None] + factor * np.random.randn(
+                            self.ntemps, self.nwalkers, nleaves_emri, ndim_emri
+                        )
+                if "sobbh" in inds:
+                    inds["sobbh"][:] = True
+                    self.logger.debug("initializing sobbh inds to true")
+                    if (
+                        "sobbh" in self.curr.source_info
+                        and self.curr.source_info["sobbh"].injection is not None
+                    ):
+                        self.logger.debug(
+                            "override sobbh starting coords to be close to the injection"
+                        )
+                        factor = 1e-5
+                        inj = np.asarray(self.curr.source_info["sobbh"].injection)
+                        if inj.ndim == 1:
+                            inj = inj[None, :]
+                        nleaves_sobbh = self.engine_info.nleaves_max["sobbh"]
+                        ndim_sobbh = inj.shape[-1]
+                        if inj.shape[0] == 1:
+                            inj = np.broadcast_to(inj, (nleaves_sobbh, ndim_sobbh))
+                        assert inj.shape == (nleaves_sobbh, ndim_sobbh), (
+                            f"SOBBH injection shape {inj.shape} doesn't match "
+                            f"(nleaves_max={nleaves_sobbh}, ndim={ndim_sobbh})."
+                        )
+                        coords["sobbh"] = inj[None, None] + factor * np.random.randn(
+                            self.ntemps, self.nwalkers, nleaves_sobbh, ndim_sobbh
+                        )
 
             state = GFState(
                 coords,
@@ -604,6 +621,8 @@ class GlobalFit:
                 random_state=np.random.get_state(),
                 sub_state_bases=self.engine_info.branch_states,
             )
+            if interfaces:
+                seed_from_search_interfaces(self.curr, state, interfaces, priors, self.ntemps)
 
             # TODO: generalize all this stuff here (?)
             if "gb" in inds:
@@ -622,6 +641,17 @@ class GlobalFit:
             # self.logger.debug("pickle state load success")
 
         return state
+
+    def search_interfaces(self) -> typing.Dict[str, typing.Any]:
+        """``{branch name: search interface}`` for the branches whose Setup has one (``search_interface``)."""
+        interfaces = {}
+        for name in self.engine_info.branch_names:
+            if name not in self.curr.source_info:
+                continue
+            interface = getattr(self.curr.source_info[name], "search_interface", None)
+            if interface is not None:
+                interfaces[name] = interface
+        return interfaces
 
     def setup_acs(self, state: GFState, rebuild_residuals: bool = False) -> AnalysisContainerArray:
         """Set up the AnalysisContainerArray for likelihood computations, see :func:`build_acs`."""
@@ -765,13 +795,13 @@ class GlobalFit:
             # generate = GenerateCurrentState(A_inj, E_inj)
             # self.logger.debug("generate function created")
 
-            # rebuild_residuals=True: branches that registered a params-based
-            # ``signal_gen`` on their Setup get their current templates
-            # subtracted here, under the hood (the converted ``get_templates``
-            # process). Branches without one are skipped with a warning and
-            # may keep subtracting in their recipe (legacy path) -- no
-            # double-subtraction either way.
-            acs = self.setup_acs(state, rebuild_residuals=False)
+            # GlobalFitSettings.rebuild_residuals: branches that registered a params-based
+            # ``signal_gen`` on their Setup get the state's templates subtracted here, under
+            # the hood (the converted ``get_templates`` process). Off by default: settings-file
+            # recipes still subtract their own initial signals.
+            acs = self.setup_acs(
+                state, rebuild_residuals=getattr(self.curr.settings_dict, "rebuild_residuals", False)
+            )
             self.logger.debug("acs setup done")
 
             state.log_like[:] = acs.likelihood(complex=False)

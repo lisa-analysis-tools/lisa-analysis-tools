@@ -12,6 +12,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, model_validator, Discriminator, Tag, field_validator   
 
 from .utility import find_class, accepted_kwargs, check_kwargs, prior_class
+from ..generators import SignalGen, WaveformHandle
 from ..typing import RunPath
 
 if TYPE_CHECKING:
@@ -223,6 +224,8 @@ class BlockBase(_Spec):
     SEARCH_INTERFACE: ClassVar[str]  # class in lisatools.globalfit.searches that seeds this branch
     # "distribution" is not implemented by the interface yet
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate", "catalog")
+    # the interface's seeding without a `search:` (None -> no interface: load_info leaves the branch off)
+    DEFAULT_SEARCH: ClassVar[SearchSpec | None] = None
 
     type: str  # block type == file stem == branch name (source_info / priors / recipe key)
     priors: PriorRef
@@ -428,6 +431,15 @@ class SourceBlock(MoveBlock):
         info = self.parse_prior_information(g)
         nleaves = self.resolve_nleaves(ctx.cfg)
         init_kwargs = {**deepcopy(self.waveform.kwargs), **engine_waveform_kwargs(ctx)}
+        waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
+        # seeded branches: the engine builds their residuals from the state (GlobalFitSettings.rebuild_residuals)
+        # through this generator; the same objects as the Settings', so the engine's deep copy keeps them together
+        signal_gen = None
+        if self.search is not None:
+            signal_gen = SignalGen(
+                WaveformHandle(waveform_class, init_kwargs), "get_signals_for_residuals",
+                info["transform_fn"], self.waveform.runtime_kwargs,
+            )
 
         settings = getattr(erebor, self.SETTINGS_NAME)(
             log_dir=g.artifacts_file_dir,
@@ -446,12 +458,12 @@ class SourceBlock(MoveBlock):
             inner_moves=make_inner_moves(self, self.filled_move_kwargs(ctx, info)),
             injection=info["injection"],
             search_interface=make_search_interface(self, info),
+            signal_gen=signal_gen,
         )
         setup = getattr(erebor, self.SETUP_NAME)(settings)
         if self.flow is not None:
             # after the Setup, so a block without inner_moves keeps the Setup's default next to the flow
             setup.inner_moves = [*setup.inner_moves, (make_flow_move(self, ctx, info, nleaves), self.flow.weight)]
-        waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
         return BlockBuild(setup, source_metadata(self, init_kwargs, g), waveform_class, resolve_td_generator(self, ctx))
 
 # --- build helpers (heavy imports stay inside functions) ---
@@ -500,7 +512,7 @@ def make_search_interface(block: BlockBase, info: dict[str, Any]):
     The prior supplies what the interface needs to seed through the inverse transform: its transform and
     its (branch-keyed) periodicity.
     """
-    spec = block.search
+    spec = block.search if block.search is not None else block.DEFAULT_SEARCH
     if spec is None:
         return None
 

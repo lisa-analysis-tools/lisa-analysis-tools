@@ -440,6 +440,22 @@ class SourceSearchBuildTest(_Built):
         self.assertIsNone(built["mbh"].setup.search_interface)
         self.assertIsNone(built["emri"].setup.search_interface)
 
+    def test_seeded_blocks_register_a_signal_gen(self):
+        # the engine rebuilds the seeded branches' residuals from the state through it (rebuild_residuals)
+        from lisatools.globalfit.stock.l2d.generators import SignalGen, WaveformHandle
+        from lisatools.sources.bbh.waveform import PhenomTHMTDIWaveform
+
+        _, built = self.build({"mbh": mbh_with_search(), "emri": EMRI_BLOCK})
+        gen = built["mbh"].setup.signal_gen
+        self.assertIsInstance(gen, SignalGen)
+        self.assertEqual(gen.method, "get_signals_for_residuals")
+        self.assertIs(gen.transform, built["mbh"].setup.transform)
+        self.assertIsInstance(gen.source, WaveformHandle)
+        self.assertIs(gen.source.waveform_class, PhenomTHMTDIWaveform)
+        self.assertIs(gen.source.init_kwargs, built["mbh"].setup.initialize_kwargs)  # copied together by the engine
+        self.assertFalse(gen.source.built)  # built on the first call, after the engine's deep copy
+        self.assertIsNone(built["emri"].setup.signal_gen)  # no search: the branch starts empty
+
     def test_mbh_interface(self):
         from lisatools.globalfit.searches import MBHBSearchInterface
 

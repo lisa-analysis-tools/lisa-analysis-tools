@@ -24,7 +24,8 @@ from lisatools.domains import DomainBaseArray, TDSettings, TDSignal
 from lisatools.globalfit.stock.l2d import build_recipe
 from lisatools.globalfit.stock.l2d.blocks import base as blocks_base
 from lisatools.globalfit.stock.l2d.blocks.base import TDGenerator, resolve_td_generator
-from lisatools.globalfit.stock.l2d.build_recipe import RecipeContext, attach_signal_gens, make_signal_gen
+from lisatools.globalfit.stock.l2d.build_recipe import RecipeContext, attach_signal_gens
+from lisatools.globalfit.stock.l2d.generators import SignalGen, WaveformHandle
 from lisatools.globalfit.stock.l2d.io import RunConfig, dump_run, load_run
 from lisatools.sources.bbh.waveform import PhenomTHMTDIOnFlyWaveform
 
@@ -134,10 +135,10 @@ class FakeWave:
         ])
 
 
-class MakeSignalGenTest(unittest.TestCase):
+class SignalGenTest(unittest.TestCase):
     def test_one_leaf_or_a_batch(self):
         wave = FakeWave()
-        gen = make_signal_gen(wave, "get_td_signals", Doubling(), {"mode": 1})
+        gen = SignalGen(wave, "get_td_signals", Doubling(), {"mode": 1})
         one = gen(1.5, 3.0)
         self.assertIsInstance(one, TDSignal)
         self.assertEqual((one.arr[0, 0], one.t0), (3.0, T0 + 6 * DT))  # transformed: amp 3, k0 6

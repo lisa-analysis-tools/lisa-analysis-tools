@@ -21,6 +21,37 @@ if typing.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def pad_ladder(betas: typing.Optional[np.ndarray | list[float]], ntemps: int) -> np.ndarray:
+    """A branch's (subset) ladder padded with its last rung to ``ntemps``; ``None`` -> no scaling (all ones).
+
+    The state keeps every temperature, so a branch tempered over fewer rungs repeats its coldest-to-hottest
+    ladder's last rung (see :meth:`BaseSearchInterface.populate_state`).
+    """
+    if betas is None:
+        return np.ones(ntemps)
+    betas = np.asarray(betas, dtype=float)
+    if len(betas) > ntemps:
+        raise ValueError(f"the branch ladder has {len(betas)} rungs, more than the sampler's {ntemps}.")
+    return np.concatenate([betas, np.full(ntemps - len(betas), betas[-1])])
+
+
+def seed_from_search_interfaces(curr: CurrentInfoGlobalFit, state: GFState, interfaces: dict,
+                                priors: dict, ntemps: int) -> None:
+    """Fill a fresh state through the branches' search interfaces (coords and on-indices).
+
+    Every index of ``state`` must be off; branches without an interface stay off. Each interface gets its
+    branch's ladder (``source_info[name].betas``) padded to ``ntemps``.
+    """
+    for name, interface in interfaces.items():
+        betas = pad_ladder(getattr(curr.source_info[name], "betas", None), ntemps)
+        interface.populate_state(curr, state, betas, priors=priors)
+        logger.info(
+            f"Seeded {name} from its {interface.search_type} search interface: "
+            f"{int(state.branches_inds[name][0, 0].sum())} leaves on"
+        )
+
+
 class BaseSearchInterface(ABC):
     """
     Base class for search interfaces.

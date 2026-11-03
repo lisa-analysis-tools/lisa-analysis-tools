@@ -1,8 +1,10 @@
-"""The run's recipe: seed the state from the blocks, build their moves, add the steps.
+"""The run's recipe: build the blocks' moves and add the steps.
 
 ``make_setup_function`` returns the engine's ``setup_function`` (called by ``run_global_fit`` with
-``(recipe, engine_info, curr, acs, priors, state)``). The library always seeds first (source inds off,
-search interfaces, initial-signal subtraction) and starts the flow trainers; then a stock recipe, or the
+``(recipe, engine_info, curr, acs, priors, state)``). By then the engine has seeded the state through the
+blocks' search interfaces (``load_info``, fresh starts only) and built the residuals from it through each
+seeded branch's ``Settings.signal_gen`` (``setup_acs``, ``GlobalFitSettings.rebuild_residuals``). The library
+sets the per-leaf ladders, attaches the generators and starts the flow trainers; then a stock recipe, or the
 run's own recipe file, adds the steps. Heavy imports stay inside functions: ``io.py`` imports this module to validate ``recipe:``.
 """
 from __future__ import annotations
@@ -19,6 +21,7 @@ import numpy as np
 from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock
 from .blocks.psd import STOCHASTIC
 from .blocks.utility import check_kwargs, find_class
+from .generators import SignalGen
 
 from ...loginfo import init_logger
 
@@ -125,93 +128,49 @@ def enabled_blocks(cfg: RunConfig) -> dict[str, Any]:
     return {name: block for name, block in cfg.blocks.items() if block.enabled}
 
 
-def pad_ladder(betas, ntemps: int) -> np.ndarray:
-    """A subset ladder padded with its last rung to ``ntemps`` (the state keeps every temperature)."""
-    betas = np.asarray(betas, dtype=float)
-    return np.concatenate([betas, np.full(ntemps - len(betas), betas[-1])])
-
-
 def psd_needs_search(block) -> bool:
     """The max-likelihood psd search runs unless psd (and galfor) are seeded from samples or a point estimate."""
     return block.search is None or block.search.search_type == "prior"
 
 
-def seed_branches(cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, priors, state) -> dict[str, Any]:
-    """Seed the state from the blocks; return the waveform generators of the seeded source branches.
+def prepare_branches(cfg: RunConfig, curr, state) -> dict[str, Any]:
+    """Set the source branches' per-leaf ladders; return the waveforms of the seeded source branches.
 
-    Every source branch starts empty; a branch with a search interface is filled by it and its initial
-    signals are subtracted from the residuals. The interfaces get the branch's own ladder, padded to the
-    sampler's temperatures.
+    The state is seeded by ``load_info`` (the blocks' search interfaces) and the residuals are built from it by
+    ``setup_acs`` through each seeded branch's ``Settings.signal_gen``. The waveform returned here is that
+    generator's (built by then), so the PE move, the residual rebuild and the TD generator share one object.
     """
-    from lisatools.globalfit.recipe import subtract_initial_signal
+    from lisatools.globalfit.searches import pad_ladder
 
     ntemps = cfg.sampler.ntemps
-    blocks = enabled_blocks(cfg)
-    sources = {name: block for name, block in blocks.items() if isinstance(block, SourceBlock)}
-
-    for name in sources:
-        state.branches_inds[name][:] = False
-        info = curr.source_info[name]
-        state.sub_states[name].betas_all = np.tile(pad_ladder(info.betas, ntemps), (info.nleaves_max, 1))
-
-    for name, block in blocks.items():
-        if block.search is not None:
-            info = curr.source_info[name]
-            info.search_interface.populate_state(curr, state, pad_ladder(info.betas, ntemps), priors=priors)
-            logger.info(f"Populated state from search interface for {name}")
-
     wave_gens = {}
-    for name, block in sources.items():
-        if block.search is None:
+    for name, block in enabled_blocks(cfg).items():
+        if not isinstance(block, SourceBlock):
             continue
         info = curr.source_info[name]
-        wave_gens[name] = waveform_classes[name](**info.initialize_kwargs)
-        subtract_initial_signal(acs, state, wave_gens[name].get_signals_for_residuals, name, info)
-
-        # plot and save the residuals after the initial signals are subtracted, for debugging
-        _ = acs.acs[0].data.plot(channel=0, filename=curr.general_info.artifacts_file_dir + f"data_after_subtracting_{name}.png")
+        state.sub_states[name].betas_all = np.tile(pad_ladder(info.betas, ntemps), (info.nleaves_max, 1))
+        if block.search is not None:
+            wave_gens[name] = info.signal_gen.waveform
     return wave_gens
-
-
-def make_signal_gen(waveform, method: str, transform, runtime_kwargs: dict):
-    """``fn(*sampling_params, **kwargs)``: the sampling->waveform transform, then ``waveform.<method>``.
-
-    Scalar params (one leaf) give one signal; 1-D params (a batch, e.g. over walkers) give a
-    ``DomainBaseArray``. ``kwargs`` are added to ``runtime_kwargs`` (e.g. ``td_settings``).
-    """
-    fn = getattr(waveform, method)
-    xp = getattr(waveform, "xp", np)
-
-    def signal_gen(*params, **kwargs):
-        single = all(np.ndim(p) == 0 for p in params)
-        coords = np.stack([np.atleast_1d(np.asarray(p, dtype=float)) for p in params], axis=-1)
-        if transform is not None:
-            coords = transform.both_transforms(coords)
-        # contiguous columns, as subtract_initial_signal passes them
-        columns = [xp.ascontiguousarray(col) for col in xp.asarray(coords).T]
-        out = fn(*columns, **{**runtime_kwargs, **kwargs})
-        return out[0] if single else out
-
-    return signal_gen
 
 
 def attach_signal_gens(ctx: RecipeContext, td_generators: dict, curr, state) -> None:
     """The seeded branches' analysis-domain and TD generators, and the shared TD residual (``data.keep_td``).
 
-    Uses the wave gens of ``seed_branches``: the PE move and both generators share one waveform object
-    (a block's ``td_waveform.class`` gets its own). The analysis-domain residuals are left to the legacy
-    subtraction.
+    The analysis-domain generator is the branch's ``Settings.signal_gen`` (the one ``setup_acs`` built the
+    residuals with); the TD generator reuses its waveform (a block's ``td_waveform.class`` gets its own).
     """
     for name, wave_gen in ctx.wave_gens.items():
         info = curr.source_info[name]
-        ctx.signal_gens[name] = make_signal_gen(
+        signal_gen = getattr(info, "signal_gen", None)
+        ctx.signal_gens[name] = signal_gen if signal_gen is not None else SignalGen(
             wave_gen, "get_signals_for_residuals", info.transform, info.waveform_kwargs
         )
         td = td_generators.get(name)
         if td is None:
             continue
         td_wave = wave_gen if td.waveform_class is None else td.waveform_class(**td.init_kwargs)
-        ctx.td_signal_gens[name] = make_signal_gen(td_wave, td.method, info.transform, td.runtime_kwargs)
+        ctx.td_signal_gens[name] = SignalGen(td_wave, td.method, info.transform, td.runtime_kwargs)
 
     if not ctx.cfg.data.keep_td:
         return
@@ -382,14 +341,14 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
     A closure, not an object: ``CurrentInfoGlobalFit`` deep-copies its settings, and functions are copied
     by reference.
     """
-    waveform_classes = {name: build.waveform_class for name, build in builds.items()}
     td_generators = {
         name: build.td_generator for name, build in builds.items() if getattr(build, "td_generator", None)
     }
 
     def setup_recipe(recipe, engine_info, curr, acs, priors, state):
+        # the state was seeded by load_info and the residuals built from it by setup_acs
         select_device(curr.general_info)
-        ctx = RecipeContext(cfg, seed_branches(cfg, waveform_classes, curr, acs, priors, state))
+        ctx = RecipeContext(cfg, prepare_branches(cfg, curr, state))
         attach_signal_gens(ctx, td_generators, curr, state)
         attach_flow_trainers(cfg, curr)
         spec = cfg.recipe

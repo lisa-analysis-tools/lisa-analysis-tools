@@ -582,6 +582,9 @@ class GlobalFitSettings:
     source_metadata: typing.Dict[str, dataclasses.dataclass] = dataclasses.field(
         default_factory=dict
     )
+    # build the residuals from the state through each branch's Settings.signal_gen when the analysis
+    # containers are assembled (run.py build_acs); off -> the recipe subtracts its own initial signals
+    rebuild_residuals: bool = False
 
 
 @dataclasses.dataclass

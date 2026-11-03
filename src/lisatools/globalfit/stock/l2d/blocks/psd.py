@@ -6,7 +6,7 @@ from pydantic import Field
 
 from .base import (
     GENERIC_MOVES, GENERIC_PSD_MOVE_FILLED, SPECIAL_MOVES, SPECIAL_PSD_MOVE_FILLED,
-    BlockBuild, BuildContext, ClassSpec, MoveBlock, PEMove, make_betas, make_search_interface,
+    BlockBuild, BuildContext, ClassSpec, MoveBlock, PEMove, SearchSpec, make_betas, make_search_interface,
 )
 
 REFERENCE_TMAX = 1e6  # top of the reference psd ladder (mojito_input/emri_mbh_psd_settings.py)
@@ -19,6 +19,8 @@ class PSDBlock(MoveBlock):
     type: Literal["psd"]
     SEARCH_INTERFACE: ClassVar[str] = "NoiseSearchInterface"
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate")  # no catalogue of noise
+    # without `search:` the branch starts on, from prior draws (then the max-likelihood search runs)
+    DEFAULT_SEARCH: ClassVar[SearchSpec | None] = SearchSpec(search_type="prior")
     FULL_LADDER: ClassVar[bool] = True  # the psd moves run on every temperature
     PE_MOVES: ClassVar[dict[str, PEMove]] = {
         "MultiGPUPSDMove": PEMove(SPECIAL_MOVES, SPECIAL_PSD_MOVE_FILLED),

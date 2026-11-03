@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Literal
 
-from .base import BlockBase, BlockBuild, BuildContext, make_search_interface
+from .base import BlockBase, BlockBuild, BuildContext, SearchSpec, make_search_interface
 from .psd import psd_betas
 
 
@@ -16,6 +16,8 @@ class GalForBlock(BlockBase):
     type: Literal["galfor"]
     SEARCH_INTERFACE: ClassVar[str] = "GalacticForegroundSearchInterface"
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate")  # no catalogue of the galaxy
+    # without `search:` the branch starts on, from prior draws (sampled by the psd move)
+    DEFAULT_SEARCH: ClassVar[SearchSpec | None] = SearchSpec(search_type="prior")
 
 
 def build(block: GalForBlock, ctx: BuildContext) -> BlockBuild:
