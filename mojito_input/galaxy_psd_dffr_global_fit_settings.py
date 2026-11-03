@@ -17,7 +17,9 @@ from the prior, Fisher in-model proposals) combined with the PSD and foreground 
 runs the same with the GB memory probe on, for memory, under its own run name.
 ``get_global_fit_calibration_settings`` runs one iteration of that, also under its own run name.
 ``get_optimisation_test_2_settings`` and ``get_optimisation_test_3_settings`` run all iterations with the
-probe, with tempering width classes off and on.
+probe, with tempering width classes off and on. ``get_azzurra_one_gpu_settings`` and
+``get_azzurra_two_gpu_settings`` run all iterations with the probe at the defaults on one and on two cards,
+from a seeded start, for the scaling test on Azzurra.
 Environment: GLOBAL_FIT_RUNS_DIR (default: global_fit_runs of the workspace), MOJITO_FOLDER (default the
 Mojito-light data on Spider), RESOLVED_GB_FILE (default the 714-day resolved-source file).
 """
@@ -93,6 +95,9 @@ NLEAVES_MAX = 8000
 NUM_BAND_PRELOAD = None
 NUM_BANDS_PRELOAD_TEMP = None
 NUM_PE_ITERATIONS = 5
+# * Devices of the run; the two-GPU entry function sets [0, 1].
+GPUS = [0]
+RANDOM_SEED = 5701424
 # An upper bound only: the recipe stops after the search and NUM_PE_ITERATIONS iterations.
 MAX_ITERATIONS = 1 + NUM_PE_ITERATIONS + 4
 PSD_PROP_REPEATS = 100
@@ -460,7 +465,7 @@ def get_general_settings(name: str) -> GeneralSetup:
 
     dt = 5.0
     Tobs = N_SEGMENTS * STFT_SEGMENT_S
-    gpus = [0] if gpu_available else None
+    gpus = list(GPUS) if gpu_available else None
     if gpu_available:
         cp.cuda.runtime.setDevice(gpus[0])
         # ! Restrict JAX to the same GPU before its backend starts.
@@ -507,7 +512,7 @@ def get_general_settings(name: str) -> GeneralSetup:
         file_store_dir=file_store_dir,
         base_file_name=name,
         domain_settings=domain_settings,
-        random_seed=5701424,
+        random_seed=RANDOM_SEED,
         backup_iter=1,
         nwalkers=NWALKERS,
         ntemps=NTEMPS,
@@ -615,3 +620,19 @@ def get_parallel_gibbs_test_settings():
 def get_optimisation_test_6_settings():
     """The full run with the probe at the defaults, with every switch of the GB moves on."""
     return build_settings("optimisation_test_6", mem_probe=True)
+
+
+def get_azzurra_one_gpu_settings():
+    """The full run at the defaults with the probe on one card, from a seeded start: the one-GPU run
+    of the Azzurra scaling test (global_fit_dev/plans/memory/handover_azzurra.md, section 5)."""
+    # ! The start is drawn from NumPy's global generator (recipe.py, run.py), which nothing else seeds.
+    np.random.seed(RANDOM_SEED)
+    return build_settings("azzurra_one_gpu", mem_probe=True)
+
+
+def get_azzurra_two_gpu_settings():
+    """The same on two cards, which share the walkers and the band buffers, from the same start."""
+    global GPUS
+    GPUS = [0, 1]
+    np.random.seed(RANDOM_SEED)
+    return build_settings("azzurra_two_gpu", mem_probe=True)
