@@ -943,7 +943,7 @@ class SOBBHTaylorT3TDIWaveform(TDPyResponseWaveformBase, JaxBase):
         # The legacy ResponseWrapper path uses ``flip_hx=True`` (it feeds
         # ``hp - i hx`` to pyResponseTDI); ``_apply_response`` builds
         # ``h_plus + 1j*h_cross`` with no flip, so the sign goes here.
-        return self._to_xp(hp_rot), self._to_xp(-hx_rot)
+        return self._to_xp(hp_rot), self._to_xp(hx_rot)
 
     @staticmethod
     def _as_float_array(x) -> NDArrayLike:
