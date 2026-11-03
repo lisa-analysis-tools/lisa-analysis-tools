@@ -405,7 +405,8 @@ def get_gb_settings(general_set: GeneralSetup, mem_probe_file: str | None) -> tu
         ndim=8,
         betas=betas,
         log_dir=general_set.file_store_dir,
-        A_lims=[10 ** (-23.2), 1e-20],
+        # * The amplitude bounds of the shared stock GB prior (erebor-priors fb65c56).
+        A_lims=[10 ** (-23.5), 1e-20],
         f0_lims=f0_lims,
         m_chirp_lims=[0.03, 1.34],
         fdot_lims=[get_fdot_mojito(f0_lims[-1], sign="-"), get_fdot_mojito(f0_lims[-1], sign="+")],

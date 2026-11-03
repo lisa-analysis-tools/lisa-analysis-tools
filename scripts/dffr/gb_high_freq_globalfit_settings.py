@@ -150,7 +150,8 @@ def get_gb_settings(general_set: GeneralSetup, response: str) -> tuple[GBSetup, 
     prior_model_code_link = "https://priors-database-f0027f.gitlab.io/mojito_light_1a.html#massive-black-hole-binaries-mbhb"
 
     delta_safe = 1e-9
-    A_lims = [10 ** (-23.2), 1e-20]
+    # * The amplitude bounds of the shared stock GB prior (erebor-priors fb65c56).
+    A_lims = [10 ** (-23.5), 1e-20]
     # * f0 and fdot limits are reset from the band edges by GBSetup.
     f0_lims = [1e-4, 0.023]
     m_chirp_lims = [0.03, 1.34]
