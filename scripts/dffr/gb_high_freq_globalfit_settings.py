@@ -157,7 +157,8 @@ def get_gb_settings(general_set: GeneralSetup, response: str) -> tuple[GBSetup, 
     fdot_lims = [get_fdot_mojito(f0_lims[-1], sign="-"), get_fdot_mojito(f0_lims[-1], sign="+")]
     phi0_lims = [0.0, 2 * np.pi]
     iota_lims = [0.0 + delta_safe, np.pi - delta_safe]
-    psi_lims = [0.0, np.pi]
+    # * psi is periodic in 2 pi (DDPC convention), as GBSetup and the catalogue conversion.
+    psi_lims = [0.0, 2 * np.pi]
     alpha_lims = [0.0, 2 * np.pi]
     delta_lims = [-np.pi / 2.0 + delta_safe, np.pi / 2.0 - delta_safe]
 
