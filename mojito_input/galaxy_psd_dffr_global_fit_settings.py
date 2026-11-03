@@ -411,7 +411,8 @@ def get_gb_settings(general_set: GeneralSetup, mem_probe_file: str | None) -> tu
         fdot_lims=[get_fdot_mojito(f0_lims[-1], sign="-"), get_fdot_mojito(f0_lims[-1], sign="+")],
         phi0_lims=[0.0, 2 * np.pi],
         iota_lims=[0.0 + delta_safe, np.pi - delta_safe],
-        psi_lims=[0.0, np.pi],
+        # * psi is periodic in 2 pi (DDPC convention), as GBSetup and the catalogue conversion.
+        psi_lims=[0.0, 2 * np.pi],
         alpha_lims=[0.0, 2 * np.pi],
         delta_lims=[-np.pi / 2.0 + delta_safe, np.pi / 2.0 - delta_safe],
         start_freq=start_freq,
@@ -496,6 +497,8 @@ def get_general_settings(name: str) -> GeneralSetup:
         trim_kwargs={"duration": 200 * 3600, "is_percent": False, "trimming_type": "from_each_end"},
         downsample_kwargs={"target_fs": 1 / dt, "window": ("kaiser", 31.0)},
         Tobs=Tobs,
+        # * The noise model includes the power the decimation folds back (user, 2026-11-03).
+        alias_correction=True,
     )
     # The galactic grid gives the foreground's sky-averaged geometry at every segment centre.
     galactic_grid_kwargs = dict(R_d=2.18, z_d=0.48, N_lambda=90, N_beta=60)
