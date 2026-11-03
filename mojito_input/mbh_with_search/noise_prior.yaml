@@ -1,0 +1,20 @@
+branch_name: psd
+priors:
+- name: S_oms
+  prior_kwargs:
+    maximum: 1.0e-10
+    minimum: 1.0e-12
+    name: oms amplitude
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: S_tm
+  prior_kwargs:
+    maximum: 1.0e-13
+    minimum: 1.0e-15
+    name: tm amplitude
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+return_gpu: false
+use_cupy: false

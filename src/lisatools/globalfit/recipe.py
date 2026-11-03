@@ -31,10 +31,11 @@ except ModuleNotFoundError:
 from lisatools.domains import FDSettings, STFTSettings, WDMSettings
 from lisatools.response.tdiconfig import TDIConfig
 
-from bbhx.utils.transform import SSB_to_LISA
+try:  # optional: only MBH settings files need bbhx
+    from bbhx.utils.transform import SSB_to_LISA
+except ImportError:
+    SSB_to_LISA = None
 from gbgpu.gbgpu import GBGPU
-from gbgpu.gbcomps import STFTGBComputations
-from gbgpu.gb_likelihood import make_band_likelihood_engine
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer
 
@@ -595,7 +596,7 @@ def mbh_catalogue_to_sampling_basis(
 
     s1z = float(catalogue_entry["PrimarySpinCompZ"])
     s2z = float(catalogue_entry["SecondarySpinCompZ"])
-    dist = float(catalogue_entry["LuminosityDistance"]) / 1e3  # Mpc -> Gpc
+    dist = float(catalogue_entry["LuminosityDistance"]) * 1e-3  # Mpc -> Gpc
     phi_ref = float(catalogue_entry["PhaseReferenceSourceFrame"]) % (2 * np.pi)
     cos_iota = np.cos(float(catalogue_entry["InclinationAngle"]))
 
@@ -1107,6 +1108,7 @@ def build_psd_moves(
     num_repeats: int = 60,
     permute_every: int = 50,
     Tmax: float = 1e6,
+    betas: typing.Optional[np.ndarray] = None,
 ) -> tuple[PSDMove, PSDMove]:
     """Build PSD search and PE moves.
 
@@ -1128,6 +1130,8 @@ def build_psd_moves(
         Number of internal PSD move repeats. Default 60.
     Tmax : float, optional
         Maximum temperature for ``TemperatureControl``. Default 1e6.
+    betas : np.ndarray, optional
+        Explicit ladder for ``TemperatureControl``; overrides ``Tmax``.
 
     Returns
     -------
@@ -1142,7 +1146,7 @@ def build_psd_moves(
 
     effective_ndim = engine_info.ndims["psd"] if galfor_info is None else engine_info.ndims["galfor"] + engine_info.ndims["psd"] 
     temperature_control = TemperatureControl(
-        effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
+        effective_ndim, nwalkers, ntemps=ntemps, betas=betas, Tmax=Tmax, permute=False
     )
 
     psd_move_kwargs = dict(
@@ -1318,6 +1322,7 @@ def build_gb_moves(
     #* Setting up gbgpu on the correct backend and (if any) gpu(s).
     #* CPU path keeps numpy and avoids the cupy-only setDevice call.
     from gbgpu.gbgpu import GBGPU
+    from gbgpu.gbcomps import STFTGBComputations
     import gbgpu
 
     gb_force_backend = general_info.force_backend
@@ -1513,6 +1518,8 @@ def build_gb_moves(
             )
             
             xp = gb_info.gb_stft_comp.xp
+
+            from gbgpu.gb_likelihood import make_band_likelihood_engine
 
             make_band_likelihood_engine(
                 domain_settings,
@@ -1885,10 +1892,13 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         # ladder on the source info and the tiled ladder on the sub-state.
         info.betas = betas
         betas_all = np.tile(betas, (info.nleaves_max, 1))
-        state.sub_states[self.branch_name].betas_all = betas_all
+        # the state (and its backend) keeps every temperature: pad a subset ladder with its last rung
+        padded = np.concatenate([betas, np.full(ntemps - len(betas), betas[-1])])
+        state.sub_states[self.branch_name].betas_all = np.tile(padded, (info.nleaves_max, 1))
         logger.debug(f"{self.branch_name} betas: {betas}")
 
-        coords_shape = (ntemps, nwalkers, info.nleaves_max, info.ndim)
+        # the move may run on a subset ladder (the first len(betas) temperatures)
+        coords_shape = (len(betas), nwalkers, info.nleaves_max, info.ndim)
 
         wf_gen_kw = (
             self.waveform_gen_kwargs
@@ -1996,11 +2006,15 @@ class PSDMoveBuilder(SourceMoveBuilder):
 
     branch_name = "psd"
 
-    def __init__(self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6):
+    def __init__(
+        self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6,
+        betas: typing.Optional[np.ndarray] = None,
+    ):
         super().__init__(branch_name="psd")
         self.num_repeats = num_repeats
         self.permute_every = permute_every
         self.Tmax = Tmax
+        self.betas = betas
 
     def build(self, engine_info, curr, acs, priors, state):
         search_move, pe_move = build_psd_moves(
@@ -2011,5 +2025,6 @@ class PSDMoveBuilder(SourceMoveBuilder):
             num_repeats=self.num_repeats,
             permute_every=self.permute_every,
             Tmax=self.Tmax,
+            betas=self.betas,
         )
         return [search_move], [pe_move]

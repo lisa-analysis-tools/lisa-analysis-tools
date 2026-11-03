@@ -42,7 +42,7 @@ from ..sensitivity import (
     XYZ2SensitivityMatrix,
     XYZSensitivityBackend,
 )
-from ..utils.utility import AET, detrend, windowfun
+from ..utils.utility import AET, detrend, windowfun, asnumpy
 from .preprocessing import BaseProcessingStep
 
 
@@ -208,6 +208,9 @@ class GeneralSettings(Settings):
     global_fit_contact: Optional[str] = None
     global_fit_code_link: Optional[str] = None
     submission_parent_folder: Optional[str] = None
+    # branches whose posteriors are not written at the end of the run; produce them later with
+    # scripts/postprocess_submission.py (psd/galfor defer the whole stochastic component)
+    defer_posteriors: list[str] = dataclasses.field(default_factory=list)
     input_data_link: Optional[str] = None
     input_reference: Optional[str] = None
     noise_model: Optional[str] = None
@@ -290,6 +293,7 @@ class GeneralSetup(Setup, GeneralSettings):
         # CPU fallback: when gpus is None, force_backend resolves to "cpu" so
         # downstream consumers stay numpy-only. GPU path keeps cupy.
         self.force_backend = self.gpu_backend if self.gpus is not None else "cpu"
+        self.logger.debug(f"Using GPUs: {self.gpus}")
         self.logger.debug(f"Saving h5 backend to {self.main_file_path}")
         self.logger.debug(f"Saving artifacts to {self.artifacts_file_dir}")
         if not os.path.exists(self.artifacts_file_dir):
@@ -326,6 +330,33 @@ class GeneralSetup(Setup, GeneralSettings):
             f"factory callable; got {type(spec).__name__}."
         )
 
+    def _get_alias_response(self, f_arr):
+        """Alias terms of the downsampling step for the sensitivity backend, or ``None``.
+
+        Controlled by ``preprocess_kwargs["alias_correction"]`` (default ``True``): decimation
+        folds the power the anti-aliasing filters leave above the new Nyquist back into the
+        band, which the filter response alone does not model. Logs and prints the choice.
+        """
+        get_alias = getattr(self.data_processor, "get_alias_response", None)
+        alias_response = get_alias(f_arr) if get_alias is not None else None
+        down = getattr(self.data_processor, "resample_down", None)
+        if alias_response is not None:
+            msg = (
+                f"Downsampling alias correction: ON ({alias_response[0].shape[0]} alias term(s), "
+                f"decimation by {down}). The noise model includes the power folded back from "
+                "above the new Nyquist."
+            )
+        elif down is not None and down > 1:
+            msg = (
+                "Downsampling alias correction: OFF. The power folded back by the decimation is NOT "
+                "modelled; the noise model is biased near the new Nyquist and in the TDI notches. "
+                "Keep the analysis band well below the new Nyquist."
+            )
+        else:
+            msg = "Downsampling alias correction: not needed (no downsampling applied)."
+        self.logger.info(msg)
+        print(msg)
+        return alias_response
     def init_data_information(self):
         """Run preprocessing, build the basis domain, and configure the sensitivity backend."""
         if self.data_processor_class is None:
@@ -335,7 +366,7 @@ class GeneralSetup(Setup, GeneralSettings):
 
         if self.fixed_psd_kwargs is None:
             self.fixed_psd_kwargs = dict(
-                psd_params=[15e-12, 3e-15],
+                psd_params=np.array([15e-12, 3e-15]),
                 galfor_params=None,
             )
 
@@ -412,6 +443,9 @@ class GeneralSetup(Setup, GeneralSettings):
         self.input_data_residual_array, orbits = self.data_processor.pour(
             settings=domain_settings, window=window, return_orbits=True
         )
+
+        filters_response = self.data_processor.get_total_response(asnumpy(domain_settings.f_arr))
+        alias_response = self._get_alias_response(asnumpy(domain_settings.f_arr))
 
         if isinstance(domain_settings, FDSettings):
             # FD path: ``pour`` returns an FDSignal whose ``settings`` IS the
@@ -494,12 +528,17 @@ class GeneralSetup(Setup, GeneralSettings):
             )
         else:
             self.sensitivity_backend = backend_cls(
-                orbits=self.gpu_orbits,
+                orbits=self.gpu_orbits if self.force_backend == self.gpu_backend else self.orbits,
                 settings=domain_settings,
                 force_backend=self.force_backend,
                 window_values=window if self.normalize_window else None,
+                filters_response=filters_response,
+                alias_frequencies=None if alias_response is None else alias_response[0],
+                alias_filters_response=None if alias_response is None else alias_response[1],
                 **sensitivity_init_kwargs,
             )
+
+            self.logger.debug(f"Using sensitivity backend {type(self.sensitivity_backend).__name__} with kwargs: {self.sensitivity_backend.kwargs}")
 
     @property
     def stft_dt(self) -> Optional[float]:

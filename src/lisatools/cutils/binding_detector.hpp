@@ -255,13 +255,16 @@ public:
      * @param R_d     disk radial scale length [kpc]
      * @param z_d     disk vertical scale height [kpc]
      * @param N_times number of time segments
+     * @param f_b     fraction of sources in the bulge (0 = disk only)
+     * @param r_b     bulge scale radius [kpc]
      */
-    void initialize_wrap(array_type<double> times, double R_d, double z_d, int N_times)
+    void initialize_wrap(array_type<double> times, double R_d, double z_d, int N_times,
+                         double f_b = 0.0, double r_b = 0.5)
     {
         gal_grid->initialize(
             R_d, z_d,
             return_pointer_and_check_length(times, std::string("times"), N_times, 1),
-            N_times
+            N_times, f_b, r_b
         );
     }
 
@@ -281,6 +284,16 @@ public:
             N_freqs, N_times,
             Amp, alpha, f_1, f_knee, f_2, avg_d
         );
+    }
+
+    /**
+     * Use the detector-tensor response from the orbit arms for R_avg (call before
+     * initialize_wrap). arms: (N_times, 3, 3) unit vectors u12, u13, u23, ecliptic frame.
+     */
+    void set_detector_arms_wrap(array_type<double> arms, int N_times)
+    {
+        gal_grid->set_detector_arms(
+            return_pointer_and_check_length(arms, std::string("arms"), N_times * 9, 1), N_times);
     }
 
     /** Return device pointer to R_avg (N_times * 6 doubles). */
@@ -309,12 +322,19 @@ class XYZSensitivityMatrixWrap {
 public:
     XYZSensitivityMatrix *sensitivity_matrix;
 
-    XYZSensitivityMatrixWrap(array_type<double> averaged_ltts_arr_, array_type<double> delta_ltts_arr_, int n_times_, double armlength_, int generation_, bool spline_noise_, double window_factor_)
+    // noise_normalization_: per-frequency factor (window power x filter response) over the
+    // active band, indexed by f_idx in the kernels. Stored NON-OWNED: keep it alive in Python.
+    XYZSensitivityMatrixWrap(array_type<double> averaged_ltts_arr_, array_type<double> delta_ltts_arr_, int n_times_, double armlength_, int generation_, bool spline_noise_, array_type<double> noise_normalization_)
     {
         double *_averaged_ltts_arr = return_pointer_and_check_length(averaged_ltts_arr_, std::string("averaged_ltts_arr"), n_times_, 6);
         double *_delta_ltts_arr = return_pointer_and_check_length(delta_ltts_arr_, std::string("delta_ltts_arr"), n_times_, 6);
 
-        sensitivity_matrix = new XYZSensitivityMatrix(_averaged_ltts_arr, _delta_ltts_arr, n_times_, armlength_, generation_, spline_noise_, window_factor_);
+        // the active-band length is unknown here; at least reject an empty array
+        if (noise_normalization_.size() == 0)
+            throw std::invalid_argument("noise_normalization: empty array; expected one factor per active frequency.");
+        double *_noise_normalization = noise_normalization_.data();
+
+        sensitivity_matrix = new XYZSensitivityMatrix(_averaged_ltts_arr, _delta_ltts_arr, n_times_, armlength_, generation_, spline_noise_, _noise_normalization);
     }
 
     ~XYZSensitivityMatrixWrap() {
@@ -364,16 +384,44 @@ public:
         array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
         array_type<double> spline_in_isi_oms_all, array_type<double> spline_in_testmass_all,
         double differential_component, int num_freqs, int num_times,
-        array_type<bool> dips_mask, int num_psds, bool run_async = false);
+        array_type<bool> dips_mask, int num_psds,
+        array_type<double> c00_all, array_type<double> c11_all, array_type<double> c22_all,
+        array_type<std::complex<double>> c01_all, array_type<std::complex<double>> c02_all,
+        array_type<std::complex<double>> c12_all,
+        bool use_external_matrix = false, bool run_async = false);
+
+    // Fused likelihood from precomputed (window-convolved) covariance bases; see
+    // XYZSensitivityMatrix::psd_likelihood_basis_wrap (PSD.hpp / PSD.cu).
+    void psd_likelihood_basis_wrap(
+        array_type<double> like_contrib_final, array_type<std::complex<double>> data,
+        array_type<int> data_index_all, array_type<double> coeffs,
+        array_type<double> B00, array_type<double> B11, array_type<double> B22,
+        array_type<std::complex<double>> B01, array_type<std::complex<double>> B02,
+        array_type<std::complex<double>> B12,
+        bool use_galaxy, array_type<double> gal_conv, array_type<double> gal_ratios,
+        int n_gal, long long gal_psd_stride, long long gal_t_stride,
+        bool use_spline_weights, array_type<double> spline_weights,
+        long long spl_psd_stride, long long spl_noise_stride, long long spl_f_stride,
+        array_type<bool> dips_mask, double differential_component,
+        int num_freqs, int num_times, int num_psds, int num_data, int n_basis,
+        bool run_async = false);
+
+    // XX galactic rows (num_psds, num_freqs) on a frequency prefix of the active grid.
+    void get_galactic_row_wrap(
+        array_type<double> out, array_type<double> freqs,
+        array_type<double> Amp_all, array_type<double> alpha_all,
+        array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+        int num_freqs, int num_psds, int time_index, bool run_async = false);
 
     void get_noise_covariance_wrap(
         array_type<double> freqs, array_type<int> time_indices,
-        double Soms_d_in, double Sa_a_in,
-        double Amp, double alpha, double f_1, double f_knee, double f_2,
-        array_type<double> spline_in_isi_oms_arr, array_type<double> spline_in_testmass_arr,
+        array_type<double> Soms_d_in_all, array_type<double> Sa_a_in_all,
+        array_type<double> Amp_all, array_type<double> alpha_all,
+        array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+        array_type<double> spline_in_isi_oms_all, array_type<double> spline_in_testmass_all,
         array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,
         array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
-        int num_freqs, int num_times);
+        int num_freqs, int num_times, int num_psds, bool run_async = false);
 
     void set_averaged_tfs_wrap(
         array_type<double> oms_xx, array_type<std::complex<double>> oms_xy, array_type<std::complex<double>> oms_xz,
@@ -381,6 +429,21 @@ public:
         array_type<double> tm_xx,  array_type<std::complex<double>> tm_xy,  array_type<std::complex<double>> tm_xz,
         array_type<double> tm_yy,  array_type<std::complex<double>> tm_yz,  array_type<double> tm_zz, int nf);
     void disable_averaged_tfs_wrap();
+
+    // unequal (per-MOSA) noise amplitudes
+    void set_noise_symmetry_wrap(bool asymmetric) { sensitivity_matrix->set_noise_symmetry(asymmetric); }
+    int get_n_noise_par() const { return sensitivity_matrix->n_noise_par; }
+    void get_noise_tfs_mosa_wrap(
+        array_type<double> freqs, array_type<double> mosa_auto,
+        array_type<std::complex<double>> mosa_cross,
+        int num_freqs, int num_times, array_type<int> time_indices);
+    void set_averaged_mosa_tfs_wrap(
+        array_type<double> mosa_auto, array_type<std::complex<double>> mosa_cross, int nf);
+
+    // downsampling aliasing: signed alias frequencies, layout (n_alias, n_grid)
+    void set_aliasing_wrap(array_type<double> alias_freqs, int n_alias, int n_grid);
+    void disable_aliasing_wrap() { sensitivity_matrix->disable_aliasing(); }
+    int get_n_alias() const { return sensitivity_matrix->n_alias; }
 
     void get_inverse_det_wrap(
         array_type<double> c00_arr, array_type<std::complex<double>> c01_arr, array_type<std::complex<double>> c02_arr,

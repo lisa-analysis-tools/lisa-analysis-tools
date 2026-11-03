@@ -1,10 +1,12 @@
 """
 Preprocessing module for loading and handling Mojito L1 files.
 
-Credits for most of the signal processing functions to Ollie Burke and Martina Muratore for the repository: https://github.com/OllieBurke/mojito-noise-sprint/blob/main/Mojito_Sprint/
+Credits for most of the signal processing functions to Ollie Burke and Martina Muratore for the repository: https://github.com/OllieBurke/mojito-noise-sprint/blob/main/Mojito_Sprint
+and to Federico Pozzoli for the integration of the filters response.
 """
 
 import dataclasses
+from fractions import Fraction
 import logging
 import os
 from typing import Callable, Optional, Sequence
@@ -14,6 +16,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mojito import MojitoL1File
 from MojitoProcessor import SignalProcessor as MPSignalProcessor
+from scipy import signal
+try:
+    from scipy.signal import freqz_sos                  # SciPy >= 1.15
+except ImportError:
+    from scipy.signal import sosfreqz as freqz_sos
+
 from tqdm import tqdm
 
 from ..domains import DomainBase
@@ -44,6 +52,50 @@ if not logger.handlers:
 
 ALLOWED_SOURCES = ["NOISE", "GB", "VGB", "MBHB", "EMRI", "SOBHB"]
 
+def _butter(n, wn, **kw):
+            return signal.butter(n, wn, **kw)
+
+def _bessel(n, wn, **kw):
+    return signal.bessel(n, wn, **kw)
+
+def _cheby1(n, wn, **kw):
+    return signal.cheby1(n, 1.0, wn, **kw)
+
+def _cheby2(n, wn, **kw):
+    return signal.cheby2(n, 40.0, wn, **kw)
+
+filter_funcs = {
+    "butterworth": _butter,
+    "bessel": _bessel,
+    "chebyshev1": _cheby1,
+    "chebyshev2": _cheby2,
+}
+
+
+def kaiser_aafilter_response(
+    freqs: float | np.ndarray, attenuation: float, freq1: float, freq2: float, fs: float
+) -> np.ndarray:
+    """Power response of a Kaiser-window FIR anti-aliasing filter, LISA Instrument style.
+
+    The filter is designed as in LISA Instrument's ``aafilter=("kaiser", attenuation, freq1, freq2)``:
+    ``scipy.signal.kaiserord(attenuation, (freq2 - freq1) / (fs / 2))`` gives the number of taps and
+    the Kaiser beta, and ``firwin`` puts the cutoff at ``(freq1 + freq2) / 2``.
+
+    Args:
+        freqs: Frequencies [Hz] (the absolute value is used).
+        attenuation: Stop-band attenuation [dB].
+        freq1: Start of the transition band [Hz].
+        freq2: End of the transition band [Hz].
+        fs: Sampling rate at which the filter runs [Hz].
+
+    Returns:
+        ``|H(f)|^2`` with the shape of ``freqs``.
+    """
+    freqs = np.abs(np.asarray(freqs, dtype=np.float64))
+    numtaps, beta = signal.kaiserord(attenuation, (freq2 - freq1) / (fs / 2))
+    taps = signal.firwin(numtaps, (freq1 + freq2) / 2, window=("kaiser", beta), fs=fs)
+    _, h = signal.freqz(taps, worN=freqs.ravel(), fs=fs)
+    return (np.abs(h) ** 2).reshape(freqs.shape)
 
 def find_file(folder: str, source_type: str, source_id: int) -> str:
     """
@@ -115,9 +167,9 @@ class L1DataLoader:
         self,
         L1_folder: str,
         source_types: list,
-        source_ids: dict = None,
-        orbits_class: Orbits = L1Orbits,
-        orbits_kwargs: dict = None,
+        source_ids: Optional[dict] = None,
+        orbits_class: Orbits | L1Orbits = L1Orbits,
+        orbits_kwargs: Optional[dict] = None,
         verbose: bool = True,
         store_individual_timeseries: bool = False,  # whether to store individual timeseries for each source type and ID
     ):
@@ -504,6 +556,7 @@ class SignalProcessor:
         self.N = times.shape[0]
         self.T = self.N * self.dt # total duration. Takes into account that times[0] may not be zero.
         self.data = data
+        self.original_fs = fs
         self.fs = fs
         self.verbose = verbose
         self.do_plots = do_plots
@@ -842,12 +895,14 @@ class BaseProcessingStep(SignalProcessor):
 
     def process(
         self,
-        highpass_kwargs: dict = None,
-        lowpass_kwargs: dict = None,
-        bandpass_kwargs: dict = None,
-        downsample_kwargs: dict = None,
-        trim_kwargs: dict = None,
-        Tobs: float = None,
+        highpass_kwargs: Optional[dict] = None,
+        lowpass_kwargs: Optional[dict] = None,
+        bandpass_kwargs: Optional[dict] = None,
+        downsample_kwargs: Optional[dict] = None,
+        trim_kwargs: Optional[dict] = None,
+        Tobs: Optional[float] = None,
+        alias_correction: bool = True,
+        upstream_aafilter_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> tuple:
         """
@@ -861,6 +916,21 @@ class BaseProcessingStep(SignalProcessor):
                 Applied after filtering and before trimming. Example: dict(target_fs=1.0).
             trim_kwargs (dict, optional): Keyword arguments for trim method.
             Tobs (float, optional): Observation time in seconds. If provided, applies trimming to keep only the first `Tobs` duration of data.
+            alias_correction (bool, optional): Model the aliasing of the downsampling step in the
+                noise covariance (default ``True``). Decimation folds the power that the
+                anti-aliasing filters leave above the new Nyquist back into the band; the filter
+                response alone does not describe it, and the data PSD is then underestimated near
+                the new Nyquist and in the TDI notches (up to factors of a few). With ``True``,
+                :meth:`get_alias_response` provides the alias terms for the sensitivity backend
+                (about one extra covariance evaluation per alias). Set ``False`` only for runs
+                whose band stays well below the new Nyquist, where the effect is negligible.
+                Has no effect without downsampling.
+            upstream_aafilter_kwargs (dict, optional): Anti-aliasing filter applied to the data
+                *before* they were loaded, e.g. by the simulation when it decimated to the L1 rate
+                (Mojito: 4 Hz -> 0.4 Hz). Not applied to the data here; it only enters the modelled
+                response (:meth:`get_total_response`, hence also the alias terms, where it weights the
+                power folded from above the new Nyquist). Keys of :func:`kaiser_aafilter_response`:
+                ``attenuation`` [dB], ``freq1``, ``freq2``, ``fs`` [Hz].
             **kwargs: Additional keyword arguments for the eventual plots.
 
         Returns:
@@ -872,24 +942,75 @@ class BaseProcessingStep(SignalProcessor):
             if self.verbose:
                 logger.info("Applying highpass filter...")
             self.data = self.highpass_filter(**highpass_kwargs, **kwargs)
+            
+            self.sos_highpass = filter_funcs[highpass_kwargs.get("filter_type", "butterworth")](
+                highpass_kwargs["order"],
+                highpass_kwargs["cutoff"],
+                btype="highpass",
+                fs=self.fs,
+                output="sos"
+            )
+            self.p_highpass = 4 if highpass_kwargs.get("zero_phase", True) else 2
             filtered = True
 
         if lowpass_kwargs is not None:
             if self.verbose:
                 logger.info("Applying lowpass filter...")
             self.data = self.lowpass_filter(**lowpass_kwargs, **kwargs)
+            
+            self.sos_lowpass = filter_funcs[lowpass_kwargs.get("filter_type", "butterworth")](
+                lowpass_kwargs["order"],
+                lowpass_kwargs["cutoff"],
+                btype="lowpass",
+                fs=self.fs,
+                output="sos"
+            )
+            self.p_lowpass = 4 if lowpass_kwargs.get("zero_phase", True) else 2
             filtered = True
 
         if bandpass_kwargs is not None:
             if self.verbose:
                 logger.info("Applying bandpass filter...")
             self.data = self.bandpass_filter(**bandpass_kwargs, **kwargs)
+            
+            self.sos_bandpass = filter_funcs[bandpass_kwargs.get("filter_type", "butterworth")](
+                bandpass_kwargs["order"],
+                [bandpass_kwargs["low"], bandpass_kwargs["high"]],
+                btype="bandpass",
+                fs=self.fs,
+                output="sos"
+            )
+            self.p_bandpass = 4 if bandpass_kwargs.get("zero_phase", True) else 2
             filtered = True
 
         if downsample_kwargs is not None:
             if self.verbose:
                 logger.info("Downsampling data...")
+            fs_before = self.fs
             self.downsample(**downsample_kwargs)
+
+            if self.fs == fs_before:
+                # target_fs equals the current rate: downsample() did nothing, so there is
+                # no anti-aliasing FIR and no alias terms (get_fir_response -> 1,
+                # get_alias_response -> None).
+                if self.verbose:
+                    logger.info("No downsampling applied: FIR response and alias terms skipped.")
+            else:
+                ratio = Fraction(downsample_kwargs["target_fs"] / fs_before).limit_denominator(10000)
+                up, down = ratio.numerator, ratio.denominator
+                self.resample_up, self.resample_down = up, down
+                # Same FIR as scipy.signal.resample_poly, which runs it at the upsampled
+                # rate up * fs with cutoff 1 / max(up, down) (relative to that Nyquist).
+                max_rate = max(up, down)
+                self.fir = signal.firwin(
+                    numtaps=2 * 10 * max_rate + 1,
+                    cutoff=1.0 / max_rate,
+                    window=downsample_kwargs.get("window", ("kaiser", 31.0)),
+                )
+                self.fir_fs = up * fs_before
+
+        self.alias_correction = alias_correction
+        self.upstream_aafilter_kwargs = upstream_aafilter_kwargs
 
         if trim_kwargs is not None:
             if self.verbose:
@@ -1000,6 +1121,121 @@ class BaseProcessingStep(SignalProcessor):
             return data_signal, self.orbits
         return data_signal
 
+    def get_filter_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """
+        Compute the power response of the applied filters at given frequencies.
+
+        Args:
+            freqs (np.ndarray): Frequencies at which to compute the power response.
+
+        Returns:
+            np.ndarray: Power response of the filters at the specified frequencies.
+        """
+        # Initialize power response to 1 (no filtering)
+        freqs = np.asarray(freqs)
+        power_response = np.ones_like(freqs, dtype=np.float64)
+
+        # Apply highpass filter response if it was applied
+        if hasattr(self, "sos_highpass"):
+            w, h = freqz_sos(self.sos_highpass, worN=np.abs(freqs), fs=self.original_fs)
+            power_response *= np.abs(h) ** self.p_highpass
+
+        # Apply lowpass filter response if it was applied
+        if hasattr(self, "sos_lowpass"):
+            w, h = freqz_sos(self.sos_lowpass, worN=np.abs(freqs), fs=self.original_fs)
+            power_response *= np.abs(h) ** self.p_lowpass
+
+        # Apply bandpass filter response if it was applied
+        if hasattr(self, "sos_bandpass"):
+            w, h = freqz_sos(self.sos_bandpass, worN=np.abs(freqs), fs=self.original_fs)
+            power_response *= np.abs(h) ** self.p_bandpass
+
+        return power_response
+
+    def get_fir_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """
+        Compute the frequency response of the FIR filter used in downsampling.
+
+        Args:
+            freqs (np.ndarray): Frequencies at which to compute the FIR response.
+        
+        Returns:
+            np.ndarray: Frequency response of the FIR filter at the specified frequencies.
+        """
+        freqs = np.asarray(freqs)
+        if not hasattr(self, "fir"):
+            return np.ones_like(freqs, dtype=np.float64)  # No FIR filter applied
+
+        # resample_poly scales the taps by ``up`` to undo the zero-stuffing loss, so the
+        # unscaled taps at the upsampled rate give the response on the input signal.
+        fir_fs = getattr(self, "fir_fs", self.original_fs)
+        return np.abs(signal.freqz(self.fir, worN=np.abs(freqs), fs=fir_fs)[1]) ** 2
+
+    def get_alias_response(self, freqs: np.ndarray) -> Optional[tuple]:
+        """Alias frequencies and filter responses of the downsampling step.
+
+        Decimating by ``D`` (``resample_poly`` with ``up=1``) from ``fs = D fs'`` to ``fs'``
+        folds the power at every ``k fs' +- f`` below the original Nyquist ``fs / 2`` onto
+        ``f``. The anti-aliasing filters only attenuate that power, so the decimated PSD is
+
+        ``S'(f) = |H(f)|^2 S(f) + sum_a |H(|f_a|)|^2 S(f_a)``,
+
+        with ``D - 1`` aliases ``f_a = -(k fs' - f)`` (``k = 1..floor(D/2)``, folded from a
+        negative frequency: the two-sided cross-spectrum is conjugated) and
+        ``f_a = +(k fs' + f)`` (``k = 1..floor((D-1)/2)``). For ``D = 2`` the only alias
+        is ``-(fs' - f)``.
+
+        Args:
+            freqs: Frequencies of the decimated data, in ``[0, fs'/2]``.
+
+        Returns:
+            ``(alias_frequencies, alias_filters_response)``, both of shape
+            ``(D - 1, len(freqs))``, to pass to the sensitivity backend; ``None`` when no
+            downsampling was applied or ``alias_correction`` is ``False``.
+        """
+        if not getattr(self, "alias_correction", True) or not hasattr(self, "resample_down"):
+            return None
+        if self.resample_up != 1:
+            logger.warning(
+                f"Alias correction is only implemented for integer decimation (up=1); got "
+                f"up={self.resample_up}, down={self.resample_down}. Aliasing is NOT modelled."
+            )
+            return None
+        D = self.resample_down
+        if D < 2:
+            return None
+        fs_new = self.original_fs / D
+        freqs = np.abs(np.asarray(freqs, dtype=np.float64))
+        alias = [-(k * fs_new - freqs) for k in range(1, D // 2 + 1)]
+        alias += [k * fs_new + freqs for k in range(1, (D - 1) // 2 + 1)]
+        alias_frequencies = np.array(alias)
+        alias_filters_response = self.get_total_response(np.abs(alias_frequencies).ravel()).reshape(
+            alias_frequencies.shape
+        )
+        return alias_frequencies, alias_filters_response
+
+    def get_upstream_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """Power response of the upstream anti-aliasing filter (``upstream_aafilter_kwargs`` of
+        :meth:`process`), applied to the data before loading; 1 when none was given."""
+        freqs = np.asarray(freqs)
+        kw = getattr(self, "upstream_aafilter_kwargs", None)
+        if kw is None:
+            return np.ones_like(freqs, dtype=np.float64)
+        return kaiser_aafilter_response(freqs, **kw)
+
+    def get_total_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """
+        Compute the total power response of all filters (upstream anti-aliasing, highpass, lowpass, bandpass, FIR) at given frequencies.
+
+        Args:
+            freqs (np.ndarray): Frequencies at which to compute the total power response.
+
+        Returns:
+            np.ndarray: Total power response of all filters at the specified frequencies.
+        """
+        power_response = self.get_filter_response(freqs)
+        fir_response = self.get_fir_response(freqs)
+        return power_response * fir_response * self.get_upstream_response(freqs)
 
 class L1ProcessingStep(L1DataLoader, BaseProcessingStep):
     """

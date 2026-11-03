@@ -1,0 +1,6 @@
+type: psd
+priors: {class: mojitolight.NoisePrior, output_file: psd_prior.yaml, kwargs: {model_type: parametric-symmetric}}
+num_prop_repeats: 200
+injection: {S_oms: 15e-12, S_tm: 3e-15}
+links:
+  prior_model_code_link: "TODO"

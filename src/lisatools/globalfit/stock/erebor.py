@@ -24,7 +24,6 @@ from eryn.state import State as ErynState
 from eryn.state import Branch as ErynBranch
 from eryn.utils import TransformContainer
 from gbgpu.utils.utility import get_fdot, get_N
-from gbgpu.gbcomps import STFTGBComputations
 
 from lisatools.sources.utils import ecliptic_to_icrs
 from lisatools.utils.utility import AET, detrend, tukey
@@ -35,8 +34,10 @@ from ..engine import Settings, Setup, GeneralSetup
 from ..moves.gbbandstructure import stft_band_structure
 from ..loginfo import init_logger
 from ..priors.gbpriors import get_fdot_mojito, MojitoF0mHzFdotPrior
+from ..searches import MBHBSearchInterface, GBSearchInterface, EMRISearchInterface, SOBHBSearchInterface, NoiseSearchInterface, GalacticForegroundSearchInterface
 
 if typing.TYPE_CHECKING:
+    from gbgpu.gbcomps import STFTGBComputations
     from ..moves.gbdebug import GBDebugSettings
     from ..moves.gbspecialmove import GBLeafCapSettings, GBSigHetSettings
 
@@ -107,6 +108,7 @@ class GBSettings(Settings):
     debug_settings: Optional[GBDebugSettings] = None
     sighet_settings: Optional[GBSigHetSettings] = None
     leaf_cap_settings: Optional[GBLeafCapSettings] = None
+    search_interface: Optional[GBSearchInterface] = None
 
 # basic transform functions for pickling
 def f_ms_to_s(x):
@@ -539,7 +541,10 @@ def m1_m2_to_mT_Q(m1, m2):
     return (m1 + m2, m1 / m2)
 
 
-from bbhx.utils.transform import LISA_to_SSB, SSB_to_LISA, mT_q  # frame helpers kept for settings files; the stock MBH basis is direct ICRS
+try:  # frame helpers kept for settings files; the stock MBH basis is direct ICRS (optional: bbhx only needed for MBHs)
+    from bbhx.utils.transform import LISA_to_SSB, SSB_to_LISA, mT_q
+except ImportError:
+    LISA_to_SSB = SSB_to_LISA = mT_q = None
 from eryn.moves import Move
 
 
@@ -619,7 +624,7 @@ class MBHSettings(Settings):
     num_prop_repeats: Optional[int] = 200
     mbh_search_file_key: Optional[str] = "_mbh_search_tmp_file"
     injection: Optional[np.ndarray] = None
-
+    search_interface: Optional[MBHBSearchInterface] = None
 
 class MBHSetup(Setup):
     """:class:`Setup` for massive black-hole binaries in the Erebor recipe.
@@ -875,7 +880,7 @@ class EMRISettings(Settings):
     inner_moves: Optional[typing.List[Move]] = None
     num_prop_repeats: Optional[int] = 10
     emri_search_file_key: Optional[str] = "_emri_search_tmp_file"
-
+    search_interface: Optional[EMRISearchInterface] = None
 
 class EMRISetup(Setup):
     """:class:`Setup` for extreme mass-ratio inspirals in the Erebor recipe.
@@ -1285,6 +1290,7 @@ class PSDSettings(Settings):
     injection: Optional[np.ndarray] = None 
     nknots: Optional[int] = None
     num_prop_repeats: int = 50
+    search_interface: Optional[NoiseSearchInterface] = None
 
 class PSDSetup(Setup):
     """:class:`Setup` for the instrumental PSD branch in the Erebor recipe.
@@ -1363,6 +1369,7 @@ class GalForSettings(Settings):
     nleaves_max: int = 1
     nleaves_min: int = 1
     ndim: int = 5
+    search_interface: Optional[GalacticForegroundSearchInterface] = None
 
 
 class GalForSetup(Setup):
