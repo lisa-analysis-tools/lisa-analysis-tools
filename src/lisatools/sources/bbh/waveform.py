@@ -273,7 +273,11 @@ class PhenomTHMWaveformBase(JaxBase):
 
         if self.use_reference_time:
             ref_time = self._to_jax(-merger_time) if self.ref_time is None else self.ref_time
-            return {'t_ref': ref_time, 'f_min': start_freq}
+            # f_ref is unused when t_ref is given, but phentax still evaluates the t(f_ref)
+            # root solve (lax.cond under vmap runs both branches). Left at phentax's default
+            # (1e-4 Hz) that solve has no root for heavy, low-ringdown-frequency sources and
+            # crashes the batch. With f_ref = f_min it is identical to the t(f_min) solve.
+            return {'t_ref': ref_time, 'f_min': start_freq, 'f_ref': start_freq}
         else:
             return {'f_min': start_freq, 'f_ref': ref_freq}
 
