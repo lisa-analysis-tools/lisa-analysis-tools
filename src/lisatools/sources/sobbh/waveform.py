@@ -1055,6 +1055,7 @@ class SOBBHTaylorT3TDIWaveform(TDPyResponseWaveformBase, JaxBase):
         ra: float | NDArrayLike,
         dec: float | NDArrayLike,
         merger_time: float | NDArrayLike,
+        num_pad: NDArrayLike | None = None,
     ) -> Tuple[NDArrayLike, NDArrayLike]:
         """Apply the TDI response; ``t_arr`` is already relative to ``waveform_t0``,
         so the base-class shift ``merger_time`` is forced to zero (as for EMRIs)."""
@@ -1062,4 +1063,4 @@ class SOBBHTaylorT3TDIWaveform(TDPyResponseWaveformBase, JaxBase):
             merger_time = self.xp.zeros(len(ra))
         else:
             merger_time = 0.0
-        return super()._apply_response(t_arr, h_plus, h_cross, ra, dec, merger_time)
+        return super()._apply_response(t_arr, h_plus, h_cross, ra, dec, merger_time, num_pad=num_pad)
