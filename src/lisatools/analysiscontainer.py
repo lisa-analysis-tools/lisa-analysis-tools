@@ -383,7 +383,7 @@ class AnalysisContainer:
             # A TD template on its own span (TDWaveformBase.get_td_signals): placed on the data grid.
             # TDSignal.transform keeps the template's own grid, so it cannot be used here.
             if gen_out.N == target.N and domains.td_grid_offset(gen_out.t0, target.t0, target.dt) == 0:
-                return gen_out
+                return gen_out.with_backend(self._data.backend)  # e.g. a GPU template into a CPU TD residual
             placed = target.associated_class(
                 self._data.xp.zeros(gen_out.arr.shape[:-1] + (target.N,), dtype=gen_out.arr.dtype), target
             )
