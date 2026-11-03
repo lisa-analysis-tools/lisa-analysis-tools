@@ -214,9 +214,11 @@ class STFTDomain : public STFTSettings {
 
   /** @brief Compute the flat index into the data array.
    *  Layout: data[(data_index * num_channels + channel) * num_times * num_freqs
-   *               + t_idx * num_freqs + f_idx] */
+   *               + t_idx * num_freqs + f_idx]
+   *  64-bit, as are the noise indices below: one split's array can hold more
+   *  than 2^31 values (a 50 GiB band buffer on an 80 GB card). */
   CUDA_DEVICE
-  int get_data_index(int t_idx, int f_idx, int channel, int data_index);
+  size_t get_data_index(int t_idx, int f_idx, int channel, int data_index);
 
   /** @brief Return the complex data value at position (t_idx, f_idx) for the
    *  given channel and data instance. */
@@ -233,7 +235,7 @@ class STFTDomain : public STFTSettings {
    *               + t_idx * num_freqs_noise + f_idx], with @p f_idx the
    *  noise bin of the pixel (see noise_bin). */
   CUDA_DEVICE
-  int get_noise_index(int t_idx, int f_idx, int channel, int noise_index);
+  size_t get_noise_index(int t_idx, int f_idx, int channel, int noise_index);
 
   /** @brief Return the (diagonal) inverse-covariance value C^{-1}_{ch}
    *  at position (t_idx, f_idx) for the given channel and noise instance. */
@@ -250,8 +252,8 @@ class STFTDomain : public STFTSettings {
    *               * num_times * num_freqs_noise + t_idx * num_freqs_noise
    *               + f_idx], with @p f_idx the noise bin of the pixel. */
   CUDA_DEVICE
-  int get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
-                            int noise_index);
+  size_t get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
+                               int noise_index);
 
   /** @brief Return the off-diagonal inverse-covariance element C^{-1}_{ch_i,
    * ch_j} at position (t_idx, f_idx) for the given noise instance. */

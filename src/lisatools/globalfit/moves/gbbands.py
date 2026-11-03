@@ -2010,43 +2010,50 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         walker order, so a cell's row is its walker.
         """
         parent = self.parent_acs
-        parent_device = None if parent.gpus is None else int(parent.gpus[0])
         arrays = []
         for device in split_devices:
-            if len(parent.linear_psd_arr) == 1 and device == parent_device:
+            if self._reads_own_parent_noise(parent, device):
                 arrays.append(parent.linear_psd_arr[0])
             else:
-                arrays.append(self._parent_noise_copy(device))
+                arrays.append(
+                    self._parent_noise_copy(self.xp, parent, device, self._parent_noise_copies)
+                )
         walkers = np.asarray(asnumpy(self.unique_band_combos[:, 1]), dtype=np.int32)
         return NoiseRowSource(arrays, parent.end_shape, walkers)
 
-    def _parent_noise_copy(self, device):
+    @staticmethod
+    def _reads_own_parent_noise(parent, device) -> bool:
+        """True when a split on ``device`` reads the parent's own noise array, not a copy of it."""
+        parent_device = None if parent.gpus is None else int(parent.gpus[0])
+        return len(parent.linear_psd_arr) == 1 and device == parent_device
+
+    @staticmethod
+    def _parent_noise_copy(xp, parent, device, copies: dict):
         """Every parent noise row in walker order, on ``device``; built once per GB move call.
 
-        The copies live in ``_parent_noise_copies``, which the main band sorter owns. The move
-        builds a new sorter in every ``propose``, so a copy never outlives the call, and the PSD
-        moves that change the parent rows run between calls.
+        The copies live in ``copies``, the ``parent_noise_copies`` of the main band sorter. The
+        move builds a new sorter in every ``propose`` and empties it at the end, so a copy never
+        outlives the call, and the PSD moves that change the parent rows run between calls.
         """
-        parent = self.parent_acs
         key = (id(parent), device)
-        rows_copy = self._parent_noise_copies.get(key)
+        rows_copy = copies.get(key)
         if rows_copy is not None:
             return rows_copy
         row_size = int(np.prod(parent.shape_sens)) * int(parent.data_length)
         num_rows = int(parent.acs_total_entries)
-        with device_context(self.xp, device):
-            rows_copy = self.xp.empty(num_rows * row_size, dtype=parent.noise_dtype)
+        with device_context(xp, device):
+            rows_copy = xp.empty(num_rows * row_size, dtype=parent.noise_dtype)
         for split, walkers in enumerate(parent.gpu_splits):
             source_device = None if parent.gpus is None else int(parent.gpus[split])
             if None not in (source_device, device) and source_device != device:
                 assert_peer_access(
-                    self.xp, [source_device, device], context="SubBandBuffer parent noise copy"
+                    xp, [source_device, device], context="SubBandBuffer parent noise copy"
                 )
-            with device_context(self.xp, device):
-                rows_copy.reshape(num_rows, row_size)[self.xp.asarray(np.asarray(walkers))] = (
+            with device_context(xp, device):
+                rows_copy.reshape(num_rows, row_size)[xp.asarray(np.asarray(walkers))] = (
                     parent.linear_psd_arr[split].reshape(-1, row_size)
                 )
-        self._parent_noise_copies[key] = rows_copy
+        copies[key] = rows_copy
         return rows_copy
 
     def update_special_indices(self, new_special_indices, inds_fill=None):
@@ -2748,25 +2755,26 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
 
         num_cells = int(src_rows.shape[0])
         kernel = _stft_window_copy_kernel()
-        same_device = device_src == device_dst
-        with device_context(self.xp, device_src):
-            if same_device:
-                target, target_rows = dst, cp.asarray(dst_rows)
-            else:
-                target = cp.empty(num_cells * lead * nf_dst, dtype=dst.dtype)
-                target_rows = cp.arange(num_cells, dtype=cp.int64)
-            kernel(src, cp.asarray(src_rows), target_rows, cp.asarray(starts),
-                   lead, nf_src, nf_dst, target, size=num_cells * lead * nf_dst)
-            if same_device:
-                return
-            target_ready = cp.cuda.Event(block=False, disable_timing=True)
-            target_ready.record()
-        # * Peer copy: the previous route through pageable host memory was 8x slower on gpu04.
-        assert_peer_access(self.xp, [device_src, device_dst], context="SubBandBuffer window copy")
+        across_cards = device_src != device_dst
+        if across_cards:
+            # * The kernel runs on the cell's card and reads the walker's rows across the cards, with no
+            # * temporary array; reading across ran at 15 GB/s on gpu03, writing across at 2 GB/s.
+            assert_peer_access(self.xp, [device_src, device_dst], context="SubBandBuffer window copy")
+            with device_context(self.xp, device_src):
+                rows_ready = cp.cuda.Event(block=False, disable_timing=True)
+                rows_ready.record()
         with device_context(self.xp, device_dst):
-            cp.cuda.get_current_stream().wait_event(target_ready)
-            block = cp.asarray(target).reshape(num_cells, lead * nf_dst)
-            dst.reshape(-1, lead * nf_dst)[cp.asarray(dst_rows)] = block
+            if across_cards:
+                cp.cuda.get_current_stream().wait_event(rows_ready)
+            kernel(src, cp.asarray(src_rows), cp.asarray(dst_rows), cp.asarray(starts),
+                   lead, nf_src, nf_dst, dst, size=num_cells * lead * nf_dst)
+            if not across_cards:
+                return
+            rows_read = cp.cuda.Event(block=False, disable_timing=True)
+            rows_read.record()
+        # ! Work queued later on the walker's card may change its rows, so it waits for the read.
+        with device_context(self.xp, device_src):
+            cp.cuda.get_current_stream().wait_event(rows_read)
 
     def verify_against_parent(self, acs: AnalysisContainerArray, inds_fill) -> None:
         """Check a freshly filled buffer against the parent ACA. ``verify_buffer`` only.
@@ -3374,6 +3382,26 @@ class BandSorter(LISAToolsParallelModule):
     @main_band_sorter.setter
     def main_band_sorter(self, main_band_sorter):
         self._main_band_sorter = main_band_sorter
+
+    def make_parent_noise_copies(self, parent_acs) -> None:
+        """Make now the copies of the parent noise rows that this propose's buffers read.
+
+        On several devices every buffer split reads a copy of the parent rows on its device. A
+        buffer would make it at its first build, after the move read the free memory that sizes
+        that build, so the budget counted the copy as free. On one device the buffers read the
+        parent's own array and nothing is made.
+        """
+        reads_parent_rows = (
+            isinstance(parent_acs.settings, STFTSettings) and SubBandBuffer.READ_PARENT_NOISE_ROWS
+        )
+        if not reads_parent_rows:
+            return
+        gpus = getattr(self.gb, "gpus", None) if self.backend.uses_cupy else None
+        for device in [int(gpu) for gpu in gpus] if gpus else [None]:
+            if not SubBandBuffer._reads_own_parent_noise(parent_acs, device):
+                SubBandBuffer._parent_noise_copy(
+                    self.xp, parent_acs, device, self.parent_noise_copies
+                )
 
     def get_buffer(
         self, acs, special_indices_unique, inds_fill=None, buffer_obj=None, **kwargs
