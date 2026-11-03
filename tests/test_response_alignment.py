@@ -149,6 +149,46 @@ class TestResponseAlignment(unittest.TestCase):
             np.asarray(tdis_b[1]), np.asarray(tdis_s1), atol=1e-22, rtol=0.0
         )
 
+    def test_padded_source_is_batch_invariant(self):
+        """A source left-padded to a longer companion (``num_pad``) must give the
+        same TDI output as alone: the buffer_time edge zeroing is per source,
+        relative to its own first valid sample, not to the shared array start.
+        Also covers B=1 (batch axis kept, same values as the scalar call)."""
+        dt, data_t0, n, pad = 5.0, 1_000_000.0, 20000, 4000
+        wf = _MiniTDWave(
+            waveform_t0=0.0,
+            data_td_settings=TDSettings(N=200000, dt=dt, t0=data_t0),
+            tdi_generation="1st generation",
+            tdi_channels="XYZ",
+            sampling_frequency=1.0 / dt,
+            orbits=self.orbits,
+            order=25,
+            buffer_time=10000.0,
+            force_backend="cpu",
+        )
+        t = np.arange(n, dtype=np.float64) * dt
+        phase = 2.0 * np.pi * 1e-3 * t
+        hp, hc = 1e-21 * np.cos(phase), 1e-21 * np.sin(phase)
+        mt = data_t0 + 1000 * dt
+        # alone (scalar path) and as a batch of one
+        t_s, c_s = wf._apply_response(t, hp, hc, 0.7, 0.3, mt)
+        t_1, c_1 = wf._apply_response(t[None], hp[None], hc[None], np.array([0.7]),
+                                      np.array([0.3]), np.array([mt]))
+        self.assertEqual(np.asarray(c_1).shape, (1, 3, n))
+        np.testing.assert_array_equal(np.asarray(c_1)[0], np.asarray(c_s))
+        # source 1 = the same waveform, left-padded by `pad` zeros next to a longer companion
+        n2 = n + pad
+        t2 = np.arange(n2, dtype=np.float64) * dt
+        tb = np.stack([t2, t2 - pad * dt])
+        hpb = np.stack([1e-21 * np.cos(2 * np.pi * 1e-3 * t2), np.r_[np.zeros(pad), hp]])
+        hcb = np.stack([1e-21 * np.sin(2 * np.pi * 1e-3 * t2), np.r_[np.zeros(pad), hc]])
+        t_b, c_b = wf._apply_response(tb, hpb, hcb, np.array([1.3, 0.7]), np.array([-0.2, 0.3]),
+                                      np.array([mt, mt]), num_pad=np.array([0, pad]))
+        t_b, c_b = np.asarray(t_b)[1], np.asarray(c_b)[1]
+        np.testing.assert_allclose(t_b[pad:], np.asarray(t_s), rtol=0, atol=1e-6)
+        self.assertTrue(np.all(c_b[:, :pad] == 0.0))
+        np.testing.assert_allclose(c_b[:, pad:], np.asarray(c_s), rtol=0, atol=1e-30)
+
     def test_times_land_on_data_grid(self):
         # General invariant for an off-grid data_t0: every label is an integer
         # number of dt from data_t0, spacing is uniform, and the signal is finite.

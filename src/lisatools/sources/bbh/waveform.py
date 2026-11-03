@@ -448,8 +448,10 @@ class PhenomTHMTDIWaveform(TDPyResponseWaveformBase, PhenomTHMWaveformBase):
                 override, ``t_min``, ``t_ref``).
 
         Returns:
-            Tuple of (times_batch, h_plus_batch, h_cross_batch),
-            each of shape (Nbatch, N_valid_times) as plain NumPy or Cupy arrays.
+            Tuple of (times_batch, h_plus_batch, h_cross_batch, num_pad): the first three
+            of shape (Nbatch, N_valid_times) as plain NumPy or Cupy arrays, left-padded to
+            the longest source; ``num_pad`` (Nbatch,) is each source's number of leading
+            padding samples.
         """
 
         reference_kwargs = self.get_reference_quantities(merger_time=merger_time, start_freq=start_freq, ref_freq=ref_freq)
@@ -484,6 +486,7 @@ class PhenomTHMTDIWaveform(TDPyResponseWaveformBase, PhenomTHMWaveformBase):
             times_out,
             hplus[:, -num_keep:] * ramp,  # apply ramp to h_plus to avoid sharp jump at the beginning of the waveform, which can cause issues with the TDI response
             hcross[:, -num_keep:] * ramp,  # apply ramp to h_cross to avoid sharp jump at the beginning of the waveform, which can cause issues with the TDI response
+            num_pad,  # per-source leading padding -> per-source edge zeroing in _apply_response
         )
 
 
