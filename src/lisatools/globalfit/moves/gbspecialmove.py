@@ -3436,6 +3436,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1) # cold chain only
         logger.info(f"Number of active leaves before proposal: {num_active_leaves}")
 
+        # ! Every budget of this propose must see the copies of the parent noise rows that the
+        # ! buffers read on several devices, so they are made before the first budget reading.
+        with tm.span("parent_noise_copies"):
+            band_sorter.make_parent_noise_copies(model.analysis_container_arr)
+
         if self.EMPTY_POOL_BEFORE_PROPOSAL:
             with tm.span("mempool_free"):
                 if self.backend.uses_cupy:
@@ -3539,6 +3544,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         logger.info(f"Number of active leaves in cold chain after proposal: {num_active_leaves}")
 
         new_inds = self.xp.asarray(new_state.branches_inds["gb"])
+        # ! The copies of the parent noise rows leave the devices with this propose, even if
+        # ! something still holds the sorter.
+        band_sorter.parent_noise_copies.clear()
         del band_sorter
         with tm.span("mempool_free"):
             self.mempool.free_all_blocks()
