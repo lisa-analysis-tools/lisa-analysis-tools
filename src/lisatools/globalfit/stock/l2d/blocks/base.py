@@ -80,6 +80,21 @@ class WaveformSpec(ClassSpec):
     runtime_kwargs: dict[str, Any] = Field(default_factory=dict)  # -> Settings.waveform_kwargs
 
 
+class TDWaveformSpec(_Spec):
+    """The block's time-domain TDI generator: ``method`` of the block's own waveform, or of ``class``.
+
+    Without ``class`` the block's waveform instance is reused (one waveform object for the PE move and both
+    generators) and ``kwargs`` must be empty. With ``class`` (a separate generator, e.g. for GBs) ``kwargs``
+    are its constructor arguments next to the engine-filled ones it accepts. ``runtime_kwargs`` go to every
+    call (default: the block's ``waveform.runtime_kwargs`` without ``class``, none with it).
+    """
+
+    class_name: str | None = Field(default=None, alias="class")
+    method: str | None = None  # None -> the block's TD_WAVEFORM_METHOD
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    runtime_kwargs: dict[str, Any] | None = None
+
+
 class MoveSpec(ClassSpec):
     weight: PositiveFloat = 1.0
 
@@ -323,9 +338,12 @@ class SourceBlock(MoveBlock):
     # waveform methods the special PE move must be told about (TDMBHSpecialMove sets its own)
     WAVEFORM_METHODS: ClassVar[dict[str, str]] = {}
     LIKE_KWARGS_FROM_WAVEFORM_KWARGS: ClassVar[bool] = False  # the likelihood call takes the waveform kwargs too
+    # default method of the block's waveform for the TD generator; None -> no TD generator unless td_waveform
+    TD_WAVEFORM_METHOD: ClassVar[str | None] = None
 
     nleaves: Literal["auto"] | PositiveInt = "auto"
     waveform: WaveformSpec
+    td_waveform: TDWaveformSpec | None = None  # None -> TD_WAVEFORM_METHOD of the waveform, if any
     links: SourceLinks = Field(default_factory=SourceLinks)  # adds waveform_model_code_link
     # Always a ladder (default: ratio 1.2 over sampler.ntemps, as the reference settings pass). Not None: the Setup's
     # own default is 24 rungs, which cannot seed a state with fewer temperatures.
@@ -359,7 +377,30 @@ class SourceBlock(MoveBlock):
             if cls.__name__ in ("ConditionalFlowMove", "FlowGaussianMove"):
                 raise ValueError("flow moves are not supported yet (they come with the recipe step).")
             check_kwargs(move.kwargs, cls, ENGINE_MOVE_KWARGS.get(cls.__name__, frozenset()))
+        self.td_generator()  # raises on a bad td_waveform
         return self
+
+    def td_generator(self) -> TDGenerator | None:
+        """The resolved TD generator (class, method, kwargs), or ``None`` when the block has none."""
+        spec = self.td_waveform
+        if spec is None and self.TD_WAVEFORM_METHOD is None:
+            return None
+        spec = spec or TDWaveformSpec()
+        method = spec.method or self.TD_WAVEFORM_METHOD
+        if method is None:
+            raise ValueError(f"td_waveform: block {self.type!r} has no default TD method; give td_waveform.method.")
+        if spec.class_name is None:
+            if spec.kwargs:
+                raise ValueError("td_waveform.kwargs construct a separate class; give td_waveform.class too.")
+            cls = resolve_class(self.waveform.class_name, self.WAVEFORM_MODULES)
+            runtime = self.waveform.runtime_kwargs if spec.runtime_kwargs is None else spec.runtime_kwargs
+        else:
+            cls = resolve_class(spec.class_name, self.WAVEFORM_MODULES)
+            check_kwargs(spec.kwargs, cls, ENGINE_WAVEFORM_KWARGS)
+            runtime = spec.runtime_kwargs or {}
+        if not callable(getattr(cls, method, None)):
+            raise ValueError(f"td_waveform: {cls.__name__} has no method {method!r}.")
+        return TDGenerator(None if spec.class_name is None else cls, method, dict(spec.kwargs), dict(runtime))
 
     @model_validator(mode="after")
     def _warn_without_search(self):
@@ -411,7 +452,7 @@ class SourceBlock(MoveBlock):
             # after the Setup, so a block without inner_moves keeps the Setup's default next to the flow
             setup.inner_moves = [*setup.inner_moves, (make_flow_move(self, ctx, info, nleaves), self.flow.weight)]
         waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
-        return BlockBuild(setup, source_metadata(self, init_kwargs, g), waveform_class)
+        return BlockBuild(setup, source_metadata(self, init_kwargs, g), waveform_class, resolve_td_generator(self, ctx))
 
 # --- build helpers (heavy imports stay inside functions) ---
 
@@ -420,10 +461,30 @@ class BuildContext(NamedTuple):
     general: Any  # built GeneralSetup
 
 
+class TDGenerator(NamedTuple):
+    """A block's time-domain TDI generator, resolved from ``td_waveform`` (built by the recipe)."""
+
+    waveform_class: type | None    # None -> the block's own waveform instance
+    method: str                    # e.g. "get_td_signals"
+    init_kwargs: dict[str, Any]    # constructor arguments of a separate class (engine-filled ones included)
+    runtime_kwargs: dict[str, Any]  # passed to every call
+
+
 class BlockBuild(NamedTuple):
     setup: Any                   # the branch Setup (PSDSetup, MBHSetup, ...)
     metadata: Any                # SourceMetadata / StochasticMetadata
     waveform_class: type | None  # constructed later by the recipe
+    td_generator: TDGenerator | None = None  # the block's TD generator, if any
+
+def resolve_td_generator(block: SourceBlock, ctx: BuildContext) -> TDGenerator | None:
+    """The block's TD generator; a separate class also gets the engine-filled arguments it accepts."""
+    td = block.td_generator()
+    if td is None or td.waveform_class is None:
+        return td
+    accepted = accepted_kwargs(td.waveform_class)
+    engine = {k: v for k, v in engine_waveform_kwargs(ctx).items() if accepted is None or k in accepted}
+    return td._replace(init_kwargs={**deepcopy(td.init_kwargs), **engine})
+
 
 def make_betas(tempering: TemperingSpec | None, default_ntemps: int):
     import numpy as np

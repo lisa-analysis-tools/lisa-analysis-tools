@@ -591,7 +591,11 @@ class SetupFunctionTest(_Runtime):
         def add_steps(recipe_self, recipe, moves):
             self.events.append(("steps", recipe, moves))
 
+        def signal_gens(ctx, td_generators, curr_, state):
+            self.events.append(("signal_gens", ctx.wave_gens, td_generators))
+
         with mock.patch.object(build_recipe, "seed_branches", seed), \
+                mock.patch.object(build_recipe, "attach_signal_gens", signal_gens), \
                 mock.patch.object(build_recipe, "build_block_moves", block_moves), \
                 mock.patch.object(StockRecipe, "add_steps", add_steps):
             result = setup(*args)
@@ -599,10 +603,11 @@ class SetupFunctionTest(_Runtime):
 
     def test_stock_recipe_seeds_then_builds_moves_then_adds_steps(self):
         self.run_setup(self.config({}, {"class": "StockRecipe", "kwargs": {"burn_in_iterations": 5}}))
-        self.assertEqual([e[0] for e in self.events], ["seed", "moves", "steps"])
+        self.assertEqual([e[0] for e in self.events], ["seed", "signal_gens", "moves", "steps"])
         self.assertEqual(self.events[0][1], {"mbh": FakeWaveform})
-        self.assertEqual(self.events[1][1], {"mbh": "generator"})
-        self.assertEqual(self.events[2][1:], ("recipe", {"psd": BranchMoves([], ["pe"])}))
+        self.assertEqual(self.events[1][1:], ({"mbh": "generator"}, {}))  # the stand-in build has no TD generator
+        self.assertEqual(self.events[2][1], {"mbh": "generator"})
+        self.assertEqual(self.events[3][1:], ("recipe", {"psd": BranchMoves([], ["pe"])}))
 
     def test_recipe_file_runs_after_seeding_with_the_engine_arguments(self):
         (self.run_dir / "plain.py").write_text(
@@ -623,7 +628,7 @@ class SetupFunctionTest(_Runtime):
         with mock.patch.object(build_recipe, "load_recipe_function", load):
             args, result = self.run_setup(cfg)
         self.assertEqual(result, "done")
-        self.assertEqual([e[0] for e in self.events], ["seed"])  # no library moves, no stock steps
+        self.assertEqual([e[0] for e in self.events], ["seed", "signal_gens"])  # no library moves, no stock steps
         self.assertEqual(loaded[0].__globals__["calls"], [args])
 
     def test_recipe_file_with_l2d_gets_the_context(self):

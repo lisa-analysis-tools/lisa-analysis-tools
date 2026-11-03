@@ -266,7 +266,8 @@ class AnalysisContainer:
                 "SensitivityMatrixBase subclass (the auto-instantiate path)."
             )
 
-        if not isinstance(sens_mat, SensitivityMatrixBase):
+        # sens_mat=None is allowed for TD data only (checked above): a TD residual store
+        if sens_mat is not None and not isinstance(sens_mat, SensitivityMatrixBase):
             raise TypeError(
                 "sens_mat must be a SensitivityMatrixBase instance or a "
                 "SensitivityMatrixBase subclass class."
@@ -378,6 +379,15 @@ class AnalysisContainer:
         target = self._data.settings
         if isinstance(gen_out, DataResidualArray):
             gen_out = gen_out.data_res_arr
+        if isinstance(gen_out, domains.TDSignal) and isinstance(target, domains.TDSettings):
+            # A TD template on its own span (TDWaveformBase.get_td_signals): placed on the data grid.
+            # TDSignal.transform keeps the template's own grid, so it cannot be used here.
+            if gen_out.N == target.N and domains.td_grid_offset(gen_out.t0, target.t0, target.dt) == 0:
+                return gen_out
+            placed = target.associated_class(
+                self._data.xp.zeros(gen_out.arr.shape[:-1] + (target.N,), dtype=gen_out.arr.dtype), target
+            )
+            return placed.add_signal(gen_out)
         if isinstance(gen_out, DomainBase):
             if gen_out.settings == target:
                 return gen_out

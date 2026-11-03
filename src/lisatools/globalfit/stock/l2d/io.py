@@ -186,6 +186,9 @@ class DataSection(_Section):
     downsample: DownsampleSpec | None = None
     trim: TrimSpec | None = None
     alias_correction: bool = True  # whether to apply the alias correction to the data (default: True)
+    # keep a time-domain residual (one shared CPU AnalysisContainer, walker 0) next to the analysis-domain
+    # ones; the seeded signals are subtracted from it through the blocks' TD generators (td_waveform)
+    keep_td: bool = False
     
 
     @model_validator(mode="after")

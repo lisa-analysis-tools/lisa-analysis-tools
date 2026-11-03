@@ -10,7 +10,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -40,6 +40,13 @@ class RecipeContext:
 
     cfg: RunConfig
     wave_gens: dict[str, Any]  # seeded source branch -> waveform generator (shared with its PE move)
+    # seeded source branch -> ``fn(*sampling_params) -> DomainBase`` (the Settings.signal_gen contract), in the
+    # analysis domain. Registered here, not on Settings: the legacy subtract_initial_signal is still the
+    # residual path, and setup_acs would subtract a Settings.signal_gen a second time.
+    signal_gens: dict[str, Any] = field(default_factory=dict)
+    # seeded source branch -> ``fn(*sampling_params, td_settings=None) -> TDSignal`` (unwindowed TDI)
+    td_signal_gens: dict[str, Any] = field(default_factory=dict)
+    td_ac: Any = None  # the shared CPU time-domain AnalysisContainer (data.keep_td), walker 0's residual
 
     def block_moves(self, engine_info, curr, acs, priors, state) -> dict[str, BranchMoves]:
         return build_block_moves(self, engine_info, curr, acs, priors, state)
@@ -164,6 +171,78 @@ def seed_branches(cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, 
         # plot and save the residuals after the initial signals are subtracted, for debugging
         _ = acs.acs[0].data.plot(channel=0, filename=curr.general_info.artifacts_file_dir + f"data_after_subtracting_{name}.png")
     return wave_gens
+
+
+def make_signal_gen(waveform, method: str, transform, runtime_kwargs: dict):
+    """``fn(*sampling_params, **kwargs)``: the sampling->waveform transform, then ``waveform.<method>``.
+
+    Scalar params (one leaf) give one signal; 1-D params (a batch, e.g. over walkers) give a
+    ``DomainBaseArray``. ``kwargs`` are added to ``runtime_kwargs`` (e.g. ``td_settings``).
+    """
+    fn = getattr(waveform, method)
+    xp = getattr(waveform, "xp", np)
+
+    def signal_gen(*params, **kwargs):
+        single = all(np.ndim(p) == 0 for p in params)
+        coords = np.stack([np.atleast_1d(np.asarray(p, dtype=float)) for p in params], axis=-1)
+        if transform is not None:
+            coords = transform.both_transforms(coords)
+        # contiguous columns, as subtract_initial_signal passes them
+        columns = [xp.ascontiguousarray(col) for col in xp.asarray(coords).T]
+        out = fn(*columns, **{**runtime_kwargs, **kwargs})
+        return out[0] if single else out
+
+    return signal_gen
+
+
+def attach_signal_gens(ctx: RecipeContext, td_generators: dict, curr, state) -> None:
+    """The seeded branches' analysis-domain and TD generators, and the shared TD residual (``data.keep_td``).
+
+    Uses the wave gens of ``seed_branches``: the PE move and both generators share one waveform object
+    (a block's ``td_waveform.class`` gets its own). The analysis-domain residuals are left to the legacy
+    subtraction.
+    """
+    for name, wave_gen in ctx.wave_gens.items():
+        info = curr.source_info[name]
+        ctx.signal_gens[name] = make_signal_gen(
+            wave_gen, "get_signals_for_residuals", info.transform, info.waveform_kwargs
+        )
+        td = td_generators.get(name)
+        if td is None:
+            continue
+        td_wave = wave_gen if td.waveform_class is None else td.waveform_class(**td.init_kwargs)
+        ctx.td_signal_gens[name] = make_signal_gen(td_wave, td.method, info.transform, td.runtime_kwargs)
+
+    if not ctx.cfg.data.keep_td:
+        return
+    if not ctx.td_signal_gens:
+        logger.warning("data.keep_td is set, but no seeded block has a TD generator: no TD residual.")
+        return
+    ctx.td_ac = setup_td_ac(curr.general_info, ctx.td_signal_gens)
+    subtract_td_signals(ctx.td_ac, ctx.td_signal_gens, state)
+
+
+def setup_td_ac(general, td_signal_gens: dict):
+    """One CPU ``AnalysisContainer`` holding the preprocessed, unwindowed TD data (no sensitivity)."""
+    from lisatools.analysiscontainer import AnalysisContainer
+    from lisatools.domains import TDSettings, TDSignal
+
+    grid = general.data_td_settings
+    arr = general.data_processor.td_signal.arr
+    arr = arr.get() if hasattr(arr, "get") else np.array(arr, copy=True)
+    if arr.shape[-1] != grid.N:
+        raise ValueError(f"TD data has {arr.shape[-1]} samples, the data grid {grid.N}.")
+    settings = TDSettings(grid.N, grid.dt, t0=grid.t0, force_backend="cpu")
+    return AnalysisContainer(TDSignal(arr, settings), signal_gen=dict(td_signal_gens))
+
+
+def subtract_td_signals(td_ac, td_signal_gens: dict, state) -> None:
+    """Subtract walker 0's seeded leaves (cold chain) from the TD residual, one leaf at a time."""
+    for name, gen in td_signal_gens.items():
+        inds = state.branches_inds[name][0, 0]
+        for leaf in np.flatnonzero(inds):
+            td_ac.data.subtract_signal(gen(*state.branches_coords[name][0, 0, leaf]))
+        logger.info(f"Subtracted {int(inds.sum())} {name} signals from the TD residual")
 
 
 def attach_flow_trainers(cfg: RunConfig, curr) -> None:
@@ -304,10 +383,14 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
     by reference.
     """
     waveform_classes = {name: build.waveform_class for name, build in builds.items()}
+    td_generators = {
+        name: build.td_generator for name, build in builds.items() if getattr(build, "td_generator", None)
+    }
 
     def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         select_device(curr.general_info)
         ctx = RecipeContext(cfg, seed_branches(cfg, waveform_classes, curr, acs, priors, state))
+        attach_signal_gens(ctx, td_generators, curr, state)
         attach_flow_trainers(cfg, curr)
         spec = cfg.recipe
         if hasattr(spec, "file"):

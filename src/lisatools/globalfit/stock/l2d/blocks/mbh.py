@@ -65,6 +65,7 @@ class MBHBlock(SourceBlock):
     SETTINGS_NAME: ClassVar[str] = "MBHSettings"
     SETUP_NAME: ClassVar[str] = "MBHSetup"
     SEARCH_INTERFACE: ClassVar[str] = "MBHBSearchInterface"
+    TD_WAVEFORM_METHOD: ClassVar[str | None] = "get_td_signals"
     PE_MOVES: ClassVar[dict[str, PEMove]] = {
         "TDMBHSpecialMove": PEMove(SPECIAL_MOVES, SPECIAL_SOURCE_MOVE_FILLED),
         "MBHMoveBuilder": PEMove(GENERIC_MOVES, GENERIC_SOURCE_MOVE_FILLED, forwards_to=RESIDUAL_MOVE),
