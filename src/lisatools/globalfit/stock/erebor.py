@@ -239,7 +239,8 @@ class GBSetup(Setup, GBSettings):
             )
 
         if self.periodic is None:
-            self.periodic = {"gb": {"phi0": 2*np.pi, "psi": np.pi, "alpha": 2 * np.pi}}
+            # * psi is periodic in 2 pi (DDPC convention), as in the stock priors and the search interface.
+            self.periodic = {"gb": {"phi0": 2*np.pi, "psi": 2 * np.pi, "alpha": 2 * np.pi}}
 
         if self.priors is None:
             priors_gb = {

@@ -711,7 +711,7 @@ def gb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float =
 
     ra = np.array(catalogue_entry["RightAscension"]) # alpha
     dec = np.array(catalogue_entry["Declination"]) # delta
-    psi_icrs = np.array(catalogue_entry["PolarisationAngle"]) % np.pi  # ensure polarization is within [0, pi]
+    psi_icrs = np.array(catalogue_entry["PolarisationAngle"]) % (2 * np.pi)  # psi is periodic in 2 pi (DDPC convention)
     # lam_ecl, beta_ecl, psi_ecl= icrs_to_ecliptic(ra, dec, psi_icrs)
 
     alpha = ra % (2 * np.pi)
