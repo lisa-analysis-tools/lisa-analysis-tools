@@ -407,7 +407,9 @@ class SharedGalacticGridTest(unittest.TestCase):
             self.skipTest("needs two devices")
         source = self.make_backend(gpu_backends[0])
         with cp.cuda.Device(1):
-            kwargs_second_device = dict(source.kwargs, orbits=device_local_orbits(source.orbits, cp, 1))
+            # ! The third argument is the device that keeps the shared table (the source's, 0); the
+            # ! replica lands on the current device. Passing 1 hands back the table on device 0.
+            kwargs_second_device = dict(source.kwargs, orbits=device_local_orbits(source.orbits, cp, 0))
             first_copy = type(source)(**kwargs_second_device)
             second_copy = type(source)(**kwargs_second_device)
         self.assertIsNot(first_copy._galactic_grid, source._galactic_grid)
