@@ -166,8 +166,6 @@ class MojitoF0mHzFdotPrior(JointPrior):
         f0_mHz = x_arr[..., 0]
         fdot = x_arr[..., 1]
 
-        out = self.xp.full_like(f0_mHz, -self.xp.inf, dtype=self.xp.float64)
-
         mask_f0 = (f0_mHz >= self.f0_min) & (f0_mHz <= self.f0_max)
         fdot_min, fdot_max = self.fdot_bounds(f0_mHz)
         mask_fdot = (fdot >= fdot_min) & (fdot <= fdot_max)
@@ -177,6 +175,6 @@ class MojitoF0mHzFdotPrior(JointPrior):
 
         # p(f0, fdot) = p(f0) * p(fdot|f0)
         f0_log_norm = -self.xp.log(self.f0_max - self.f0_min)
-        out[valid] = f0_log_norm - self.xp.log(valid_fdot_diff[valid])
+        out = self.xp.where(valid, f0_log_norm - self.xp.log(valid_fdot_diff), -self.xp.inf)
 
-        return self._to_device(out)
+        return self._to_device(out.astype(self.xp.float64, copy=False))

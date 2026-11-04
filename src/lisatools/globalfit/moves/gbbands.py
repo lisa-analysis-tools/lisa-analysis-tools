@@ -2526,8 +2526,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         """
         self.get_ll(params, data_index, noise_index, N_vals, phase_maximize=phase_maximize)
         delta = self.d_h_out.real - 0.5 * self.h_h_out.real
-        delta[~self.kept_out] = -1e300
-        return delta
+        return self.xp.where(self.kept_out, delta, -1e300)
 
     def get_removal_ll(self, params, data_index, noise_index, N_vals):
         """Log-likelihood delta of REMOVING a source that is in the residual.
@@ -2543,8 +2542,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         """
         self.get_ll(params, data_index, noise_index, N_vals)
         delta = -self.d_h_out.real - 0.5 * self.h_h_out.real
-        delta[~self.kept_out] = -1e300
-        return delta
+        return self.xp.where(self.kept_out, delta, -1e300)
 
     def get_ll_grad(self, params, data_index, noise_index, N_vals,
                      *, param_eps=None, chunk=None):

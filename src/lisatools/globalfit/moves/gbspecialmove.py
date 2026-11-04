@@ -618,6 +618,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.band_units = max(1, int(band_units))
         self.jump_scales = float(gamma_base) * self.xp.array([0.2, 1.0, 2.5])
         self.jump_scales_probs = self.xp.array([0.2, 0.6, 0.2])
+        self._jump_scale_cdf = self.jump_scales_probs.cumsum()
+        self._jump_scale_cdf /= self._jump_scale_cdf[-1]
         fim_interval = num_stationary_fim_steps
         if int(fim_interval) != fim_interval or fim_interval < 1:
             raise ValueError(
@@ -2032,8 +2034,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             new_coords = q["gb"][0, :, 0, :]
             factors = factors.reshape(-1)
         else:
-            scale_inds = xp.random.choice(
-                len(self.jump_scales), size=coords.shape[0], p=self.jump_scales_probs
+            scale_inds = self._jump_scale_cdf.searchsorted(
+                xp.random.random_sample(coords.shape[0]), side="right"
             )
             self._last_jump_scale_inds = scale_inds
             _rand = xp.random.randn(*coords.shape)
@@ -2233,6 +2235,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             lo_bin = (buffer_obj.frequency_lims[0][slots] / self.df).astype(int)
             hi_bin = (buffer_obj.frequency_lims[1][slots] / self.df).astype(int)
 
+        map_cpu = (asnumpy(t_i), asnumpy(w_i), asnumpy(b_i))
+        out_of_prior_accepts = self.xp.zeros((), dtype=self.xp.int64)
+
         for move_i in range(self.num_repeat_proposals):
             # * a Fisher jump records its scale indices here; a stretch jump leaves None
             self._last_jump_scale_inds = None
@@ -2244,17 +2249,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # In-model steps stay within +- N/4 bins of the current source
                 # and inside the band window (widened by N/4).
                 new_bin = self.xp.abs(new[:, 1] / 1e3 / self.df).astype(int)
-                new_logp[
-                    (self.xp.abs(new[:, 1] / 1e3 - curr[:, 1] / 1e3) / self.df).astype(int) > n4
-                ] = -np.inf
-                new_logp[new_bin < lo_bin - n4] = -np.inf
-                new_logp[new_bin > hi_bin + n4] = -np.inf
+                outside_window = (
+                    ((self.xp.abs(new[:, 1] / 1e3 - curr[:, 1] / 1e3) / self.df).astype(int) > n4)
+                    | (new_bin < lo_bin - n4)
+                    | (new_bin > hi_bin + n4)
+                )
+                new_logp = self.xp.where(outside_window, -np.inf, new_logp)
             else:
                 # Non-FD domains (STFT / WDM) do not use N_vals windowing:
                 # bound candidates directly by the cell frequency limits.
                 new_f_hz = new[:, 1] / 1e3
-                new_logp[new_f_hz < buffer_obj.frequency_lims[0][slots]] = -np.inf
-                new_logp[new_f_hz > buffer_obj.frequency_lims[1][slots]] = -np.inf
+                outside_cell = (
+                    (new_f_hz < buffer_obj.frequency_lims[0][slots])
+                    | (new_f_hz > buffer_obj.frequency_lims[1][slots])
+                )
+                new_logp = self.xp.where(outside_cell, -np.inf, new_logp)
 
             # Sig-het TRUST REGION: reject candidates outside the
             # expansion's validity region around the block anchor
@@ -2277,18 +2286,19 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 ] = -np.inf
 
             keep = ~self.xp.isinf(new_logp)
+            keep_rows = self.xp.flatnonzero(keep)
             new_ll = self.xp.full(len(ids), -1e300)
-            if bool(keep.any()):
+            if keep_rows.size:
                 with _tspan(getattr(self, "_prop_timer", None), "inmodel_add_ll"):
-                    new_ll[keep] = buffer_obj.get_add_ll(
-                        new[keep], slots[keep], slots[keep],
-                        N_vals[keep] if N_vals is not None else None,
+                    new_ll[keep_rows] = buffer_obj.get_add_ll(
+                        new[keep_rows], slots[keep_rows], slots[keep_rows],
+                        N_vals[keep_rows] if N_vals is not None else None,
                         phase_maximize=self.phase_maximize,
                     )
                 if self.phase_maximize and buffer_obj.phase_angle is not None:
-                    new[keep, 3] = new[keep, 3] - buffer_obj.phase_angle
-                    new[keep] = self.periodic.wrap(
-                        {"gb": new[keep][:, None, :]}, xp=xp
+                    new[keep_rows, 3] = new[keep_rows, 3] - buffer_obj.phase_angle
+                    new[keep_rows] = self.periodic.wrap(
+                        {"gb": new[keep_rows][:, None, :]}, xp=xp
                     )["gb"][:, 0]
 
             delta_ll = new_ll - ll_ref
@@ -2296,40 +2306,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             accept = lnpdiff >= self.xp.log(self.xp.random.rand(*lnpdiff.shape))
 
             bad_mask = (new_ll <= -1e299) | (new_logp <= -1e229)
-            bad_accepts = accept & bad_mask
-            if bool(xp.any(bad_accepts)):
-                if bool(xp.any(beta[bad_accepts] != 0.0)):
-                    logger.warning(
-                        f"{self.name}: accepted an out-of-prior in-model "
-                        "coordinate at beta > 0."
-                    )
-                accept[bad_accepts] = False
+            out_of_prior_accepts += self.xp.count_nonzero(accept & bad_mask & (beta != 0.0))
+            accept &= ~bad_mask
 
             prop_counts[1][t_i, w_i, b_i] += 1
-            if bool(accept.any()):
-                curr[accept] = new[accept]
-                ll_ref[accept] = new_ll[accept]
-                curr_prior[accept] = new_logp[accept]
-                ll_change_log[t_i[accept], w_i[accept], b_i[accept]] += delta_ll[accept]
-                acc_counts[1][t_i[accept], w_i[accept], b_i[accept]] += 1
+            curr[:] = self.xp.where(accept[:, None], new, curr)
+            ll_ref[:] = self.xp.where(accept, new_ll, ll_ref)
+            curr_prior[:] = self.xp.where(accept, new_logp, curr_prior)
+            ll_change_log[t_i, w_i, b_i] += self.xp.where(accept, delta_ll, 0.0)
+            acc_counts[1][t_i, w_i, b_i] += accept
 
             # * To log Fisher jumps proposed and accepted per (scale, temperature)
             scale_inds = getattr(self, "_last_jump_scale_inds", None)
             scale_counts = getattr(self, "_jump_scale_counts", None)
             if scale_inds is not None and scale_counts is not None:
-                n_temps = scale_counts.shape[2]
-                cells = scale_inds * n_temps + t_i
-                scale_counts[0] += xp.bincount(
-                    cells, minlength=scale_counts[0].size
-                ).reshape(scale_counts[0].shape)
-                # weights instead of cells[accept]: older CuPy raises on an empty bincount input
-                scale_counts[1] += xp.bincount(
-                    cells, weights=accept.astype(xp.float64), minlength=scale_counts[1].size
-                ).astype(scale_counts.dtype).reshape(scale_counts[1].shape)
+                xp.add.at(scale_counts[0], (scale_inds, t_i), 1)
+                xp.add.at(scale_counts[1], (scale_inds, t_i), accept.astype(scale_counts.dtype))
 
             self._debug_verify_in_model(
-                buffer_obj, curr, new, slots, N_vals, delta_ll, keep,
-                (asnumpy(t_i), asnumpy(w_i), asnumpy(b_i)), move_i,
+                buffer_obj, curr, new, slots, N_vals, delta_ll, keep, map_cpu, move_i,
             )
 
             # Sig-het drift refresh: every ``sighet_refresh_every``
@@ -2374,6 +2369,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"{int(far.sum())}/{len(ids)} sources at repeat "
                         f"{move_i + 1}."
                     )
+
+        num_out_of_prior = int(out_of_prior_accepts)
+        if num_out_of_prior:
+            logger.warning(
+                f"{self.name}: accepted {num_out_of_prior} out-of-prior in-model "
+                "coordinates at beta > 0 in this block (rejected)."
+            )
 
         # End-of-block sig-het DRIFT audit (debug knob): report exactly
         # how far each source walked from its heterodyne expansion point
