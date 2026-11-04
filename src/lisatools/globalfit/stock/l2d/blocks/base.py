@@ -5,6 +5,7 @@ import importlib
 import inspect
 import os
 import warnings
+from types import SimpleNamespace
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar, Literal, NamedTuple, Annotated, TYPE_CHECKING, List
@@ -440,6 +441,11 @@ class SourceBlock(MoveBlock):
                 WaveformHandle(waveform_class, init_kwargs), "get_signals_for_residuals",
                 info["transform_fn"], self.waveform.runtime_kwargs,
             )
+        search_interface = make_search_interface(self, info)
+        injection = info["injection"]  # the YAML's, if given
+        if injection is None and search_interface is not None and search_interface.search_type == "catalog":
+            # the diagnostic plots' truths: here, so a restart (which does not seed) keeps them
+            injection = search_interface.catalog_truths(SimpleNamespace(general_info=g))
 
         settings = getattr(erebor, self.SETTINGS_NAME)(
             log_dir=g.artifacts_file_dir,
@@ -456,8 +462,8 @@ class SourceBlock(MoveBlock):
             num_prop_repeats=self.num_prop_repeats,
             betas=make_betas(self.tempering, ctx.cfg.sampler.ntemps),
             inner_moves=make_inner_moves(self, self.filled_move_kwargs(ctx, info)),
-            injection=info["injection"],
-            search_interface=make_search_interface(self, info),
+            injection=injection,
+            search_interface=search_interface,
             signal_gen=signal_gen,
         )
         setup = getattr(erebor, self.SETUP_NAME)(settings)

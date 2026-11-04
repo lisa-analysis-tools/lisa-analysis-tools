@@ -161,7 +161,10 @@ def fake_general():
 class AttachSignalGensTest(_TD):
     def run_attach(self, keep_td, td_generators):
         cfg = self.config({"mbh": mbh_with_search()}, keep_td=keep_td)
-        info = types.SimpleNamespace(transform=None, waveform_kwargs={"wk": 1})
+        self.wave = FakeWave()
+        # a seeded branch's Settings.signal_gen (build_source registers it), over the shared waveform
+        signal_gen = SignalGen(self.wave, "get_signals_for_residuals", None, {"wk": 1})
+        info = types.SimpleNamespace(transform=None, waveform_kwargs={"wk": 1}, signal_gen=signal_gen)
         curr = types.SimpleNamespace(source_info={"mbh": info}, general_info=fake_general())
         # walker 0 (cold chain) has leaves 0 and 2 on; walker 1 differs and must be ignored
         inds = np.zeros((2, 2, 3), bool)
@@ -172,14 +175,13 @@ class AttachSignalGensTest(_TD):
         coords[0, 0, 2] = [10.0, 50.0]
         coords[0, 1, 1] = [99.0, 7.0]
         state = types.SimpleNamespace(branches_inds={"mbh": inds}, branches_coords={"mbh": coords})
-        self.wave = FakeWave()
         ctx = RecipeContext(cfg, {"mbh": self.wave})
         attach_signal_gens(ctx, td_generators, curr, state)
         return ctx, curr
 
     def test_generators_share_the_seeded_waveform(self):
-        ctx, _ = self.run_attach(False, {"mbh": TDGenerator(None, "get_td_signals", {}, {"td": 1})})
-        self.assertEqual(sorted(ctx.signal_gens), ["mbh"])
+        ctx, curr = self.run_attach(False, {"mbh": TDGenerator(None, "get_td_signals", {}, {"td": 1})})
+        self.assertIs(ctx.signal_gens["mbh"], curr.source_info["mbh"].signal_gen)  # the one setup_acs used
         self.assertEqual(sorted(ctx.td_signal_gens), ["mbh"])
         self.assertIsNone(ctx.td_ac)
         ctx.signal_gens["mbh"](1.0, 2.0)

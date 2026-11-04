@@ -258,7 +258,7 @@ def fake_info(betas, nleaves=2, ndim=3, search_interface=None):
     return types.SimpleNamespace(
         betas=np.asarray(betas, dtype=float), nleaves_max=nleaves, ndim=ndim, num_prop_repeats=7,
         waveform_kwargs={"mode_selection_threshold": 1e-4}, initialize_kwargs={"order": 30},
-        transform=object(), inner_moves=[("stretch", 1.0)], search_interface=search_interface,
+        transform=object(), inner_moves=[("stretch", 1.0)], search_interface=search_interface, signal_gen=None,
     )
 
 

@@ -43,9 +43,7 @@ class RecipeContext:
 
     cfg: RunConfig
     wave_gens: dict[str, Any]  # seeded source branch -> waveform generator (shared with its PE move)
-    # seeded source branch -> ``fn(*sampling_params) -> DomainBase`` (the Settings.signal_gen contract), in the
-    # analysis domain. Registered here, not on Settings: the legacy subtract_initial_signal is still the
-    # residual path, and setup_acs would subtract a Settings.signal_gen a second time.
+    # seeded source branch -> its Settings.signal_gen (analysis domain; setup_acs built the residuals with it)
     signal_gens: dict[str, Any] = field(default_factory=dict)
     # seeded source branch -> ``fn(*sampling_params, td_settings=None) -> TDSignal`` (unwindowed TDI)
     td_signal_gens: dict[str, Any] = field(default_factory=dict)
@@ -122,7 +120,7 @@ def load_recipe_function(path: Path, name: str):
     return fn
 
 
-# --- seeding --- #
+# --- branches and generators (the state is seeded by load_info, the residuals built by setup_acs) --- #
 
 def enabled_blocks(cfg: RunConfig) -> dict[str, Any]:
     return {name: block for name, block in cfg.blocks.items() if block.enabled}
@@ -149,7 +147,7 @@ def prepare_branches(cfg: RunConfig, curr, state) -> dict[str, Any]:
             continue
         info = curr.source_info[name]
         state.sub_states[name].betas_all = np.tile(pad_ladder(info.betas, ntemps), (info.nleaves_max, 1))
-        if block.search is not None:
+        if info.signal_gen is not None:  # seeded (build_source registers it for blocks with a search)
             wave_gens[name] = info.signal_gen.waveform
     return wave_gens
 
@@ -162,10 +160,7 @@ def attach_signal_gens(ctx: RecipeContext, td_generators: dict, curr, state) -> 
     """
     for name, wave_gen in ctx.wave_gens.items():
         info = curr.source_info[name]
-        signal_gen = getattr(info, "signal_gen", None)
-        ctx.signal_gens[name] = signal_gen if signal_gen is not None else SignalGen(
-            wave_gen, "get_signals_for_residuals", info.transform, info.waveform_kwargs
-        )
+        ctx.signal_gens[name] = info.signal_gen
         td = td_generators.get(name)
         if td is None:
             continue

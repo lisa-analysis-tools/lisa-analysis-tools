@@ -618,15 +618,15 @@ class BaseSearchInterface(ABC):
             coords[:, :, leaf, :] = draws[:, :, leaf, :]
             state.branches_inds[self.branch_name][:, :, leaf] = True
 
-        if self.search_type == "catalog":
-            # store injection truths (sampling basis) for diagnostic plots
-            injection = self.get_catalog_values(curr)
-            if subset_inds is not None:
-                injection = injection[subset_inds]
-            try:
-                setattr(curr.source_info[self.branch_name], "injection", injection)
-            except AttributeError:
-                logger.warning(f"No injection data is saved for {self.branch_name}.")
+    def catalog_truths(self, curr: CurrentInfoGlobalFit) -> np.ndarray:
+        """The catalog values of the sources this interface seeds (sampling basis, periodic wrapped).
+
+        The truths of the diagnostic plots. Set when the run is built, not while seeding, so a restart (which
+        does not seed) keeps them. Reads ``curr.general_info`` (catalogue, data start).
+        """
+        truths = self.get_catalog_values(curr)
+        subset_inds = self.get_subset_inds(curr=curr)
+        return truths if subset_inds is None else truths[subset_inds]
 
 class MBHBSearchInterface(BaseSearchInterface):
 
