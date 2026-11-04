@@ -147,6 +147,8 @@ def build_curr_info(cfg: RunConfig):
         rank_info=make_rank_info(cfg),
         setup_function=make_setup_function(cfg, builds),
         source_metadata={name: build.metadata for name, build in builds.items()},
+        # the residuals are built from the (seeded) state through the blocks' Settings.signal_gen
+        rebuild_residuals=True,
     )
     return CurrentInfoGlobalFit(settings)
 

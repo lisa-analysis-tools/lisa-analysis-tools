@@ -394,9 +394,14 @@ class PSDSearchBuildTest(_Built):
         np.save(path, np.array(self.POINT))
         return {"search_type": "point_estimate", "search_path": str(path), "spread": [1e-13, 1e-16], **extra}
 
-    def test_no_search_means_no_interface(self):
+    def test_no_search_means_a_prior_interface(self):
+        # load_info seeds through the interfaces: without `search:` psd starts on, from prior draws
+        from lisatools.globalfit.searches import NoiseSearchInterface
+
         _, built = self.build(priors=NOISE_PRIOR)
-        self.assertIsNone(built["psd"].setup.search_interface)
+        interface = built["psd"].setup.search_interface
+        self.assertIsInstance(interface, NoiseSearchInterface)
+        self.assertEqual((interface.search_type, interface.search_path, interface.spread), ("prior", None, None))
 
     def test_interface_gets_the_prior_transform_and_the_search_arguments(self):
         from lisatools.globalfit.searches import NoiseSearchInterface

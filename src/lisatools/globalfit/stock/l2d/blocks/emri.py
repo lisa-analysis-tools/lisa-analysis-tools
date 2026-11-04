@@ -22,6 +22,7 @@ class EMRIBlock(SourceBlock):
     SETTINGS_NAME: ClassVar[str] = "EMRISettings"
     SETUP_NAME: ClassVar[str] = "EMRISetup"
     SEARCH_INTERFACE: ClassVar[str] = "EMRISearchInterface"
+    TD_WAVEFORM_METHOD: ClassVar[str | None] = "get_td_signals"
     WAVEFORM_METHODS: ClassVar[dict[str, str]] = dict(
         waveform_gen_method="get_signals_for_residuals", waveform_like_method="__call__"
     )

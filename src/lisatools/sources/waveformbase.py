@@ -35,6 +35,7 @@ from ..domains import (
     get_stft_settings,
     pad_td_signal,
     place_td_signal_on_grid,
+    td_grid_offset,
 )
 from ..utils.parallelbase import LISAToolsParallelModule
 from ..utils.typing import NDArrayLike, ArrayModule
@@ -730,6 +731,63 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
                 for i in range(channels.shape[0])
             ])
         return self._td_to_output_domain(times_in=times, signal_in=channels, output_domain=output_domain, domain_kwargs=domain_kwargs)
+
+    def get_td_signals(
+        self, *args, td_settings: TDSettings | None = None, **kwargs
+    ) -> TDSignal | DomainBaseArray:
+        """Per-source TDI signals in the time domain, unwindowed, on the data sampling grid.
+
+        Args:
+            *args: Waveform arguments, as for :meth:`get_signals_for_residuals`.
+            td_settings: ``None`` keeps each source's own time span, clipped to the data span.
+                A :class:`TDSettings` (the data grid or a sub-span of it, same ``dt``) places every
+                source on that grid.
+            **kwargs: Keyword arguments for the waveform generation.
+
+        Returns:
+            A :class:`TDSignal`, or a :class:`DomainBaseArray` of them for a batch.
+
+        Raises:
+            ValueError: if the sources' samples, or ``td_settings``, are not on the
+                ``data_t0 + k * dt`` grid.
+        """
+        if td_settings is not None:
+            if not np.isclose(td_settings.dt, self.dt):
+                raise ValueError(f"td_settings.dt={td_settings.dt} differs from the data dt={self.dt}.")
+            td_grid_offset(td_settings.t0, self.data_t0, self.dt)
+
+        times, channels = self.compute_tdi_channels(*args, **kwargs)
+        if times.ndim == 2:
+            return DomainBaseArray([
+                self._td_signal_on_grid(times[i], channels[i], td_settings) for i in range(channels.shape[0])
+            ])
+        return self._td_signal_on_grid(times, channels, td_settings)
+
+    def _td_signal_on_grid(
+        self, times: NDArrayLike, channels: NDArrayLike, td_settings: TDSettings | None
+    ) -> TDSignal:
+        """One source's ``(times, channels)`` as a :class:`TDSignal` on its span or on ``td_settings``."""
+        data = self.domain_settings
+        n = times.shape[-1]
+        k0 = td_grid_offset(times[0], data.t0, data.dt)
+        if td_grid_offset(times[-1], data.t0, data.dt) != k0 + n - 1:
+            raise ValueError("get_td_signals needs samples uniformly spaced by the data dt.")
+
+        if td_settings is None:
+            # the source's own span, clipped to the data (no overlap: left as is; add_signal skips it)
+            start, end = max(k0, 0), min(k0 + n, data.N)
+            if start >= end:
+                start, end = k0, k0 + n
+            td_settings = TDSettings(
+                N=end - start, dt=data.dt, t0=data.t0 + start * data.dt, force_backend=self.force_backend
+            )
+        k_out = td_grid_offset(td_settings.t0, data.t0, data.dt)
+
+        out = self.xp.zeros(channels.shape[:-1] + (td_settings.N,), dtype=channels.dtype)
+        lo, hi = max(k0, k_out), min(k0 + n, k_out + td_settings.N)
+        if lo < hi:
+            out[..., lo - k_out:hi - k_out] = channels[..., lo - k0:hi - k0]
+        return TDSignal(out, TDSettings(*td_settings.args, t0=td_settings.t0, force_backend=self.force_backend))
 
 
 class TDPyResponseWaveformBase(TDWaveformBase):

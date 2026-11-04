@@ -530,6 +530,22 @@ def _apply_fd_add(target, sign, template_arr, template_settings):
     )
 
 
+def td_grid_offset(t0: float, grid_t0: float, dt: float, atol_samples: float = 1e-6) -> int:
+    """Number of samples from ``grid_t0`` to ``t0`` on the ``grid_t0 + k * dt`` grid.
+
+    Raises ``ValueError`` when ``t0`` is not on that grid (to ``atol_samples`` of a sample): a silent
+    rounding would shift the signal by up to half a sample.
+    """
+    samples = (float(t0) - float(grid_t0)) / float(dt)
+    k = round(samples)
+    if abs(samples - k) > atol_samples:
+        raise ValueError(
+            f"t0={float(t0)!r} is not on the time grid t0={float(grid_t0)!r} + k * dt={float(dt)!r} "
+            f"(off by {samples - k:+.3e} samples)."
+        )
+    return int(k)
+
+
 def _apply_td_add(target, sign, template_arr, template_settings):
     """Add ``sign * template_arr`` (TD) to ``target.arr`` over the time-range overlap."""
     data_settings = target.settings
@@ -539,7 +555,7 @@ def _apply_td_add(target, sign, template_arr, template_settings):
             f"({template_settings.dt}) must match for TD add_signal."
         )
 
-    time_offset = int(round((template_settings.t0 - data_settings.t0) / data_settings.dt))
+    time_offset = td_grid_offset(template_settings.t0, data_settings.t0, data_settings.dt)
     t_start_data = max(0, time_offset)
     t_end_data = min(data_settings.N, time_offset + template_settings.N)
     if t_start_data >= t_end_data:
