@@ -63,6 +63,7 @@ def _preprocess_kwargs(cfg: RunConfig) -> dict:
         downsample_kwargs=downsample,
         trim_kwargs=dump(data.trim),
         Tobs=data.Tobs,
+        upstream_aafilter_kwargs=dump(data.aafilter),
         alias_correction=data.alias_correction,
     )
 

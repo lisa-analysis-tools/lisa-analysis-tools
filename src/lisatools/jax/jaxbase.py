@@ -75,12 +75,37 @@ class JaxBase:
     
         elif isinstance(x, (float, int, np.ndarray)):
             platform = jax.default_backend()
+            # An explicit jax.default_device(...) context (e.g. device_context(None) pins
+            # JAX to CPU) still wins: only fill in the device when none is set.
+            if device_id is None and platform == "gpu" and jax.config.jax_default_device is None:
+                # Host inputs follow the caller's cupy device, like cupy inputs do via
+                # DLPack. Otherwise device_put(device=None) puts them on JAX's default
+                # device (gpu0), and also switches the calling thread's CUDA current
+                # device to 0, so a per-split thread inside cp.cuda.Device(k) would do
+                # all of its subsequent cupy work on gpu0.
+                device_id = self._current_cupy_device()
             device = jax.devices(platform)[device_id] if device_id is not None else None
             return jax.device_put(x, device=device)
            
         else:
             raise TypeError(f"Unsupported type for _to_jax: {type(x)}")
         
+    @staticmethod
+    def _current_cupy_device() -> Optional[int]:
+        """Index of the calling thread's current cupy device in ``jax.devices("gpu")``.
+
+        Relies on the module's precondition that JAX and cupy enumerate CUDA devices in
+        the same order. Returns None (JAX default device) if cupy has no usable GPU or
+        JAX cannot see that index.
+        """
+        if not cupy_available:
+            return None
+        try:
+            dev = int(cp.cuda.runtime.getDevice())
+        except Exception:  # noqa: BLE001 -- no CUDA runtime / no device
+            return None
+        return dev if dev < len(jax.devices("gpu")) else None
+
     def _from_jax(self, x: jnp.ndarray, do_synchronize: bool = False, to_host: bool = False) -> np.ndarray | cp.ndarray:
         """Convert a JAX array back to either a NumPy or CuPy array, depending on the backend."""
         if do_synchronize:
