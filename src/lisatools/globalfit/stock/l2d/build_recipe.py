@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import numpy as np
 
 from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock
-from .blocks.psd import STOCHASTIC
 from .blocks.utility import check_kwargs, find_class
 from .generators import SignalGen
 
@@ -56,7 +55,7 @@ class RecipeContext:
 # --- the recipes --- #
 
 class StockRecipe:
-    """psd search (when the seeding rules need it), optional burn-in, then joint PE until ``run.num_iterations``."""
+    """psd max-likelihood search (when there is a psd block), optional burn-in, then joint PE until ``run.num_iterations``."""
 
     def __init__(self, burn_in_iterations: int | None = None):
         if burn_in_iterations is not None and (
@@ -124,11 +123,6 @@ def load_recipe_function(path: Path, name: str):
 
 def enabled_blocks(cfg: RunConfig) -> dict[str, Any]:
     return {name: block for name, block in cfg.blocks.items() if block.enabled}
-
-
-def psd_needs_search(block) -> bool:
-    """The max-likelihood psd search runs unless psd (and galfor) are seeded from samples or a point estimate."""
-    return block.search is None or block.search.search_type == "prior"
 
 
 def prepare_branches(cfg: RunConfig, curr, state) -> dict[str, Any]:
@@ -243,8 +237,7 @@ def build_block_moves(ctx: RecipeContext, engine_info, curr, acs, priors, state)
             if block.search is not None:
                 moves[name] = source_moves(block, cls, ctx, engine_info, curr, acs, priors, state)
         else:
-            search = any(psd_needs_search(b) for n, b in blocks.items() if n in STOCHASTIC)
-            moves[name] = psd_moves(block, cls, engine_info, curr, acs, priors, state, search=search)
+            moves[name] = psd_moves(block, cls, engine_info, curr, acs, priors, state)
     return moves
 
 
@@ -284,10 +277,11 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     return BranchMoves([], [move])
 
 
-def psd_moves(block, cls, engine_info, curr, acs, priors, state, search: bool = True) -> BranchMoves:
-    """The psd search and PE moves from one ``pe_move`` (only ``max_logl_mode`` differs).
+def psd_moves(block, cls, engine_info, curr, acs, priors, state) -> BranchMoves:
+    """The psd max-likelihood search and PE moves from one ``pe_move`` (only ``max_logl_mode`` differs).
 
-    They sample galfor too when it is a branch (the generic builder finds it in ``curr.source_info`` itself).
+    The search runs however psd is seeded (prior, samples or a point estimate). The moves sample galfor too
+    when it is a branch (the generic builder finds it in ``curr.source_info`` itself).
     """
     from eryn.moves.tempering import TemperatureControl
 
@@ -318,7 +312,7 @@ def psd_moves(block, cls, engine_info, curr, acs, priors, state, search: bool = 
         pe = [cls(acs, priors, max_logl_mode=False, name="psd pe move", **common)]
         for move in search_moves + pe:
             move.accepted = np.zeros((g.ntemps, g.nwalkers))
-    return BranchMoves(search_moves if search else [], pe)
+    return BranchMoves(search_moves, pe)
 
 
 # --- the engine's setup_function --- #

@@ -153,8 +153,9 @@ class SearchSpec(_Spec):
     """How a block's walkers are seeded: the arguments of the branch's search interface.
 
     The interface (``lisatools.globalfit.searches``) gets the prior's transform and periodicity from
-    the builder and seeds through the inverse transform. A block without ``search`` has no
-    interface: source branches then start empty, psd/galfor run the max-likelihood search.
+    the builder and seeds through the inverse transform (``GlobalFit.load_info``, fresh starts). A block
+    without ``search`` gets its ``DEFAULT_SEARCH``: none for source branches (they start empty), ``prior`` for
+    psd/galfor. The psd max-likelihood search runs whatever the seeding.
     """
 
     search_type: Literal["prior", "distribution", "samples", "point_estimate", "catalog"] = "catalog"

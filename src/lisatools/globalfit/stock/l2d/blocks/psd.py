@@ -10,7 +10,6 @@ from .base import (
 )
 
 REFERENCE_TMAX = 1e6  # top of the reference psd ladder (mojito_input/emri_mbh_psd_settings.py)
-STOCHASTIC = ("psd", "galfor")  # the branches the psd move samples (one ladder, one search)
 
 
 class PSDBlock(MoveBlock):
@@ -19,7 +18,7 @@ class PSDBlock(MoveBlock):
     type: Literal["psd"]
     SEARCH_INTERFACE: ClassVar[str] = "NoiseSearchInterface"
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate")  # no catalogue of noise
-    # without `search:` the branch starts on, from prior draws (then the max-likelihood search runs)
+    # without `search:` the branch starts on, from prior draws (the max-likelihood search always runs)
     DEFAULT_SEARCH: ClassVar[SearchSpec | None] = SearchSpec(search_type="prior")
     FULL_LADDER: ClassVar[bool] = True  # the psd moves run on every temperature
     PE_MOVES: ClassVar[dict[str, PEMove]] = {

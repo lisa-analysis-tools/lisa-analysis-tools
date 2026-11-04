@@ -124,19 +124,19 @@ class GalForMovesTest(_GalFor):
             self.assertIs(move.kwargs["galfor_transform_fn"], infos["galfor"].transform)
             self.assertIs(move.kwargs["psd_transform_fn"], infos["psd"].transform)
 
-    def test_the_search_runs_if_either_block_needs_it(self):
+    def test_the_search_runs_whatever_the_seeding(self):
         psd_point = {**PSD_BLOCK, "search": point_search(self.run_dir, "psd", 2)}
         galfor_point = {**GALFOR_BLOCK, "search": point_search(self.run_dir, "galfor", 5)}
-        for blocks, searched in (
-            ({"psd": psd_point, "galfor": GALFOR_BLOCK}, True),
-            ({"psd": PSD_BLOCK, "galfor": galfor_point}, True),
-            ({"psd": psd_point, "galfor": galfor_point}, False),
-            ({"psd": psd_point, "galfor": {**GALFOR_BLOCK, "enabled": False}}, False),
+        for blocks in (
+            {"psd": PSD_BLOCK, "galfor": GALFOR_BLOCK},
+            {"psd": psd_point, "galfor": GALFOR_BLOCK},
+            {"psd": psd_point, "galfor": galfor_point},
+            {"psd": psd_point, "galfor": {**GALFOR_BLOCK, "enabled": False}},
         ):
             with self.subTest(blocks={n: b.get("search", {}).get("search_type") for n, b in blocks.items()}):
                 infos = self.infos() if blocks["galfor"].get("enabled", True) else {"psd": self.infos()["psd"]}
                 _, _, _, moves = self.moves(blocks, infos)
-                self.assertEqual((len(moves["psd"].search), len(moves["psd"].pe)), (int(searched), 1))
+                self.assertEqual((len(moves["psd"].search), len(moves["psd"].pe)), (1, 1))
 
     def test_galfor_is_seeded_on_its_ladder(self):
         # load_info seeds every branch through its interface (seed_from_search_interfaces)

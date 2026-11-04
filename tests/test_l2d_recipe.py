@@ -32,7 +32,6 @@ from lisatools.globalfit.stock.l2d import build_recipe
 from lisatools.globalfit.searches import pad_ladder
 from lisatools.globalfit.stock.l2d.build_recipe import (
     BranchMoves, RecipeContext, StockRecipe, build_block_moves, make_setup_function, prepare_branches,
-    psd_needs_search,
 )
 from lisatools.globalfit.stock.l2d.generators import SignalGen, WaveformHandle
 from lisatools.globalfit.stock.l2d.io import RecipeFile, RunConfig, StockRecipeSpec, dump_run, load_run
@@ -307,13 +306,6 @@ class LadderHelpersTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "more than the sampler"):
             pad_ladder([1.0, 0.5], 1)
 
-    def test_psd_search_runs_unless_seeded_from_samples_or_a_point(self):
-        block = lambda search: types.SimpleNamespace(search=search)
-        self.assertTrue(psd_needs_search(block(None)))
-        self.assertTrue(psd_needs_search(block(types.SimpleNamespace(search_type="prior"))))
-        self.assertFalse(psd_needs_search(block(types.SimpleNamespace(search_type="samples"))))
-        self.assertFalse(psd_needs_search(block(types.SimpleNamespace(search_type="point_estimate"))))
-
 
 class PrepareBranchesTest(_Runtime):
     def prepare(self, blocks, infos):
@@ -452,12 +444,13 @@ class MoveBuildTest(_Runtime):
         ))
         self.assertEqual(pe.accepted.shape, (cfg.sampler.ntemps, NWALKERS))
 
-    def test_psd_search_is_dropped_when_seeded_from_a_point(self):
+    def test_psd_search_runs_also_when_seeded_from_a_point(self):
         point = self.run_dir / "psd_point.npy"
         np.save(point, np.array([1.5e-11, 3e-15]))
         psd = {**PSD_BLOCK, "search": {"search_type": "point_estimate", "search_path": str(point), "spread": 1e-3}}
         _, _, _, moves = self.moves({"psd": psd}, {"psd": fake_info(np.ones(5), nleaves=1, ndim=2)})
-        self.assertEqual((moves["psd"].search, len(moves["psd"].pe)), ([], 1))
+        (search,), (pe,) = moves["psd"].search, moves["psd"].pe
+        self.assertEqual((search.kwargs["max_logl_mode"], pe.kwargs["max_logl_mode"]), (True, False))
 
     def test_generic_source_builder(self):
         built = []
