@@ -217,6 +217,11 @@ PRIOR_PRECISION_FACTOR = 12.0
 JACOBIAN_STEP_RELATIVE = 1e-6
 JACOBIAN_STEP_FLOOR = 1e-3
 
+# * Side bins of the STFT Fisher matrix of the in-model proposal. At 12 the matrix is 4e-4 smaller than at 16
+# * and keeps its shape, and a pass of the DFFR Fisher kernel fits one round of its threads (529 against 750 us
+# * per source on an A100). The likelihood keeps the settings' side bins.
+FISHER_N_SIDE_BINS = 12
+
 # * Cached Fisher Information matrices in the gb branch supplemental, per leaf slot:
 # * FIM in the sampling basis, the prior widths, the blocks served, and whether the slot holds one.
 _FIM_STORE_KEYS = ("fim_matrix", "fim_widths", "fim_age", "fim_valid")
@@ -1855,8 +1860,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         route_information_matrix partitions the sources by the shard of their walker.
         """
         xp = self.xp
+        side_bins = {}  # * only the STFT comp takes side bins
         if isinstance(self._basis_settings, STFTSettings):
             info_comp = self.gb_stft_comp
+            # ! Never more side bins than the likelihood's.
+            side_bins = {"n_side_bins": min(FISHER_N_SIDE_BINS, int(info_comp.n_side_bins))}
         elif isinstance(self._basis_settings, FDSettings):
             info_comp = self.gb_fd_comp
         else:
@@ -1864,7 +1872,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
         return _RoutedBandEngine.route_information_matrix(
             info_comp, model.analysis_container_arr, params_phys,
-            inds=test_inds, noise_index=xp.asarray(walker_inds).astype(xp.int32),
+            inds=test_inds, noise_index=xp.asarray(walker_inds).astype(xp.int32), **side_bins,
         )
 
     def _compute_fisher_sampling(self, model, band_sorter, ids, cell_f0_lims):
