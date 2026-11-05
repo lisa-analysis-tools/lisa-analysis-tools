@@ -71,7 +71,7 @@ The widths come from the source's prior box in the sampling basis:
 - $f_0$: the cell's frequency range (the in-model gate rejects any $f_0$ outside it), mapped into the
   sampling basis and cut at the prior's $f_0$ range;
 - $\dot f$: the bounds of the joint $(f_0, \dot f)$ prior at the source's $f_0$
-  (`MojitoF0mHzFdotPrior.fdot_bounds`), which widen with $f_0$;
+  (`MojitoF0mHzFdotPrior.get_fdot_bounds`), which widen with $f_0$;
 - $\phi_0$, $\psi$ and $\alpha$: their periods;
 - $\ln A$, $\cos\iota$ and $\sin\delta$: their prior ranges.
 
@@ -205,7 +205,7 @@ next block.
 | `GBSpecialBase._run_rj_step` | Clears the held matrix of every accepted birth and death. |
 | `GBSpecialBase._write_back_state` | Moves each held matrix to its source's new slot. |
 | `GBSpecialBase.in_model_proposal` | The Gaussian jump with a jump scale per source. |
-| `priors/gbpriors.py`: `MojitoF0mHzFdotPrior.fdot_bounds` | The $\dot f$ bounds at a given $f_0$ (mHz). |
+| `priors/gbpriors.py`: `MojitoF0mHzFdotPrior.get_fdot_bounds` | The $\dot f$ bounds at a given $f_0$ (mHz). |
 | `stock/erebor.py`: `GBSettings.num_stationary_fim_steps` | The interval of the parameter-estimation moves. |
 | `recipe.py`: `build_gb_moves` | Passes the interval to each move, 1 for the search moves. |
 

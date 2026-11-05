@@ -29,7 +29,7 @@ inner_moves:
 flow:
   # weight: 0.2
   # # the flow on the unimodal parameters only, a stretch on the degenerate ones (one CombineMove):
-  # parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
+  # parameters: [logM, q, s1z, s2z, d_L, phi_ref, t_c]
   # complement: {class: StretchMove}
   # model:
   #   class: ZukoFlow
@@ -49,7 +49,7 @@ flow:
 search:
   # search_type: point_estimate
   # search_path: /data/asantini/globalfit/erebor_org_setup/search_results/mbh/point_estimates.npy
-  # parameters_searched: ['logM', 'logq', 's1z', 's2z', 'cos_iota', 'psi', 'alpha', 'sin_delta', 't_c']
+  # parameters_searched: ['logM', 'q', 's1z', 's2z', 'cos_iota', 'psi', 'alpha', 'sin_delta', 't_c']
   search_type: catalog
   spread: [1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-1, 1e-1, 1e-2, 1e-2, 1e-1]
 pe_move: 

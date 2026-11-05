@@ -409,7 +409,7 @@ class PSDSearchBuildTest(_Built):
         self.assertEqual(iface.search_type, "point_estimate")
         self.assertEqual(iface.search_path, str(self.run_dir / "psd_point_build.npy"))
         np.testing.assert_array_equal(iface.spread, [1e-13, 1e-16])
-        self.assertIsNone(iface.parameters_searched)  # "all"
+        np.testing.assert_array_equal(iface.parameters_searched, np.arange(2))  # "all": every sampling-basis column
         self.assertIsNone(iface.periodic)  # the noise prior has none
         self.assertEqual(iface.sampling_basis, ["S_oms", "S_tm"])
 

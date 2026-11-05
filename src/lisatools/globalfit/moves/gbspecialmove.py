@@ -1735,11 +1735,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """Uniform prior box (lower, upper) of every source, sampling basis, each (n_src, ndim).
 
         A one-column prior gives its ``minimum`` and ``maximum``. A joint (f0, fdot) prior gives f0
-        its ``f0_min`` and ``f0_max`` and fdot its bounds at each source's f0 (``fdot_bounds``).
-        f0 is narrowed to the cell's frequency range, which the in-model gate enforces:
-        ``cell_f0_lims`` holds the physical limits per source, mapped into the sampling basis
-        through the transform container. Periodic columns span their period, [0, period), the
-        range the periodic container wraps into.
+        its ``f0_min`` and ``f0_max`` and fdot its bounds at each source's f0 (``get_fdot_bounds``,
+        as in LAT's ``MojitoF0mHzFdotPrior`` and erebor-priors' ``F0FdotPrior``). f0 is narrowed to
+        the cell's frequency range, which the in-model gate enforces: ``cell_f0_lims`` holds the
+        physical limits per source, mapped into the sampling basis through the transform container.
+        Periodic columns span their period, [0, period), the range the periodic container wraps
+        into.
         """
         xp = self.xp
         coords = xp.asarray(coords)
@@ -1761,18 +1762,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"the prior of column {columns[0]} ({type(dist).__name__}) has the range "
                         f"[{minimum}, {maximum}]; the prior box needs finite bounds")
                 lower[:, columns[0]], upper[:, columns[0]] = minimum, maximum
-            elif len(columns) == 2 and hasattr(dist, "fdot_bounds"):
+            elif len(columns) == 2 and hasattr(dist, "get_fdot_bounds"):
                 # * joint (f0, fdot) prior: f0 uniform, fdot uniform between f0-dependent bounds
                 f0_column, fdot_column = columns
                 lower[:, f0_column], upper[:, f0_column] = float(dist.f0_min), float(dist.f0_max)
-                fdot_low, fdot_high = dist.fdot_bounds(coords[:, f0_column])
+                fdot_low, fdot_high = dist.get_fdot_bounds(coords[:, f0_column])
                 lower[:, fdot_column] = xp.asarray(fdot_low)
                 upper[:, fdot_column] = xp.asarray(fdot_high)
             else:
                 raise TypeError(
                     f"the prior box cannot read {type(dist).__name__} over columns {columns}: "
                     "it needs a one-column prior with minimum and maximum, or a joint (f0, fdot) "
-                    "prior with f0_min, f0_max and fdot_bounds(f0)")
+                    "prior with f0_min, f0_max and get_fdot_bounds(f0)")
 
         # * f0: the cell's physical limits mapped through the local slope of the transform
         input_basis = list(getattr(self.transform_fn, "input_basis", []))
