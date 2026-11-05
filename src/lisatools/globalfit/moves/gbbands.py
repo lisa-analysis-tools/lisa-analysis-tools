@@ -1342,7 +1342,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
         sources_now_map,
         sources_inject_now_map,
         special_band_inds,
-        opt_snr_rej_samp_limit=5.0,
+        opt_snr_rej_samp_limit=0.0,
         force_backend="gpu",
         use_template_arr=False,
         basis_settings: Optional[DomainSettingsBase] = None,
