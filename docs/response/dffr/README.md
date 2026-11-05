@@ -39,7 +39,7 @@ Measured on one full A100 and on the CPU of SURF Spider; the details and the con
 
 | Quantity | DFFR against the existing response |
 | --- | --- |
-| Speed of the likelihood methods on the A100 (a year of one-day segments, 1000 to 10 000 sources) | 2.1 to 8.8 times faster; `get_ll` 7.7 µs per source instead of 63.5 at 10 000 sources |
+| Speed of the likelihood methods on the A100 (a year of one-day segments, 10 side bins, 1000 to 10 000 sources) | 2.1 to 8.8 times faster; `get_ll` 7.7 µs per source instead of 63.5 at 10 000 sources |
 | Speed of the Fisher matrix on the A100 | 1.6 to 2.0 times faster |
 | Speed of the galactic-binary block of the global fit (56 binaries, 32 walkers, 24 temperatures, one A100) | an iteration in 17.2 min instead of 31.6; the in-model likelihood evaluations 3.4 times faster |
 | Speed on the CPU, one thread | 0.28 to 0.40 of the time in the likelihood methods |
@@ -178,12 +178,19 @@ raises `TypeError`.
 
 These apply to both responses and were measured in the validation.
 
-- Side bins (`n_side_bins`). With the production taper of 0.1157 (1e4 s on a one-day segment), the
-  10 side bins of production leave 1.3e-3 (20 mHz) to 1.7e-3 (0.5 mHz) of a source's noise-weighted
-  power outside the template: a mismatch of 6.4e-4 to 8.8e-4 against time-domain data and a loss
-  of 6 to 9 in ln L at the true parameters for a source of SNR 100. A tone keeps 1.3e-6 to 5.8e-6
-  of its power beyond 30 bins and 4e-8 to 1e-7 beyond 60; the validation used 60. More side bins
-  cost time in proportion to the band, 2 n_side_bins + 1 bins per segment.
+- Side bins (`n_side_bins`). With the production taper of 0.1157 (1e4 s on a one-day segment), 10
+  side bins leave 1.3e-3 (20 mHz) to 1.7e-3 (0.5 mHz) of a source's noise-weighted power outside
+  the template: a mismatch of 6.4e-4 to 8.8e-4 against time-domain data and a loss of 6 to 9 in
+  ln L at the true parameters for a source of SNR 100. A tone keeps 1.3e-6 to 5.8e-6 of its power
+  beyond 30 bins and 4e-8 to 1e-7 beyond 60; the validation used 60. The benchmarks of this effort
+  ran at 10 side bins; the full-band global fit runs 16 (`N_SIDE_BINS` of
+  `galaxy_psd_dffr_global_fit_settings.py`). On an A100 80 GB at 713 segments and 24 000 sources,
+  10 / 12 / 16 side bins cost 15.0 / 17.0 / 20.5 µs per `get_ll`, 12.6 / 14.2 / 17.1 µs per
+  `fill_global` and 514 / 529 / 750 µs per 8-parameter Fisher matrix. The likelihood grows by
+  about 0.46 µs per bin of the 2 n_side_bins + 1 per segment; the Fisher matrix jumps from 12 to 16,
+  where a pass of 4 segment rows exceeds the 128 threads of a block. The GB move therefore computes
+  its Fisher matrix at 12 side bins (`FISHER_N_SIDE_BINS`), 4e-4 smaller than at 16 with the same
+  shape, and keeps the settings' side bins for every likelihood.
 - The window taper. A taper of 1/(14 mHz) = 71 s, as the tracked high-frequency settings had,
   leaves up to 1.9e-2 of a tone's power outside 10 side bins; 1e4 s leaves 1.4e-3. The taper also
   sets the width of the store windows and so the memory per cell of the GB block.

@@ -36,13 +36,6 @@ from ...sensitivity import SensitivityMatrixBase
 from ...utils.parallelbase import LISAToolsParallelModule
 from ...utils.utility import asnumpy
 from ..galaxyglobal import fit_each_leaf, make_gmm, run_gb_bulk_search
-from gbgpu.gb_likelihood import (
-    BandLikelihoodEngine,
-    FDBandLikelihoodEngine,
-    SwapLLResult,
-    WDMBandLikelihoodEngine,
-    make_band_likelihood_engine,
-)
 from .globalfitmove import GFCombineMove, GlobalFitMove
 from ..priors.gbpriors import get_fdot_mojito
 
@@ -217,6 +210,11 @@ PRIOR_PRECISION_FACTOR = 12.0
 # * |x|. It is exact for the linear f0 and fdot transforms, also for fdot sampled as fdot x Tobs^2.
 JACOBIAN_STEP_RELATIVE = 1e-6
 JACOBIAN_STEP_FLOOR = 1e-3
+
+# * Side bins of the STFT Fisher matrix of the in-model proposal. At 12 the matrix is 4e-4 smaller than at 16
+# * and keeps its shape, and a pass of the DFFR Fisher kernel fits one round of its threads (529 against 750 us
+# * per source on an A100). The likelihood keeps the settings' side bins.
+FISHER_N_SIDE_BINS = 12
 
 # * Cached Fisher Information matrices in the gb branch supplemental, per leaf slot:
 # * FIM in the sampling basis, the prior widths, the blocks served, and whether the slot holds one.
@@ -1745,11 +1743,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         """Uniform prior box (lower, upper) of every source, sampling basis, each (n_src, ndim).
 
         A one-column prior gives its ``minimum`` and ``maximum``. A joint (f0, fdot) prior gives f0
-        its ``f0_min`` and ``f0_max`` and fdot its bounds at each source's f0 (``fdot_bounds``).
-        f0 is narrowed to the cell's frequency range, which the in-model gate enforces:
-        ``cell_f0_lims`` holds the physical limits per source, mapped into the sampling basis
-        through the transform container. Periodic columns span their period, [0, period), the
-        range the periodic container wraps into.
+        its ``f0_min`` and ``f0_max`` and fdot its bounds at each source's f0 (``get_fdot_bounds``,
+        as in LAT's ``MojitoF0mHzFdotPrior`` and erebor-priors' ``F0FdotPrior``). f0 is narrowed to
+        the cell's frequency range, which the in-model gate enforces: ``cell_f0_lims`` holds the
+        physical limits per source, mapped into the sampling basis through the transform container.
+        Periodic columns span their period, [0, period), the range the periodic container wraps
+        into.
         """
         xp = self.xp
         coords = xp.asarray(coords)
@@ -1771,18 +1770,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"the prior of column {columns[0]} ({type(dist).__name__}) has the range "
                         f"[{minimum}, {maximum}]; the prior box needs finite bounds")
                 lower[:, columns[0]], upper[:, columns[0]] = minimum, maximum
-            elif len(columns) == 2 and hasattr(dist, "fdot_bounds"):
+            elif len(columns) == 2 and hasattr(dist, "get_fdot_bounds"):
                 # * joint (f0, fdot) prior: f0 uniform, fdot uniform between f0-dependent bounds
                 f0_column, fdot_column = columns
                 lower[:, f0_column], upper[:, f0_column] = float(dist.f0_min), float(dist.f0_max)
-                fdot_low, fdot_high = dist.fdot_bounds(coords[:, f0_column])
+                fdot_low, fdot_high = dist.get_fdot_bounds(coords[:, f0_column])
                 lower[:, fdot_column] = xp.asarray(fdot_low)
                 upper[:, fdot_column] = xp.asarray(fdot_high)
             else:
                 raise TypeError(
                     f"the prior box cannot read {type(dist).__name__} over columns {columns}: "
                     "it needs a one-column prior with minimum and maximum, or a joint (f0, fdot) "
-                    "prior with f0_min, f0_max and fdot_bounds(f0)")
+                    "prior with f0_min, f0_max and get_fdot_bounds(f0)")
 
         # * f0: the cell's physical limits mapped through the local slope of the transform
         input_basis = list(getattr(self.transform_fn, "input_basis", []))
@@ -1858,8 +1857,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         route_information_matrix partitions the sources by the shard of their walker.
         """
         xp = self.xp
+        side_bins = {}  # * only the STFT comp takes side bins
         if isinstance(self._basis_settings, STFTSettings):
             info_comp = self.gb_stft_comp
+            # ! Never more side bins than the likelihood's.
+            side_bins = {"n_side_bins": min(FISHER_N_SIDE_BINS, int(info_comp.n_side_bins))}
         elif isinstance(self._basis_settings, FDSettings):
             info_comp = self.gb_fd_comp
         else:
@@ -1867,7 +1869,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
         return _RoutedBandEngine.route_information_matrix(
             info_comp, model.analysis_container_arr, params_phys,
-            inds=test_inds, noise_index=xp.asarray(walker_inds).astype(xp.int32),
+            inds=test_inds, noise_index=xp.asarray(walker_inds).astype(xp.int32), **side_bins,
         )
 
     def _compute_fisher_sampling(self, model, band_sorter, ids, cell_f0_lims):
@@ -3509,6 +3511,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1) # cold chain only
         logger.info(f"Number of active leaves before proposal: {num_active_leaves}")
 
+        # ! Every budget of this propose must see the copies of the parent noise rows that the
+        # ! buffers read on several devices, so they are made before the first budget reading.
+        with tm.span("parent_noise_copies"):
+            band_sorter.make_parent_noise_copies(model.analysis_container_arr)
+
         if self.EMPTY_POOL_BEFORE_PROPOSAL:
             with tm.span("mempool_free"):
                 if self.backend.uses_cupy:
@@ -3612,6 +3619,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         logger.info(f"Number of active leaves in cold chain after proposal: {num_active_leaves}")
 
         new_inds = self.xp.asarray(new_state.branches_inds["gb"])
+        # ! The copies of the parent noise rows leave the devices with this propose, even if
+        # ! something still holds the sorter.
+        band_sorter.parent_noise_copies.clear()
         del band_sorter
         with tm.span("mempool_free"):
             self.mempool.free_all_blocks()
@@ -4160,7 +4170,7 @@ def para_log_like(
         x[:, 0] = np.log(gb.A_max)
         x[:, 3] = gb.phi0_max % (2 * np.pi)
         x[:, 4] = np.cos(gb.iota_max % (np.pi))
-        x[:, 5] = gb.psi_max % (np.pi)
+        x[:, 5] = gb.psi_max % (2 * np.pi)
 
     else:
         # breakpoint()

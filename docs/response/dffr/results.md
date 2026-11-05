@@ -407,8 +407,9 @@ the fly:
 ## Speed on the A100 and on the CPU
 
 DFFR against the existing response on the A100 (a year of one-day segments, the ESA production
-fixture; `L1Orbits` within 3 % except at batch 1), as the ratio of the existing time to the DFFR
-time, with the final Fisher kernel:
+fixture at 10 side bins; `L1Orbits` within 3 % except at batch 1), as the ratio of the existing
+time to the DFFR time, with the final Fisher kernel. The global fit runs 16 side bins, where DFFR
+`get_ll` costs 1.37 times and its Fisher matrix 1.46 times the 10-side-bin time (README, side bins):
 
 | Method | Batch 1 | 10 | 100 | 1000 | 10 000 | Per source at 10 000, existing / DFFR [µs] |
 | --- | --- | --- | --- | --- | --- | --- |

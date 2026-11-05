@@ -348,12 +348,16 @@ class StftMultiGpuConcurrencyCheck(unittest.TestCase):
         for split, device in enumerate(buffer.gpus):
             params, slot_rows, _n = rows([split], TIMING_ROWS_PER_SHARD)
             intra_host = np.asarray(buffer.ac_to_intra)[harness.host(slot_rows)]
+            # ! A cell's noise row is not its own position when the buffer reads the parent's noise
+            # ! rows (the default): it is its walker's row, as _split_plan reads it.
+            noise_host = np.asarray(buffer.noise_row_of_ac)[harness.host(slot_rows)]
             with cp.cuda.Device(int(device)):
                 comp = engine._comp_for_split(buffer, split, device)
                 physical = buffer.transform_fn.both_transforms(xp.asarray(harness.host(params)), xp=xp)
                 intra = xp.asarray(intra_host, dtype=xp.int32)
+                noise = xp.asarray(noise_host, dtype=xp.int32)
                 starts = engine._split_start_inds(buffer, split)
-            cls.launches.append((int(device), comp, physical, intra, starts))
+            cls.launches.append((int(device), comp, physical, intra, noise, starts))
 
     def _mean_call_seconds(self, call, repeats=5):
         for _ in range(2):
@@ -368,10 +372,10 @@ class StftMultiGpuConcurrencyCheck(unittest.TestCase):
     def test_launch_returns_before_its_kernel(self):
         import cupy as cp
 
-        for device, comp, params, intra, starts in self.launches:
+        for device, comp, params, intra, noise, starts in self.launches:
             def launch():
                 with cp.cuda.Device(device):
-                    comp.get_ll_stft(params, data_index=intra, noise_index=intra,
+                    comp.get_ll_stft(params, data_index=intra, noise_index=noise,
                                      start_freq_inds=starts)
 
             launch()

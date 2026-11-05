@@ -36,13 +36,6 @@ from ...sensitivity import SensitivityMatrixBase
 from ...utils.parallelbase import LISAToolsParallelModule
 from ...utils.utility import asnumpy
 from ..galaxyglobal import fit_each_leaf, make_gmm, run_gb_bulk_search
-from gbgpu.gb_likelihood import (
-    BandLikelihoodEngine,
-    FDBandLikelihoodEngine,
-    SwapLLResult,
-    WDMBandLikelihoodEngine,
-    make_band_likelihood_engine,
-)
 from .globalfitmove import GFCombineMove, GlobalFitMove
 from ..priors.gbpriors import get_fdot_mojito
 
@@ -3710,7 +3703,7 @@ def para_log_like(
         x[:, 0] = np.log(gb.A_max)
         x[:, 3] = gb.phi0_max % (2 * np.pi)
         x[:, 4] = np.cos(gb.iota_max % (np.pi))
-        x[:, 5] = gb.psi_max % (np.pi)
+        x[:, 5] = gb.psi_max % (2 * np.pi)
 
     else:
         # breakpoint()

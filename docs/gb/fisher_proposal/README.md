@@ -71,7 +71,7 @@ The widths come from the source's prior box in the sampling basis:
 - $f_0$: the cell's frequency range (the in-model gate rejects any $f_0$ outside it), mapped into the
   sampling basis and cut at the prior's $f_0$ range;
 - $\dot f$: the bounds of the joint $(f_0, \dot f)$ prior at the source's $f_0$
-  (`MojitoF0mHzFdotPrior.fdot_bounds`), which widen with $f_0$;
+  (`MojitoF0mHzFdotPrior.get_fdot_bounds`), which widen with $f_0$;
 - $\phi_0$, $\psi$ and $\alpha$: their periods;
 - $\ln A$, $\cos\iota$ and $\sin\delta$: their prior ranges.
 
@@ -173,7 +173,7 @@ changed temperature in a swap keeps its matrix and gets the new $\beta$.
 recomputed at the source's position. A source without a matrix (a fresh start, a birth, a restart)
 gets one at its next block.
 
-- `GBSettings.num_stationary_fim_steps` (default 1) sets it for the parameter-estimation moves
+- `GBMoveSettings.num_stationary_fim_steps` (default 1) sets it for the parameter-estimation moves
   (`rj_prior`, `rj_fstat_mcmc`, `rj_refit`) built by `build_gb_moves`. With 1, every block gets a
   new matrix, as before the change.
 - The search moves (`rj_prior_search`, `rj_fstat_mcmc_search`, `rj_refit_search`) always use 1: a
@@ -205,8 +205,8 @@ next block.
 | `GBSpecialBase._run_rj_step` | Clears the held matrix of every accepted birth and death. |
 | `GBSpecialBase._write_back_state` | Moves each held matrix to its source's new slot. |
 | `GBSpecialBase.in_model_proposal` | The Gaussian jump with a jump scale per source. |
-| `priors/gbpriors.py`: `MojitoF0mHzFdotPrior.fdot_bounds` | The $\dot f$ bounds at a given $f_0$ (mHz). |
-| `stock/erebor.py`: `GBSettings.num_stationary_fim_steps` | The interval of the parameter-estimation moves. |
+| `priors/gbpriors.py`: `MojitoF0mHzFdotPrior.get_fdot_bounds` | The $\dot f$ bounds at a given $f_0$ (mHz). |
+| `stock/erebor.py`: `GBMoveSettings.num_stationary_fim_steps` | The interval of the parameter-estimation moves. |
 | `recipe.py`: `build_gb_moves` | Passes the interval to each move, 1 for the search moves. |
 
 ## What the logs show

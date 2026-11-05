@@ -1,0 +1,8 @@
+type: psd
+priors: {class: mojitolight.NoisePrior, kwargs: {model_type: parametric-symmetric}}
+num_prop_repeats: 100
+injection: {S_oms: 15e-12, S_tm: 3e-15}  # the Mojito-light noise levels, for the plots only
+# tempering: absent -> the reference ladder from 1 to 1/1e6, shared with galfor
+pe_move:
+  class: MultiGPUPSDMove
+  kwargs: {permute_every: 200, live_dangerously: true, run_async: true, run_threaded: false}

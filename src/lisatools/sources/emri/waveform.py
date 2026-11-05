@@ -332,6 +332,7 @@ class EMRITDIWaveform(TDPyResponseWaveformBase):
         ra: float | NDArrayLike,
         dec: float | NDArrayLike,
         merger_time: float | NDArrayLike,
+        num_pad: NDArrayLike | None = None,
     ) -> Tuple[NDArrayLike, NDArrayLike]:
         """Apply the TDI response to a batch of sources.
 
@@ -342,6 +343,7 @@ class EMRITDIWaveform(TDPyResponseWaveformBase):
             ra: Right ascension in radians, float or shape (Nbatch,).
             dec: Declination in radians, float or shape (Nbatch,).
             merger_time: Time of merger in seconds (relative to waveform_t0), float or shape (Nbatch,). Ignored for emris, will be set to 0.0. 
+            num_pad: Optional per-source number of leading padding samples (see the base class).
 
         Returns:
             Tuple of (times_batch, channels_batch) where times_batch is the time array after shifting and padding with shape (Nbatch, Ntimes), and channels_batch is the TDI response with shape (Nbatch, num_channels, num_times).
@@ -349,4 +351,4 @@ class EMRITDIWaveform(TDPyResponseWaveformBase):
 
         merger_time = 0.0 if isinstance(merger_time, float) else get_array_module(merger_time).zeros_like(merger_time)
 
-        return super()._apply_response(t_arr, h_plus, h_cross, ra, dec, merger_time)
+        return super()._apply_response(t_arr, h_plus, h_cross, ra, dec, merger_time, num_pad=num_pad)

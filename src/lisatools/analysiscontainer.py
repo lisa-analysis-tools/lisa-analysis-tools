@@ -175,6 +175,21 @@ def _on_device(arr, device: Optional[int]) -> bool:
     arr_device = getattr(arr, "device", None)
     return getattr(arr_device, "id", None) == int(device)
 
+
+def _move_attrs_to_device(obj, attrs, device: int) -> None:
+    """Rebind each cupy array attribute of ``obj`` in ``attrs`` onto GPU ``device``.
+
+    Routed through the host like the linear-buffer repack (no P2P copy). Missing,
+    ``None``, host and already-local attributes are left alone. Attributes are set
+    directly so property setters (dirty flags, ``can_redo``) are not triggered.
+    """
+    for attr in attrs:
+        arr = getattr(obj, attr, None)
+        if hasattr(arr, "get") and not _on_device(arr, device):
+            host = arr.get()
+            with cp.cuda.Device(int(device)):
+                setattr(obj, attr, cp.asarray(host))
+
 class AnalysisContainer:
     """Combinatorial container that combines sensitivity and data information.
 
@@ -230,7 +245,8 @@ class AnalysisContainer:
         if data is None:
             raise TypeError("AnalysisContainer requires a ``data`` argument.")
         if sens_mat is None:
-            raise TypeError("AnalysisContainer requires a ``sens_mat`` argument.")
+            if not isinstance(data, domains.TDSignal):
+                raise TypeError("If not used to store TDSignal data, AnalysisContainer requires a ``sens_mat`` argument.")
 
         # 1. normalise data to a DomainBase
         self._data: DomainBase = _coerce_to_domain_base(data)
@@ -250,7 +266,8 @@ class AnalysisContainer:
                 "SensitivityMatrixBase subclass (the auto-instantiate path)."
             )
 
-        if not isinstance(sens_mat, SensitivityMatrixBase):
+        # sens_mat=None is allowed for TD data only (checked above): a TD residual store
+        if sens_mat is not None and not isinstance(sens_mat, SensitivityMatrixBase):
             raise TypeError(
                 "sens_mat must be a SensitivityMatrixBase instance or a "
                 "SensitivityMatrixBase subclass class."
@@ -362,6 +379,15 @@ class AnalysisContainer:
         target = self._data.settings
         if isinstance(gen_out, DataResidualArray):
             gen_out = gen_out.data_res_arr
+        if isinstance(gen_out, domains.TDSignal) and isinstance(target, domains.TDSettings):
+            # A TD template on its own span (TDWaveformBase.get_td_signals): placed on the data grid.
+            # TDSignal.transform keeps the template's own grid, so it cannot be used here.
+            if gen_out.N == target.N and domains.td_grid_offset(gen_out.t0, target.t0, target.dt) == 0:
+                return gen_out.with_backend(self._data.backend)  # e.g. a GPU template into a CPU TD residual
+            placed = target.associated_class(
+                self._data.xp.zeros(gen_out.arr.shape[:-1] + (target.N,), dtype=gen_out.arr.dtype), target
+            )
+            return placed.add_signal(gen_out)
         if isinstance(gen_out, DomainBase):
             if gen_out.settings == target:
                 return gen_out
@@ -1871,10 +1897,10 @@ class AnalysisContainerArray:
                 int(n_splits) if (gpus is None and n_splits is not None)
                 else (1 if gpus is None else len(gpus))
             )
-            split_num = int(np.ceil(self.acs_total_entries / num_machines))
-            split_inds = np.arange(split_num, self.acs_total_entries, split_num)
-            self.gpu_splits = gpu_splits = np.split(
-                np.arange(self.acs_total_entries), split_inds
+            # ! Through the class: SubBandBuffer holds an instance flag of the same name, which hides
+            # ! the method on self.
+            self.gpu_splits = gpu_splits = AnalysisContainerArray.contiguous_splits(
+                int(self.acs_total_entries), num_machines
             )
 
         self.gpu_map = np.zeros(self.acs_total_entries, dtype=int)
@@ -1954,9 +1980,16 @@ class AnalysisContainerArray:
         self.reset_linear_data_arr()
         self.reset_linear_psd_arr()
         if gpus is not None:
+            # The repack moves only invC; keep each container's covariance and
+            # determinant on the same GPU, or one full matrix per container stays on
+            # the GPU it was built on. Then release what the repack freed into each
+            # device's pool (the per-container free only covers the current device).
+            for ac, gpu in zip(self.acs.flatten(), self.gpu_map):
+                _move_attrs_to_device(ac.sens_mat, ("_sens_mat", "_detC"), gpu)
+            self.free_gpu_memory()
             # Restore whatever device the caller was on before __init__.
             self.xp.cuda.runtime.setDevice(self._main_device_at_init)
-    
+
     def num_noise_rows(self, split: int) -> int:
         """Inverse-CSD rows of ``split``: one per AC, or the rows of its external noise array."""
         
@@ -2045,6 +2078,29 @@ class AnalysisContainerArray:
                 with self.xp.cuda.Device(int(self.gpus[split])):
                     table[self.xp.asarray(ac_ids)] = self.xp.asarray(rows)
         self._point_at_noise_rows(ac_ids)
+
+    @staticmethod
+    def contiguous_splits(n_entries: int, num_splits: int) -> list:
+        """Default partition: ``num_splits`` contiguous blocks of ``ceil(n_entries / num_splits)`` entries."""
+        split_num = int(np.ceil(n_entries / num_splits))
+        return np.split(np.arange(n_entries), np.arange(split_num, n_entries, split_num))
+
+    @staticmethod
+    def place_container(ac: "AnalysisContainer", device: int) -> None:
+        """Move one container's data residual and sensitivity arrays to GPU ``device``.
+
+        Lets a caller that builds containers on one GPU shard them as it goes,
+        instead of holding every container on the build GPU until ``__init__``
+        repacks them. A sensitivity whose inverse is still pending keeps it
+        pending, so ``invC``/``detC`` are computed on ``device`` at first read,
+        as the repack would do.
+        """
+        _move_attrs_to_device(ac.data_res_arr.data_res_arr, ("_arr",), device)
+        sens = ac.sens_mat
+        if getattr(sens, "_inv_det_dirty", False):
+            _move_attrs_to_device(sens, ("_sens_mat",), device)
+        else:
+            _move_attrs_to_device(sens, ("_sens_mat", "_invC", "_detC"), device)
 
     def synchronize(self):
         if self.gpus is not None:

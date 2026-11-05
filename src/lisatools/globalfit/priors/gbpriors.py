@@ -138,7 +138,7 @@ class MojitoF0mHzFdotPrior(JointPrior):
         self.f0_min = f0_min_mHz
         self.f0_max = f0_max_mHz
 
-    def fdot_bounds(self, f0_mHz: NDArrayLike) -> tuple[NDArrayLike, NDArrayLike]:
+    def get_fdot_bounds(self, f0_mHz: NDArrayLike) -> tuple[NDArrayLike, NDArrayLike]:
         """fdot bounds at f0: the mojito power laws take f0 in Hz."""
         f0_Hz = f0_mHz * 1e-3
         return get_fdot_mojito(f0_Hz, sign="-"), get_fdot_mojito(f0_Hz, sign="+")
@@ -151,7 +151,7 @@ class MojitoF0mHzFdotPrior(JointPrior):
         f0_mHz_samples = self.xp.random.uniform(self.f0_min, self.f0_max, size=size)
 
         # 2. Get bounds and sample fdot
-        fdot_min, fdot_max = self.fdot_bounds(f0_mHz_samples)
+        fdot_min, fdot_max = self.get_fdot_bounds(f0_mHz_samples)
         fdot_samples = self.xp.random.uniform(fdot_min, fdot_max, size=size)
 
         samples = self.xp.stack([f0_mHz_samples, fdot_samples], axis=-1)
@@ -167,7 +167,7 @@ class MojitoF0mHzFdotPrior(JointPrior):
         fdot = x_arr[..., 1]
 
         mask_f0 = (f0_mHz >= self.f0_min) & (f0_mHz <= self.f0_max)
-        fdot_min, fdot_max = self.fdot_bounds(f0_mHz)
+        fdot_min, fdot_max = self.get_fdot_bounds(f0_mHz)
         mask_fdot = (fdot >= fdot_min) & (fdot <= fdot_max)
 
         valid = mask_f0 & mask_fdot

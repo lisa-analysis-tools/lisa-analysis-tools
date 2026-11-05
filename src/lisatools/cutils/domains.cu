@@ -179,8 +179,8 @@ int STFTDomain::get_freq_index(double f) {
  * num_freqs + f_idx
  */
 CUDA_DEVICE
-int STFTDomain::get_data_index(int t_idx, int f_idx, int channel,
-                               int data_index) {
+size_t STFTDomain::get_data_index(int t_idx, int f_idx, int channel,
+                                  int data_index) {
   if (data_index >= num_data) {
 #ifdef __CUDACC__
 #else
@@ -188,7 +188,8 @@ int STFTDomain::get_data_index(int t_idx, int f_idx, int channel,
         "data_index is larger than available data instances.");
 #endif
   }
-  return ((data_index * num_channels + channel) * num_times + t_idx) *
+  // ! In 64 bits from the first factor: a split's buffer can hold more than 2^31 values.
+  return (((size_t)data_index * num_channels + channel) * num_times + t_idx) *
              num_freqs +
          f_idx;
 }
@@ -210,8 +211,8 @@ cmplx STFTDomain::get_data_value(int t_idx, int f_idx, int channel,
  * num_freqs_noise + f_idx
  */
 CUDA_DEVICE
-int STFTDomain::get_noise_index(int t_idx, int f_idx, int channel,
-                                int noise_index) {
+size_t STFTDomain::get_noise_index(int t_idx, int f_idx, int channel,
+                                   int noise_index) {
   if (noise_index >= num_noise) {
 #ifdef __CUDACC__
 #else
@@ -219,7 +220,7 @@ int STFTDomain::get_noise_index(int t_idx, int f_idx, int channel,
         "noise_index is larger than available noise instances.");
 #endif
   }
-  return ((noise_index * num_channels + channel) * num_times + t_idx) *
+  return (((size_t)noise_index * num_channels + channel) * num_times + t_idx) *
              num_freqs_noise +
          f_idx;
 }
@@ -242,8 +243,8 @@ cmplx STFTDomain::get_invC_value(int t_idx, int f_idx, int channel,
  *             * num_times + t_idx) * num_freqs_noise + f_idx
  */
 CUDA_DEVICE
-int STFTDomain::get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
-                                      int noise_index) {
+size_t STFTDomain::get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
+                                         int noise_index) {
   if (noise_index >= num_noise) {
 #ifdef __CUDACC__
 #else
@@ -251,7 +252,7 @@ int STFTDomain::get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
         "noise_index is larger than available noise instances.");
 #endif
   }
-  return (((noise_index * num_channels + ch_i) * num_channels + ch_j) *
+  return ((((size_t)noise_index * num_channels + ch_i) * num_channels + ch_j) *
               num_times +
           t_idx) *
              num_freqs_noise +
@@ -1186,7 +1187,7 @@ void compute_likelihood_contributions_kernel(
 
     int num_ch = domain.num_channels;
     // Base offset into template_vals for this binary (row-major).
-    int template_base = bin * num_ch * num_times_template * num_freqs_template;
+    size_t template_base = (size_t)bin * num_ch * num_times_template * num_freqs_template;
 
     for (int idx = start_idx; idx < total_tf; idx += incr_idx) {
       int t_local = idx / num_freqs_template;
