@@ -81,6 +81,7 @@ from .gbdebug import (
 from .gbbands import (
     BandScheduler,
     BandSorter,
+    FriendTables,
     StoreWindowTrackCounter,
     SubBandBuffer,
     estimate_buffer_preload_limits,
@@ -2013,16 +2014,45 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         one full pass (``self.time >= 1``) and the cold-chain friend table
         exists; it is then drawn with probability ``stretch_probability``
         per repeat round (the info-matrix Cholesky jump otherwise).
+
+        Inside a walker-parity half of :meth:`_run_in_model_halves` the friend
+        comes from the other parity's tables (``self._friend_tables``) at the
+        source's current f0, and the factor is -inf where the friend lies
+        outside the window placed at the proposed f0 (the reverse check), so
+        the forward and the reverse move draw it with the same probability.
         """
         xp = self.xp
+        friend_tables = getattr(self, "_friend_tables", None)
+        friend_index, friend_ready = None, False
+        if friend_tables is not None:
+            friend_block = self._friend_block
+            if friend_block is None:
+                # The tables and the block's temperatures are fixed within a block, so its table indices are found once.
+                index = friend_tables.table_index(band_sorter.temp_inds[source_ids])
+                friend_block = self._friend_block = (index, bool((index >= 0).all()))
+            friend_index, friend_ready = friend_block
         use_stretch = (
             self.stretch_probability > 0.0
             and self.time >= 1
-            and getattr(band_sorter, "friend_start_inds", None) is not None
+            and (
+                friend_ready if friend_tables is not None
+                else getattr(band_sorter, "friend_start_inds", None) is not None
+            )
             and bool(np.random.rand() < self.stretch_probability)
         )
 
-        if use_stretch:
+        if use_stretch and friend_tables is not None:
+            deviation = xp.random.randint(0, friend_tables.window, size=len(source_ids))
+            ranks, self._friends_for_stretch = friend_tables.draw(friend_index, coords[:, 1], deviation)
+            q, factors = self.get_proposal(
+                {"gb": coords[None, :, None, :]},
+                model.random,
+                s_inds_all={"gb": xp.ones((1, coords.shape[0], 1), dtype=bool)},
+            )
+            new_coords = q["gb"][0, :, 0, :]
+            outside = ~friend_tables.in_window(friend_index, ranks, new_coords[:, 1])
+            factors = xp.where(outside, -xp.inf, factors.reshape(-1))
+        elif use_stretch:
             # Friends drawn per source; Eryn's GroupStretchMove supplies the
             # stretch math + (ndim-1)*log(zz) factors through find_friends.
             self._friends_for_stretch = band_sorter.draw_friends(source_ids)

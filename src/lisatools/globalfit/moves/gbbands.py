@@ -3564,3 +3564,60 @@ class BandSorter(LISAToolsParallelModule):
         )
 
         return {"band_counts": band_counts}
+
+
+class FriendTables:
+    """Friend tables of the exact group stretch: the live rows of one walker parity, one f0-sorted table per
+    temperature.
+
+    A walker draws its friends from the other parity, whose rows stay fixed while the walker's half of the in-model
+    block runs. The tables hold copies of the band sorter's rows, so the sorter may change while a half draws from
+    them. A temperature has a table when it holds at least ``max(2, window)`` rows; a source whose temperature has
+    none draws from the cold table, and a source without either gets no stretch.
+    """
+
+    # One sort and one searchsorted serve every temperature: the key is table index * KEY_STRIDE + f0 (in mHz).
+    KEY_STRIDE = 1000.0
+
+    def __init__(self, coords, inds, temp_inds, walker_inds, parity, ntemps, window, xp=np):
+        self.xp, self.window = xp, int(window)
+        row_ids = xp.flatnonzero(inds & (walker_inds % 2 == parity))
+        table_index = temp_inds[row_ids].astype(xp.int64)
+        keys = table_index * self.KEY_STRIDE + coords[row_ids, 1]
+        order = xp.argsort(keys)
+        self.keys = keys[order]
+        self.coords = coords[row_ids[order]]
+        self.counts = xp.bincount(table_index, minlength=int(ntemps)).astype(xp.int64)
+        self.offsets = xp.concatenate([xp.zeros(1, dtype=xp.int64), xp.cumsum(self.counts)])
+        self.has_table = self.counts >= max(2, self.window)
+
+    def table_index(self, temps):
+        """Table of each source: its own temperature's when that has one, else the cold one, else -1."""
+        xp = self.xp
+        temps = xp.asarray(temps).astype(xp.int64)
+        return xp.where(self.has_table[temps], temps, xp.where(self.has_table[0], 0, -1))
+
+    def window_start(self, index, f0):
+        """First rank of the window of ``window`` rows placed at ``f0`` in the tables ``index`` (which must exist).
+
+        The arithmetic of :meth:`BandSorter.build_friend_index`, clip(searchsorted(f0, "right") - window // 2, 0,
+        n - window), inside each table's segment of the sorted keys.
+        """
+        xp = self.xp
+        offsets, counts = self.offsets[index], self.counts[index]
+        insert = xp.searchsorted(self.keys, index * self.KEY_STRIDE + f0, side="right")
+        return offsets + xp.minimum(xp.maximum(insert - offsets - self.window // 2, 0), counts - self.window)
+
+    def draw(self, index, f0, deviation):
+        """Ranks ``window_start + deviation`` (``deviation`` in [0, window)) and the friends' coordinates."""
+        ranks = self.window_start(index, f0) + deviation
+        return ranks, self.coords[ranks]
+
+    def in_window(self, index, ranks, f0):
+        """True where the rows ``ranks`` lie in the window placed at ``f0`` (the reverse check)."""
+        start = self.window_start(index, f0)
+        return (ranks >= start) & (ranks < start + self.window)
+
+    def window_rows(self, index, f0):
+        """(n, window) ranks of the windows placed at ``f0``, for a move that reads a whole window."""
+        return self.window_start(index, f0)[:, None] + self.xp.arange(self.window)[None, :]
