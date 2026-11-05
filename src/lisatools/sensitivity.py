@@ -54,6 +54,12 @@ from .utils.utility import AET, get_array_module
 
 if TYPE_CHECKING:
     from .utils.typing import NDArrayLike, ArrayModule
+    try:
+        from eryn.utils import TransformContainer
+    except (ImportError, ModuleNotFoundError):
+        class TransformContainer:
+            def __init__(self, *args, **kwargs):
+                pass
 
 logger = getLogger(__name__)
 
@@ -2158,7 +2164,12 @@ def make_tm_proxy_transform(ndim: int = 2 * len(MOSA_NAMES), tm_start: int = len
     spline parameters); the TM slots hold ``TM_PROXY_NAMES`` and are mapped in place to
     the per-MOSA amplitudes that :meth:`XYZSensitivityBackend.split_psd_params` expects.
     """
-    from eryn.utils import TransformContainer
+    try:
+        from eryn.utils import TransformContainer
+    except (ImportError, ModuleNotFoundError):
+        raise ImportError(
+            "eryn is required for the TM proxy transform. Install with `pip install eryn`."
+        )
 
     basis = list(range(ndim))
     return TransformContainer(
