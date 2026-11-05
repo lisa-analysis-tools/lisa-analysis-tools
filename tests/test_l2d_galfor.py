@@ -28,7 +28,7 @@ from eryn.moves.tempering import make_ladder
 from pydantic import ValidationError
 
 from lisatools.globalfit.stock.l2d.blocks.galfor import GalForBlock
-from lisatools.globalfit.stock.l2d.build_recipe import seed_branches
+from lisatools.globalfit.searches import seed_from_search_interfaces
 from lisatools.globalfit.stock.l2d.io import RunConfig, load_run
 from lisatools.globalfit.stock.l2d.load_settings import build_curr_info
 
@@ -124,32 +124,32 @@ class GalForMovesTest(_GalFor):
             self.assertIs(move.kwargs["galfor_transform_fn"], infos["galfor"].transform)
             self.assertIs(move.kwargs["psd_transform_fn"], infos["psd"].transform)
 
-    def test_the_search_runs_if_either_block_needs_it(self):
+    def test_the_search_runs_whatever_the_seeding(self):
         psd_point = {**PSD_BLOCK, "search": point_search(self.run_dir, "psd", 2)}
         galfor_point = {**GALFOR_BLOCK, "search": point_search(self.run_dir, "galfor", 5)}
-        for blocks, searched in (
-            ({"psd": psd_point, "galfor": GALFOR_BLOCK}, True),
-            ({"psd": PSD_BLOCK, "galfor": galfor_point}, True),
-            ({"psd": psd_point, "galfor": galfor_point}, False),
-            ({"psd": psd_point, "galfor": {**GALFOR_BLOCK, "enabled": False}}, False),
+        for blocks in (
+            {"psd": PSD_BLOCK, "galfor": GALFOR_BLOCK},
+            {"psd": psd_point, "galfor": GALFOR_BLOCK},
+            {"psd": psd_point, "galfor": galfor_point},
+            {"psd": psd_point, "galfor": {**GALFOR_BLOCK, "enabled": False}},
         ):
             with self.subTest(blocks={n: b.get("search", {}).get("search_type") for n, b in blocks.items()}):
                 infos = self.infos() if blocks["galfor"].get("enabled", True) else {"psd": self.infos()["psd"]}
                 _, _, _, moves = self.moves(blocks, infos)
-                self.assertEqual((len(moves["psd"].search), len(moves["psd"].pe)), (int(searched), 1))
+                self.assertEqual((len(moves["psd"].search), len(moves["psd"].pe)), (1, 1))
 
-    def test_galfor_is_seeded_on_its_ladder_and_stays_on(self):
+    def test_galfor_is_seeded_on_its_ladder(self):
+        # load_info seeds every branch through its interface (seed_from_search_interfaces)
         ladder = make_ladder(7, ntemps=5, Tmax=1e6)
         infos = self.infos(ladder)
         infos["galfor"].search_interface = self.fake_interface("galfor")
         blocks = {"psd": PSD_BLOCK, "galfor": {**GALFOR_BLOCK, "search": {"search_type": "prior"}}}
         cfg = self.config(blocks)
         curr, state = self.runtime(cfg, infos)
-        wave_gens = seed_branches(cfg, {}, curr, object(), {}, state)
-        (args, _), = infos["galfor"].search_interface.populate_state.call_args_list
+        seed_from_search_interfaces(curr, state, {"galfor": infos["galfor"].search_interface}, {}, cfg.sampler.ntemps)
+        (args, kwargs), = infos["galfor"].search_interface.populate_state.call_args_list
         np.testing.assert_array_equal(args[2], ladder)
-        self.assertEqual((self.events, wave_gens), ([("populate", "galfor")], {}))
-        self.assertTrue(state.branches_inds["galfor"].all())
+        self.assertEqual((self.events, kwargs), ([("populate", "galfor")], {"priors": {}}))
 
 
 class GalForBuildTest(_Run):

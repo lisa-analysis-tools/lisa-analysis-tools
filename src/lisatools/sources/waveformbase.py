@@ -35,6 +35,7 @@ from ..domains import (
     get_stft_settings,
     pad_td_signal,
     place_td_signal_on_grid,
+    td_grid_offset,
 )
 from ..utils.parallelbase import LISAToolsParallelModule
 from ..utils.typing import NDArrayLike, ArrayModule
@@ -731,6 +732,63 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
             ])
         return self._td_to_output_domain(times_in=times, signal_in=channels, output_domain=output_domain, domain_kwargs=domain_kwargs)
 
+    def get_td_signals(
+        self, *args, td_settings: TDSettings | None = None, **kwargs
+    ) -> TDSignal | DomainBaseArray:
+        """Per-source TDI signals in the time domain, unwindowed, on the data sampling grid.
+
+        Args:
+            *args: Waveform arguments, as for :meth:`get_signals_for_residuals`.
+            td_settings: ``None`` keeps each source's own time span, clipped to the data span.
+                A :class:`TDSettings` (the data grid or a sub-span of it, same ``dt``) places every
+                source on that grid.
+            **kwargs: Keyword arguments for the waveform generation.
+
+        Returns:
+            A :class:`TDSignal`, or a :class:`DomainBaseArray` of them for a batch.
+
+        Raises:
+            ValueError: if the sources' samples, or ``td_settings``, are not on the
+                ``data_t0 + k * dt`` grid.
+        """
+        if td_settings is not None:
+            if not np.isclose(td_settings.dt, self.dt):
+                raise ValueError(f"td_settings.dt={td_settings.dt} differs from the data dt={self.dt}.")
+            td_grid_offset(td_settings.t0, self.data_t0, self.dt)
+
+        times, channels = self.compute_tdi_channels(*args, **kwargs)
+        if times.ndim == 2:
+            return DomainBaseArray([
+                self._td_signal_on_grid(times[i], channels[i], td_settings) for i in range(channels.shape[0])
+            ])
+        return self._td_signal_on_grid(times, channels, td_settings)
+
+    def _td_signal_on_grid(
+        self, times: NDArrayLike, channels: NDArrayLike, td_settings: TDSettings | None
+    ) -> TDSignal:
+        """One source's ``(times, channels)`` as a :class:`TDSignal` on its span or on ``td_settings``."""
+        data = self.domain_settings
+        n = times.shape[-1]
+        k0 = td_grid_offset(times[0], data.t0, data.dt)
+        if td_grid_offset(times[-1], data.t0, data.dt) != k0 + n - 1:
+            raise ValueError("get_td_signals needs samples uniformly spaced by the data dt.")
+
+        if td_settings is None:
+            # the source's own span, clipped to the data (no overlap: left as is; add_signal skips it)
+            start, end = max(k0, 0), min(k0 + n, data.N)
+            if start >= end:
+                start, end = k0, k0 + n
+            td_settings = TDSettings(
+                N=end - start, dt=data.dt, t0=data.t0 + start * data.dt, force_backend=self.force_backend
+            )
+        k_out = td_grid_offset(td_settings.t0, data.t0, data.dt)
+
+        out = self.xp.zeros(channels.shape[:-1] + (td_settings.N,), dtype=channels.dtype)
+        lo, hi = max(k0, k_out), min(k0 + n, k_out + td_settings.N)
+        if lo < hi:
+            out[..., lo - k_out:hi - k_out] = channels[..., lo - k0:hi - k0]
+        return TDSignal(out, TDSettings(*td_settings.args, t0=td_settings.t0, force_backend=self.force_backend))
+
 
 class TDPyResponseWaveformBase(TDWaveformBase):
     """
@@ -829,7 +887,9 @@ class TDPyResponseWaveformBase(TDWaveformBase):
 
         Returns:
             Tuple of (times_batch, h_plus_batch, h_cross_batch),
-            each of shape (Nbatch, Ntimes).
+            each of shape (Nbatch, Ntimes), optionally followed by ``num_pad``
+            (shape (Nbatch,)): the number of leading padding samples of each
+            source (see :meth:`_apply_response`).
 
         """
         raise NotImplementedError(
@@ -845,8 +905,15 @@ class TDPyResponseWaveformBase(TDWaveformBase):
         ra: float | NDArrayLike,
         dec: float | NDArrayLike,
         merger_time: float | NDArrayLike,
+        num_pad: NDArrayLike | None = None,
     ) -> Tuple[NDArrayLike, NDArrayLike]:
         """Apply the TDI response to a batch of sources.
+
+        Every source's output depends only on its own parameters, never on its
+        batch companions: the response edge zeroing (``buffer_time``) and the
+        pre-``data_t0`` cut are applied per source, relative to that source's own
+        first valid sample, so a source gives the same template alone, in a pair
+        or inside any batch (up to the zero-filled extent of the shared array).
 
         Args:
             t_arr: Time array relative to zero, shape (Ntimes,) or (Nbatch, Ntimes).
@@ -855,9 +922,15 @@ class TDPyResponseWaveformBase(TDWaveformBase):
             ra: Right ascension in radians, float or shape (Nbatch,).
             dec: Declination in radians, float or shape (Nbatch,).
             merger_time: Time of merger in seconds (relative to waveform_t0), float or shape (Nbatch,).
+            num_pad: Optional number of leading padding samples per source, shape (Nbatch,).
+                When sources of different lengths are stacked into a common array (see
+                :meth:`PhenomTHMWaveformBase.trim_and_shift_times`), source ``b``'s own
+                waveform starts at index ``num_pad[b]``. ``None`` means no padding (every
+                source starts at index 0).
 
         Returns:
             Tuple of (times_batch, channels_batch) where times_batch is the time array after shifting and padding with shape (Nbatch, Ntimes), and channels_batch is the TDI response with shape (Nbatch, num_channels, num_times).
+            For a scalar (single-source) call the batch axis is dropped: (Ntimes,) and (num_channels, Ntimes).
         """
         single_source = isinstance(ra, float)
 
@@ -994,12 +1067,16 @@ class TDPyResponseWaveformBase(TDWaveformBase):
             t0_shift_to_data=t0_shift_to_data,
         )
 
-        tdis = self.xp.array(self.response.get_tdi_delays(run_async=self.run_async)) # (Nbatch, num_channels, Ntimes) if batched else (num_channels, Ntimes)
-        if len(tdis.shape) == 3:
+        # get_tdi_delays returns one entry per channel, each (Ntimes,) for a batch
+        # of one and (Nbatch, Ntimes) otherwise. Normalise to (Nbatch, num_channels,
+        # Ntimes) so a batch of size 1 goes through exactly the same path as B > 1.
+        tdis = self.xp.array(self.response.get_tdi_delays(run_async=self.run_async))
+        if tdis.ndim == 2:
+            tdis = tdis[None, :, :]
+        else:
             tdis = tdis.transpose(1, 0, 2)
 
-        tdis = tdis[..., :-num_buffer_ponts] # remove the padded points
-        tdis[..., :num_buffer_ponts] = 0.0  # zero out the corrupted points at the start
+        tdis = tdis[..., :-num_buffer_ponts]  # remove the right-padded points
         shifted_t_arr = shifted_t_arr[:, :-num_buffer_ponts]
 
         # Apply the sub-dt shift to the time labels so they describe what the
@@ -1024,22 +1101,37 @@ class TDPyResponseWaveformBase(TDWaveformBase):
         # start_ind is smaller, silently discarding valid in-window signal from
         # later-starting sources in a heterogeneous batch. The min drops only
         # samples that are before data_t0 for *every* source; any per-source
-        # remainder before data_t0 is handled downstream (build_common_grid masks
-        # negative grid indices; the residual path re-aligns per source). For a
-        # single source min == max, so that path is unchanged.
+        # remainder before data_t0 is zeroed below (as the single-source trim
+        # would have removed it). For a single source min == max.
         start_ind = int(start_inds.min())
+
+        # Per-source edge zeroing. The response kernels only fill output samples
+        # >= tdi_start_ind (= num_buffer_ponts) of the shared array: earlier samples
+        # would need delayed/interpolated strain from before the start of the input
+        # array. That garbage region is batch-common, but each source's own waveform
+        # starts at its own first valid sample ``num_pad[b]``. Zero the first
+        # ``buffer_time`` *of each source's own waveform* (plus its leading padding),
+        # and everything before data_t0 for that source (what the single-source trim
+        # removes), so the output never depends on the batch companions' lengths.
+        batch_size, _, n_out = tdis.shape
+        if num_pad is None:
+            first_valid = self.xp.zeros(batch_size, dtype=int)
+        else:
+            first_valid = self.xp.asarray(num_pad).astype(int).reshape(batch_size)
+        zero_until = self.xp.maximum(first_valid + num_buffer_ponts, start_inds)
+        keep = self.xp.arange(n_out)[None, :] >= zero_until[:, None]  # (Nbatch, Ntimes)
+        # In place: ``tdis`` is a view of the fresh array built from the response
+        # output above (output buffers are zero-initialised, so no NaN * 0).
+        tdis *= keep[:, None, :]
 
         if start_ind > 0:
             shifted_t_arr = shifted_t_arr[:, start_ind:]
             tdis = tdis[..., start_ind:]
-        
-        # now remove the extra time dimensions if we only had one source (to be consistent with the single-source path)
+
+        # scalar (single-source) call: drop the batch axis -> (Ntimes,), (num_channels, Ntimes)
         if single_source:
             shifted_t_arr = shifted_t_arr[0]
-            if tdis.ndim == 3:
-                # legacy-response fallback keeps a batch axis; squeeze to the
-                # (num_channels, Ntimes) single-source contract.
-                tdis = tdis[0]
+            tdis = tdis[0]
 
         # if _saved_device is not None and _saved_device != _response_device_id:
         #     self.xp.cuda.runtime.setDevice(_saved_device)
@@ -1076,9 +1168,14 @@ class TDPyResponseWaveformBase(TDWaveformBase):
         batching natively), then optionally projects all signals onto a common STFT
         grid when ``self.force_uniform_stft`` is True.
         """
-        times_batch, hplus_batch, hcross_batch = self.wave_gen_batch(*args, ra, dec, merger_time, **kwargs)
+        # wave_gen_batch returns (times, h_plus, h_cross) or, when the sources were
+        # left-padded to a common length, (times, h_plus, h_cross, num_pad).
+        times_batch, hplus_batch, hcross_batch, *rest = self.wave_gen_batch(*args, ra, dec, merger_time, **kwargs)
+        num_pad = rest[0] if rest else None
 
-        return self._apply_response(times_batch, hplus_batch, hcross_batch, ra, dec, merger_time)
+        return self._apply_response(
+            times_batch, hplus_batch, hcross_batch, ra, dec, merger_time, num_pad=num_pad
+        )
 
     def compute_tdi_channels(
         self,

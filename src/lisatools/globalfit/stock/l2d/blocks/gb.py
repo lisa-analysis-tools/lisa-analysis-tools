@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any, ClassVar, Literal
 
 from pydantic import Field, PositiveInt, model_validator
@@ -127,6 +128,7 @@ class GBBlock(SourceBlock):
             num_repeat_proposals=self.num_prop_repeats,
             **{name: value for name, value in gb_move_kwargs(self).items() if name in move_fields},
         )
+        search_interface = make_search_interface(self, info)
         settings = GBSettings.from_general_setup(
             general_setup,
             priors=info["priors"],
@@ -136,9 +138,13 @@ class GBBlock(SourceBlock):
             waveform=GBWaveformSettings(**deepcopy(self.waveform.runtime_kwargs)),
             stft=GBSTFTSettings(**deepcopy(self.stft)),
             moves=moves,
-            search_interface=make_search_interface(self, info),
+            search_interface=search_interface,
         )
         setup = GBSetup(settings)
+        if search_interface is not None and search_interface.search_type == "catalog":
+            # * As SourceBlock.build_source: the plots' truths, set here so a restart (which does not seed) keeps
+            # * them. GBSettings has no injection field; the plots read the setup's attribute if present.
+            setup.injection = search_interface.catalog_truths(SimpleNamespace(general_info=general_setup))
         metadata = setup.make_source_metadata(
             waveform_model_code_link=self.links.waveform_model_code_link,
             prior_model_code_link=self.links.prior_model_code_link,

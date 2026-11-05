@@ -5,6 +5,7 @@ import importlib
 import inspect
 import os
 import warnings
+from types import SimpleNamespace
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar, Literal, NamedTuple, Annotated, TYPE_CHECKING, List
@@ -12,6 +13,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, model_validator, Discriminator, Tag, field_validator   
 
 from .utility import find_class, accepted_kwargs, check_kwargs, prior_class
+from ..generators import SignalGen, WaveformHandle
 from ..typing import RunPath
 
 if TYPE_CHECKING:
@@ -82,6 +84,21 @@ class WaveformSpec(ClassSpec):
     runtime_kwargs: dict[str, Any] = Field(default_factory=dict)  # -> Settings.waveform_kwargs
 
 
+class TDWaveformSpec(_Spec):
+    """The block's time-domain TDI generator: ``method`` of the block's own waveform, or of ``class``.
+
+    Without ``class`` the block's waveform instance is reused (one waveform object for the PE move and both
+    generators) and ``kwargs`` must be empty. With ``class`` (a separate generator, e.g. for GBs) ``kwargs``
+    are its constructor arguments next to the engine-filled ones it accepts. ``runtime_kwargs`` go to every
+    call (default: the block's ``waveform.runtime_kwargs`` without ``class``, none with it).
+    """
+
+    class_name: str | None = Field(default=None, alias="class")
+    method: str | None = None  # None -> the block's TD_WAVEFORM_METHOD
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    runtime_kwargs: dict[str, Any] | None = None
+
+
 class MoveSpec(ClassSpec):
     weight: PositiveFloat = 1.0
 
@@ -98,8 +115,8 @@ class FlowSpec(_Spec):
     take a Gaussian random walk, in one ``FlowGaussianMove`` (each proposal moves one half, the flow's with
     probability ``flow_prob``); ``gaussian`` holds its arguments (default: ``flow_prob`` 0.5 and a per-leaf
     covariance adapted from the chain, ``{adapt_cov: true}``). The builder
-    fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer device (``compute.flow_gpu``)
-    and output paths; the trainer is started by the setup function.
+    fills the flow's dimensions, leaf conditioning, periodic map, seed, trainer device (``compute.flow_gpu``,
+    the cpu without it) and output paths; the trainer is started by the setup function.
     """
 
     weight: PositiveFloat  # among the block's inner moves
@@ -140,10 +157,11 @@ class SearchSpec(_Spec):
     """How a block's walkers are seeded: the arguments of the branch's search interface.
 
     The interface (``lisatools.globalfit.searches``) gets the prior's transform and periodicity from
-    the builder and seeds through the inverse transform. A block without ``search`` has no
-    interface: source branches then start empty, psd/galfor run the max-likelihood search.
-    ``kwargs`` are the interface class's own arguments (e.g. ``evolve_to_data_start`` of the GB
-    interface), checked against that class at load.
+    the builder and seeds through the inverse transform (``GlobalFit.load_info``, fresh starts). A block
+    without ``search`` gets its ``DEFAULT_SEARCH``: none for source branches (they start empty), ``prior`` for
+    psd/galfor. The psd max-likelihood search runs whatever the seeding. ``kwargs`` are the interface
+    class's own arguments (e.g. ``evolve_to_data_start`` of the GB interface), checked against that class
+    at load.
     """
 
     search_type: Literal["prior", "distribution", "samples", "point_estimate", "catalog"] = "catalog"
@@ -218,6 +236,8 @@ class BlockBase(_Spec):
     SEARCH_INTERFACE: ClassVar[str]  # class in lisatools.globalfit.searches that seeds this branch
     # "distribution" is not implemented by the interface yet
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate", "catalog")
+    # the interface's seeding without a `search:` (None -> no interface: load_info leaves the branch off)
+    DEFAULT_SEARCH: ClassVar[SearchSpec | None] = None
 
     type: str  # block type == file stem == branch name (source_info / priors / recipe key)
     priors: PriorRef
@@ -344,9 +364,12 @@ class SourceBlock(MoveBlock):
     # waveform methods the special PE move must be told about (TDMBHSpecialMove sets its own)
     WAVEFORM_METHODS: ClassVar[dict[str, str]] = {}
     LIKE_KWARGS_FROM_WAVEFORM_KWARGS: ClassVar[bool] = False  # the likelihood call takes the waveform kwargs too
+    # default method of the block's waveform for the TD generator; None -> no TD generator unless td_waveform
+    TD_WAVEFORM_METHOD: ClassVar[str | None] = None
 
     nleaves: Literal["auto"] | PositiveInt = "auto"
     waveform: WaveformSpec
+    td_waveform: TDWaveformSpec | None = None  # None -> TD_WAVEFORM_METHOD of the waveform, if any
     links: SourceLinks = Field(default_factory=SourceLinks)  # adds waveform_model_code_link
     # Always a ladder (default: ratio 1.2 over sampler.ntemps, as the reference settings pass). Not None: the Setup's
     # own default is 24 rungs, which cannot seed a state with fewer temperatures.
@@ -380,7 +403,30 @@ class SourceBlock(MoveBlock):
             if cls.__name__ in ("ConditionalFlowMove", "FlowGaussianMove"):
                 raise ValueError("flow moves are not supported yet (they come with the recipe step).")
             check_kwargs(move.kwargs, cls, ENGINE_MOVE_KWARGS.get(cls.__name__, frozenset()))
+        self.td_generator()  # raises on a bad td_waveform
         return self
+
+    def td_generator(self) -> TDGenerator | None:
+        """The resolved TD generator (class, method, kwargs), or ``None`` when the block has none."""
+        spec = self.td_waveform
+        if spec is None and self.TD_WAVEFORM_METHOD is None:
+            return None
+        spec = spec or TDWaveformSpec()
+        method = spec.method or self.TD_WAVEFORM_METHOD
+        if method is None:
+            raise ValueError(f"td_waveform: block {self.type!r} has no default TD method; give td_waveform.method.")
+        if spec.class_name is None:
+            if spec.kwargs:
+                raise ValueError("td_waveform.kwargs construct a separate class; give td_waveform.class too.")
+            cls = resolve_class(self.waveform.class_name, self.WAVEFORM_MODULES)
+            runtime = self.waveform.runtime_kwargs if spec.runtime_kwargs is None else spec.runtime_kwargs
+        else:
+            cls = resolve_class(spec.class_name, self.WAVEFORM_MODULES)
+            check_kwargs(spec.kwargs, cls, ENGINE_WAVEFORM_KWARGS)
+            runtime = spec.runtime_kwargs or {}
+        if not callable(getattr(cls, method, None)):
+            raise ValueError(f"td_waveform: {cls.__name__} has no method {method!r}.")
+        return TDGenerator(None if spec.class_name is None else cls, method, dict(spec.kwargs), dict(runtime))
 
     @model_validator(mode="after")
     def _warn_without_search(self):
@@ -408,6 +454,20 @@ class SourceBlock(MoveBlock):
         info = self.parse_prior_information(g)
         nleaves = self.resolve_nleaves(ctx.cfg)
         init_kwargs = {**deepcopy(self.waveform.kwargs), **engine_waveform_kwargs(ctx)}
+        waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
+        # seeded branches: the engine builds their residuals from the state (GlobalFitSettings.rebuild_residuals)
+        # through this generator; the same objects as the Settings', so the engine's deep copy keeps them together
+        signal_gen = None
+        if self.search is not None:
+            signal_gen = SignalGen(
+                WaveformHandle(waveform_class, init_kwargs), "get_signals_for_residuals",
+                info["transform_fn"], self.waveform.runtime_kwargs,
+            )
+        search_interface = make_search_interface(self, info)
+        injection = info["injection"]  # the YAML's, if given
+        if injection is None and search_interface is not None and search_interface.search_type == "catalog":
+            # the diagnostic plots' truths: here, so a restart (which does not seed) keeps them
+            injection = search_interface.catalog_truths(SimpleNamespace(general_info=g))
 
         settings = getattr(erebor, self.SETTINGS_NAME)(
             log_dir=g.artifacts_file_dir,
@@ -424,15 +484,15 @@ class SourceBlock(MoveBlock):
             num_prop_repeats=self.num_prop_repeats,
             betas=make_betas(self.tempering, ctx.cfg.sampler.ntemps),
             inner_moves=make_inner_moves(self, self.filled_move_kwargs(ctx, info)),
-            injection=info["injection"],
-            search_interface=make_search_interface(self, info),
+            injection=injection,
+            search_interface=search_interface,
+            signal_gen=signal_gen,
         )
         setup = getattr(erebor, self.SETUP_NAME)(settings)
         if self.flow is not None:
             # after the Setup, so a block without inner_moves keeps the Setup's default next to the flow
             setup.inner_moves = [*setup.inner_moves, (make_flow_move(self, ctx, info, nleaves), self.flow.weight)]
-        waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
-        return BlockBuild(setup, source_metadata(self, init_kwargs, g), waveform_class)
+        return BlockBuild(setup, source_metadata(self, init_kwargs, g), waveform_class, resolve_td_generator(self, ctx))
 
 # --- build helpers (heavy imports stay inside functions) ---
 
@@ -441,10 +501,30 @@ class BuildContext(NamedTuple):
     general: Any  # built GeneralSetup
 
 
+class TDGenerator(NamedTuple):
+    """A block's time-domain TDI generator, resolved from ``td_waveform`` (built by the recipe)."""
+
+    waveform_class: type | None    # None -> the block's own waveform instance
+    method: str                    # e.g. "get_td_signals"
+    init_kwargs: dict[str, Any]    # constructor arguments of a separate class (engine-filled ones included)
+    runtime_kwargs: dict[str, Any]  # passed to every call
+
+
 class BlockBuild(NamedTuple):
     setup: Any                   # the branch Setup (PSDSetup, MBHSetup, ...)
     metadata: Any                # SourceMetadata / StochasticMetadata
     waveform_class: type | None  # constructed later by the recipe
+    td_generator: TDGenerator | None = None  # the block's TD generator, if any
+
+def resolve_td_generator(block: SourceBlock, ctx: BuildContext) -> TDGenerator | None:
+    """The block's TD generator; a separate class also gets the engine-filled arguments it accepts."""
+    td = block.td_generator()
+    if td is None or td.waveform_class is None:
+        return td
+    accepted = accepted_kwargs(td.waveform_class)
+    engine = {k: v for k, v in engine_waveform_kwargs(ctx).items() if accepted is None or k in accepted}
+    return td._replace(init_kwargs={**deepcopy(td.init_kwargs), **engine})
+
 
 def make_betas(tempering: TemperingSpec | None, default_ntemps: int):
     import numpy as np
@@ -463,7 +543,7 @@ def make_search_interface(block: BlockBase, info: dict[str, Any]):
     The prior supplies what the interface needs to seed through the inverse transform: its transform and
     its (branch-keyed) periodicity.
     """
-    spec = block.search
+    spec = block.search if block.search is not None else block.DEFAULT_SEARCH
     if spec is None:
         return None
 
@@ -549,7 +629,7 @@ def make_flow_move(block: SourceBlock, ctx: BuildContext, info: dict[str, Any], 
         )
     flow = find_class(spec.model.class_name, FLOW_MODULES)(
         dims=len(names),
-        device="cpu",  # the proposal side; the trainer runs on compute.flow_gpu
+        device="cpu",  # the proposal side; the trainer runs on compute.flow_gpu (or the cpu)
         conditioning=eryn.flows.OneHotLeafConditioning(nleaves_max=nleaves),
         data_transform=transform,
         **seed,

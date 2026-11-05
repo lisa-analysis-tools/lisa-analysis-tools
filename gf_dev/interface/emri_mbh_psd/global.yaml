@@ -16,7 +16,7 @@ compute:
   backend: cuda12x
   head_rank: 1
   main_rank: 0
-  flow_gpu: 5  # the mbh and emri flow trainers
+  flow_gpu: 5  # the mbh and emri flow trainers (leave it out to train them on the cpu)
 
 data:
   loader: mojito_l1

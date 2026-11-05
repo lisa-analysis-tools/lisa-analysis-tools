@@ -435,10 +435,46 @@ class SourceSearchSchemaTest(_Sources):
 
 
 class SourceSearchBuildTest(_Built):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # a catalog search reads the catalogue when the block is built (the diagnostic plots' truths)
+        cls.general.catalogue = {"MBHB": {18: MBH_CATALOGUE_ENTRY}}
+
+    def test_catalog_truths_are_set_at_build(self):
+        # set here and not while seeding, so a restart (which does not seed) keeps them
+        _, built = self.build({"mbh": mbh_with_search()})
+        setup = built["mbh"].setup
+        curr = types.SimpleNamespace(general_info=types.SimpleNamespace(catalogue={"MBHB": {18: MBH_CATALOGUE_ENTRY}}))
+        np.testing.assert_array_equal(setup.injection, setup.search_interface.get_catalog_values(curr))
+
+    def test_a_yaml_injection_wins_over_the_catalog(self):
+        cfg = self.config({"mbh": mbh_with_search()})
+        basis = cfg.blocks["mbh"].parse_prior_information(self.general)["basis"]
+        injection = {name: 0.5 for name in basis}
+        _, built = self.build({"mbh": {**mbh_with_search(), "injection": injection}})
+        np.testing.assert_array_equal(built["mbh"].setup.injection, [0.5] * len(basis))
+
     def test_no_search_means_no_interface(self):
         _, built = self.build({"mbh": MBH_BLOCK, "emri": EMRI_BLOCK})
         self.assertIsNone(built["mbh"].setup.search_interface)
         self.assertIsNone(built["emri"].setup.search_interface)
+
+    def test_seeded_blocks_register_a_signal_gen(self):
+        # the engine rebuilds the seeded branches' residuals from the state through it (rebuild_residuals)
+        from lisatools.globalfit.stock.l2d.generators import SignalGen, WaveformHandle
+        from lisatools.sources.bbh.waveform import PhenomTHMTDIWaveform
+
+        _, built = self.build({"mbh": mbh_with_search(), "emri": EMRI_BLOCK})
+        gen = built["mbh"].setup.signal_gen
+        self.assertIsInstance(gen, SignalGen)
+        self.assertEqual(gen.method, "get_signals_for_residuals")
+        self.assertIs(gen.transform, built["mbh"].setup.transform)
+        self.assertIsInstance(gen.source, WaveformHandle)
+        self.assertIs(gen.source.waveform_class, PhenomTHMTDIWaveform)
+        self.assertIs(gen.source.init_kwargs, built["mbh"].setup.initialize_kwargs)  # copied together by the engine
+        self.assertFalse(gen.source.built)  # built on the first call, after the engine's deep copy
+        self.assertIsNone(built["emri"].setup.signal_gen)  # no search: the branch starts empty
 
     def test_mbh_interface(self):
         from lisatools.globalfit.searches import MBHBSearchInterface
@@ -462,7 +498,11 @@ class SourceSearchBuildTest(_Built):
     def test_emri_interface(self):
         from lisatools.globalfit.searches import EMRISearchInterface
 
-        block = {**EMRI_BLOCK, "search": {"search_type": "catalog", "spread": 1e-3}}
+        # the stand-in prior's 3-column basis cannot take the 14 catalogue values: the YAML truths skip the catalogue
+        block = {
+            **EMRI_BLOCK, "search": {"search_type": "catalog", "spread": 1e-3},
+            "injection": {"log_m1": 13.0, "m2": 10.0, "phiK": 1.0},
+        }
         _, built = self.build({"emri": block})
         iface = built["emri"].setup.search_interface
         self.assertIsInstance(iface, EMRISearchInterface)

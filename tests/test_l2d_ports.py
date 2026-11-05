@@ -247,6 +247,28 @@ class EmriMbhPsdTest(_Port):
         self.assertIs(type(move), ConditionalFlowMove)
         self.assertEqual(move.flow.dims, len(basis))
 
+    def test_flow_trainer_runs_on_the_cpu_without_flow_gpu(self):
+        from types import SimpleNamespace
+
+        from lisatools.globalfit.stock.l2d.blocks.base import BuildContext, make_flow_move
+
+        # the port as written (cuda backend), less compute.flow_gpu
+        run = self.root / EMRI_MBH_PSD.name
+        shutil.copytree(EMRI_MBH_PSD, run, ignore=shutil.ignore_patterns("out"))
+        raw = yaml.safe_load((run / "global.yaml").read_text())
+        del raw["compute"]["flow_gpu"]
+        (run / "global.yaml").write_text(yaml.safe_dump(raw, sort_keys=False))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cfg = load_run(run)
+        self.assertNotEqual(cfg.compute.backend, "cpu")
+        self.assertIsNone(cfg.compute.flow_gpu)
+
+        basis = ["logM", "logq", "s1z", "s2z", "d_L", "t_c", "phi_ref", "cos_i", "lam", "sin_beta", "psi"]
+        ctx = BuildContext(cfg=cfg, general=SimpleNamespace(artifacts_file_dir=str(self.root)))
+        move = make_flow_move(cfg.blocks["mbh"], ctx, {"basis": basis, "periodic": None}, nleaves=6)
+        self.assertEqual(move.executor_init_kwargs["worker_device"], "cpu")
+
     def test_flow_gaussian_needs_parameters(self):
         from pydantic import ValidationError
 

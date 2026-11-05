@@ -63,8 +63,8 @@ def _preprocess_kwargs(cfg: RunConfig) -> dict:
         downsample_kwargs=downsample,
         trim_kwargs=dump(data.trim),
         Tobs=data.Tobs,
+        upstream_aafilter_kwargs=dump(data.aafilter),
         alias_correction=data.alias_correction,
-        upstream_aafilter_kwargs=dump(data.upstream_aafilter),
     )
 
 def _pre_config(cfg: RunConfig) -> None:
@@ -147,6 +147,8 @@ def build_curr_info(cfg: RunConfig):
         rank_info=make_rank_info(cfg),
         setup_function=make_setup_function(cfg, builds),
         source_metadata={name: build.metadata for name, build in builds.items()},
+        # the residuals are built from the (seeded) state through the blocks' Settings.signal_gen
+        rebuild_residuals=True,
     )
     return CurrentInfoGlobalFit(settings)
 

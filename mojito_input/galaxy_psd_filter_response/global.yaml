@@ -33,7 +33,7 @@ data:
   trim: {duration: 200 h, trimming_type: from_each_end}
   alias_correction: true  # the noise model includes the power the decimation folds back
   # Kaiser FIR fitted to the anti-aliasing filter of the Mojito L0 simulation (4 Hz -> 0.4 Hz decimation)
-  upstream_aafilter: {attenuation: 186.2, freq1: 0.09432, freq2: 0.20585, fs: 4.0}
+  aafilter: {attenuation: 186.2, freq1: 0.09432, freq2: 0.20585, fs: 4.0}
 
 domain:
   type: stft

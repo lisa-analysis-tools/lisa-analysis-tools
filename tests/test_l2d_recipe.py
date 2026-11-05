@@ -29,10 +29,11 @@ import lisatools.globalfit.moves as gf_moves
 import lisatools.globalfit.recipe as gf_recipe
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from lisatools.globalfit.stock.l2d import build_recipe
+from lisatools.globalfit.searches import pad_ladder
 from lisatools.globalfit.stock.l2d.build_recipe import (
-    BranchMoves, RecipeContext, StockRecipe, build_block_moves, make_setup_function, pad_ladder, psd_needs_search,
-    seed_branches,
+    BranchMoves, RecipeContext, StockRecipe, build_block_moves, make_setup_function, prepare_branches,
 )
+from lisatools.globalfit.stock.l2d.generators import SignalGen, WaveformHandle
 from lisatools.globalfit.stock.l2d.io import RecipeFile, RunConfig, StockRecipeSpec, dump_run, load_run
 
 from tests.test_l2d_blocks import NOISE_PRIOR, error_keys
@@ -256,7 +257,7 @@ def fake_info(betas, nleaves=2, ndim=3, search_interface=None):
     return types.SimpleNamespace(
         betas=np.asarray(betas, dtype=float), nleaves_max=nleaves, ndim=ndim, num_prop_repeats=7,
         waveform_kwargs={"mode_selection_threshold": 1e-4}, initialize_kwargs={"order": 30},
-        transform=object(), inner_moves=[("stretch", 1.0)], search_interface=search_interface,
+        transform=object(), inner_moves=[("stretch", 1.0)], search_interface=search_interface, signal_gen=None,
     )
 
 
@@ -294,97 +295,65 @@ class _Runtime(_Recipe):
         )
         return curr, state
 
-    def subtract_patch(self):
-        def record(acs, state, wave_gen, name, info):
-            self.events.append(("subtract", name))
-            self.subtracted[name] = wave_gen
 
-        self.subtracted = {}
-        return mock.patch.object(gf_recipe, "subtract_initial_signal", record)
-
-
-# --- seeding --- #
+# --- branch preparation (the state is seeded by load_info, the residuals built by setup_acs) --- #
 
 class LadderHelpersTest(unittest.TestCase):
     def test_pad_ladder(self):
         np.testing.assert_array_equal(pad_ladder([1.0, 0.5], 4), [1.0, 0.5, 0.5, 0.5])
         np.testing.assert_array_equal(pad_ladder([1.0, 0.5, 0.25], 3), [1.0, 0.5, 0.25])
-
-    def test_psd_search_runs_unless_seeded_from_samples_or_a_point(self):
-        block = lambda search: types.SimpleNamespace(search=search)
-        self.assertTrue(psd_needs_search(block(None)))
-        self.assertTrue(psd_needs_search(block(types.SimpleNamespace(search_type="prior"))))
-        self.assertFalse(psd_needs_search(block(types.SimpleNamespace(search_type="samples"))))
-        self.assertFalse(psd_needs_search(block(types.SimpleNamespace(search_type="point_estimate"))))
+        np.testing.assert_array_equal(pad_ladder(None, 3), np.ones(3))
+        with self.assertRaisesRegex(ValueError, "more than the sampler"):
+            pad_ladder([1.0, 0.5], 1)
 
 
-class SeedingTest(_Runtime):
-    def seed(self, blocks, infos):
+class PrepareBranchesTest(_Runtime):
+    def prepare(self, blocks, infos):
         cfg = self.config(blocks)
         curr, state = self.runtime(cfg, infos)
-        priors = {"stand-in": "priors"}
-        with self.subtract_patch():
-            wave_gens = seed_branches(cfg, {"mbh": FakeWaveform, "emri": FakeWaveform}, curr, None, priors, state)
-        return cfg, curr, state, priors, wave_gens
+        return cfg, state, prepare_branches(cfg, curr, state)
 
-    def test_seeded_and_empty_sources(self):
+    def with_signal_gen(self, info):
+        info.signal_gen = SignalGen(
+            WaveformHandle(FakeWaveform, info.initialize_kwargs), "get_signals_for_residuals", None, {}
+        )
+        return info
+
+    def test_ladders_and_the_seeded_waveforms(self):
         infos = {
-            "mbh": fake_info([1.0, 0.8, 0.6], nleaves=3, search_interface=self.fake_interface("mbh")),
+            "mbh": self.with_signal_gen(fake_info([1.0, 0.8, 0.6], nleaves=3)),
             "emri": fake_info([1.0], nleaves=2),
         }
-        cfg, curr, state, priors, wave_gens = self.seed({"mbh": mbh_with_search(), "emri": EMRI_BLOCK}, infos)
+        cfg, state, wave_gens = self.prepare({"mbh": mbh_with_search(), "emri": EMRI_BLOCK}, infos)
         ntemps = cfg.sampler.ntemps
 
-        # every source starts empty; populate_state (mocked here) would switch on the seeded leaves
-        self.assertFalse(state.branches_inds["mbh"].any())
-        self.assertFalse(state.branches_inds["emri"].any())
-
-        # the interface gets the branch ladder padded to every temperature, and the priors
-        (args, kwargs), = infos["mbh"].search_interface.populate_state.call_args_list
-        self.assertIs(args[0], curr)
-        self.assertIs(args[1], state)
-        np.testing.assert_array_equal(args[2], [1.0, 0.8, 0.6] + [0.6] * (ntemps - 3))
-        self.assertEqual(kwargs, {"priors": priors})
-
-        # one generator per seeded branch, built from the Setup's initialize_kwargs, used for the subtraction
+        # the seeded branch's waveform is its signal_gen's (built once, from the Setup's initialize_kwargs)
         self.assertEqual(list(wave_gens), ["mbh"])
+        self.assertIs(wave_gens["mbh"], infos["mbh"].signal_gen.waveform)
         self.assertEqual([g.kwargs for g in FakeWaveform.made], [{"order": 30}])
-        self.assertEqual(self.subtracted["mbh"], wave_gens["mbh"].get_signals_for_residuals)
-        self.assertEqual(self.events, [("populate", "mbh"), ("subtract", "mbh")])
 
         # the state keeps every temperature: (nleaves, sampler.ntemps), padded with the last rung
-        self.assertEqual(state.sub_states["mbh"].betas_all.shape, (3, ntemps))
+        np.testing.assert_array_equal(
+            state.sub_states["mbh"].betas_all, np.tile([1.0, 0.8, 0.6] + [0.6] * (ntemps - 3), (3, 1))
+        )
         np.testing.assert_array_equal(state.sub_states["emri"].betas_all, np.ones((2, ntemps)))
 
-    def test_all_branches_are_populated_before_any_subtraction(self):
-        infos = {
-            "mbh": fake_info([1.0], search_interface=self.fake_interface("mbh")),
-            "emri": fake_info([1.0], search_interface=self.fake_interface("emri")),
-        }
-        self.seed({"mbh": mbh_with_search(), "emri": emri_with_search()}, infos)
-        self.assertEqual(
-            sorted(self.events[:2]), [("populate", "emri"), ("populate", "mbh")], self.events
-        )
-        self.assertEqual(sorted(self.events[2:]), [("subtract", "emri"), ("subtract", "mbh")])
-
-    def test_psd_is_seeded_by_its_interface_without_subtraction(self):
-        point = self.run_dir / "psd_point.npy"
-        np.save(point, np.array([1.5e-11, 3e-15]))
-        psd = {**PSD_BLOCK, "search": {"search_type": "point_estimate", "search_path": str(point), "spread": 1e-3}}
-        ladder = make_ladder(2, ntemps=5, Tmax=1e6)
-        infos = {"psd": fake_info(ladder, nleaves=1, search_interface=self.fake_interface("psd"))}
-        _, _, state, _, wave_gens = self.seed({"psd": psd}, infos)
-        (args, _), = infos["psd"].search_interface.populate_state.call_args_list
-        np.testing.assert_array_equal(args[2], ladder)
-        self.assertEqual(self.events, [("populate", "psd")])
-        self.assertEqual(wave_gens, {})
-        self.assertTrue(state.branches_inds["psd"].all())  # psd is never switched off
-
-    def test_disabled_blocks_are_left_alone(self):
-        infos = {"mbh": fake_info([1.0], search_interface=self.fake_interface("mbh"))}
-        _, _, state, _, wave_gens = self.seed({"mbh": {**mbh_with_search(), "enabled": False}}, infos)
+    def test_the_state_is_not_reseeded(self):
+        # a restart keeps the chain: no index is switched off, no interface is called
+        iface = self.fake_interface("mbh")
+        infos = {"mbh": self.with_signal_gen(fake_info([1.0], search_interface=iface))}
+        _, state, _ = self.prepare({"mbh": mbh_with_search()}, infos)
         self.assertTrue(state.branches_inds["mbh"].all())
-        self.assertEqual((self.events, wave_gens), ([], {}))
+        iface.populate_state.assert_not_called()
+
+    def test_psd_and_disabled_blocks_are_left_alone(self):
+        infos = {"psd": fake_info([1.0], nleaves=1), "mbh": fake_info([1.0])}
+        _, state, wave_gens = self.prepare(
+            {"psd": PSD_BLOCK, "mbh": {**mbh_with_search(), "enabled": False}}, infos
+        )
+        self.assertEqual(wave_gens, {})
+        self.assertEqual(vars(state.sub_states["psd"]), {})
+        self.assertEqual(vars(state.sub_states["mbh"]), {})
 
 
 # --- moves --- #
@@ -475,12 +444,13 @@ class MoveBuildTest(_Runtime):
         ))
         self.assertEqual(pe.accepted.shape, (cfg.sampler.ntemps, NWALKERS))
 
-    def test_psd_search_is_dropped_when_seeded_from_a_point(self):
+    def test_psd_search_runs_also_when_seeded_from_a_point(self):
         point = self.run_dir / "psd_point.npy"
         np.save(point, np.array([1.5e-11, 3e-15]))
         psd = {**PSD_BLOCK, "search": {"search_type": "point_estimate", "search_path": str(point), "spread": 1e-3}}
         _, _, _, moves = self.moves({"psd": psd}, {"psd": fake_info(np.ones(5), nleaves=1, ndim=2)})
-        self.assertEqual((moves["psd"].search, len(moves["psd"].pe)), ([], 1))
+        (search,), (pe,) = moves["psd"].search, moves["psd"].pe
+        self.assertEqual((search.kwargs["max_logl_mode"], pe.kwargs["max_logl_mode"]), (True, False))
 
     def test_generic_source_builder(self):
         built = []
@@ -580,8 +550,8 @@ class SetupFunctionTest(_Runtime):
         curr = types.SimpleNamespace(general_info=general or fake_general(cfg.sampler.ntemps))
         args = ("recipe", "engine_info", curr, "acs", "priors", "state")
 
-        def seed(cfg_, classes, *rest):
-            self.events.append(("seed", classes))
+        def prepare(cfg_, curr_, state):
+            self.events.append(("prepare", state))
             return {"mbh": "generator"}
 
         def block_moves(ctx, *rest):
@@ -591,18 +561,23 @@ class SetupFunctionTest(_Runtime):
         def add_steps(recipe_self, recipe, moves):
             self.events.append(("steps", recipe, moves))
 
-        with mock.patch.object(build_recipe, "seed_branches", seed), \
+        def signal_gens(ctx, td_generators, curr_, state):
+            self.events.append(("signal_gens", ctx.wave_gens, td_generators))
+
+        with mock.patch.object(build_recipe, "prepare_branches", prepare), \
+                mock.patch.object(build_recipe, "attach_signal_gens", signal_gens), \
                 mock.patch.object(build_recipe, "build_block_moves", block_moves), \
                 mock.patch.object(StockRecipe, "add_steps", add_steps):
             result = setup(*args)
         return args, result
 
-    def test_stock_recipe_seeds_then_builds_moves_then_adds_steps(self):
+    def test_stock_recipe_prepares_then_builds_moves_then_adds_steps(self):
         self.run_setup(self.config({}, {"class": "StockRecipe", "kwargs": {"burn_in_iterations": 5}}))
-        self.assertEqual([e[0] for e in self.events], ["seed", "moves", "steps"])
-        self.assertEqual(self.events[0][1], {"mbh": FakeWaveform})
-        self.assertEqual(self.events[1][1], {"mbh": "generator"})
-        self.assertEqual(self.events[2][1:], ("recipe", {"psd": BranchMoves([], ["pe"])}))
+        self.assertEqual([e[0] for e in self.events], ["prepare", "signal_gens", "moves", "steps"])
+        self.assertEqual(self.events[0][1], "state")  # the engine's (already seeded) state
+        self.assertEqual(self.events[1][1:], ({"mbh": "generator"}, {}))  # the stand-in build has no TD generator
+        self.assertEqual(self.events[2][1], {"mbh": "generator"})
+        self.assertEqual(self.events[3][1:], ("recipe", {"psd": BranchMoves([], ["pe"])}))
 
     def test_recipe_file_runs_after_seeding_with_the_engine_arguments(self):
         (self.run_dir / "plain.py").write_text(
@@ -623,7 +598,7 @@ class SetupFunctionTest(_Runtime):
         with mock.patch.object(build_recipe, "load_recipe_function", load):
             args, result = self.run_setup(cfg)
         self.assertEqual(result, "done")
-        self.assertEqual([e[0] for e in self.events], ["seed"])  # no library moves, no stock steps
+        self.assertEqual([e[0] for e in self.events], ["prepare", "signal_gens"])  # no library moves, no stock steps
         self.assertEqual(loaded[0].__globals__["calls"], [args])
 
     def test_recipe_file_with_l2d_gets_the_context(self):

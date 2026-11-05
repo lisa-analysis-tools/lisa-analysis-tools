@@ -85,7 +85,7 @@ class ComputeSection(_Section):
     backend: Literal["cpu", "cuda11x", "cuda12x", "cuda13x"] = "cpu"
     head_rank: int = 1
     main_rank: int = 0
-    flow_gpu: int | None = None  # where every flow trainer runs; never a sampling GPU (None on cpu -> "cpu")
+    flow_gpu: int | None = None  # where every flow trainer runs; never a sampling GPU (None -> the cpu)
 
     @model_validator(mode="after")
     def _cpu_means_no_gpus(self):
@@ -135,22 +135,12 @@ class DownsampleSpec(_Section):
 
     window: tuple[str, float] = ("kaiser", 31.0)
 
-class UpstreamAAFilterSpec(_Section):
-    """The anti-aliasing filter the data went through before loading (Mojito: its 4 Hz -> 0.4 Hz decimation).
-
-    It is not applied here: it only enters the modelled response (``upstream_aafilter_kwargs``).
-    """
-
-    attenuation: PositiveFloat  # dB
-    freq1: PositiveFloat  # Hz, where the filter starts to fall
-    freq2: PositiveFloat  # Hz, where it reaches its attenuation
-    fs: PositiveFloat  # Hz, the sampling frequency it ran at
-
-    @model_validator(mode="after")
-    def _ordered(self):
-        if self.freq1 >= self.freq2:
-            raise ValueError(f"freq1 ({self.freq1}) must be below freq2 ({self.freq2}).")
-        return self
+class AafilterSpec(_Section):
+    """Anti-aliasing filter for downsampling."""
+    attenuation: float = 186.2 # [dB]
+    freq1: float = 0.09432 # [Hz]
+    freq2: float = 0.20585 # [Hz]
+    fs: float = 4.0 # [Hz]
 
 class L1OrbitsSpec(_Section):
     """Orbits read from the mojito L1 data folder (``lisatools.detector.L1Orbits``)."""
@@ -192,10 +182,14 @@ class DataSection(_Section):
     dt: Duration                      # seconds: `dt: 5.0` or `dt: 5 s`
     highpass: FilterSpec | None = None
     lowpass: FilterSpec | None = None
+    aafilter: AafilterSpec | None = None # attenuation, freq1, freq2, fs; used only for the downsampling done by L01
     downsample: DownsampleSpec | None = None
     trim: TrimSpec | None = None
     alias_correction: bool = True  # whether to apply the alias correction to the data (default: True)
-    upstream_aafilter: UpstreamAAFilterSpec | None = None  # its response enters the noise model
+    # keep a time-domain residual (one shared CPU AnalysisContainer, walker 0) next to the analysis-domain
+    # ones; the seeded signals are subtracted from it through the blocks' TD generators (td_waveform)
+    keep_td: bool = False
+
 
     @model_validator(mode="after")
     def _orbits_match_loader(self):
@@ -413,8 +407,6 @@ class RunConfig(_Section):
             if block.NEEDS_REFERENCE_TIME and data.reference_time is None:
                 raise ValueError(f"block {name!r} needs data.reference_time (absolute SSB time, in seconds).")
             if isinstance(block, SourceBlock):
-                if block.flow is not None and self.compute.backend != "cpu" and self.compute.flow_gpu is None:
-                    raise ValueError(f"block {name!r} has a flow: set compute.flow_gpu, the GPU its trainer runs on.")
                 key = block.SOURCE_IDS_KEY
                 if key not in source_types:
                     raise ValueError(f"block {name!r} needs {key!r} in data.source_types.")
