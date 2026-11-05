@@ -32,17 +32,16 @@ try:
 except (ModuleNotFoundError, ImportError):
     gpu_available = False
 
-from gbgpu.gbcomps import STFTGBComputations
+from ereborpriors.stock.mojitolight import GBPrior
 
 from lisatools.detector import L1Orbits
 from lisatools.domains import STFTSettings
 from lisatools.globalfit.engine import GeneralSettings, GeneralSetup, GlobalFitSettings, RankInfo
-from lisatools.globalfit.moves.gbdebug import GBDebugSettings
 from lisatools.globalfit.postprocessing import SourceMetadata
 from lisatools.globalfit.preprocessing import L1ProcessingStep
 from lisatools.globalfit.recipe import PERecipeStep, build_gb_moves, setup_state_for_injection
 from lisatools.globalfit.run import CurrentInfoGlobalFit
-from lisatools.globalfit.stock.erebor import GBSettings, GBSetup, get_fdot_mojito
+from lisatools.globalfit.stock.erebor import GBMoveSettings, GBSettings, GBSetup, GBSTFTSettings
 from lisatools.sensitivity import XYZSensitivityBackend
 
 # ? Under "lisatools", whose level and run-log handler the global fit sets; __name__ is not.
@@ -75,6 +74,11 @@ SMOKE_ITERATIONS = 3
 # ? An upper bound only: the wall-clock budget ends a full run first.
 MAX_ITERATIONS = 1_000_000
 RESPONSES = ("tdi_on_the_fly", "dffr")
+# * The stock GB prior of erebor-priors, at the commit this run installs.
+GB_PRIOR_CODE_LINK = (
+    "https://github.com/Erebor-L2D/erebor-priors/blob/fb65c565aea06c62a41ddbe95bb6b40a1a9c04b6/"
+    "src/ereborpriors/stock/mojitolight/gb.py"
+)
 
 
 class BudgetPERecipeStep(PERecipeStep):
@@ -145,145 +149,41 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state, stop_iterations=
 
 
 def get_gb_settings(general_set: GeneralSetup, response: str) -> tuple[GBSetup, SourceMetadata]:
-    waveform_model = "GBGPU"
-    waveform_model_code_link = "https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0"
-    prior_model_code_link = "https://priors-database-f0027f.gitlab.io/mojito_light_1a.html#massive-black-hole-binaries-mbhb"
+    # ! The FD serial search reads search_kwargs; FD GB setups come at a later stage.
+    # search_kwargs = dict(
+    #     nwalkers=32,
+    #     ntemps=24,
+    #     shutoff_band_iteration=2,
+    #     shutoff_frequency_threshold=None,
+    #     burn_1=700,
+    #     nsteps_1=300,
+    #     snr_threshold=8.0,
+    #     burn_2=500,
+    #     nsteps_2=500,
+    #     refit_start_iteration=5,
+    # )
 
-    delta_safe = 1e-9
-    # * The amplitude bounds of the shared stock GB prior (erebor-priors fb65c56).
-    A_lims = [10 ** (-23.5), 1e-20]
-    # * f0 and fdot limits are reset from the band edges by GBSetup.
-    f0_lims = [1e-4, 0.023]
-    m_chirp_lims = [0.03, 1.34]
-    fdot_lims = [get_fdot_mojito(f0_lims[-1], sign="-"), get_fdot_mojito(f0_lims[-1], sign="+")]
-    phi0_lims = [0.0, 2 * np.pi]
-    iota_lims = [0.0 + delta_safe, np.pi - delta_safe]
-    # * psi is periodic in 2 pi (DDPC convention), as GBSetup and the catalogue conversion.
-    psi_lims = [0.0, 2 * np.pi]
-    alpha_lims = [0.0, 2 * np.pi]
-    delta_lims = [-np.pi / 2.0 + delta_safe, np.pi / 2.0 - delta_safe]
-
-    domain_settings = general_set.domain_settings
-    start_freq = float(domain_settings.min_freq)
-    end_freq = float(domain_settings.max_freq)
-    Tobs = general_set.Tobs
-
-    oversample = 4
-    extra_buffer = 5
-    start_freq_ind = int(np.round(start_freq * Tobs))
-
-    initialize_kwargs = dict(
-        orbits=general_set.gpu_orbits if gpu_available else general_set.orbits,
-        t0=general_set.data_t0,
-        force_backend=general_set.gpu_backend,
-    )
-
-    # * Geometric ladder of the source file; the hottest chain samples nearly the prior.
-    betas = 1 / 1.2 ** np.arange(general_set.ntemps)
-    betas[-1] = 0.0001
-
-    search_kwargs = dict(
-        nwalkers=32,
-        ntemps=24,
-        shutoff_band_iteration=2,
-        shutoff_frequency_threshold=None,
-        burn_1=700,
-        nsteps_1=300,
-        snr_threshold=8.0,
-        burn_2=500,
-        nsteps_2=500,
-        refit_start_iteration=5,
-    )
-    stretch_probability = 0.0
-
-    waveform_kwargs = dict(
-        dt=general_set.dt,
-        T=Tobs,
-        use_c_implementation=True,
-        start_freq_ind=start_freq_ind,
-        tdi_channel_setup="XYZ",
-        tdi2=True,
-        oversample=oversample,
-        window=general_set.window_type,
-        window_alpha=general_set.window_alpha,
-    )
-
-    # * The two runs differ only in "response"; DFFR ignores the TDI-on-the-fly knobs and ran with
-    # * first-order delays, which is no longer its default.
-    gb_stft_kwargs = dict(
-        n_side_bins=N_SIDE_BINS,
-        freq_from_tdi_phase=True,
-        use_midpoint=True,
-        linear_envelope=True,
-        response=response,
-        first_order_delays=True,
-    )
-
-    debug_settings = GBDebugSettings(
-        enabled=False,
-        plot_walker=0,
-        plot_band=None,
-        seq_pick="first",
-        rj_trace=False,
-        prop_timing_sync=False,
-    )
-
-    gb_settings = GBSettings(
-        Tobs=Tobs,
-        dt=general_set.dt,
-        initialize_kwargs=initialize_kwargs,
+    # * The time grid, window, STFT domain, orbits, backend and ladder come from general_set.
+    gb_settings = GBSettings.from_general_setup(
+        general_set,
+        # * The shared erebor-priors stock GB prior; GBSetup limits its f0 to the proposed bands.
+        priors={"gb": GBPrior.prior_factory()},
         nleaves_max=NLEAVES_MAX,
         nleaves_min=0,
-        ndim=8,
-        betas=betas,
-        log_dir=general_set.file_store_dir,
-        A_lims=A_lims,
-        f0_lims=f0_lims,
-        m_chirp_lims=m_chirp_lims,
-        fdot_lims=fdot_lims,
-        phi0_lims=phi0_lims,
-        iota_lims=iota_lims,
-        psi_lims=psi_lims,
-        alpha_lims=alpha_lims,
-        delta_lims=delta_lims,
-        start_freq=start_freq,
-        end_freq=end_freq,
-        oversample=oversample,
-        extra_buffer=extra_buffer,
-        search_kwargs=search_kwargs,
-        stretch_probability=stretch_probability,
-        start_freq_ind=start_freq_ind,
-        num_repeat_proposals=50,
-        num_band_preload=NUM_BAND_PRELOAD,
-        num_bands_preload_temp=NUM_BANDS_PRELOAD_TEMP,
-        t0=general_set.data_t0,
-        waveform_kwargs=waveform_kwargs,
-        domain_settings=domain_settings,
-        gb_wdm_comp=None,
-        gb_stft_comp=STFTGBComputations,
-        gb_stft_kwargs=gb_stft_kwargs,
-        stft_band_alpha=general_set.window_alpha,
-        debug_settings=debug_settings,
-        leaf_cap_settings=None,
-        sighet_settings=None,
+        # * The two runs differ only in "response"; DFFR ignores the TDI-on-the-fly knobs and ran
+        # * with first-order delays.
+        stft=GBSTFTSettings(n_side_bins=N_SIDE_BINS, response=response, first_order_delays=True),
+        moves=GBMoveSettings(
+            num_repeat_proposals=50,
+            stretch_probability=0.0,
+            num_band_preload=NUM_BAND_PRELOAD,
+            num_bands_preload_temp=NUM_BANDS_PRELOAD_TEMP,
+        ),
     )
     gb_setup = GBSetup(gb_settings)
-
-    band_edges = gb_setup.band_edges.copy()
-    frequency_ranges = list(zip(band_edges[:-1], band_edges[1:]))
-    metadata_initialize_kwargs = initialize_kwargs.copy()
-    metadata_initialize_kwargs.pop("orbits", None)
-    # ? CPU backend in the metadata, which is serialised.
-    metadata_initialize_kwargs["force_backend"] = "cpu"
-    gb_metadata = SourceMetadata(
-        source_type="gb",
-        frequency_ranges=frequency_ranges,
-        waveform_model=waveform_model,
-        waveform_model_code_link=waveform_model_code_link,
-        prior_model_code_link=prior_model_code_link,
-        waveform_model_config=dict(
-            init_kwargs=metadata_initialize_kwargs, runtime_kwargs=waveform_kwargs
-        ),
+    gb_metadata = gb_setup.make_source_metadata(
+        waveform_model_code_link="https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0",
+        prior_model_code_link=GB_PRIOR_CODE_LINK,
     )
     return gb_setup, gb_metadata
 

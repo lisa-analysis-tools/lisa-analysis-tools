@@ -1250,66 +1250,46 @@ class GBWaveformDict(typing.TypedDict):
     window_alpha: float
 
 
-def build_gb_moves(
+@dataclasses.dataclass
+class GBMoveParts:
+    """The engine-owned constructor arguments of every GB special move (``GBSpecialBase``)."""
+
+    args: tuple  # gb, priors, start_freq_ind, data_length, acs, band_edges, band_N_vals, gpu_priors
+    kwargs: dict  # waveform, transform, domain computations, temperature control, store windows
+    gpu_priors: dict  # the RJ prior move's proposal distribution
+    ntemps: int
+    nwalkers: int
+
+
+def default_gb_debug_settings(debug_settings, artifacts_file_dir: str):
+    """``debug_settings`` with its plot folder in the run's artifacts when it names none."""
+    if debug_settings is None or debug_settings.plot_dir is not None:
+        return debug_settings
+    return dataclasses.replace(
+        debug_settings, plot_dir=os.path.join(artifacts_file_dir, "gb_debug", "")
+    )
+
+
+def prepare_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
     acs: AnalysisContainerArray,
     priors: dict,
     state: GFState,
     *,
-    Tmax: float = 1e6,
-    search_move_names: typing.Optional[typing.Sequence[str]] = None,
-    pe_move_names: typing.Optional[typing.Sequence[str]] = None,
-    include_search: typing.Optional[bool] = None,
-    include_refit: bool = True,
-    **kwargs,
-) -> typing.Tuple[typing.List[GBSpecialBase], typing.List[GBSpecialBase]]:
-    """Build GB search and PE moves.
+    Tmax: typing.Optional[float] = None,
+    waveform_class: typing.Optional[type] = None,
+) -> GBMoveParts:
+    """Set up what every GB move runs on, and return the moves' engine-owned constructor arguments.
 
-    Both moves share the same ``acs``, ``priors``, and
-    ``TemperatureControl`` instance, so updates to ``acs`` (e.g. signal
-    subtraction by another branch) are visible to both moves at runtime.
-
-    The GB move classes, per-move flags, and list ordering are the GB
-    *reference recipe* and stay here; a settings file steers which of them it
-    actually installs through the keyword-only design knobs below (this
-    replaces the post-hoc ``[m for m in gb_pe_moves if "prior" in m.name]``
-    filtering that GB settings files used to duplicate).
-
-    Parameters
-    ----------
-    engine_info :
-        Engine info object exposing ``ndims``.
-    curr : CurrentInfoGlobalFit
-        Current run info; reads ``source_info["gb"]`` and ``general_info``.
-    acs :
-        Shared analysis container (passed by reference).
-    priors : dict
-        Shared priors dict (passed by reference).
-    Tmax : float, optional
-        Maximum temperature for ``TemperatureControl``. Default 1e6.
-    search_move_names : sequence of str, optional
-        Explicit names of search moves to build (e.g. ``["rj_prior_search"]``).
-        If ``None`` and ``include_search`` is not ``False``, defaults to
-        ``["rj_fstat_mcmc_search", "rj_prior_search"]`` for FD, or ``[]`` for STFT/WDM.
-    pe_move_names : sequence of str, optional
-        Explicit names of PE moves to build (e.g. ``["rj_prior"]``). If ``None``,
-        defaults to ``["rj_prior", "rj_fstat_mcmc"]`` (plus refit if available) for FD,
-        or ``["rj_prior"]`` for STFT/WDM.
-    include_search : bool, optional
-        Deprecated in favor of ``search_move_names``. When ``False``, return an empty
-        search-move list. Default ``None``.
-    include_refit : bool, optional
-        When ``False``, never build the GMM-refit moves even if the refit
-        file is present. Default ``True`` (refit is still gated on the file
-        existing).
-
-    Returns
-    -------
-    gb_search_moves : List[GBSpecialBase]
-    gb_pe_moves : List[GBSpecialBase]
+    It builds the GB waveform (``waveform_class``, default ``GBGPU``) and the domain computations, sizes the
+    STFT store windows, subtracts the start sources from the residuals and sets the band temperatures.
+    ``Tmax`` tops the moves' ``TemperatureControl``; ``None`` takes ``gb_info.moves.Tmax``.
+    ``build_gb_moves`` and the l2d GB block add each move's own knobs.
     """
     gb_info: GBSetup = curr.source_info["gb"]
+    if Tmax is None:
+        Tmax = gb_info.moves.Tmax
     general_info: GeneralSetup = curr.general_info
     nwalkers: int = general_info.nwalkers
     ntemps: int = general_info.ntemps
@@ -1330,60 +1310,55 @@ def build_gb_moves(
     if gpus is not None:
         _gb_backend.set_cuda_device(gpus[0])
         
-    gb = GBGPU(**gb_info.initialize_kwargs)
+    gb = (GBGPU if waveform_class is None else waveform_class)(**gb_info.waveform.initialize_kwargs)
     if gpus is not None:
         cp.cuda.runtime.setDevice(gpus[0])
         gb.gpus = gpus
     else:
         gb.gpus = None
 
-    logger.debug(f"GBGPU initialized at t0 = {gb_info.initialize_kwargs['t0']}")
+    logger.debug(f"GBGPU initialized at t0 = {gb_info.waveform.t0}")
     logger.debug(f"GBGPU initialized with gpus: {gb.gpus} and backend: {gb.backend}")
     
     #* Ensure gb computations frames are initialized. (currently STFT only)
-    if isinstance(gb_info.gb_stft_comp, type) and issubclass(gb_info.gb_stft_comp, STFTGBComputations):
-        assert gb_info.gb_stft_kwargs is not None
-        
+    if isinstance(domain_settings, STFTSettings):
+        stft_settings = gb_info.stft
+
         if acs.domain_group_kwargs is None or acs.domain_group_kwargs == dict():
             domain_kwargs = dict(
                 tdi_type="XYZ",
                 window_alpha=general_info.window_alpha,
-                use_midpoint=gb_info.gb_stft_kwargs["use_midpoint"],
-                linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"]
+                use_midpoint=stft_settings.use_midpoint,
+                linear_envelope=stft_settings.linear_envelope,
             )
             acs.domain_group_kwargs = domain_kwargs
             acs._ensure_cpp_splits()
-        
+
         tdi_config = TDIConfig(
-            tdi='2nd generation', 
+            tdi='2nd generation',
             force_backend=general_info.force_backend
         )
 
-        gb_stft_comp = STFTGBComputations(
+        # * Kept on the setup: the store windows, the start subtraction and the moves read it.
+        gb_info.gb_stft_comp = STFTGBComputations(
             stft_comps=acs.cpp_splits[0],
             T=gb_info.Tobs,
             t_ref=MOJITO_REFERENCE_TIME,
             orbits=general_info.gpu_orbits,
             tdi_config=tdi_config,
             force_backend=general_info.force_backend,
-            n_side_bins=gb_info.gb_stft_kwargs["n_side_bins"],
-            freq_from_tdi_phase=gb_info.gb_stft_kwargs["freq_from_tdi_phase"],
             window_alpha=general_info.window_alpha,
-            use_midpoint=gb_info.gb_stft_kwargs["use_midpoint"],
-            linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"],
-            # * Optional keys: the response and the DFFR settings; without them the comp's defaults hold.
-            **{key: gb_info.gb_stft_kwargs[key]
-               for key in ("response", "first_order_delays")
-               if key in gb_info.gb_stft_kwargs},
+            **stft_settings.computation_kwargs,
         )
-        gb_info.gb_stft_comp = gb_stft_comp
 
     #* STFT store windows are sized here, where the comp's stencil, its t_ref and data_t0 are all known.
     gb_info.stft_store_windows = None
     band_structure = getattr(gb_info, "band_structure", None)
     if isinstance(acs.settings, STFTSettings) and band_structure is not None:
+        # ? The bands start at the grid's lowest frequency, or above it when the GB prior does.
+        first_edge_hz, grid_min_hz = float(asnumpy(band_structure.edges_hz)[0]), float(acs.settings.min_freq)
         if (float(band_structure.grid_df_hz) != float(acs.settings.df)
-                or not np.isclose(float(asnumpy(band_structure.edges_hz)[0]), float(acs.settings.min_freq))):
+                or (first_edge_hz < grid_min_hz and not np.isclose(first_edge_hz, grid_min_hz))):
             raise ValueError(
                 "the GB band structure was built on a different STFT grid than the analysis container; "
                 "its store windows would index the wrong bins."
@@ -1498,7 +1473,7 @@ def build_gb_moves(
                 data_splits=acs.gpu_map,
                 num_per_gpu=num_per_gpu_walker,
                 N=N_vals,
-                **gb_info.waveform_kwargs,
+                **gb_info.waveform.waveform_kwargs,
             )
         elif isinstance(domain_settings, WDMSettings):
             if gb_info.gb_wdm_comp is None:
@@ -1518,12 +1493,11 @@ def build_gb_moves(
                 factors=factors_arr,
             )
         elif isinstance(domain_settings, STFTSettings):
-            assert gb_info.gb_stft_comp is not None, (
-                "STFT-domain GB initialization requires "
-                "gb_info.gb_stft_comp; build an STFTGBComputations in the "
-                "settings file and pass it via GBSettings.gb_stft_comp."
+            assert getattr(gb_info, "gb_stft_comp", None) is not None, (
+                "STFT-domain GB initialization requires gb_info.gb_stft_comp, which "
+                "build_gb_moves builds above for an STFT domain."
             )
-            
+
             xp = gb_info.gb_stft_comp.xp
 
             from gbgpu.gb_likelihood import make_band_likelihood_engine
@@ -1532,14 +1506,14 @@ def build_gb_moves(
                 domain_settings,
                 gb_stft_comp=gb_info.gb_stft_comp,
                 nchannels=acs.nchannels,
-                tdi_channel_setup=gb_info.waveform_kwargs["tdi_channel_setup"],
+                tdi_channel_setup=gb_info.waveform.tdi_channel_setup,
             ).fill_template(
                 acs,
                 xp.asarray(coords_in_in),
                 xp.asarray(data_index).astype(xp.int32),
                 None,
                 factor=-1,
-                waveform_kwargs=gb_info.waveform_kwargs,
+                waveform_kwargs=gb_info.waveform.waveform_kwargs,
             )
         else:
             raise NotImplementedError(
@@ -1623,18 +1597,8 @@ def build_gb_moves(
         effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
     )
     
-    # * GB move options come from the settings file through gb_info; None gives each class's defaults.
-    debug_settings = getattr(gb_info, "debug_settings", None)
-    if debug_settings is not None and debug_settings.plot_dir is None:
-        debug_settings = dataclasses.replace(
-            debug_settings,
-            plot_dir=os.path.join(curr.general_info.artifacts_file_dir, "gb_debug", ""),
-        )
-    leaf_cap_settings = getattr(gb_info, "leaf_cap_settings", None)
-    sighet_settings = getattr(gb_info, "sighet_settings", None)
-
-    gb_move_kwargs = dict(
-        waveform_kwargs=gb_info.waveform_kwargs,
+    engine_kwargs = dict(
+        waveform_kwargs=gb_info.waveform.waveform_kwargs,
         parameter_transforms=gb_info.transform,
         provide_betas=True,
         skip_supp_names_update=["group_move_points"],
@@ -1642,22 +1606,99 @@ def build_gb_moves(
         force_backend=general_info.force_backend,
         nfriends=nwalkers,
         temperature_control=temperature_control,
-        num_repeat_proposals=gb_info.num_repeat_proposals,
-        search_kwargs=gb_info.search_kwargs,
-        stretch_probability=gb_info.stretch_probability,
         gb_wdm_comp=getattr(gb_info, "gb_wdm_comp", None),
         gb_fd_comp=getattr(gb_info, "gb_fd_comp", None),
         gb_stft_comp=getattr(gb_info, "gb_stft_comp", None),
         orbits=getattr(gb_info, "orbits", None),
         tdi_config=getattr(gb_info, "tdi_config", None),
-        t_ref=float(getattr(gb_info, "t0", 0.0) or 0.0),
-        debug_settings=debug_settings,
-        leaf_cap_settings=leaf_cap_settings,
-        sighet_settings=sighet_settings,
-        num_band_preload=getattr(gb_info, "num_band_preload", None),
-        num_bands_preload_temp=getattr(gb_info, "num_bands_preload_temp", None),
+        # ? The moves use t_ref for the FD computation only.
+        t_ref=float(gb_info.waveform.t0 or 0.0),
         ntemps=ntemps,
         stft_store_windows=gb_info.stft_store_windows,
+    )
+    return GBMoveParts(gb_move_args, engine_kwargs, gpu_priors, ntemps, nwalkers)
+
+
+def build_gb_moves(
+    engine_info: Setup,
+    curr: CurrentInfoGlobalFit,
+    acs: AnalysisContainerArray,
+    priors: dict,
+    state: GFState,
+    *,
+    Tmax: typing.Optional[float] = None,
+    search_move_names: typing.Optional[typing.Sequence[str]] = None,
+    pe_move_names: typing.Optional[typing.Sequence[str]] = None,
+    include_search: typing.Optional[bool] = None,
+    include_refit: typing.Optional[bool] = None,
+    **kwargs,
+) -> typing.Tuple[typing.List[GBSpecialBase], typing.List[GBSpecialBase]]:
+    """Build GB search and PE moves.
+
+    Both moves share the same ``acs``, ``priors``, and
+    ``TemperatureControl`` instance, so updates to ``acs`` (e.g. signal
+    subtraction by another branch) are visible to both moves at runtime.
+
+    The GB move classes, per-move flags, and list ordering are the GB
+    *reference recipe* and stay here; a settings file steers which of them it
+    actually installs through the keyword-only design knobs below (this
+    replaces the post-hoc ``[m for m in gb_pe_moves if "prior" in m.name]``
+    filtering that GB settings files used to duplicate).
+
+    Parameters
+    ----------
+    engine_info :
+        Engine info object exposing ``ndims``.
+    curr : CurrentInfoGlobalFit
+        Current run info; reads ``source_info["gb"]`` and ``general_info``.
+    acs :
+        Shared analysis container (passed by reference).
+    priors : dict
+        Shared priors dict (passed by reference).
+    Tmax : float, optional
+        Maximum temperature for ``TemperatureControl``. ``None`` takes ``gb_info.moves.Tmax``.
+    search_move_names : sequence of str, optional
+        Explicit names of search moves to build (e.g. ``["rj_prior_search"]``).
+        ``None`` takes ``gb_info.moves.search_move_names``, unless ``include_search`` is set.
+    pe_move_names : sequence of str, optional
+        Explicit names of PE moves to build (e.g. ``["rj_prior"]``). ``None`` takes
+        ``gb_info.moves.pe_move_names``.
+    include_search : bool, optional
+        Deprecated in favor of ``search_move_names``. When ``False``, return an empty
+        search-move list. Default ``None``.
+    include_refit : bool, optional
+        When ``False``, never build the GMM-refit moves even if the refit file is present.
+        ``None`` takes ``gb_info.moves.include_refit`` (refit is still gated on the file existing).
+
+    Returns
+    -------
+    gb_search_moves : List[GBSpecialBase]
+    gb_pe_moves : List[GBSpecialBase]
+    """
+    gb_info: GBSetup = curr.source_info["gb"]
+    # * The move choices come from the setup's moves group; explicit arguments override them.
+    if include_refit is None:
+        include_refit = gb_info.moves.include_refit
+    general_info: GeneralSetup = curr.general_info
+    domain_settings = general_info.domain_settings
+    parts = prepare_gb_moves(engine_info, curr, acs, priors, state, Tmax=Tmax)
+    gb_move_args, gpu_priors = parts.args, parts.gpu_priors
+    ntemps, nwalkers = parts.ntemps, parts.nwalkers
+
+    # * GB move options come from the setup's moves group.
+    move_settings = gb_info.moves
+    gb_move_kwargs = dict(
+        parts.kwargs,
+        num_repeat_proposals=move_settings.num_repeat_proposals,
+        search_kwargs=move_settings.search_kwargs,
+        stretch_probability=move_settings.stretch_probability,
+        debug_settings=default_gb_debug_settings(
+            move_settings.debug_settings, general_info.artifacts_file_dir
+        ),
+        leaf_cap_settings=move_settings.leaf_cap_settings,
+        sighet_settings=move_settings.sighet_settings,
+        num_band_preload=move_settings.num_band_preload,
+        num_bands_preload_temp=move_settings.num_bands_preload_temp,
     )
 
     # Check aliases in kwargs if any
@@ -1665,6 +1706,12 @@ def build_gb_moves(
         pe_move_names = kwargs.pop("pe_search_names")
     if "search_moves_names" in kwargs and search_move_names is None:
         search_move_names = kwargs.pop("search_moves_names")
+
+    # * Without explicit names, the moves group names the moves.
+    if search_move_names is None and include_search is None:
+        search_move_names = move_settings.search_move_names
+    if pe_move_names is None:
+        pe_move_names = move_settings.pe_move_names
 
     # Resolve search_move_names
     if search_move_names is None:
@@ -1722,7 +1769,7 @@ def build_gb_moves(
         # * the search moves recompute each source's Fisher matrix at every block, since a source
         # * climbing onto its signal needs one at its current position
         fim_interval = (
-            1 if name.endswith("_search") else int(getattr(gb_info, "num_stationary_fim_steps", 1))
+            1 if name.endswith("_search") else int(move_settings.num_stationary_fim_steps)
         )
         if name == "rj_prior_search":
             move = GBSpecialRJPriorMove(
@@ -1969,7 +2016,8 @@ class GBMoveBuilder(SourceMoveBuilder):
 
     Wraps :func:`build_gb_moves` (which owns the GB machinery + the GB reference
     move recipe) in the :class:`SourceMoveBuilder` interface. Design knobs are
-    forwarded so a settings file can steer which moves it installs.
+    forwarded so a settings file can steer which moves it installs; ``None``
+    takes the value of the setup's moves group.
     """
 
     branch_name = "gb"
@@ -1977,11 +2025,11 @@ class GBMoveBuilder(SourceMoveBuilder):
     def __init__(
         self,
         *,
-        Tmax: float = 1e6,
+        Tmax: typing.Optional[float] = None,
         search_move_names: typing.Optional[typing.Sequence[str]] = None,
         pe_move_names: typing.Optional[typing.Sequence[str]] = None,
         include_search: typing.Optional[bool] = None,
-        include_refit: bool = True,
+        include_refit: typing.Optional[bool] = None,
         **kwargs,
     ):
         super().__init__(branch_name="gb")

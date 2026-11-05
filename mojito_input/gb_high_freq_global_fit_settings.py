@@ -27,7 +27,9 @@ from lisatools.utils.constants import *
 from lisatools.sensitivity import XYZSensitivityBackend
 from eryn.state import BranchSupplemental
 from lisatools.globalfit.run import CurrentInfoGlobalFit
-from lisatools.globalfit.stock.erebor import PSDSetup, PSDSettings, MBHSetup, MBHSettings, GBSetup, GBSettings, get_fdot_mojito
+from lisatools.globalfit.stock.erebor import PSDSetup, PSDSettings, MBHSetup, MBHSettings, GBSetup, GBSettings
+from lisatools.globalfit.stock.erebor import GBMoveSettings, GBSTFTSettings
+from ereborpriors.stock.mojitolight import GBPrior
 
 
 from eryn.prior import uniform_dist, log_uniform
@@ -73,6 +75,11 @@ if TYPE_CHECKING:
 
 
 MOJITO_REFERENCE_TIME = 97729089.327664
+# * The stock GB prior of erebor-priors, at the commit this run installs.
+GB_PRIOR_CODE_LINK = (
+    "https://github.com/Erebor-L2D/erebor-priors/blob/fb65c565aea06c62a41ddbe95bb6b40a1a9c04b6/"
+    "src/ereborpriors/stock/mojitolight/gb.py"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +129,7 @@ def setup_recipe(
     setup_state_for_injection(curr, state, "GB", "gb", spread=spread_gb, subset_inds=subset_inds, priors=priors)
     
         
+    # ! WDM GB setups come at a later stage; GBSettings has no gb_wdm_comp until then.
     # #* ============== Chunked-heterodyne (WDM) GB likelihood ==============
     # # When the run domain is WDM, the GB branch uses the chunked-het
     # # likelihood (``gb_wdm_het.GBWDMHeterodyne``). Built lazily here, not on
@@ -197,97 +205,24 @@ def setup_recipe(
 ###############
 
 def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMetadata]:
-    
-    waveform_model = "GBGPU"
-    waveform_model_code_link = "https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0"
-    prior_model_code_link = "https://priors-database-f0027f.gitlab.io/mojito_light_1a.html#massive-black-hole-binaries-mbhb"
-
-    delta_safe = 1e-9
-
-    A_lims = [10**(-23.2), 1e-20]
-    f0_lims = [1e-4, 0.023] # reset by band limits
-    
-    m_chirp_lims = [0.03, 1.34]
-    # fdot_max_val = get_fdot(f0_lims[-1], Mc=m_chirp_lims[-1])
-    
-    fdot_lims = [get_fdot_mojito(f0_lims[-1], sign="-"), get_fdot_mojito(f0_lims[-1], sign="+")] # also reset in band limits
-    phi0_lims = [0.0, 2 * np.pi]
-    iota_lims = [0.0 + delta_safe, np.pi - delta_safe]
-    psi_lims = [0.0, np.pi]
-    alpha_lims = [0.0, 2 * np.pi]
-    delta_lims = [-np.pi / 2.0 + delta_safe, np.pi / 2.0 - delta_safe]
-    
-    input_data_arr: DataResidualArray = general_set.input_data_residual_array
-
-    domain_settings: DomainSettingsBase = general_set.domain_settings
-    if getattr(domain_settings, "min_freq", None) is not None:
-        start_freq = float(domain_settings.min_freq)
-        end_freq = float(domain_settings.max_freq)
-    else:
-        start_freq = float(input_data_arr.settings.f_arr.min())
-        end_freq = float(input_data_arr.settings.f_arr.max())
-
-    Tobs = general_set.Tobs
-
-    oversample = 4
-    extra_buffer = 5
-    
-    assert start_freq and end_freq and general_set.preprocess_kwargs
-    start_freq_ind = int(np.round(start_freq * Tobs))
-
-    initialize_kwargs = dict(
-        orbits=general_set.gpu_orbits if gpu_available else general_set.orbits, 
-        t0=general_set.data_t0,
-        force_backend=general_set.gpu_backend
-    )
-
-    # geometric spacing 
+    # ! Grids without min_freq (FD, WDM) come at a later stage: the factory reads the STFT grid.
+    assert general_set.preprocess_kwargs
     assert general_set.ntemps is not None, "ntemps must be set in general_info" # TODO add post init method of settings
-    betas = 1 / 1.2 ** np.arange(general_set.ntemps)
-    betas[-1] = 0.0001
 
-    search_kwargs = dict(
-        nwalkers = 32,
-        ntemps = 24,
-        shutoff_band_iteration = 2,
-        shutoff_frequency_threshold = None, # 4e-3 
-        burn_1 = 700,
-        nsteps_1 = 300,
-        snr_threshold = 8.0,
-        burn_2 = 500,
-        nsteps_2 = 500,
-        refit_start_iteration = 5
-    )
-    stretch_probability = 0.0
-    
-    waveform_kwargs = dict(
-        dt=general_set.dt,
-        T=Tobs,
-        use_c_implementation=True,
-        start_freq_ind=start_freq_ind,
-        tdi_channel_setup="XYZ",
-        tdi2=True,
-        oversample=oversample,
-        window=general_set.window_type,
-        window_alpha=general_set.window_alpha
-    )
-    
-    gb_stft_kwargs = dict(
-        n_side_bins=10, 
-        freq_from_tdi_phase=True,
-        use_midpoint=True,
-        linear_envelope=True
-    )
+    # ! The FD serial search reads search_kwargs; FD GB setups come at a later stage.
+    # search_kwargs = dict(
+    #     nwalkers = 32,
+    #     ntemps = 24,
+    #     shutoff_band_iteration = 2,
+    #     shutoff_frequency_threshold = None, # 4e-3
+    #     burn_1 = 700,
+    #     nsteps_1 = 300,
+    #     snr_threshold = 8.0,
+    #     burn_2 = 500,
+    #     nsteps_2 = 500,
+    #     refit_start_iteration = 5
+    # )
 
-    # * plot_dir=None puts the debug plots in <artifacts_file_dir>/gb_debug/.
-    debug_settings = GBDebugSettings(
-        enabled=False,
-        plot_walker=0,
-        plot_band=None,
-        seq_pick="first",
-        rj_trace=False,
-        prop_timing_sync=False,
-    )
     leaf_cap_settings = None
     # leaf_cap_settings = GBLeafCapSettings(
     #     start=None,
@@ -308,75 +243,29 @@ def get_gb_erebor_settings(general_set: GeneralSetup) -> tuple[GBSetup, SourceMe
     #     drift_check=os.environ.get("GB_SIGHET_DRIFT_CHECK", "0") == "1",
     # )
 
-    gb_settings = GBSettings(
-        #* Settings
-        Tobs=Tobs,
-        dt=general_set.dt,
-        initialize_kwargs=initialize_kwargs,
-        # Transform, Priors, and Periodic handled later
+    # * The time grid, window, STFT domain, orbits, backend and ladder come from general_set.
+    gb_settings = GBSettings.from_general_setup(
+        general_set,
+        # * The shared erebor-priors stock GB prior; GBSetup limits its f0 to the proposed bands.
+        priors={"gb": GBPrior.prior_factory()},
         nleaves_max=20,
         nleaves_min=0,
-        ndim=8,
-        betas=betas,
-        log_dir=general_set.file_store_dir,
-        #* GB settings
-        A_lims=A_lims,
-        f0_lims=f0_lims,
-        m_chirp_lims=m_chirp_lims,
-        fdot_lims=fdot_lims,
-        phi0_lims=phi0_lims,
-        iota_lims=iota_lims,
-        psi_lims=psi_lims,
-        alpha_lims=alpha_lims,
-        delta_lims=delta_lims,
-        start_freq=start_freq,
-        end_freq=end_freq,
-        oversample=oversample,
-        extra_buffer=extra_buffer,
-        # Start_resample_iter, Iter_count_per_resample, !group_proposal_kwargs (handled later?)
-        search_kwargs=search_kwargs,
-        stretch_probability=stretch_probability,
-        start_freq_ind=start_freq_ind,
-        num_repeat_proposals=50,
-        num_band_preload=512,
-        num_bands_preload_temp=128,
-        t0=general_set.data_t0,
-        # tdi_setup="XYZ", degenerate with waveform_kwargs, skipped if provided
-        # use_tdi2=True,
-        waveform_kwargs=waveform_kwargs,
-        # Run domain + chunked-het GB likelihood. ``gb_wdm_comp`` is built
-        # lazily in ``setup_recipe`` (the C++ orbit wrap is not picklable, and
-        # CurrentInfoGlobalFit deepcopies the settings tree).
-        domain_settings=domain_settings,
-        gb_wdm_comp=None,
-        gb_stft_comp=STFTGBComputations,
-        gb_stft_kwargs=gb_stft_kwargs,
-        stft_band_alpha=getattr(general_set, "window_alpha", None),
-        debug_settings=debug_settings,
-        leaf_cap_settings=leaf_cap_settings,
-        sighet_settings=sighet_settings,
+        # ! The chunked-het (WDM) GB likelihood comes at a later stage: no gb_wdm_comp until then.
+        stft=GBSTFTSettings(n_side_bins=10),
+        moves=GBMoveSettings(
+            num_repeat_proposals=50,
+            stretch_probability=0.0,
+            num_band_preload=512,
+            num_bands_preload_temp=128,
+            leaf_cap_settings=leaf_cap_settings,
+            sighet_settings=sighet_settings,
+        ),
     )
-
     gb_setup = GBSetup(gb_settings)
-
-    band_edges = gb_setup.band_edges.copy()
-    band_starts = band_edges[:-1]
-    band_ends = band_edges[1:]
-    frequency_ranges = [(start, end) for start, end in zip(band_starts, band_ends)]
-
-    metadata_initialize_kwargs = initialize_kwargs.copy()
-    _ = metadata_initialize_kwargs.pop("orbits", None)  # remove orbits from
-    metadata_initialize_kwargs['force_backend'] = 'cpu'  # override to cpu for metadata to avoid issues with serialization
-
-    gb_metadata = SourceMetadata(
-        source_type="gb",
-        frequency_ranges=frequency_ranges,
-        waveform_model=waveform_model,
-        waveform_model_code_link=waveform_model_code_link,
-        prior_model_code_link=prior_model_code_link,
-        waveform_model_config=dict(init_kwargs=metadata_initialize_kwargs, runtime_kwargs=waveform_kwargs),
+    gb_metadata = gb_setup.make_source_metadata(
+        waveform_model_code_link="https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0",
+        prior_model_code_link=GB_PRIOR_CODE_LINK,
     )
-
     return gb_setup, gb_metadata
 
 
@@ -418,8 +307,9 @@ def get_general_erebor_settings() -> GeneralSetup:
     ntemps = 4
     
     #* =============================== DOMAIN SETTINGS =================================
+    # ! GBSetup builds STFT bands only for now; the FD and WDM choices below come at a later stage.
     domain_cls = STFTSettings
- 
+
     if domain_cls == STFTSettings:
         stft_dt = 1 * 24 * 3600.0  # hours
         domain_settings = STFTSettings.make_factory(

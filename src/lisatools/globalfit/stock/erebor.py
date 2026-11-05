@@ -32,83 +32,198 @@ from lisatools.utils.constants import YRSID_SI, PC_SI
 from ...domains import DomainSettingsBase, FDSettings, WDMSettings, STFTSettings
 from ..engine import Settings, Setup, GeneralSetup
 from ..moves.gbbandstructure import stft_band_structure
+from ..moves.gbdebug import GBDebugSettings
 from ..loginfo import init_logger
-from ..priors.gbpriors import get_fdot_mojito, MojitoF0mHzFdotPrior
+from ereborpriors.priors import F0FdotPrior
 from ..searches import MBHBSearchInterface, GBSearchInterface, EMRISearchInterface, SOBHBSearchInterface, NoiseSearchInterface, GalacticForegroundSearchInterface
 
 if typing.TYPE_CHECKING:
-    from gbgpu.gbcomps import STFTGBComputations
-    from ..moves.gbdebug import GBDebugSettings
     from ..moves.gbspecialmove import GBLeafCapSettings, GBSigHetSettings
+
+
+# * The GB code reads the sampling columns by position: the amplitude (ln A) first, then these.
+GB_POSITIONAL_COLUMNS = ("f0", "fdot", "phi0", "cos_iota", "psi", "alpha", "sin_delta")
+
+
+@dataclasses.dataclass
+class GBWaveformSettings:
+    """The GBGPU arguments: its constructor arguments and its waveform call arguments.
+
+    The run chooses the first four fields; :meth:`GBSettings.from_general_setup` fills the others
+    from the run's :class:`GeneralSetup`.
+    """
+
+    oversample: int = 4
+    # ! The STFT computation in build_gb_moves is fixed to XYZ, second-generation TDI.
+    tdi_channel_setup: str = "XYZ"
+    tdi2: bool = True
+    use_c_implementation: bool = True
+    # * Filled from the GeneralSetup.
+    dt: Optional[float] = None
+    T: Optional[float] = None
+    start_freq_ind: Optional[int] = None
+    window: Optional[str] = None
+    window_alpha: Optional[float] = None
+    orbits: Any = None
+    t0: Optional[float] = None
+    force_backend: Optional[str] = None
+
+    @property
+    def initialize_kwargs(self) -> dict[str, Any]:
+        """The GBGPU constructor arguments."""
+        return dict(orbits=self.orbits, t0=self.t0, force_backend=self.force_backend)
+
+    @property
+    def waveform_kwargs(self) -> dict[str, Any]:
+        """The GBGPU waveform call arguments."""
+        return dict(
+            dt=self.dt,
+            T=self.T,
+            use_c_implementation=self.use_c_implementation,
+            start_freq_ind=self.start_freq_ind,
+            tdi_channel_setup=self.tdi_channel_setup,
+            tdi2=self.tdi2,
+            oversample=self.oversample,
+            window=self.window,
+            window_alpha=self.window_alpha,
+        )
+
+
+@dataclasses.dataclass
+class GBSTFTSettings:
+    """What the STFT band structure and the STFT GB computation are built from.
+
+    The defaults are those of the full-band DFFR run. :meth:`GBSettings.from_general_setup` fills
+    the STFT domain and the band taper from the run's :class:`GeneralSetup`.
+    """
+
+    n_side_bins: int = 16
+    response: str = "dffr"
+    # * First-order delays, as in every DFFR run of the GB memory effort (user, 2026-10-30).
+    first_order_delays: bool = True
+    use_midpoint: bool = True
+    linear_envelope: bool = True
+    # DFFR does not read it; the TDI-on-the-fly response does.
+    freq_from_tdi_phase: bool = True
+    # Forwarded to stft_band_structure (k_safety_factor, q, floor_correction, convention).
+    band_kwargs: Optional[dict[str, Any]] = None
+    # * Filled from the GeneralSetup: the STFT grid and the taper as a fraction of a segment.
+    domain_settings: Optional[DomainSettingsBase] = None
+    band_alpha: Optional[float] = None
+
+    @property
+    def computation_kwargs(self) -> dict[str, Any]:
+        """The STFTGBComputations arguments that the run chooses."""
+        return dict(
+            n_side_bins=self.n_side_bins,
+            freq_from_tdi_phase=self.freq_from_tdi_phase,
+            use_midpoint=self.use_midpoint,
+            linear_envelope=self.linear_envelope,
+            response=self.response,
+            first_order_delays=self.first_order_delays,
+        )
+
+
+@dataclasses.dataclass
+class GBMoveSettings:
+    """What build_gb_moves needs: the moves to build and the settings every GB move gets.
+
+    The defaults are those of the full-band DFFR run.
+    """
+
+    pe_move_names: typing.Sequence[str] = ("rj_prior",)
+    search_move_names: typing.Sequence[str] = ()
+    include_refit: bool = False
+    Tmax: float = 1e6
+    num_repeat_proposals: int = 50
+    # * 0: every in-model proposal is the Fisher (FIM) proposal.
+    stretch_probability: float = 0.0
+    num_stationary_fim_steps: int = 1
+    # Bands, and (band, walker) units per tempering chunk, preloaded per proposal; None sizes them
+    # from the free memory.
+    num_band_preload: Optional[int] = None
+    num_bands_preload_temp: Optional[int] = None
+    debug_settings: GBDebugSettings = dataclasses.field(default_factory=GBDebugSettings)
+    leaf_cap_settings: Optional[GBLeafCapSettings] = None
+    sighet_settings: Optional[GBSigHetSettings] = None
+    # ! Read by the FD serial search only; FD GB setups come at a later stage.
+    search_kwargs: Optional[dict[str, Any]] = None
 
 
 @dataclasses.dataclass
 class GBSettings(Settings):
     """Settings dataclass describing the GB branch in an Erebor-style recipe.
 
-    Mostly holds parameter limits, frequency-band oversampling, and the
-    starting frequency / TDI configuration consumed by :class:`GBSetup`.
+    The GBGPU, STFT and move settings sit in three groups, and :meth:`from_general_setup` fills
+    what the run's :class:`GeneralSetup` owns. The prior comes from erebor-priors
+    (``priors={"gb": mojitolight.GBPrior.prior_factory()}``); the transform and the periodic map
+    follow from it, and :class:`GBSetup` sets its f0 range to the proposed bands.
     """
 
-    A_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    f0_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    m_chirp_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    fdot_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    phi0_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    iota_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    psi_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    alpha_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    delta_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    start_freq: float = 0.0001  # this might get adjusted ?
-    end_freq: float = 0.025
-    oversample: int = 4 # FD
-    extra_buffer: int = 5
-    start_resample_iter: Optional[typing.Tuple[int]] = (-1,)  # -1 so that it starts right at the start of PE
-    iter_count_per_resample: Optional[int] = 10
-    num_repeat_proposals: int = 100
-    search_kwargs: Optional[dict] = None
-    stretch_probability: float = 0.5
-    num_stationary_fim_steps: int = 1
-    group_proposal_kwargs: Optional[dict] = None
-    start_freq_ind: Optional[int] = 0  # goes into GPU for start of data stream
-    t0: Optional[float] = 0.0
-    tdi_setup: Optional[str] = "XYZ" # other options are AET and AE.
-    use_tdi2: Optional[bool] = True
-    waveform_kwargs: dict = dataclasses.field(default_factory=dict)
-    # Domain selection for this branch. The user passes the same
-    # ``DomainSettingsBase`` that lives on the parent ``GeneralSetup``
-    # (FDSettings, STFTSettings, WDMSettings, ...). The band structure /
-    # waveform-engine selection branches on ``isinstance(domain_settings, ...)``
-    # — no string mode flag.
-    domain_settings: Optional[DomainSettingsBase] = None
-    # Optional WDM-domain likelihood object (a
-    # ``gbgpu.gbcomps.GBWDMComputations`` instance). Required when
-    # ``domain_settings`` is a :class:`WDMSettings`; ignored otherwise. The
-    # user builds this once their WDM grid + lookup table are known
-    # (see global-fit input scripts).
-    gb_wdm_comp: typing.Any = None
-    # Optional STFT/Fresnel-domain likelihood object (a
-    # ``gbgpu.gbcomps.STFTGBComputations`` instance, built around the parent
-    # ``STFTComputationGroup``). Required when ``domain_settings`` is a
-    # :class:`STFTSettings`; ignored otherwise.
-    gb_stft_comp: Optional[STFTGBComputations] = None
-    gb_stft_kwargs: Optional[dict[str, Any]] = None
-    stft_band_alpha: Optional[float] = None
-    # Forwarded to :func:`stft_band_structure` (k_safety_factor, q,
-    # floor_correction, convention). Empty means the decided recipe.
-    stft_band_kwargs: Optional[dict[str, Any]] = None
-    # Maximum bands preloaded into memory during proposal / RJ moves.
-    # When None, automatically estimated based on GPU memory and basis grid.
-    num_band_preload: Optional[int] = None
-    # Maximum (band, walker) units preloaded per tempering chunk.
-    # When None, automatically estimated based on GPU memory and ntemps.
-    num_bands_preload_temp: Optional[int] = None
-    # GB move options, passed to every GB move by build_gb_moves.
-    # None gives each class's defaults; debug is then disabled.
-    debug_settings: Optional[GBDebugSettings] = None
-    sighet_settings: Optional[GBSigHetSettings] = None
-    leaf_cap_settings: Optional[GBLeafCapSettings] = None
+    # ! FD and WDM GB setups come at a later stage; their fields are commented out until then.
+    # start_freq: float = 0.0001  # this might get adjusted ?
+    # end_freq: float = 0.025
+    # extra_buffer: int = 5
+    # # Optional WDM-domain likelihood object (a ``gbgpu.gbcomps.GBWDMComputations`` instance).
+    # gb_wdm_comp: typing.Any = None
+    waveform: GBWaveformSettings = dataclasses.field(default_factory=GBWaveformSettings)
+    stft: GBSTFTSettings = dataclasses.field(default_factory=GBSTFTSettings)
+    moves: GBMoveSettings = dataclasses.field(default_factory=GBMoveSettings)
     search_interface: Optional[GBSearchInterface] = None
+
+    @classmethod
+    def from_general_setup(
+        cls,
+        general_setup: GeneralSetup,
+        *,
+        priors: dict,
+        nleaves_max: int,
+        nleaves_min: int = 0,
+        betas: Optional[np.ndarray] = None,
+        waveform: Optional[GBWaveformSettings] = None,
+        stft: Optional[GBSTFTSettings] = None,
+        moves: Optional[GBMoveSettings] = None,
+        search_interface: Optional[GBSearchInterface] = None,
+    ) -> GBSettings:
+        """GB settings of a run, with what the run's GeneralSetup owns filled in.
+
+        ``waveform``, ``stft`` and ``moves`` hold the run's choices (by default those of the
+        full-band DFFR run); the time grid, the window, the STFT domain, the orbits and the backend
+        come from ``general_setup``. Without ``betas`` the ladder is :class:`GBSetup`'s default.
+        """
+        domain_settings = general_setup.domain_settings
+        on_gpu = general_setup.gpus is not None
+        waveform = dataclasses.replace(
+            waveform or GBWaveformSettings(),
+            dt=general_setup.dt,
+            T=general_setup.Tobs,
+            # * The first bin of the snapped STFT grid (min_freq, not the requested value).
+            start_freq_ind=int(np.round(float(domain_settings.min_freq) * general_setup.Tobs)),
+            window=general_setup.window_type,
+            window_alpha=general_setup.window_alpha,
+            orbits=general_setup.gpu_orbits if on_gpu else general_setup.orbits,
+            t0=general_setup.data_t0,
+            force_backend=general_setup.force_backend,
+        )
+        stft = dataclasses.replace(
+            stft or GBSTFTSettings(),
+            domain_settings=domain_settings,
+            band_alpha=general_setup.window_alpha,
+        )
+        return cls(
+            Tobs=general_setup.Tobs,
+            dt=general_setup.dt,
+            log_dir=general_setup.file_store_dir,
+            priors=priors,
+            nleaves_max=nleaves_max,
+            nleaves_min=nleaves_min,
+            ntemps=general_setup.ntemps,
+            betas=betas,
+            waveform=waveform,
+            stft=stft,
+            moves=moves or GBMoveSettings(),
+            search_interface=search_interface,
+        )
 
 # basic transform functions for pickling
 def f_ms_to_s(x):
@@ -186,8 +301,8 @@ class GBSetup(Setup, GBSettings):
     """:class:`Setup` for galactic binaries in the Erebor recipe.
 
     Args:
-        gb_settings: Settings dataclass holding GB parameter ranges and
-            domain configuration.
+        gb_settings: the GB settings: the prior and the waveform, STFT and move groups (see
+            :meth:`GBSettings.from_general_setup`).
     """
 
     def __init__(self, gb_settings: GBSettings):
@@ -202,63 +317,69 @@ class GBSetup(Setup, GBSettings):
         self.init_setup()
 
     def init_sampling_info(self):
-        """Build the GB :class:`TransformContainer`, prior, periodicity, and waveform kwargs.
+        """Take the GB prior, check its columns, and set the default ladder.
 
-        Plain parameter names (same convention as
-        :func:`make_gb_transform_container`) with ICRS sky angles
-        (``alpha`` / ``sin_delta``) -- the run frame is ICRS. ``A`` is
-        sampled in ``ln A`` (the ``np.exp`` transform maps to the physical
-        amplitude), ``f0`` in mHz.
+        The prior is an erebor-priors GB prior under the key ``"gb"``
+        (``mojitolight.GBPrior.prior_factory()``). The transform and the periodic map come from it
+        unless they are given, and its (f0, fdot) entry is rebuilt as erebor-priors' ``F0FdotPrior``
+        over the bands the moves propose in. The sampling basis is ln A, f0 [mHz], fdot, phi0,
+        cos iota, psi, alpha, sin delta, with ICRS sky angles; the waveform basis adds fddot as its
+        fourth column.
         """
-        input_basis = ["A", "f0", "fdot", "phi0",
-                       "cos_iota", "psi", "alpha", "sin_delta"]
-
-        if self.transform is None:
-            gb_transform_fn_in = {
-                "A": np.exp,
-                "f0": f_ms_to_s,
-                # "phi0": lambda x: -1 * x,  # flip sign of phi0 to match JaxGB convention.
-                "cos_iota": np.arccos,
-                "sin_delta": np.arcsin,
-
-            }
-
-            output_basis = [
-                "A", "f0", "fdot",
-                "fddot", "phi0", "cos_iota",
-                "psi", "alpha", "sin_delta"
-            ]
-
-            gb_fill_dict = {"fddot": 0.0}
-
-            self.transform = TransformContainer(
-                input_basis=input_basis,
-                output_basis=output_basis,
-                parameter_transforms=gb_transform_fn_in,
-                fill_dict=gb_fill_dict,
+        if not isinstance(self.priors, dict) or "gb" not in self.priors:
+            raise ValueError(
+                "GBSetup needs priors={'gb': prior}, for example "
+                "mojitolight.GBPrior.prior_factory() from erebor-priors."
+            )
+        gb_prior = self.priors["gb"]
+        if getattr(gb_prior, "branch_name", "gb") != "gb":
+            raise ValueError(
+                f"the GB prior belongs to the {gb_prior.branch_name!r} branch, not 'gb'."
             )
 
+        if self.transform is None:
+            self.transform = gb_prior.get_transforms()
         if self.periodic is None:
-            # * psi is periodic in 2 pi (DDPC convention), as in the stock priors and the search interface.
-            self.periodic = {"gb": {"phi0": 2*np.pi, "psi": 2 * np.pi, "alpha": 2 * np.pi}}
+            self.periodic = {"gb": gb_prior.get_periodic()}
 
-        if self.priors is None:
-            priors_gb = {
-                input_basis[0]: uniform_dist(*(np.log(np.asarray(self.A_lims)))),
-                # * f0 (mHz) and fdot share one prior: fdot is uniform between the mojito bounds at
-                # * the source's f0, so its density depends on f0. fdot_lims stays the global envelope.
-                (input_basis[1], input_basis[2]): MojitoF0mHzFdotPrior(
-                    f0_min_mHz=float(self.f0_lims[0]) * 1e3,
-                    f0_max_mHz=float(self.f0_lims[1]) * 1e3,
-                ),
-                input_basis[3]: uniform_dist(self.phi0_lims[0], self.phi0_lims[1]),
-                input_basis[4]: uniform_dist(*np.sort(np.cos(self.iota_lims))),
-                input_basis[5]: uniform_dist(self.psi_lims[0], self.psi_lims[1]),
-                input_basis[6]: uniform_dist(self.alpha_lims[0], self.alpha_lims[1]),
-                input_basis[7]: uniform_dist(*np.sort(np.sin(self.delta_lims))),
-            }
+        # ! The GB code reads the sampling and waveform columns by position: their order is fixed.
+        input_basis = list(self.transform.input_basis)
+        output_basis = list(self.transform.output_basis)
+        if (
+            tuple(input_basis[1:]) != GB_POSITIONAL_COLUMNS
+            or len(output_basis) != len(input_basis) + 1
+            or output_basis[3] != "fddot"
+        ):
+            raise ValueError(
+                "the GB sampling basis must be an amplitude column, then "
+                f"{list(GB_POSITIONAL_COLUMNS)}, and the waveform basis must add fddot as its "
+                f"fourth column; got {input_basis} -> {output_basis}."
+            )
+        if self.ndim is None:
+            self.ndim = len(input_basis)
+        elif self.ndim != len(input_basis):
+            raise ValueError(
+                f"ndim is {self.ndim}, but the GB prior has {len(input_basis)} columns."
+            )
 
-            self.priors = {"gb": ProbDistContainer(priors_gb)}
+        # * The (f0, fdot) entry becomes erebor-priors' F0FdotPrior over f0_lims, the prior's own range
+        # * clipped to the bands the moves propose in, so no prior mass sits in the first and the last band.
+        priors_in = dict(gb_prior.priors_in)
+        if ("f0", "fdot") not in priors_in:
+            raise ValueError("the GB prior needs a joint ('f0', 'fdot') entry.")
+        priors_in[("f0", "fdot")] = F0FdotPrior(
+            f0_min=float(self.f0_lims[0]) * 1e3, f0_max=float(self.f0_lims[1]) * 1e3, f0_units="mHz"
+        )
+        # ? Rebuilt as the same class, so the prior keeps its YAML dump and labels.
+        self.priors = {
+            "gb": type(gb_prior)(
+                priors_in=priors_in, branch_name="gb", include_fddot=gb_prior.include_fddot
+            )
+        }
+        self.logger.info(
+            f"GB prior f0 range, clipped to the proposed bands: [{self.f0_lims[0] * 1e3:.7f}, "
+            f"{self.f0_lims[1] * 1e3:.7f}] mHz"
+        )
 
         if self.betas is None:
             # snrs_ladder = np.array(
@@ -277,70 +398,42 @@ class GBSetup(Setup, GBSettings):
         if self.other_tempering_kwargs is None:
             self.other_tempering_kwargs = dict(adaptation_time=2, permute=True)
 
-        if self.initialize_kwargs is None:
-            self.initialize_kwargs = {}
-
-        # GBGPU FD waveform kwargs. The WDM-domain engine in
-        # ``gb_likelihood.WDMBandLikelihoodEngine`` ignores
-        # ``start_freq_ind`` / ``oversample`` (it dispatches to the WDM C
-        # kernel via ``GBWDMComputations``), but we keep the same dict so
-        # the down-stream Buffer's ``tdi_channel_setup`` read still works
-        # on either path. The settings file may pre-populate
-        # ``waveform_kwargs`` (stft_tof field); this default is built from
-        # the other fields only when it is left empty.
-        if not self.waveform_kwargs:
-            self.waveform_kwargs = dict(
-                dt=self.dt,
-                T=self.Tobs,
-                use_c_implementation=True,
-                oversample=self.oversample,
-                start_freq_ind=self.start_freq_ind,
-                tdi_channel_setup=self.tdi_setup,
-                tdi2=self.use_tdi2
-            )
-
-        if self.group_proposal_kwargs is None:
-            self.group_proposal_kwargs: typing.Dict[str, Any] = dict(
-                n_iter_update=1, 
-                live_dangerously=True, 
-                a=1.75, 
-                num_repeat_proposals=200
-            )
-        
-        if self.search_kwargs is None:
-            # Configuration for the stft_tof per-band serial GB search
-            # (consumed by ``GBSpecialRJSerialSearchMCMC.setup`` and
-            # ``GBSpecialRJRefitMove.setup``):
-            #   nwalkers / ntemps          — per-band ParaEnsembleSampler size
-            #   burn_1 / nsteps_1          — stage 1: F-stat (phase-maximized)
-            #                                MCMC, Gibbs on the 4 intrinsic-
-            #                                like params
-            #   snr_threshold              — band "found a source" gate on the
-            #                                stage-1 chain's min optimal SNR
-            #   burn_2 / nsteps_2          — stage 2: full-likelihood refine
-            #                                from stage-1's last sample; its
-            #                                samples feed the GMM fit that
-            #                                becomes the RJ proposal
-            #   shutoff_band_iteration     — shut a band off after this many
-            #                                consecutive source-less search
-            #                                iterations (all-off reverts the
-            #                                RJ proposal to the global prior)
-            #   shutoff_frequency_threshold— only bands above this frequency
-            #                                are shutoff-eligible (None = all)
-            #   refit_start_iteration      — samples kept per leaf for the
-            #                                GMM refit in GBSpecialRJRefitMove
-            self.search_kwargs: typing.Dict[str, Any] = dict(
-                nwalkers = 32,
-                ntemps = 24,
-                shutoff_band_iteration = 5,
-                shutoff_frequency_threshold = None, # 4e-3
-                burn_1 = 200,
-                nsteps_1 = 200,
-                snr_threshold = 8.0,
-                burn_2 = 500,
-                nsteps_2 = 500,
-                refit_start_iteration = 5
-            )
+        # ! The serial search that reads search_kwargs is FD only; FD GB setups come at a later
+        # ! stage, so its default is commented out until then.
+        # if self.moves.search_kwargs is None:
+        #     # Configuration for the stft_tof per-band serial GB search
+        #     # (consumed by ``GBSpecialRJSerialSearchMCMC.setup`` and
+        #     # ``GBSpecialRJRefitMove.setup``):
+        #     #   nwalkers / ntemps          — per-band ParaEnsembleSampler size
+        #     #   burn_1 / nsteps_1          — stage 1: F-stat (phase-maximized)
+        #     #                                MCMC, Gibbs on the 4 intrinsic-
+        #     #                                like params
+        #     #   snr_threshold              — band "found a source" gate on the
+        #     #                                stage-1 chain's min optimal SNR
+        #     #   burn_2 / nsteps_2          — stage 2: full-likelihood refine
+        #     #                                from stage-1's last sample; its
+        #     #                                samples feed the GMM fit that
+        #     #                                becomes the RJ proposal
+        #     #   shutoff_band_iteration     — shut a band off after this many
+        #     #                                consecutive source-less search
+        #     #                                iterations (all-off reverts the
+        #     #                                RJ proposal to the global prior)
+        #     #   shutoff_frequency_threshold— only bands above this frequency
+        #     #                                are shutoff-eligible (None = all)
+        #     #   refit_start_iteration      — samples kept per leaf for the
+        #     #                                GMM refit in GBSpecialRJRefitMove
+        #     self.moves.search_kwargs = dict(
+        #         nwalkers = 32,
+        #         ntemps = 24,
+        #         shutoff_band_iteration = 5,
+        #         shutoff_frequency_threshold = None, # 4e-3
+        #         burn_1 = 200,
+        #         nsteps_1 = 200,
+        #         snr_threshold = 8.0,
+        #         burn_2 = 500,
+        #         nsteps_2 = 500,
+        #         refit_start_iteration = 5
+        #     )
 
     # def __getattr__(self, attr: str) -> typing.Any:
     #     if hasattr(self.gb_settings, attr):
@@ -360,145 +453,206 @@ class GBSetup(Setup, GBSettings):
         if self.branch_backend is None:
             self.branch_backend = GBHDFBackend
 
+    def make_source_metadata(
+        self,
+        waveform_model_code_link: str = "",
+        prior_model_code_link: str = "",
+        prior_model_config_file: str = "",
+    ):
+        """The GB branch's :class:`SourceMetadata`: per-band frequency ranges, GBGPU arguments.
+
+        The metadata is written to disk, so the GBGPU arguments hold no orbits and name the CPU
+        backend.
+        """
+        from ..postprocessing import SourceMetadata
+
+        band_edges = np.asarray(self.band_edges)
+        init_kwargs = self.waveform.initialize_kwargs
+        init_kwargs.pop("orbits")
+        init_kwargs["force_backend"] = "cpu"
+        return SourceMetadata(
+            source_type="gb",
+            frequency_ranges=list(zip(band_edges[:-1], band_edges[1:])),
+            waveform_model="GBGPU",
+            waveform_model_code_link=waveform_model_code_link,
+            prior_model_code_link=prior_model_code_link,
+            prior_model_config_file=prior_model_config_file,
+            waveform_model_config=dict(
+                init_kwargs=init_kwargs, runtime_kwargs=self.waveform.waveform_kwargs
+            ),
+        )
+
+    def prior_f0_range_hz(self) -> tuple[float, float]:
+        """The f0 range of the GB prior's joint (f0, fdot) entry, in Hz."""
+        if not isinstance(self.priors, dict) or "gb" not in self.priors:
+            raise ValueError(
+                "GBSetup needs priors={'gb': prior}, for example "
+                "mojitolight.GBPrior.prior_factory() from erebor-priors."
+            )
+        joint_prior = self.priors["gb"].priors_in.get(("f0", "fdot"))
+        if joint_prior is None:
+            raise ValueError("the GB prior needs a joint ('f0', 'fdot') entry.")
+        # ? F0FdotPrior holds its f0 range in its own units.
+        scale = 1e-3 if joint_prior.f0_units == "mHz" else 1.0
+        return float(joint_prior.f0_min) * scale, float(joint_prior.f0_max) * scale
+
     def init_band_structure(self):
-        """Compute :attr:`band_edges` and :attr:`band_N_vals` from the GB frequency range.
+        """Compute :attr:`band_edges` and :attr:`band_N_vals` from the STFT domain.
 
-        FD and WDM use a frequency-banded layout whose edges are derived from
-        ``df = 1/Tobs`` (always meaningful for either basis) and the
-        FD-oversampled per-band N. For WDM runs the per-band ``band_N_vals``
-        is unused by the WDM likelihood engine (which sizes its buffers from
-        ``WDMSettings.Nf_active`` / ``Nt_active``) but is preserved for shape
-        parity.
-
-        STFT instead uses the sub-bin containment recipe from
+        STFT uses the sub-bin containment recipe from
         :mod:`lisatools.globalfit.moves.gbbandstructure`, and additionally
         sets :attr:`band_structure` so the store-window helper is reachable.
+        The FD and WDM layouts are commented out until those GB setups return.
         """
         #: Only the STFT path builds one; FD and WDM leave it None so a reader
         #: gets None rather than an AttributeError.
         self.band_structure = None
 
         # band separation setup
-        if self.oversample is None and self.Tobs < YRSID_SI / 2.0:
-            self.oversample = 2
-        elif self.oversample is None:
-            self.oversample = 4
+        if self.waveform.oversample is None and self.Tobs < YRSID_SI / 2.0:
+            self.waveform.oversample = 2
+        elif self.waveform.oversample is None:
+            self.waveform.oversample = 4
 
-        assert self.oversample >= 1
+        assert self.waveform.oversample >= 1
 
-        # Clamp the GB band to the WDM active band when running on a WDM
-        # grid. The WDM kernel only carries layers in [ind_min_f, ind_max_f];
-        # putting band edges outside that range silently produces zero-fill
-        # behaviour, so we trim to stay inside.
-        if isinstance(self.domain_settings, WDMSettings):
-            wdm = self.domain_settings
-            wdm_min = float(wdm.ind_min_f * wdm.layer_df)
-            wdm_max = float(wdm.ind_max_f * wdm.layer_df)
-            self.start_freq = max(self.start_freq, wdm_min)
-            self.end_freq = min(self.end_freq, wdm_max)
-            if self.start_freq >= self.end_freq:
-                raise ValueError(
-                    "WDM active band [{:.4e}, {:.4e}] does not overlap GB "
-                    "frequency range; widen WDMSettings.min_freq/max_freq "
-                    "or the GB start/end_freq.".format(wdm_min, wdm_max)
-                )
+        # ! FD and WDM GB setups come at a later stage. Their band code is commented out below until
+        # ! then, and any domain other than STFT raises.
+        # FD and WDM use a frequency-banded layout whose edges are derived from
+        # ``df = 1/Tobs`` (always meaningful for either basis) and the
+        # FD-oversampled per-band N. For WDM runs the per-band ``band_N_vals``
+        # is unused by the WDM likelihood engine (which sizes its buffers from
+        # ``WDMSettings.Nf_active`` / ``Nt_active``) but is preserved for shape
+        # parity.
+        #
+        # # Clamp the GB band to the WDM active band when running on a WDM
+        # # grid. The WDM kernel only carries layers in [ind_min_f, ind_max_f];
+        # # putting band edges outside that range silently produces zero-fill
+        # # behaviour, so we trim to stay inside.
+        # if isinstance(self.domain_settings, WDMSettings):
+        #     wdm = self.domain_settings
+        #     wdm_min = float(wdm.ind_min_f * wdm.layer_df)
+        #     wdm_max = float(wdm.ind_max_f * wdm.layer_df)
+        #     self.start_freq = max(self.start_freq, wdm_min)
+        #     self.end_freq = min(self.end_freq, wdm_max)
+        #     if self.start_freq >= self.end_freq:
+        #         raise ValueError(
+        #             "WDM active band [{:.4e}, {:.4e}] does not overlap GB "
+        #             "frequency range; widen WDMSettings.min_freq/max_freq "
+        #             "or the GB start/end_freq.".format(wdm_min, wdm_max)
+        #         )
+        #
+        # if isinstance(self.domain_settings, WDMSettings):
+        #     # WDM path: one band per WDM frequency layer. Edges land on
+        #     # ``k * layer_df`` boundaries so the band grid aligns with the
+        #     # WDM grid; ``band_N_vals`` is unused by the WDM likelihood
+        #     # engine but is preserved with one entry per band for shape
+        #     # parity with the FD layout.
+        #     wdm = self.domain_settings
+        #     layer_df = float(wdm.layer_df)
+        #     k_lo = int(np.ceil(self.start_freq / layer_df))
+        #     k_hi = int(np.floor(self.end_freq / layer_df))
+        #     if k_hi <= k_lo:
+        #         raise ValueError(
+        #             "GB frequency range [{:.4e}, {:.4e}] spans fewer than "
+        #             "one WDM layer (layer_df={:.4e}).".format(
+        #                 self.start_freq, self.end_freq, layer_df
+        #             )
+        #         )
+        #     self.band_edges = np.asarray(
+        #         [k * layer_df for k in range(k_lo, k_hi + 1)]
+        #     )
+        #     self.band_N_vals = np.asarray(
+        #         [
+        #             get_N(1e-30, edge, self.Tobs, oversample=self.oversample).item()
+        #             for edge in self.band_edges[:-1]
+        #         ]
+        #     )
+        # elif isinstance(self.domain_settings, FDSettings):
+        #     # FD path: bands sized in multiples of ``df = 1/Tobs`` using the
+        #     # FD-oversampled per-band N. Walks down from ``end_freq``
+        #     # (stft_tof refinements: half-bin start, min_N stop guard, and
+        #     # edge trim against out-of-bound indexing).
+        #     # TODO: assign to binned f or leave general? probably better to be general
+        #     band_edges_in_reverse_order = [self.end_freq]
+        #     current_N = get_N(1e-30, self.end_freq, self.Tobs, oversample=self.oversample).item()
+        #     min_N = get_N(1e-30, self.start_freq, self.Tobs, oversample=self.oversample).item()
+        #     band_N_vals_reverse_order = [current_N]
+        #
+        #     current_freq = self.end_freq - self.df / 2
+        #     last_freq = self.end_freq
+        #     while current_freq > self.start_freq + min_N * self.df:
+        #         current_freq = last_freq - (current_N * 2 + self.extra_buffer) * self.df
+        #         band_edges_in_reverse_order.append(current_freq)
+        #         current_N = get_N(1e-30, current_freq, self.Tobs, oversample=self.oversample).item()
+        #         band_N_vals_reverse_order.append(current_N)
+        #         last_freq = current_freq
+        #
+        #     band_edges = np.asarray(band_edges_in_reverse_order)[::-1]
+        #     band_N_vals = np.asarray(band_N_vals_reverse_order)[::-1]
+        #
+        #     # trim edges to avoid out of bound indexing
+        #     self.band_edges = band_edges[2:-1]
+        #     self.band_N_vals = band_N_vals[2:-1]
 
-        if isinstance(self.domain_settings, WDMSettings):
-            # WDM path: one band per WDM frequency layer. Edges land on
-            # ``k * layer_df`` boundaries so the band grid aligns with the
-            # WDM grid; ``band_N_vals`` is unused by the WDM likelihood
-            # engine but is preserved with one entry per band for shape
-            # parity with the FD layout.
-            wdm = self.domain_settings
-            layer_df = float(wdm.layer_df)
-            k_lo = int(np.ceil(self.start_freq / layer_df))
-            k_hi = int(np.floor(self.end_freq / layer_df))
-            if k_hi <= k_lo:
-                raise ValueError(
-                    "GB frequency range [{:.4e}, {:.4e}] spans fewer than "
-                    "one WDM layer (layer_df={:.4e}).".format(
-                        self.start_freq, self.end_freq, layer_df
-                    )
-                )
-            self.band_edges = np.asarray(
-                [k * layer_df for k in range(k_lo, k_hi + 1)]
-            )
-            self.band_N_vals = np.asarray(
-                [
-                    get_N(1e-30, edge, self.Tobs, oversample=self.oversample).item()
-                    for edge in self.band_edges[:-1]
-                ]
-            )
-        elif isinstance(self.domain_settings, FDSettings):
-            # FD path: bands sized in multiples of ``df = 1/Tobs`` using the
-            # FD-oversampled per-band N. Walks down from ``end_freq``
-            # (stft_tof refinements: half-bin start, min_N stop guard, and
-            # edge trim against out-of-bound indexing).
-            # TODO: assign to binned f or leave general? probably better to be general
-            band_edges_in_reverse_order = [self.end_freq]
-            current_N = get_N(1e-30, self.end_freq, self.Tobs, oversample=self.oversample).item()
-            min_N = get_N(1e-30, self.start_freq, self.Tobs, oversample=self.oversample).item()
-            band_N_vals_reverse_order = [current_N]
-
-            current_freq = self.end_freq - self.df / 2
-            last_freq = self.end_freq
-            while current_freq > self.start_freq + min_N * self.df:
-                current_freq = last_freq - (current_N * 2 + self.extra_buffer) * self.df
-                band_edges_in_reverse_order.append(current_freq)
-                current_N = get_N(1e-30, current_freq, self.Tobs, oversample=self.oversample).item()
-                band_N_vals_reverse_order.append(current_N)
-                last_freq = current_freq
-
-            band_edges = np.asarray(band_edges_in_reverse_order)[::-1]
-            band_N_vals = np.asarray(band_N_vals_reverse_order)[::-1]
-
-            # trim edges to avoid out of bound indexing
-            self.band_edges = band_edges[2:-1]
-            self.band_N_vals = band_N_vals[2:-1]
-
-        elif isinstance(self.domain_settings, STFTSettings):
+        if isinstance(self.stft.domain_settings, STFTSettings):
             # STFT path: the sub-bin containment recipe, W_band = k * B_q.
-            if self.stft_band_alpha is None:
+            if self.stft.band_alpha is None:
                 raise ValueError(
-                    "STFT band structure needs stft_band_alpha (the Tukey "
-                    "taper fraction). Pass general_setup.window_alpha, which "
-                    "the data processor sets to window_taper_duration / "
-                    "DT_STFT."
+                    "STFT band structure needs stft.band_alpha (the Tukey taper fraction); "
+                    "GBSettings.from_general_setup fills it from general_setup.window_alpha."
                 )
             band_structure = stft_band_structure(
-                self.domain_settings, self.stft_band_alpha,
-                **(self.stft_band_kwargs or {})
+                self.stft.domain_settings, self.stft.band_alpha,
+                **(self.stft.band_kwargs or {})
+            )
+            # * Only the bands the prior reaches, plus one guard band on each side (the moves never propose
+            # * in the first and the last band): the GB block holds and runs no band outside the prior.
+            prior_f0_min_hz, prior_f0_max_hz = self.prior_f0_range_hz()
+            first_band, last_band = (
+                int(band) for band in band_structure.assign(np.array([prior_f0_min_hz, prior_f0_max_hz]))
+            )
+            first_band = max(first_band - 1, 0)
+            last_band = min(last_band + 1, band_structure.n_bands - 1)
+            band_structure = dataclasses.replace(
+                band_structure, edges_hz=band_structure.edges_hz[first_band:last_band + 2]
             )
             self.band_edges = band_structure.edges_hz
             self.band_N_vals = band_structure.band_N_vals(
-                oversample=self.oversample
+                oversample=self.waveform.oversample
             )
             self.band_structure = band_structure
             self.logger.info(
                 "STFT band structure: %d bands, alpha=%.5f, median width "
                 "%.4g coherent elements (%.4g STFT pixels)",
-                band_structure.n_bands, self.stft_band_alpha,
+                band_structure.n_bands, self.stft.band_alpha,
                 float(np.median(band_structure.width_coherent_elements)),
                 float(np.median(band_structure.width_grid_pixels)),
             )
 
         else:
-            raise ValueError(
-                "GBSetup only supports FDSettings, WDMSettings, or STFTSettings for "
-                "domain_settings; got {}.".format(type(self.domain_settings))
+            raise NotImplementedError(
+                "GBSetup builds STFT bands only for now; FD and WDM GB setups come at a later "
+                f"stage (got {type(self.stft.domain_settings).__name__})."
             )
         
-        self.f0_lims = [self.band_edges[1].min(), self.band_edges[-2].max()]
-
-        self.fdot_lims = [
-            get_fdot_mojito(self.f0_lims[1], sign="-"), 
-            get_fdot_mojito(self.f0_lims[1], sign="+"), 
+        # * The moves propose only in the inner bands, between the second and the second-last edge. The f0 range
+        # * is the prior's, clipped to them: the bands follow the prior, never the other way round.
+        prior_f0_min_hz, prior_f0_max_hz = self.prior_f0_range_hz()
+        self.f0_lims = [
+            max(prior_f0_min_hz, float(self.band_edges[1])), min(prior_f0_max_hz, float(self.band_edges[-2]))
         ]
+        if not self.f0_lims[0] < self.f0_lims[1]:
+            raise ValueError(
+                f"the GB prior's f0 range [{prior_f0_min_hz}, {prior_f0_max_hz}] Hz misses the bands the moves "
+                f"propose in, [{float(self.band_edges[1])}, {float(self.band_edges[-2])}] Hz."
+            )
 
         self.num_sub_bands = len(self.band_edges) - 1
-        
+
         self.logger.info(
-            f"GB f0 prior range is set from {round(self.f0_lims[0],7)} to {round(self.f0_lims[1],7)}"
+            f"GB f0 range of the proposed bands: {round(self.f0_lims[0], 7)} to "
+            f"{round(self.f0_lims[1], 7)} Hz"
         )
         self.logger.info(f"The number of subbands is {self.num_sub_bands}")
         self.logger.info(f"Min freq of subbands is {self.band_edges.min()}")

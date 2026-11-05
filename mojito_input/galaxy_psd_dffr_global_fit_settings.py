@@ -40,10 +40,10 @@ try:
 except (ModuleNotFoundError, ImportError):
     gpu_available = False
 
+from ereborpriors.stock.mojitolight import GBPrior
 from eryn.moves import TemperatureControl
 from eryn.prior import ProbDistContainer, uniform_dist
 from eryn.utils import TransformContainer
-from gbgpu.gbcomps import STFTGBComputations
 
 from lisatools.detector import L1Orbits
 from lisatools.domains import STFTSettings
@@ -51,7 +51,7 @@ from lisatools.globalfit.engine import GeneralSettings, GeneralSetup, GlobalFitS
 from lisatools.globalfit.moves import GFCombineMove, MultiGPUPSDMove
 from lisatools.globalfit.moves.gbdebug import GBDebugSettings
 from lisatools.globalfit.moves.gbspecialmove import GBSpecialBase
-from lisatools.globalfit.postprocessing import SourceMetadata, StochasticMetadata
+from lisatools.globalfit.postprocessing import StochasticMetadata
 from lisatools.globalfit.preprocessing import L1ProcessingStep
 from lisatools.globalfit.recipe import (
     MOJITO_REFERENCE_TIME,
@@ -65,11 +65,12 @@ from lisatools.globalfit.run import CurrentInfoGlobalFit
 from lisatools.globalfit.stock.erebor import (
     GalForSettings,
     GalForSetup,
+    GBMoveSettings,
     GBSettings,
     GBSetup,
+    GBSTFTSettings,
     PSDSettings,
     PSDSetup,
-    get_fdot_mojito,
 )
 from lisatools.sensitivity import XYZSensitivityBackend
 
@@ -108,6 +109,11 @@ PSD_PROP_REPEATS = 100
 # * scatter_around_injection widens hotter chains.
 GB_START_SPREAD = np.array([1e-3, 1e-9, 1e-19, 1e-3, 1e-3, 1e-3, 1e-4, 1e-4])
 PROBE_FILE_NAME = "mem_probe.jsonl"
+# * The stock GB prior of erebor-priors, at the commit this run installs.
+GB_PRIOR_CODE_LINK = (
+    "https://github.com/Erebor-L2D/erebor-priors/blob/fb65c565aea06c62a41ddbe95bb6b40a1a9c04b6/"
+    "src/ereborpriors/stock/mojitolight/gb.py"
+)
 
 LOG10_TM_ASD_RANGE = (-16.0, -13.0)
 LOG10_OMS_ASD_RANGE = (-12.0, -10.0)
@@ -158,7 +164,10 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
     check_resolved_rows(resolved, galaxy_entry, general_info.data_t0 - MOJITO_REFERENCE_TIME)
     # * Sources below the amplitude prior's lower limit cannot start: the recipe refuses a start state
     # * outside the prior. They stay in the data and out of the model (user, 2026-10-30).
-    below_amplitude_prior = resolved["Amplitude"] < curr.source_info["gb"].A_lims[0]
+    # * The cut is in ln A, the prior's first sampling column, so it matches the prior's support.
+    amplitude_column = curr.source_info["gb"].transform.input_basis[0]
+    ln_amplitude_floor = priors["gb"].priors_in[amplitude_column].minimum
+    below_amplitude_prior = np.log(resolved["Amplitude"]) < ln_amplitude_floor
     logger.info(
         f"Left out {below_amplitude_prior.sum()} resolved sources below the amplitude prior's lower "
         f"limit, CatalogueIndex {rows[below_amplitude_prior].tolist()}"
@@ -209,12 +218,8 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
     # ! Build the GB moves before the PSD moves: this call resets acs.domain_group_kwargs, which
     # ! drops the cached computation groups, and MultiGPUPSDMove binds split 0's sensitivity
     # ! backend once, at construction.
-    _, gb_pe_moves = build_gb_moves(
-        engine_info, curr, acs, priors, state,
-        search_move_names=[],
-        pe_move_names=["rj_prior"],
-        include_refit=False,
-    )
+    # The GB setup's moves group names the moves.
+    _, gb_pe_moves = build_gb_moves(engine_info, curr, acs, priors, state)
 
     psd_info = curr.source_info["psd"]
     galfor_info = curr.source_info["galfor"]
@@ -344,117 +349,35 @@ def get_galfor_settings(general_set: GeneralSetup) -> tuple:
 
 
 def get_gb_settings(general_set: GeneralSetup, mem_probe_file: str | None) -> tuple:
-    delta_safe = 1e-9
-    # * f0 and fdot limits are reset from the band edges by GBSetup.
-    f0_lims = [START_FREQ_HZ, END_FREQ_HZ]
-    domain_settings = general_set.domain_settings
-    start_freq = float(domain_settings.min_freq)
-    end_freq = float(domain_settings.max_freq)
-    Tobs = general_set.Tobs
-    oversample = 4
-    start_freq_ind = int(np.round(start_freq * Tobs))
-
-    initialize_kwargs = dict(
-        orbits=general_set.gpu_orbits if gpu_available else general_set.orbits,
-        t0=general_set.data_t0,
-        force_backend=general_set.gpu_backend,
-    )
-    # * Geometric ladder; the hottest chain samples nearly the prior.
-    betas = 1 / 1.2 ** np.arange(general_set.ntemps)
-    betas[-1] = 0.0001
-
-    waveform_kwargs = dict(
-        dt=general_set.dt,
-        T=Tobs,
-        use_c_implementation=True,
-        start_freq_ind=start_freq_ind,
-        tdi_channel_setup="XYZ",
-        tdi2=True,
-        oversample=oversample,
-        window=general_set.window_type,
-        window_alpha=general_set.window_alpha,
-    )
-    # * first_order_delays=True as in every DFFR run of the GB memory effort (user, 2026-10-30);
-    # * DFFR's own default is the full delays.
-    gb_stft_kwargs = dict(
-        n_side_bins=N_SIDE_BINS,
-        # The recipe needs the key; DFFR does not read the value.
-        freq_from_tdi_phase=True,
-        use_midpoint=True,
-        linear_envelope=True,
-        response="dffr",
-        first_order_delays=True,
-    )
-    debug_settings = GBDebugSettings(
-        enabled=False,
-        plot_walker=0,
-        plot_band=None,
-        seq_pick="first",
-        rj_trace=False,
-        prop_timing_sync=False,
-        # The probe runs Python on every CuPy allocation (about 10 % of an iteration).
-        mem_probe=mem_probe_file is not None,
-        mem_probe_file=mem_probe_file,
-    )
-    gb_settings = GBSettings(
-        Tobs=Tobs,
-        dt=general_set.dt,
-        initialize_kwargs=initialize_kwargs,
+    # * The time grid, window, STFT domain, orbits, backend and ladder come from general_set.
+    gb_settings = GBSettings.from_general_setup(
+        general_set,
+        # * The shared erebor-priors stock GB prior; GBSetup limits its f0 to the proposed bands.
+        priors={"gb": GBPrior.prior_factory()},
         nleaves_max=NLEAVES_MAX,
         nleaves_min=0,
-        ndim=8,
-        betas=betas,
-        log_dir=general_set.file_store_dir,
-        # * The amplitude bounds of the shared stock GB prior (erebor-priors fb65c56).
-        A_lims=[10 ** (-23.5), 1e-20],
-        f0_lims=f0_lims,
-        m_chirp_lims=[0.03, 1.34],
-        fdot_lims=[get_fdot_mojito(f0_lims[-1], sign="-"), get_fdot_mojito(f0_lims[-1], sign="+")],
-        phi0_lims=[0.0, 2 * np.pi],
-        iota_lims=[0.0 + delta_safe, np.pi - delta_safe],
-        # * psi is periodic in 2 pi (DDPC convention), as GBSetup and the catalogue conversion.
-        psi_lims=[0.0, 2 * np.pi],
-        alpha_lims=[0.0, 2 * np.pi],
-        delta_lims=[-np.pi / 2.0 + delta_safe, np.pi / 2.0 - delta_safe],
-        start_freq=start_freq,
-        end_freq=end_freq,
-        oversample=oversample,
-        extra_buffer=5,
-        # None takes GBSettings' defaults; only the GB search moves, which are off, read them.
-        search_kwargs=None,
-        # * 0: every in-model proposal is the Fisher (FIM) proposal.
-        stretch_probability=0.0,
-        start_freq_ind=start_freq_ind,
-        num_repeat_proposals=50,
-        num_band_preload=NUM_BAND_PRELOAD,
-        num_bands_preload_temp=NUM_BANDS_PRELOAD_TEMP,
-        t0=general_set.data_t0,
-        waveform_kwargs=waveform_kwargs,
-        domain_settings=domain_settings,
-        gb_wdm_comp=None,
-        gb_stft_comp=STFTGBComputations,
-        gb_stft_kwargs=gb_stft_kwargs,
-        stft_band_alpha=general_set.window_alpha,
-        debug_settings=debug_settings,
-        leaf_cap_settings=None,
-        sighet_settings=None,
+        # * DFFR with first-order delays, as in every DFFR run of the GB memory effort (user,
+        # * 2026-10-30).
+        stft=GBSTFTSettings(n_side_bins=N_SIDE_BINS, response="dffr", first_order_delays=True),
+        moves=GBMoveSettings(
+            pe_move_names=["rj_prior"],
+            search_move_names=[],
+            include_refit=False,
+            num_repeat_proposals=50,
+            # * 0: every in-model proposal is the Fisher (FIM) proposal.
+            stretch_probability=0.0,
+            num_band_preload=NUM_BAND_PRELOAD,
+            num_bands_preload_temp=NUM_BANDS_PRELOAD_TEMP,
+            # The probe runs Python on every CuPy allocation (about 10 % of an iteration).
+            debug_settings=GBDebugSettings(
+                mem_probe=mem_probe_file is not None, mem_probe_file=mem_probe_file
+            ),
+        ),
     )
     gb_setup = GBSetup(gb_settings)
-
-    band_edges = gb_setup.band_edges.copy()
-    metadata_initialize_kwargs = initialize_kwargs.copy()
-    metadata_initialize_kwargs.pop("orbits", None)
-    # CPU backend in the metadata, which is serialised.
-    metadata_initialize_kwargs["force_backend"] = "cpu"
-    gb_metadata = SourceMetadata(
-        source_type="gb",
-        frequency_ranges=list(zip(band_edges[:-1], band_edges[1:])),
-        waveform_model="GBGPU",
+    gb_metadata = gb_setup.make_source_metadata(
         waveform_model_code_link="https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0",
-        prior_model_code_link="https://priors-database-f0027f.gitlab.io/mojito_light_1a.html#massive-black-hole-binaries-mbhb",
-        waveform_model_config=dict(
-            init_kwargs=metadata_initialize_kwargs, runtime_kwargs=waveform_kwargs
-        ),
+        prior_model_code_link=GB_PRIOR_CODE_LINK,
     )
     return gb_setup, gb_metadata
 
