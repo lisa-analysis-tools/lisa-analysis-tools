@@ -1437,23 +1437,30 @@ def build_gb_moves(
         coords_out_gb = state.branches["gb"].coords[0,
             state.branches["gb"].inds[0]
         ]
-        coords_out_gb[:, 3] = coords_out_gb[:, 3] % (2 * np.pi)
-        coords_out_gb[:, 5] = coords_out_gb[:, 5] % (1 * np.pi)
-        coords_out_gb[:, 6] = coords_out_gb[:, 6] % (2 * np.pi)
+        # * Wrap the periodic columns into their prior range, with the GB prior's own periods.
+        input_basis = list(gb_info.transform.input_basis)
+        for name, period in gb_info.periodic["gb"].items():
+            column = input_basis.index(name)
+            coords_out_gb[:, column] = coords_out_gb[:, column] % period
 
         check = priors["gb"].logpdf(coords_out_gb)
         if np.any(np.isinf(check)):
-
-            # check which prior is inf
             inf_indices = np.where(np.isinf(check))[0]
-            inf_coords = coords_out_gb[inf_indices]
-            logger.error(f"Found {len(inf_indices)} coordinates with inf logpdf under GB priors. Example inf coordinates: {inf_coords[:5]}") 
-
+            logger.error(
+                f"Found {len(inf_indices)} GB start coordinates outside the GB prior. "
+                f"Examples: {coords_out_gb[inf_indices][:5]}"
+            )
             logger.info("Prior bounds for GB parameters:")
             for param_name, prior in priors["gb"].priors_in.items():
-                logger.info(f"  {param_name}: [{prior.min_val},{prior.max_val}]")
-            breakpoint()
-            raise ValueError("Starting priors are inf. If injecting, try reducing spread.")
+                # ? A one-column prior has minimum and maximum; the joint (f0, fdot) prior has the
+                # ? f0 range, and fdot's bounds follow from f0.
+                lower = getattr(prior, "minimum", getattr(prior, "f0_min", None))
+                upper = getattr(prior, "maximum", getattr(prior, "f0_max", None))
+                logger.info(f"  {param_name}: [{lower}, {upper}]")
+            raise ValueError(
+                f"{len(inf_indices)} GB start coordinates lie outside the GB prior (bounds in the "
+                "log). If injecting, try reducing the spread."
+            )
 
         coords_in_in = gb_info.transform.both_transforms(coords_out_gb)
 
