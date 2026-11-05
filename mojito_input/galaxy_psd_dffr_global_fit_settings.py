@@ -89,6 +89,8 @@ WINDOW_TAPER_S = 1.0 / START_FREQ_HZ
 N_SIDE_BINS = 16
 NWALKERS = 32
 NTEMPS = 24
+# * Inverse temperature of the hottest GB chain; the PSD move keeps its own ladder (Tmax 1e6).
+GB_HOTTEST_BETA = 1.0e-4
 # * 7319 resolved sources and 55 verification binaries; the rest is room for RJ births.
 NLEAVES_MAX = 8000
 # * None: the moves size their buffers from the memory free at each build.
@@ -361,7 +363,7 @@ def get_gb_settings(general_set: GeneralSetup, mem_probe_file: str | None) -> tu
     )
     # * Geometric ladder; the hottest chain samples nearly the prior.
     betas = 1 / 1.2 ** np.arange(general_set.ntemps)
-    betas[-1] = 0.0001
+    betas[-1] = GB_HOTTEST_BETA
 
     waveform_kwargs = dict(
         dt=general_set.dt,
@@ -636,3 +638,18 @@ def get_azzurra_two_gpu_settings():
     GPUS = [0, 1]
     np.random.seed(RANDOM_SEED)
     return build_settings("azzurra_two_gpu", mem_probe=True)
+
+
+def get_azzurra_two_gpu_long_settings():
+    """A production run on two cards from the same seeded start, without the probe, for as many GB iterations as its
+    job allows: the job's time limit ends it, and the backend keeps every finished iteration (backup_iter=1).
+    12 temperatures; the GB ladder 1/1.2^k with its hottest chain at T = 10, the PSD move at Tmax 1e6."""
+    global GPUS, NUM_PE_ITERATIONS, MAX_ITERATIONS, NTEMPS, GB_HOTTEST_BETA
+    GPUS = [0, 1]
+    NTEMPS = 12
+    GB_HOTTEST_BETA = 0.1
+    # * A bound far above what 1.5 days hold; the job's end stops the run.
+    NUM_PE_ITERATIONS = 1000
+    MAX_ITERATIONS = 1 + NUM_PE_ITERATIONS + 4
+    np.random.seed(RANDOM_SEED)
+    return build_settings("azzurra_two_gpu_long_t12", mem_probe=False)
