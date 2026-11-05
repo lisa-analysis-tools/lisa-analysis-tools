@@ -888,6 +888,9 @@ def _extract_sensitivity_metadata(gi) -> tuple[dict, dict]:
     kwargs.pop("orbits")
     kwargs.pop("settings")
     kwargs.pop("window_values")
+    if kwargs["data_td_settings"] is not None:
+            kwargs.pop("data_td_settings")
+
     kwargs["force_backend"] = "cpu"
 
     domain_metadata = {
@@ -1213,6 +1216,10 @@ class RunMetadata(MetadataBase):
             )
 
         window_values, _ = windowfun(self.window_type, N, alpha=self.window_alpha)
+
+        if "data_td_settings" not in sensitivity_kwargs:
+            data_td_settings = self.get_data_td_settings()
+            sensitivity_kwargs["data_td_settings"] = data_td_settings
 
         return sensitivity_class(
             orbits=orbits,

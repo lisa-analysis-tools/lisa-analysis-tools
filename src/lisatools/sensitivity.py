@@ -39,7 +39,7 @@ from cudakima import AkimaInterpolant1D
 
 from . import detector as lisa_models
 from .detector import L1Orbits, Orbits, icrs_to_ecliptic
-from .domains import DomainSettingsBase, WDMSettings
+from .domains import DomainSettingsBase, WDMSettings, TDSettings
 from .stochastic import (
     FittedHyperbolicTangentGalacticForeground,
     HyperbolicTangentGalacticForeground,
@@ -2183,6 +2183,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             light travel times and spacecraft positions.
         settings: Domain settings (frequency or time-frequency) the matrix is
             evaluated on.
+        data_dt_settings: time domain settings for the data. If provided and the `settings` are frequency domain, 
+            the time-domain settings will be used to compute the transfer functions. 
+            Otherwise, the time array used for this will be derived from the orbits.
         tdi_generation: 1 for TDI 1.5 or 2 for TDI 2.0.
         use_splines: If ``True``, use Akima spline interpolation for the noise
             knots passed in :meth:`set_sensitivity_matrix`.
@@ -2267,6 +2270,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         self,
         orbits: Orbits | L1Orbits,
         settings: DomainSettingsBase,
+        data_td_settings: Optional[TDSettings] = None,
         tdi_generation: int = 2,
         use_splines: bool = False,
         spline_order: Optional[str] = "cubic",
@@ -2335,6 +2339,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         self.alias_frequencies = alias_frequencies
         self.alias_filters_response = alias_filters_response
 
+        self.data_td_settings = data_td_settings
         self.average_transfer_functions = average_transfer_functions
         self._averaging_active = False   # set True by get_averaged_ltts() in FD averaged mode
 
@@ -2352,6 +2357,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         return {
             "orbits": self.orbits,
             "settings": self.basis_settings,
+            "data_td_settings": self.data_td_settings,
             "tdi_generation": self.tdi_generation,
             "use_splines": self.use_splines,
             "spline_order": self.spline_order,
@@ -2546,29 +2552,28 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
 
         else:
+            base_t_arr = self.data_td_settings.t_arr if self.data_td_settings is not None else self.orbits.ltt_t
+            # Average the transfer functions over the td data support if available, else on the 
+            # FULL orbit span. orbits.ltt_t is
+            # the native LTT time grid (fine cadence, ~25M pts); the breathing is smooth
+            # on day-to-month scales, so we decimate to ~daily resolution -> numerically
+            # identical to the full-grid average but tractable. No user-provided
+            # epoch count needed.
+            t_full = self.xp.asarray(base_t_arr)
+            stride = max(1, int(len(t_full) // _N_AVERAGE_EPOCHS))
+            t_arr = t_full[::stride]
+
+            tiled_times = self.xp.tile(t_arr[:, self.xp.newaxis], (1, 6)).flatten()
+            links = self.xp.tile(self.xp.asarray(self.orbits.LINKS), (t_arr.shape[0],))
+            ltts = self.orbits.get_light_travel_times(tiled_times, links).reshape(len(t_arr), 6)
+            # single effective epoch: the orbit-averaged LTTs, i.e. C(E[L])
             if self.average_transfer_functions:
-                # Average the transfer functions over the FULL orbit span. orbits.ltt_t is
-                # the native LTT time grid (fine cadence, ~25M pts); the breathing is smooth
-                # on day-to-month scales, so we decimate to ~daily resolution -> numerically
-                # identical to the full-grid average but tractable. No user-provided
-                # epoch count needed.
-                t_full = self.xp.asarray(self.orbits.ltt_t)
-                stride = max(1, int(len(t_full) // _N_AVERAGE_EPOCHS))
-                t_arr = t_full[::stride]
-                tiled_times = self.xp.tile(t_arr[:, self.xp.newaxis], (1, 6)).flatten()
-                links = self.xp.tile(self.xp.asarray(self.orbits.LINKS), (t_arr.shape[0],))
-                ltts = self.orbits.get_light_travel_times(tiled_times, links).reshape(len(t_arr), 6)
-                # NOTE: ltts holds N decimated epochs -> the wrap is built with n_times=N
-                # (see _setup), but time_indices=[0]. The N epochs feed the one-time TF
-                # average only (_build_and_attach_averaged_tfs); the likelihood reads the
-                # averaged TFs and iterates a single effective time. See the
-                # get_averaged_ltts docstring for the full rationale.
-                self.time_indices = self.xp.array([0], dtype=self.xp.int32)
                 self._averaging_active = True
             else:
-                # single effective epoch: the orbit-averaged LTTs, i.e. C(E[L])
-                ltts = self.xp.mean(self.orbits.ltt, axis=0)[self.xp.newaxis, :]
-                self.time_indices = self.xp.array([0], dtype=self.xp.int32)
+                ltts = self.xp.mean(ltts, axis=0)[self.xp.newaxis, :]
+
+            self.time_indices = self.xp.array([0], dtype=self.xp.int32)
+
 
         # with orbits.LINKS order: 12, 23, 31, 13, 32, 21, we need averages between pairs
         # pairs: (12,21), (23,32), (31,13)
