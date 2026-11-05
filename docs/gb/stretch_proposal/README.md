@@ -118,8 +118,8 @@ The numbers are in `results.md`.
 | `GBSpecialBase._run_in_model_halves` | The split by walker parity and the table build before each half. |
 | `GBSpecialBase.in_model_proposal` | The coin; inside a half, the stretch with the friend at the current $f_0$ and the reverse check; the Fisher jump otherwise. |
 | `GBSpecialBase.find_friends` | Hands the friends to Eryn's `GroupStretchMove.get_proposal`. |
-| `stock/erebor.py`: `GBSettings.stretch_probability` | The probability of a stretch round; its default is 0.5. |
-| `recipe.py`: `build_gb_moves` | Passes the probability to every GB move and sets `nfriends` to the number of walkers. |
+| `stock/erebor.py`: `GBMoveSettings.stretch_probability` | The probability of a stretch round, in the `moves` group of `GBSettings`; its default is 0. |
+| `recipe.py`: `prepare_gb_moves`, `build_gb_moves` | `prepare_gb_moves` sets `nfriends` to the number of walkers; `build_gb_moves` passes the probability of the `moves` group to every GB move. |
 
 The table of the earlier rule (`BandSorter.build_friend_index`, `draw_friends`) is still built at the
 start of a propose at probability above 0, which costs one sort per propose; the exact rule does not
@@ -127,8 +127,9 @@ use it.
 
 ## How to switch it on
 
-Set `stretch_probability` in the `GBSettings` of the settings file. The global-fit settings files set
-0; a settings file that leaves the field out takes the default, 0.5.
+Set `stretch_probability` in the `GBMoveSettings` of a settings file (the `moves` group of
+`GBSettings`), or among the `pe_move` knobs of the gb block in a YAML run. Its default is 0 in both,
+and the global-fit settings files and YAML runs set 0.
 
 The measurements favour the stretch in the burn-in phase only (see `results.md`). From the production
 search's candidates, the stretch at 0.5 doubles the share of the missed sources that converge within
