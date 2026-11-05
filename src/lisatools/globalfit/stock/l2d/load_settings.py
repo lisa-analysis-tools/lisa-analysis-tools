@@ -64,6 +64,7 @@ def _preprocess_kwargs(cfg: RunConfig) -> dict:
         trim_kwargs=dump(data.trim),
         Tobs=data.Tobs,
         alias_correction=data.alias_correction,
+        upstream_aafilter_kwargs=dump(data.upstream_aafilter),
     )
 
 def _pre_config(cfg: RunConfig) -> None:

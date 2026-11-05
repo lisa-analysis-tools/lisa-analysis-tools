@@ -135,6 +135,23 @@ class DownsampleSpec(_Section):
 
     window: tuple[str, float] = ("kaiser", 31.0)
 
+class UpstreamAAFilterSpec(_Section):
+    """The anti-aliasing filter the data went through before loading (Mojito: its 4 Hz -> 0.4 Hz decimation).
+
+    It is not applied here: it only enters the modelled response (``upstream_aafilter_kwargs``).
+    """
+
+    attenuation: PositiveFloat  # dB
+    freq1: PositiveFloat  # Hz, where the filter starts to fall
+    freq2: PositiveFloat  # Hz, where it reaches its attenuation
+    fs: PositiveFloat  # Hz, the sampling frequency it ran at
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if self.freq1 >= self.freq2:
+            raise ValueError(f"freq1 ({self.freq1}) must be below freq2 ({self.freq2}).")
+        return self
+
 class L1OrbitsSpec(_Section):
     """Orbits read from the mojito L1 data folder (``lisatools.detector.L1Orbits``)."""
 
@@ -178,6 +195,7 @@ class DataSection(_Section):
     downsample: DownsampleSpec | None = None
     trim: TrimSpec | None = None
     alias_correction: bool = True  # whether to apply the alias correction to the data (default: True)
+    upstream_aafilter: UpstreamAAFilterSpec | None = None  # its response enters the noise model
 
     @model_validator(mode="after")
     def _orbits_match_loader(self):

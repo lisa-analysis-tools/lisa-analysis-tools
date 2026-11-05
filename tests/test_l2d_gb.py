@@ -38,7 +38,7 @@ from tests.test_l2d_load_settings import FakeL1
 
 RUN_FOLDERS = {
     name: Path(__file__).resolve().parents[1] / "mojito_input" / name
-    for name in ("gb_psd_galfor_dffr",)
+    for name in ("gb_psd_galfor_dffr", "galaxy_psd_filter_response")
 }
 CANDIDATES_FILE = "gb_candidates.hdf5"
 MOJITO_REFERENCE_TIME_S = 97729089.327664
@@ -247,6 +247,22 @@ class GBRunFolderTest(_GBConfig):
         raw["search"]["search_path"] = str(self.run_dir / CANDIDATES_FILE)
         gb_yaml.write_text(yaml.safe_dump(raw, sort_keys=False))
         return load_run(run)
+
+    def test_filter_response_folder_loads_as_written(self):
+        from lisatools.globalfit.stock.l2d.blocks.base import make_betas
+
+        cfg = self.load("galaxy_psd_filter_response")
+        self.assertEqual(sorted(cfg.blocks), ["galfor", "gb", "psd"])
+        self.assertEqual(cfg.domain.max_freq, 0.09999)
+        self.assertEqual(
+            load_settings._preprocess_kwargs(cfg)["upstream_aafilter_kwargs"],
+            dict(attenuation=186.2, freq1=0.09432, freq2=0.20585, fs=4.0),
+        )
+        # * The gb ladder ends at T = 10; psd keeps the reference ladder of the Quentin run (Tmax 1e6).
+        gb_betas = make_betas(cfg.blocks["gb"].tempering, cfg.sampler.ntemps)
+        self.assertEqual(len(gb_betas), 12)
+        np.testing.assert_allclose(gb_betas[-1], 0.1, rtol=1e-12)
+        self.assertIsNone(cfg.blocks["psd"].tempering)
 
     def test_run_folder_loads_as_written(self):
         cfg = self.load("gb_psd_galfor_dffr")
