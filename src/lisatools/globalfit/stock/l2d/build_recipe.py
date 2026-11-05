@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import numpy as np
 
 from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock
+from .blocks.gb import GBBlock, gb_move_kwargs
 from .blocks.psd import STOCHASTIC
 from .blocks.utility import check_kwargs, find_class
 
@@ -129,14 +130,17 @@ def psd_needs_search(block) -> bool:
     return block.search is None or block.search.search_type == "prior"
 
 
-def seed_branches(cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, priors, state) -> dict[str, Any]:
+def seed_branches(
+    cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, priors, state, engine_info=None
+) -> dict[str, Any]:
     """Seed the state from the blocks; return the waveform generators of the seeded source branches.
 
     Every source branch starts empty; a branch with a search interface is filled by it and its initial
     signals are subtracted from the residuals. The interfaces get the branch's own ladder, padded to the
-    sampler's temperatures.
+    sampler's temperatures. The GB generator is its band machinery (``prepare_gb_moves``, which needs
+    ``engine_info``); it subtracts the start sources itself.
     """
-    from lisatools.globalfit.recipe import subtract_initial_signal
+    from lisatools.globalfit.recipe import prepare_gb_moves, subtract_initial_signal
 
     ntemps = cfg.sampler.ntemps
     blocks = enabled_blocks(cfg)
@@ -158,8 +162,14 @@ def seed_branches(cfg: RunConfig, waveform_classes: dict[str, type], curr, acs, 
         if block.search is None:
             continue
         info = curr.source_info[name]
-        wave_gens[name] = waveform_classes[name](**info.initialize_kwargs)
-        subtract_initial_signal(acs, state, wave_gens[name].get_signals_for_residuals, name, info)
+        if isinstance(block, GBBlock):
+            # * GBGPU has no per-source residual generator: the band likelihood engine subtracts the start sources.
+            wave_gens[name] = prepare_gb_moves(
+                engine_info, curr, acs, priors, state, waveform_class=waveform_classes[name]
+            )
+        else:
+            wave_gens[name] = waveform_classes[name](**info.initialize_kwargs)
+            subtract_initial_signal(acs, state, wave_gens[name].get_signals_for_residuals, name, info)
 
         # plot and save the residuals after the initial signals are subtracted, for debugging
         _ = acs.acs[0].data.plot(channel=0, filename=curr.general_info.artifacts_file_dir + f"data_after_subtracting_{name}.png")
@@ -208,7 +218,9 @@ def build_block_moves(ctx: RecipeContext, engine_info, curr, acs, priors, state)
         cls = find_class(block.pe_move.class_name, (block.PE_MOVES[block.pe_move.class_name].module,))
         if isinstance(block, SourceBlock):
             if block.search is not None:
-                moves[name] = source_moves(block, cls, ctx, engine_info, curr, acs, priors, state)
+                # * The GB move runs on the band machinery seed_branches set up, not on a waveform generator.
+                make_moves = gb_moves if isinstance(block, GBBlock) else source_moves
+                moves[name] = make_moves(block, cls, ctx, engine_info, curr, acs, priors, state)
         else:
             search = any(psd_needs_search(b) for n, b in blocks.items() if n in STOCHASTIC)
             moves[name] = psd_moves(block, cls, engine_info, curr, acs, priors, state, search=search)
@@ -248,6 +260,32 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     logger.debug(f"{name} PE move kwargs: {move.__dict__}")
     logger.info(f"Built {name} PE move {move} with {len(move.moves)} inner moves")
     move.accepted = np.zeros((g.ntemps, g.nwalkers))
+    return BranchMoves([], [move])
+
+
+def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, state) -> BranchMoves:
+    """The GB PE move: ``block.pe_move``'s class on the band machinery ``seed_branches`` set up
+    (``prepare_gb_moves``, which also subtracted the start sources and set the band temperatures)."""
+    from lisatools.globalfit.moves.gbdebug import GBDebugSettings
+    from lisatools.globalfit.recipe import default_gb_debug_settings
+
+    parts = ctx.wave_gens[block.type]
+    kwargs = gb_move_kwargs(block)
+    # * As the settings files: the debug defaults, with plots in the run's artifacts.
+    kwargs["debug_settings"] = default_gb_debug_settings(
+        kwargs.get("debug_settings") or GBDebugSettings(), curr.general_info.artifacts_file_dir
+    )
+    move = cls(
+        *parts.args,
+        **parts.kwargs,
+        rj_proposal_distribution=parts.gpu_priors,
+        num_repeat_proposals=block.num_prop_repeats,
+        # ! GBSpecialBase reads "fstat" and "refit" in its name; the prior RJ move needs neither.
+        name=f"{block.type} pe move",
+        **kwargs,
+    )
+    move.accepted = np.zeros((parts.ntemps, parts.nwalkers))
+    logger.info(f"Built {block.type} PE move {type(move).__name__} with {block.num_prop_repeats} proposals")
     return BranchMoves([], [move])
 
 
@@ -307,7 +345,7 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
 
     def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         select_device(curr.general_info)
-        ctx = RecipeContext(cfg, seed_branches(cfg, waveform_classes, curr, acs, priors, state))
+        ctx = RecipeContext(cfg, seed_branches(cfg, waveform_classes, curr, acs, priors, state, engine_info))
         attach_flow_trainers(cfg, curr)
         spec = cfg.recipe
         if hasattr(spec, "file"):
