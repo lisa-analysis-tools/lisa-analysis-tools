@@ -2131,6 +2131,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         pr = self.transform_fn.both_transforms(ref_track, xp=xp)
         return xp.abs(pr[:, 0]), pr[:, 1].copy(), pr[:, 2].copy()
 
+    def _run_in_model_halves(self, model, band_sorter, buffer_obj, band_temps,
+                             picked, ll_change_log, prop_counts, acc_counts):
+        """In-model repeats of the exact group stretch: the even walkers' sources first, then the odd walkers'.
+
+        Before each half the friend tables are built from the live rows of the other parity as they are then, so no
+        friend moves while a half runs. The window holds ``nfriends // 2`` ranks, the copies of a source in one parity
+        when ``nfriends`` is the walker count, as the recipe sets it.
+        """
+        periodic = getattr(self, "periodic", None)
+        # ! The reverse check reads the proposed f0 before the repeat loop wraps the periodic columns.
+        if periodic is not None and 1 in [int(column) for column in periodic.inds_periodic.get("gb", [])]:
+            raise ValueError("the exact stretch needs a non-periodic f0 in sampling column 1")
+        n_picked = len(picked["ids"])
+        parity = picked["walker_inds"] % 2
+        try:
+            for half in (0, 1):
+                members = parity == half
+                if not bool(members.any()):
+                    continue
+                subset = {
+                    key: value[members] if getattr(value, "ndim", 0) >= 1 and value.shape[0] == n_picked else value
+                    for key, value in picked.items()
+                }
+                with _tspan(getattr(self, "_prop_timer", None), "friend_tables"):
+                    self._friend_tables = FriendTables(
+                        band_sorter.coords, band_sorter.inds, band_sorter.temp_inds, band_sorter.walker_inds,
+                        1 - half, self.ntemps, self.nfriends // 2, self.xp,
+                    )
+                self._friend_block = None
+                self._run_in_model_repeats(model, band_sorter, buffer_obj, band_temps, subset,
+                                           ll_change_log, prop_counts, acc_counts)
+        finally:
+            self._friend_tables = None
+
     def _run_in_model_repeats(self, model, band_sorter, buffer_obj, band_temps,
                               picked, ll_change_log, prop_counts, acc_counts):
         """``num_repeat_proposals`` in-model rounds on the picked live sources.
@@ -2141,7 +2175,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         only the tracked coordinates and counters move). After the repeats,
         the final coordinates are written back into the residual and into
         the BandSorter.
+
+        At ``stretch_probability > 0`` the block runs once per walker parity
+        (:meth:`_run_in_model_halves`), each half through this method.
         """
+        if self.stretch_probability > 0.0 and getattr(self, "_friend_tables", None) is None:
+            self._run_in_model_halves(model, band_sorter, buffer_obj, band_temps, picked,
+                                      ll_change_log, prop_counts, acc_counts)
+            return
         xp = self.xp
         # Read ``inds`` from the MAIN sorter AFTER the RJ step: _run_rj_step
         # flips band_sorter.inds on accepted births/deaths, so this mask
