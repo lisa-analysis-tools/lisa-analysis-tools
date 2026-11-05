@@ -564,7 +564,7 @@ class SnapshotTest(_RunFolder):
         self.assertTrue(Path(raw["run"]["output_dir"]).is_absolute())
         psd = raw["blocks"]["psd"]
         self.assertEqual(psd["priors"]["class"], "mojitolight.stochastic.NoisePrior")  # alias, not class_name
-        self.assertEqual(psd["tempering"], {"ntemps": 3, "ratio": 1.5})
+        self.assertEqual(psd["tempering"], {"ntemps": 3, "ratio": 1.5, "Tmax": None})  # defaults written out
         self.assertEqual(psd["inner_moves"], None)  # defaults written out
 
     def test_single_file_may_contain_blocks(self):

@@ -383,6 +383,15 @@ class RunConfig(_Section):
                     f"block {name!r}: its ladder spans every temperature; tempering.ntemps ({ntemps}) "
                     f"must equal sampler.ntemps ({self.sampler.ntemps}) or be left out."
                 )
+            if tempering is not None and tempering.Tmax is not None:
+                # * The ladder must keep decreasing, with the cold chain at beta 1.
+                rungs = ntemps or self.sampler.ntemps
+                second_hottest = tempering.ratio ** (rungs - 2) if rungs >= 2 else None
+                if second_hottest is None or tempering.Tmax <= second_hottest:
+                    raise ValueError(
+                        f"block {name!r}: tempering.Tmax ({tempering.Tmax}) needs at least two rungs and must be "
+                        f"above the second-hottest rung's temperature, ratio ** (ntemps - 2) = {second_hottest}."
+                    )
             if block.NEEDS_REFERENCE_TIME and data.reference_time is None:
                 raise ValueError(f"block {name!r} needs data.reference_time (absolute SSB time, in seconds).")
             if isinstance(block, SourceBlock):

@@ -88,6 +88,8 @@ class MoveSpec(ClassSpec):
 class TemperingSpec(_Spec):
     ntemps: PositiveInt | None = None  # None -> sampler.ntemps
     ratio: float = Field(default=1.2, gt=1.0)  # geometric ladder: betas = ratio ** -arange(ntemps)
+    # the hottest rung's temperature: its beta becomes 1 / Tmax, the other rungs stay ratio ** -k
+    Tmax: float | None = Field(default=None, gt=1.0)
 
 class FlowSpec(_Spec):
     """A normalizing-flow proposal (``ConditionalFlowMove``) trained online by a ``ProcessExecutor``.
@@ -450,7 +452,10 @@ def make_betas(tempering: TemperingSpec | None, default_ntemps: int):
     if tempering is None:
         return None
     ntemps = tempering.ntemps or default_ntemps
-    return 1.0 / tempering.ratio ** np.arange(ntemps)
+    betas = 1.0 / tempering.ratio ** np.arange(ntemps)
+    if tempering.Tmax is not None:
+        betas[-1] = 1.0 / tempering.Tmax
+    return betas
 
 def make_search_interface(block: BlockBase, info: dict[str, Any]):
     """The block's search interface, or ``None`` without ``search``.
