@@ -1,4 +1,5 @@
 #include "Detector.hpp"
+#include <cstdint>
 #include <string>
 #include <iostream>
 #include <pybind11/pybind11.h>
@@ -102,6 +103,8 @@ void detector_part(py::module &m) {
     .def("get_normal_unit_vec_wrap", &OrbitsWrap::get_normal_unit_vec_wrap, "Get link normal vector.")
     // You can also expose public data members directly using def_readwrite
     .def_readwrite("orbits", &OrbitsWrap::orbits)
+    // Raw address of the C++ Orbits object, used by Orbits.ptr in detector.py
+    .def_property_readonly("ptr", [](const OrbitsWrap &o) { return reinterpret_cast<std::uintptr_t>(o.orbits); })
     // .def("get_link_ind", &OrbitsWrap::get_link_ind, "Get link index.")
     ;
 
