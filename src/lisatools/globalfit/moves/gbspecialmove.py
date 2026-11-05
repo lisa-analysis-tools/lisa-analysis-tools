@@ -2356,7 +2356,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     | (_drift_n > self.sighet_settings.trust_dphase)
                 ] = -np.inf
 
-            keep = ~self.xp.isinf(new_logp)
+            keep = ~self.xp.isinf(new_logp) & self.xp.isfinite(factors)
             keep_rows = self.xp.flatnonzero(keep)
             new_ll = self.xp.full(len(ids), -1e300)
             if keep_rows.size:
