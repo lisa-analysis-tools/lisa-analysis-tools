@@ -53,6 +53,8 @@ SPECIAL_PSD_MOVE_FILLED = frozenset({
     "sensitivity_backend", "temperature_control", "periodic", "use_gpu",
 })
 GENERIC_PSD_MOVE_FILLED = frozenset({"branch_name", "num_repeats", "Tmax", "betas"})
+# search interface arguments the builder fills from the prior (make_search_interface)
+SEARCH_INTERFACE_FILLED = frozenset({"transform", "periodic"})
 
 
 class PEMove(NamedTuple):
@@ -138,14 +140,20 @@ class SearchSpec(_Spec):
     The interface (``lisatools.globalfit.searches``) gets the prior's transform and periodicity from
     the builder and seeds through the inverse transform. A block without ``search`` has no
     interface: source branches then start empty, psd/galfor run the max-likelihood search.
+    ``kwargs`` are the interface class's own arguments (e.g. ``evolve_to_data_start`` of the GB
+    interface), checked against that class at load.
     """
 
     search_type: Literal["prior", "distribution", "samples", "point_estimate", "catalog"] = "catalog"
-    search_path: RunPath | None = None  # samples / point estimates: a file or a folder (one file per source)
+    # samples / point estimates: a file or a folder (one file per source); catalog: an HDF5 file whose root holds
+    # one dataset per catalogue column, read in place of the loaded catalogue
+    search_path: RunPath | None = None
     parameters_searched: list[str] | Literal["all"] = "all"  # names in the prior's input (sampling) basis
     # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
     spread: float | list[float] | list[list[float]] | list[list[list[float]]] | None = None
     is_eryn_backend: bool = False  # search results are an eryn backend, already in the sampling basis
+    max_resample_tries: PositiveInt = 50  # redraws of walkers that land outside the prior around a point value
+    kwargs: dict[str, Any] = Field(default_factory=dict)  # the interface class's own arguments
 
     @model_validator(mode="after")
     def _same_rules_as_the_interface(self):
@@ -223,6 +231,17 @@ class BlockBase(_Spec):
                 f"search_type {self.search.search_type!r} is not available for the {self.type!r} block; "
                 f"use one of {list(self.SEARCH_TYPES)}."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _search_kwargs_fit_the_interface(self):
+        if self.search is None or not self.search.kwargs:
+            return self
+        fields = sorted(set(self.search.kwargs) & set(SearchSpec.model_fields))
+        if fields:
+            raise ValueError(f"{fields} are search fields; give them next to search_type, not in search.kwargs.")
+        interface = getattr(importlib.import_module("lisatools.globalfit.searches"), self.SEARCH_INTERFACE)
+        check_kwargs(self.search.kwargs, interface, SEARCH_INTERFACE_FILLED)
         return self
 
     def parse_prior_information(self, g: GeneralSetup) -> dict[str, Any]:
@@ -457,6 +476,8 @@ def make_search_interface(block: BlockBase, info: dict[str, Any]):
         spread=None if spec.spread is None else np.asarray(spec.spread, dtype=float),
         is_eryn_backend=spec.is_eryn_backend,
         periodic=info["periodic"],
+        max_resample_tries=spec.max_resample_tries,
+        **deepcopy(spec.kwargs),
     )
 
 def engine_waveform_kwargs(ctx: BuildContext) -> dict[str, Any]:

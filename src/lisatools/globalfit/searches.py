@@ -33,7 +33,8 @@ class BaseSearchInterface(ABC):
                  search_path: typing.Optional[str] = None,
                  spread: typing.Optional[float | np.ndarray] = None,
                  is_eryn_backend: bool = False,
-                 periodic: typing.Optional[dict[str, dict[str, float]]] = None):
+                 periodic: typing.Optional[dict[str, dict[str, float]]] = None,
+                 max_resample_tries: int = 50):
         """
         Parameters
         ----------
@@ -44,7 +45,8 @@ class BaseSearchInterface(ABC):
         parameters_searched : list[str], optional
             List of parameter names in the sampling basis that are being searched. If None, all parameters in the sampling basis are searched.
         search_path : str, optional
-            Path to the file or directory containing the search results. Required for ``search_type`` in ``["distribution", "samples", "point_estimate", "catalog"]``.
+            Path to the file or directory containing the search results. Required for ``search_type`` in ``["distribution", "samples", "point_estimate"]``.
+            For ``catalog``, an optional HDF5 file whose root holds one dataset per catalogue column, read in place of the loaded catalogue.
         spread : float or np.ndarray, optional
             Spread to use for scattering walkers around the starting points. Can be a scalar, 1-D array (diagonal covariance), 2-D array (full covariance), or 3-D array (one covariance per leaf). Required for ``search_type`` in ``["point_estimate", "catalog"]``.
         is_eryn_backend : bool, optional
@@ -53,9 +55,12 @@ class BaseSearchInterface(ABC):
             Periodic parameters in the settings format ``{branch_name: {sampling-basis name: period}}``
             (e.g. ``curr.source_info["mbh"].periodic``). Starting points are wrapped into ``[0, period)``
             after the transform to the sampling basis.
+        max_resample_tries : int, optional
+            Resample passes for walkers drawn outside the prior around a point value. Default 50.
         """
 
         self.search_type = search_type
+        self.max_resample_tries = int(max_resample_tries)
         self.search_path = search_path
         self.spread = spread
         self.transform = transform
@@ -176,12 +181,15 @@ class BaseSearchInterface(ABC):
         np.ndarray
             The transformed parameters in the sampling basis.
         """
-        if self.transform is not None:            
-            # Create a filled array with the same shape as the input parameters, but with the last dimension equal to the number of physical parameters, otherwise the transform will fail.
-            filled = np.ones((*params.shape[:-1], len(self.physical_parameters)))
-            filled[..., self.parameters_searched] = params
-            filled_converted = self.transform.both_inverse_transforms(filled)
-            params = filled_converted[..., self.parameters_searched]
+        if self.transform is not None:
+            # * Rows with every waveform-basis column (e.g. the EMRI catalogue rows) are inverted as they are.
+            if params.shape[-1] != self.transform.ndim_full:
+                # * Other rows hold the searched parameters in the sampling-basis order: place them, then add the
+                # * transform's fixed columns (e.g. the GB fddot), which the inverse transform expects.
+                filled = np.ones((*params.shape[:-1], self.transform.ndim))
+                filled[..., self.parameters_searched] = params
+                params = self.transform.fill_values(filled)
+            params = self.transform.both_inverse_transforms(params)[..., self.parameters_searched]
 
         return params
 
@@ -189,11 +197,32 @@ class BaseSearchInterface(ABC):
         """
         Returns the source catalog for the specific source type.
         """
+
+        if self.search_path is not None:
+            return self.get_search_catalog()
+
         catalog = getattr(curr.general_info, "catalogue", {}).get(self.catalog_source_name, {})
         if not catalog:
             raise ValueError(f"No catalog found for source type {self.catalog_source_name}")
 
         entries = [catalog[source_id] for source_id in sorted(catalog.keys())]
+        return entries
+
+    def get_search_catalog(self) -> list[dict]:
+        """
+        Returns the catalog of the search results at ``search_path``, one entry per source: the rows of an HDF5
+        file whose root holds one dataset per catalogue column.
+        """
+        import h5py
+
+        with h5py.File(self.search_path, "r") as catalog_file:
+            columns = {name: np.atleast_1d(item[()]) for name, item in catalog_file.items()
+                       if isinstance(item, h5py.Dataset)}
+        if not columns:
+            raise ValueError(f"{self.search_path} holds no catalogue columns at its root")
+
+        num_sources = len(next(iter(columns.values())))
+        entries = [{name: values[row] for name, values in columns.items()} for row in range(num_sources)]
         return entries
 
     @abstractmethod
@@ -548,7 +577,7 @@ class BaseSearchInterface(ABC):
                 covariances=covariances,
                 num_walkers=num_walkers,
                 betas=betas,
-                **kwargs
+                **{"max_resample_tries": self.max_resample_tries, **kwargs},
             )
 
     def get_subset_inds(self, curr: CurrentInfoGlobalFit, **kwargs) -> typing.Optional[np.ndarray]:
@@ -715,15 +744,23 @@ class GBSearchInterface(BaseSearchInterface):
     """
     Search interface for GB sources.
 
+    A ``catalog`` search with a ``search_path`` seeds from the rows of that file, such as the galaxy
+    search's ``gb_candidates.hdf5``. The STFT GB computations take the parameters at the catalogue's
+    reference epoch (their ``t_ref``), so STFT runs need ``evolve_to_data_start=False``.
+
     Attributes
     ----------
     evolve_to_data_start: bool
         If True, when seeding from the catalog values evolve the source parameters to the start of the data segment using the provided evolution function. If False, use the catalog values directly without evolution.
+    reference_time: float or None
+        The epoch of the GB kernels' parameters (``t_ref``); ``None`` takes the mojito catalogue epoch.
+        The STFT GB computations do not use it.
     """
 
-    def __init__(self, evolve_to_data_start: bool = True, **kwargs):
+    def __init__(self, evolve_to_data_start: bool = True, reference_time: typing.Optional[float] = None, **kwargs):
         super().__init__(**kwargs)
         self.evolve_to_data_start = evolve_to_data_start
+        self.reference_time = reference_time
 
     @property
     def branch_name(self):
