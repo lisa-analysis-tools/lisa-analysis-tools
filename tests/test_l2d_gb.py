@@ -138,6 +138,61 @@ class GBSchemaTest(_GBConfig):
         kwargs = gb_move_kwargs(self.config({"pe_move": pe_move}).blocks["gb"])
         self.assertEqual(kwargs["debug_settings"], GBDebugSettings(mem_probe=True))
 
+    def test_extra_moves(self):
+        from lisatools.globalfit.moves.gbspecialmove import GBFStatSettings
+
+        self.assertEqual(self.config().blocks["gb"].extra_moves, {})
+        fstat = {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.3,
+                 "kwargs": {"fstat_settings": {"nsteps_1": 100}}}
+        block = self.config({"extra_moves": {"fstat": fstat}}).blocks["gb"]
+        spec = block.extra_moves["fstat"]
+        self.assertEqual((spec.class_name, spec.weight, spec.burn_in_share), ("GBFStatRJMove", 0.1, 0.3))
+        # the mapping becomes the move's settings dataclass, its other fields at their defaults
+        self.assertEqual(gb_move_kwargs(block, spec.kwargs)["fstat_settings"], GBFStatSettings(nsteps_1=100))
+        # without burn_in_weight the burn-in share is the PE share; a share of one phase only is allowed
+        block = self.config({"extra_moves": {
+            "fstat": {"class": "GBFStatRJMove", "weight": 0.2},
+            "second": {"class": "GBFStatRJMove", "weight": 0.0, "burn_in_weight": 0.5},
+        }}).blocks["gb"]
+        self.assertEqual([spec.burn_in_share for spec in block.extra_moves.values()], [0.2, 0.5])
+
+        def extra(**fields):
+            return {"extra_moves": {"x": {"class": "GBFStatRJMove", "weight": 0.5, **fields}}}
+
+        for changes, message in (
+            ({"extra_moves": {"x": {"class": "GBFStatRJMove"}}}, "Field required"),
+            (extra(weight=1.0), "less than 1"),
+            (extra(weight=-0.1), "greater than or equal to 0"),
+            (extra(burn_in_weight=1.0), "less than 1"),
+            # no burn_in_weight: the burn-in share is the PE share, here 0 as well
+            (extra(weight=0.0), "would never run"),
+            ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.6},
+                              "b": {"class": "GBFStatRJMove", "weight": 0.4}}}, "of the PE iterations"),
+            ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.5},
+                              "b": {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.5}}},
+             "of the burn-in iterations"),
+            ({"extra_moves": {"pe": {"class": "GBFStatRJMove", "weight": 0.5}}}, "the name pe"),
+            ({"extra_moves": {"x": {"class": "GBSpecialRJPriorMove", "weight": 0.5}}}, "is not one of"),
+            (extra(seed=1), "Extra inputs are not permitted"),
+            (extra(kwargs={"acs": None}), "filled in by the builder"),
+            (extra(kwargs={"fstat_search": {}}), "does not accept"),
+            (extra(kwargs={"fstat_settings": {"nsteps": 10}}), "GBFStatSettings does not accept"),
+            (extra(kwargs={"fstat_settings": True}), "must be a mapping"),
+            (extra(kwargs={"debug_settings": True}), "must be a mapping"),
+            ({**extra(), "stft": {"response": "tdi_on_the_fly"}}, "stft response dffr only"),
+        ):
+            with self.subTest(changes=changes):
+                self.assertConfigError(message, changes)
+
+    def test_extra_move_takes_the_pe_move_knobs_under_its_own(self):
+        kwargs = {"stretch_probability": 0.25, "debug_settings": {"mem_probe": True}}
+        block = self.config({"extra_moves": {"fstat": {"class": "GBFStatRJMove", "weight": 0.5,
+                                                       "kwargs": kwargs}}}).blocks["gb"]
+        kwargs = gb_move_kwargs(block, {**block.pe_move.kwargs, **block.extra_moves["fstat"].kwargs})
+        self.assertEqual(kwargs["stretch_probability"], 0.25)
+        self.assertEqual(kwargs["num_stationary_fim_steps"], REFERENCE_PE_MOVE_KWARGS["num_stationary_fim_steps"])
+        self.assertEqual(kwargs["debug_settings"].mem_probe, True)
+
     def test_waveform_and_stft_knobs(self):
         block = self.config(
             {"waveform": {"class": "GBGPU", "runtime_kwargs": {"oversample": 2}}, "stft": {"n_side_bins": 12}}

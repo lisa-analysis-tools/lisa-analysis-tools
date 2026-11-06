@@ -5,7 +5,8 @@ engine-owned arguments (``recipe.prepare_gb_moves``). The in-model proposals bel
 ``stretch_probability`` sets how often a proposal is a stretch instead of a Fisher-matrix one, so the block
 takes no ``inner_moves`` and no ``flow``. ``waveform.runtime_kwargs`` and ``stft`` hold the knobs of
 ``GBWaveformSettings`` and ``GBSTFTSettings``; the builder fills their time grid, window, orbits and domain
-from the ``GeneralSetup``.
+from the ``GeneralSetup``. ``extra_moves`` adds GB moves that take turns with ``pe_move`` (``EXTRA_MOVES``, the
+F-statistic RJ move ``GBFStatRJMove`` among them), each in its share of the burn-in and the PE iterations.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import dataclasses
 import importlib
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, NamedTuple
 
 from pydantic import Field, PositiveInt, model_validator
 
@@ -34,12 +35,36 @@ GB_SPECIAL_MOVE_FILLED = frozenset({
 # GBWaveformSettings and GBSTFTSettings fields the builder fills from the GeneralSetup
 GB_WAVEFORM_FILLED = frozenset({"dt", "T", "start_freq_ind", "window", "window_alpha", "orbits", "t0", "force_backend"})
 GB_STFT_FILLED = frozenset({"domain_settings", "band_alpha"})
-# pe_move kwargs the YAML gives as mappings, and the dataclass each one becomes
+# pe_move and extra_moves kwargs the YAML gives as mappings, and the dataclass each one becomes
 GB_MOVE_DATACLASSES = {
     "debug_settings": ("lisatools.globalfit.moves.gbdebug", "GBDebugSettings"),
     "leaf_cap_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBLeafCapSettings"),
     "sighet_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBSigHetSettings"),
+    "fstat_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBFStatSettings"),
 }
+
+
+class ExtraMove(NamedTuple):
+    """A class the gb block may name in ``extra_moves``: where it lives and where its RJ proposal comes from."""
+
+    module: str
+    # True: the band sorter draws the move's dead rows from the prior, as for pe_move; False: the move builds its own
+    # proposal (the F-statistic move at its first search)
+    prior_proposal: bool
+
+
+class ExtraMoveSpec(ClassSpec):
+    """A GB move that takes turns with ``pe_move``: its class, its kwargs over the pe_move's, and its share of the
+    iterations of each phase."""
+
+    # the share of the PE step's iterations in which the block runs this move instead of pe_move; 0: not in PE
+    weight: float = Field(ge=0.0, lt=1.0)
+    # the same for the burn-in step; None takes weight
+    burn_in_weight: float | None = Field(default=None, ge=0.0, lt=1.0)
+
+    @property
+    def burn_in_share(self) -> float:
+        return self.weight if self.burn_in_weight is None else self.burn_in_weight
 
 
 class GBBlock(SourceBlock):
@@ -60,6 +85,10 @@ class GBBlock(SourceBlock):
     PE_MOVES: ClassVar[dict[str, PEMove]] = {
         "GBSpecialRJPriorMove": PEMove(SPECIAL_MOVES, GB_SPECIAL_MOVE_FILLED),
     }
+    # * The classes extra_moves may name; the recipe fills GB_SPECIAL_MOVE_FILLED for them as for pe_move
+    EXTRA_MOVES: ClassVar[dict[str, ExtraMove]] = {
+        "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False),
+    }
 
     nleaves: PositiveInt = 8000  # the most sources at once (nleaves_max); the least is 0
     num_prop_repeats: PositiveInt = 50  # the move's num_repeat_proposals
@@ -76,6 +105,42 @@ class GBBlock(SourceBlock):
             phase_maximize=False, ranks_needed=0,
         ),
     }))
+    # * Moves that take turns with pe_move, keyed by a name that names the move ("gb <name> move"). Each runs in its
+    # * share of each phase's iterations and pe_move in the rest. Their kwargs go over the pe_move's, so the moves share
+    # * the in-model knobs unless an entry sets its own.
+    extra_moves: dict[str, ExtraMoveSpec] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _extra_moves_fit_the_block(self):
+        for name, spec in self.extra_moves.items():
+            if name == "pe":
+                raise ValueError("extra_moves: the name pe is the pe_move's (gb pe move); choose another.")
+            if spec.class_name not in self.EXTRA_MOVES:
+                raise ValueError(
+                    f"extra_moves {name}: the class {spec.class_name} is not one of {sorted(self.EXTRA_MOVES)}."
+                )
+            if spec.weight == 0.0 and spec.burn_in_share == 0.0:
+                raise ValueError(f"extra_moves {name} has no share in either phase, so it would never run.")
+            if spec.class_name == "GBFStatRJMove" and self.stft.get("response", "dffr") != "dffr":
+                raise ValueError(
+                    f"extra_moves {name}: GBFStatRJMove computes its F-statistic with the stft response dffr only."
+                )
+            cls = find_class(spec.class_name, (self.EXTRA_MOVES[spec.class_name].module,))
+            check_kwargs(spec.kwargs, cls, GB_SPECIAL_MOVE_FILLED)
+            for key, (module, class_name) in GB_MOVE_DATACLASSES.items():
+                value = spec.kwargs.get(key)
+                if value is not None and not isinstance(value, dict):
+                    raise ValueError(f"extra_moves {name} kwargs {key} must be a mapping of {class_name} fields.")
+                if value is not None:
+                    check_kwargs(value, find_class(class_name, (module,)), frozenset())
+        for phase, shares in (("PE", [spec.weight for spec in self.extra_moves.values()]),
+                              ("burn-in", [spec.burn_in_share for spec in self.extra_moves.values()])):
+            if sum(shares) >= 1.0:
+                raise ValueError(
+                    f"the gb block's extra_moves take {sum(shares):g} of the {phase} iterations; they must leave "
+                    "pe_move a share above 0."
+                )
+        return self
 
     @model_validator(mode="after")
     def _proposals_belong_to_the_pe_move(self):
@@ -153,9 +218,10 @@ class GBBlock(SourceBlock):
         return BlockBuild(setup, metadata, find_class(self.waveform.class_name, self.WAVEFORM_MODULES))
 
 
-def gb_move_kwargs(block: GBBlock) -> dict[str, Any]:
-    """The pe_move kwargs, with their mappings made into the move's settings dataclasses."""
-    kwargs = deepcopy(block.pe_move.kwargs)
+def gb_move_kwargs(block: GBBlock, kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The pe_move kwargs (or the given ones, e.g. an extra move's over the pe_move's), with their mappings made into
+    the move's settings dataclasses."""
+    kwargs = deepcopy(block.pe_move.kwargs if kwargs is None else kwargs)
     for name, (module, class_name) in GB_MOVE_DATACLASSES.items():
         if isinstance(kwargs.get(name), dict):
             kwargs[name] = find_class(class_name, (module,))(**kwargs[name])

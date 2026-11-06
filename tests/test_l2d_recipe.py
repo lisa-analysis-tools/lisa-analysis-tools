@@ -31,7 +31,7 @@ from eryn.moves.tempering import TemperatureControl, make_ladder
 from lisatools.globalfit.stock.l2d import build_recipe
 from lisatools.globalfit.searches import pad_ladder
 from lisatools.globalfit.stock.l2d.build_recipe import (
-    BranchMoves, RecipeContext, StockRecipe, build_block_moves, make_setup_function, prepare_branches,
+    Alternative, BranchMoves, RecipeContext, StockRecipe, build_block_moves, make_setup_function, prepare_branches,
 )
 from lisatools.globalfit.stock.l2d.generators import SignalGen, WaveformHandle
 from lisatools.globalfit.stock.l2d.io import RecipeFile, RunConfig, StockRecipeSpec, dump_run, load_run
@@ -535,6 +535,42 @@ class StockRecipeTest(unittest.TestCase):
     def test_no_search_step_without_search_moves(self):
         (pe,) = self.steps({"psd": BranchMoves([], ["psd pe"])})
         self.assertEqual(pe["name"], "pe")
+
+    def test_alternating_pe_moves_take_turns_in_weighted_steps(self):
+        alternatives = [Alternative("gb prior", 0.6, 0.3), Alternative("gb fstat", 0.4, 0.5),
+                        Alternative("gb jump", 0.0, 0.2)]
+        moves = {
+            "gb": BranchMoves([], ["gb prior"], alternatives),
+            "psd": BranchMoves(["psd search"], ["psd pe"]),
+        }
+        search, burn_in, pe = self.steps(moves, burn_in_iterations=10)
+        self.assertEqual([s["name"] for s in (search, burn_in, pe)], ["psd search", "burn-in", "pe"])
+        self.assertIsInstance(pe["adjust"], gf_recipe.PERecipeStep)
+        self.assertEqual(pe["adjust"].weights, [0.6, 0.4])
+        prior_combined, fstat_combined = pe["adjust"].moves
+        # each alternative with every other branch's PE moves, in the branches' order
+        self.assertEqual(prior_combined.moves, ["gb prior", "psd pe"])
+        self.assertEqual(fstat_combined.moves, ["gb fstat", "psd pe"])
+        self.assertFalse(fstat_combined.share_temperature_control)
+        # the burn-in step takes the burn-in shares, the alternative without a PE share among them, and the same
+        # combined moves as the PE step for the alternatives in both
+        self.assertIsInstance(burn_in["adjust"], gf_recipe.IterationCountRecipeStep)
+        self.assertEqual(burn_in["adjust"].weights, [0.3, 0.5, 0.2])
+        self.assertEqual(burn_in["adjust"].moves[:2], pe["adjust"].moves)
+        self.assertEqual(burn_in["adjust"].moves[2].moves, ["gb jump", "psd pe"])
+
+    def test_a_burn_in_only_move_needs_a_burn_in_step(self):
+        moves = {"gb": BranchMoves([], ["a"], [Alternative("a", 1.0, 0.5), Alternative("b", 0.0, 0.5)])}
+        with self.assertRaisesRegex(ValueError, "no burn-in step"):
+            self.steps(moves)
+
+    def test_only_one_block_may_alternate(self):
+        moves = {
+            "gb": BranchMoves([], ["a"], [Alternative("a", 0.5, 0.5), Alternative("b", 0.5, 0.5)]),
+            "mbh": BranchMoves([], ["c"], [Alternative("c", 0.5, 0.5), Alternative("d", 0.5, 0.5)]),
+        }
+        with self.assertRaisesRegex(ValueError, "only one block"):
+            self.steps(moves)
 
     def test_nothing_to_sample(self):
         with self.assertRaisesRegex(ValueError, "nothing to sample"):
