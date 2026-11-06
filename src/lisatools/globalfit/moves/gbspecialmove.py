@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import logging
@@ -15,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 import numpy as np
 import numpy
 
-from eryn.state import BranchSupplemental
+from eryn.state import BranchSupplemental, State
 from gbgpu.gbgpu import GBGPU
 from gbgpu.utils.utility import get_N, get_fdot
 from scipy import stats
@@ -37,7 +38,6 @@ from ...utils.parallelbase import LISAToolsParallelModule
 from ...utils.utility import asnumpy
 from ..galaxyglobal import fit_each_leaf, make_gmm, run_gb_bulk_search
 from .globalfitmove import GFCombineMove, GlobalFitMove
-from ..priors.gbpriors import get_fdot_mojito
 
 try:
     import cupy as cp
@@ -48,9 +48,9 @@ except ModuleNotFoundError:
 
     gpu_available = False
 
+from eryn.ensemble import EnsembleSampler
 from eryn.moves import GroupStretchMove, Move, StretchMove
 from eryn.moves.multipletry import get_mt_computations, logsumexp
-from eryn.paraensemble import ParaEnsembleSampler
 from eryn.prior import ProbDistContainer, uniform_dist
 from eryn.utils import PeriodicContainer
 from eryn.utils.utility import groups_from_inds
@@ -99,6 +99,8 @@ __all__ = [
     "SeqPickStrategy",
     "GBSigHetSettings",
     "GBLeafCapSettings",
+    "GBFStatRJMove",
+    "GBFStatSettings",
 ]
 
 logger = logging.getLogger(__name__)
@@ -110,7 +112,7 @@ class _NoOpMempool:
         return
 
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from eryn.state import Branch
 from eryn.utils import TransformContainer
@@ -4113,201 +4115,6 @@ def gb_refit_func(comm, curr, main_rank, class_extra_gpus, class_ranks_list):
         fit_each_leaf(rank, curr, gather_rank, comm)
         pass
 
-def para_log_like(
-    x,
-    gb,
-    acs,
-    walker_max,
-    transform_fn,
-    phase_maximize,
-    waveform_kwargs,
-    fstat=True,
-    return_snr=False,
-):
-    """Vectorized GB log-likelihood used by serial-search and refit moves.
-
-    Args:
-        x: GB parameter rows (untransformed).
-        gb: :class:`gbgpu.GBGPU` instance.
-        acs: :class:`AnalysisContainerArray`.
-        walker_max: Index of the walker whose data the proposals are scored
-            against.
-        transform_fn: :class:`TransformContainer` for GB parameters.
-        phase_maximize: If ``True``, marginalize over phase.
-        waveform_kwargs: Forwarded to ``gb.get_fstat_ll`` / ``gb.get_ll``.
-        fstat: If ``True``, use the F-statistic likelihood (``get_fstat_ll``)
-            and overwrite the amplitude / phase / iota / polarization
-            entries of ``x`` with their maximized values.
-        return_snr: If ``True`` and ``fstat`` is ``False``, also return the
-            optimal SNR per row.
-
-    Returns:
-        Per-row log-likelihood (or ``(ll, snr)`` tuple).
-    """
-    xp = gb.backend.xp
-
-    x_tmp = transform_fn.both_transforms(x, xp=xp)
-    # need to get just f, fdot, fddot, alpha, delta
-    data_index = xp.full(x.shape[0], walker_max, dtype=xp.int32)
-    if fstat:
-        x_in = x_tmp[:, xp.array([1, 2, 3, 7, 8])]
-        # breakpoint()
-        # TODO: fix for N>256?
-        ll = gb.get_fstat_ll(
-            x_in,
-            acs.linear_data_arr,
-            acs.linear_psd_arr,
-            data_index=data_index,
-            noise_index=data_index,
-            data_length=acs.end_shape[0],
-            data_splits=np.array([gb.gpus[0]]),
-            phase_maximize=phase_maximize,
-            return_cupy=True,
-            N=512,  
-            **waveform_kwargs,
-        )
-
-        x[:, 0] = np.log(gb.A_max)
-        x[:, 3] = gb.phi0_max % (2 * np.pi)
-        x[:, 4] = np.cos(gb.iota_max % (np.pi))
-        x[:, 5] = gb.psi_max % (2 * np.pi)
-
-    else:
-        # breakpoint()
-        x_in = x_tmp[:]
-        ll = gb.get_ll(
-            x_in,
-            acs.linear_data_arr,
-            acs.linear_psd_arr,
-            data_index=data_index,
-            noise_index=data_index,
-            data_length=acs.end_shape[0],
-            data_splits=np.array([gb.gpus[0]]),
-            phase_maximize=phase_maximize,
-            return_cupy=True,
-            # N=512,
-            **waveform_kwargs,
-        )
-        # breakpoint()
-
-        # params_remove_in = x_in.copy()
-        # params_add_in = x_in.copy()
-
-        # params_remove_in[:, 0] *= 1e-50
-        # breakpoint()
-        # ll_diff_2 = gb.swap_likelihood_difference(
-        #     params_remove_in,
-        #     params_add_in,
-        #     acs.linear_data_arr,
-        #     acs.linear_psd_arr,
-        #     # start_freq_ind=self.xp.asarray(self.acs.start_freq_ind).astype(np.int32),
-        #     data_index=data_index,
-        #     noise_index=data_index,
-        #     # N=N_vals,
-        #     data_length=acs.data_length,
-        #     data_splits=np.array([gb.gpus[0]]),
-        #     phase_maximize=phase_maximize,
-        #     return_cupy=True,
-        #     N=256,
-        #     **waveform_kwargs,
-        # )
-        # breakpoint()
-
-        if phase_maximize:
-            x[:, 3] = (x[:, 3] - xp.angle(xp.asarray(gb.non_marg_d_h))) % (2 * np.pi)
-
-        if return_snr:
-            opt_snr = gb.h_h.real ** (1 / 2)
-            return (ll, opt_snr)
-
-    return ll
-
-
-class PriorTransformFn:
-    """Transform between unit-cube prior coordinates and GB :math:`(f, \\dot f)`.
-
-    Used by the serial-search move to draw uniform-in-band proposals while
-    keeping the rest of the GB prior unchanged.
-
-    Args:
-        f_min: Minimum frequency (Hz).
-        f_max: Maximum frequency (Hz).
-        fdot_min: Minimum frequency derivative.
-        fdot_max: Maximum frequency derivative.
-    """
-
-    def __init__(self, f_min: float, f_max: float, fdot_min: float, fdot_max: float):
-        self.f_min, self.f_max, self.fdot_min, self.fdot_max = (
-            f_min,
-            f_max,
-            fdot_min,
-            fdot_max,
-        )
-
-    def adjust_logp(self, logp, groups_running):
-        """Add the (uniform) ``f`` and ``fdot`` log-density to ``logp``."""
-        xp = get_array_module(self.f_min)
-
-        if groups_running is None:
-            groups_running = xp.arange(len(self.f_min))
-
-        f_min_here = self.f_min[groups_running]
-        f_max_here = self.f_max[groups_running]
-        f_logpdf = np.log(1.0 / (f_max_here - f_min_here))
-
-        fdot_min_here = self.fdot_min[groups_running]
-        fdot_max_here = self.fdot_max[groups_running]
-        fdot_logpdf = np.log(1.0 / (fdot_max_here - fdot_min_here))
-
-        logp[:] += f_logpdf[:, None, None]
-        logp[:] += fdot_logpdf[:, None, None]
-
-        return logp
-
-    def transform_to_prior_basis(self, coords, groups_running):
-        """Map ``f`` / ``fdot`` columns of ``coords`` to the unit-cube basis."""
-        xp = get_array_module(self.f_min)
-
-        if groups_running is None:
-            groups_running = xp.arange(len(self.f_min))
-
-        f_min_here = self.f_min[groups_running]
-        f_max_here = self.f_max[groups_running]
-        try:
-            coords[:, :, :, 1] = (coords[:, :, :, 1] - f_min_here[:, None, None]) / (
-                f_max_here[:, None, None] - f_min_here[:, None, None]
-            )
-        except:
-            breakpoint()
-
-        fdot_min_here = self.fdot_min[groups_running]
-        fdot_max_here = self.fdot_max[groups_running]
-        coords[:, :, :, 2] = (coords[:, :, :, 2] - fdot_min_here[:, None, None]) / (
-            fdot_max_here[:, None, None] - fdot_min_here[:, None, None]
-        )
-
-        return
-
-    def transform_from_prior_basis(self, coords, groups_running):
-        """Map ``f`` / ``fdot`` columns of ``coords`` from unit cube back to physical."""
-        if groups_running is None:
-            groups_running = xp.arange(len(self.f_min))
-
-        assert groups_running.shape[0] == coords.shape[0]
-        f_min_here = self.f_min[groups_running]
-        f_max_here = self.f_max[groups_running]
-        coords[:, :, :, 1] = (
-            coords[:, :, :, 1] * (f_max_here[:, None, None] - f_min_here[:, None, None])
-        ) + f_min_here[:, None, None]
-
-        fdot_min_here = self.fdot_min[groups_running]
-        fdot_max_here = self.fdot_max[groups_running]
-        coords[:, :, :, 2] = (
-            coords[:, :, :, 2] * (fdot_max_here[:, None, None] - fdot_min_here[:, None, None])
-        ) + fdot_min_here[:, None, None]
-
-        return
-
 
 class BayesGMMFit:
     """Variational Bayesian GMM fit to per-leaf GB samples (sklearn ``BayesianGaussianMixture``).
@@ -4478,347 +4285,779 @@ def gather_gmms(gmms):
 
 from lisatools.sampling.gmm import vec_fit_gmm_min_bic
 
-class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
-    """Reversible-jump GB move that runs a serial F-statistic MCMC search per band.
+# ======================================================================================================================
+# The F-statistic RJ move: births from an F-statistic search of the bands on the STFT/DFFR response
+# ======================================================================================================================
 
-    Each band proposes one new GB at a time using a parallel ensemble
-    sampler driven by :func:`para_log_like`, with proposals drawn from a
-    band-restricted prior via :class:`PriorTransformFn`.
+
+@dataclass
+class GBFStatSettings:
+    """Settings of :class:`GBFStatRJMove`: its search of the bands, the search's schedule and what a search writes.
+
+    The defaults are the reviewed values, from the study on a benchmark group of 11 bands near 2.83 mHz
+    (``docs/gb/fstat_move/results.md``).
     """
-    comm_info = None
 
-    def get_rank_function(self):
-        return gb_search_func
+    # Walkers of each band's sampler, in both stages
+    nwalkers: int = 32
+    # Stage 1, the F-statistic over f0, fdot and the sky: the start ladder (coldest first; Eryn adapts it per band with
+    # its ends kept), the burn-in and the stored steps
+    betas_1: tuple[float, ...] = (1.0, 0.5, 0.25, 0.12, 0.05, 0.0)
+    burn_1: int = 500
+    nsteps_1: int = 300
+    # Stage 2, the full likelihood over every column, as stage 1: production's spacing 1.2^-k cut to 12 temperatures
+    # with T = 10 on top, a fixed ladder rather than the run's own
+    betas_2: tuple[float, ...] = tuple(float(1.2**-power) for power in range(11)) + (0.1,)
+    burn_2: int = 400
+    nsteps_2: int = 500
+    # The gate's effective-SNR target on the settled noise, where a birth under the global f0 prior breaks even
+    snr_eff_threshold: float = 7.5
+    # The foreground's inflation of the noise PSD below shutoff_frequency_threshold, which lowers a source's effective
+    # SNR by its square root: the median over the population
+    galfor_inflation_factor: float = 1.3
+    # Upper edge (Hz) of the galactic foreground: below it the gate's target is lower and no band is shut off; None
+    # puts every band above it
+    shutoff_frequency_threshold: Optional[float] = 6e-3
+    # Searches in a row without a detection after which a band above that edge is shut off
+    shutoff_band_iteration: int = 2
+    # What each search saves to output_dir: "none", "summary" (per-band values, the mixtures, the times) or "full"
+    # (also the chains, megabytes per search on tens of bands)
+    save_search_records: str = "none"
+    # Folder of the search log (fstat_search.log) and of the saved records; the recipe builders fill
+    # <run>_artifacts/fstat_search/, and None writes neither
+    output_dir: Optional[str] = None
+
+
+class GBFStatRJMove(GBSpecialBase):
+    """Reversible-jump GB move whose births come from an F-statistic search of the bands, on the STFT/DFFR response.
+
+    It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back). :meth:`setup`
+    searches at every propose, and the search's mixture becomes the RJ proposal. A search runs on the residual of the
+    max-likelihood walker, in every interior band that is not shut off:
+
+    1. stage 1 samples f0, fdot and the sky of each band with the F-statistic, which maximizes the four amplitude
+       parameters analytically; one Eryn sampler per band (``nsamplers``) runs on the run's own prior restricted to
+       the band (:class:`BandMaskTransform`);
+    2. a band passes when the largest stored cold sqrt(2F) exceeds the gate's threshold (:meth:`detection_gate`);
+    3. stage 2 samples every column of the passing bands with the full likelihood, from the F-statistic maximizers at
+       stage 1's last state;
+    4. one Gaussian mixture per passing band, fitted to its stage-2 cold chain in every column but phi0 and psi,
+       becomes the RJ proposal, which draws phi0 and psi uniformly.
+
+    A search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
+    ``save_search_records`` asks for one. The math (the start draws, the amplitudes and their map to the extrinsic
+    parameters, the gate) sits in static and class methods. Points are in the GB sampling basis, with the columns
+    ``COL_*``.
+
+    Args:
+        *args: :class:`GBSpecialBase`'s arguments.
+        fstat_settings: The search's settings; None takes the defaults of :class:`GBFStatSettings`.
+        **kwargs: :class:`GBSpecialBase`'s keyword arguments.
+    """
+
+    # Sampling columns of the GB branch: ln A, f0 (mHz), fdot, phi0, cos iota, psi, lam, sin beta
+    COL_LN_AMP, COL_F0, COL_FDOT, COL_PHI0, COL_COS_IOTA, COL_PSI, COL_LAM, COL_SIN_BETA = range(8)
+    NDIM = 8
+    # Columns of the waveform rows (amp, f0 in Hz, fdot, fddot, phi0, iota, psi, lam, beta) that the maximizers set
+    PHYS_AMP, PHYS_PHI0, PHYS_IOTA, PHYS_PSI = 0, 4, 5, 6
+    # Stage 1 samples the columns the F-statistic depends on; it maximizes the other four analytically
+    SAMPLED_COLUMNS = (COL_F0, COL_FDOT, COL_LAM, COL_SIN_BETA)
+    # The proposal's mixture covers every column but phi0 and psi, which it draws uniformly
+    GMM_COLUMNS = (COL_LN_AMP, COL_F0, COL_FDOT, COL_COS_IOTA, COL_LAM, COL_SIN_BETA)
+    # The component counts that vec_fit_gmm_min_bic tries and the draws its BIC is scored on
+    GMM_MIN_COMPONENTS, GMM_MAX_COMPONENTS, GMM_BIC_DRAWS = 1, 30, 5000
+    # * The mixture fit runs in chunks of bands that fit the free device memory minus 1 GiB or 5 % of the device (the
+    # * larger), from an estimate of 12 working arrays of (samples x components) doubles per band
+    GMM_HEADROOM_BYTES = 2**30
+    GMM_HEADROOM_FRACTION = 0.05
+    GMM_WORK_ARRAYS = 12
+    # The likelihood value of a row that is not scored, as the band engine writes it
+    REJECTED_LL = -1e300
+    # * With one source in a band, maximizing the four amplitudes and the four sampled columns puts the stage-1 peak of
+    # * 2F at rho_eff^2 + 8; the stored cold samples lie a chi2(4) drop below the peak
+    GATE_PEAK_OFFSET = 8.0
+    GATE_DROP_DOF = 4
+    # Upper-triangle order of the F-statistic overlaps (numpy.triu_indices(4))
+    TRIU = np.triu_indices(4)
+    # The levels of save_search_records, and the record's arrays with a steps or walkers axis, which only "full" keeps
+    RECORD_LEVELS = ("none", "summary", "full")
+    CHAIN_KEYS = (
+        "stage1_cold_fstat", "stage1_last_cold", "stage2_start", "stage2_start_fstat", "stage2_start_replaced",
+        "stage2_cold_coords", "stage2_cold_ll",
+    )
+    SEARCH_LOG_NAME = "fstat_search.log"
+
+    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None, **kwargs):
+        # * always an RJ move: its proposal only arrives with the first search, after construction
+        super().__init__(*args, **{**kwargs, "is_rj_prop": True})
+        self.fstat_settings = deepcopy(fstat_settings) if fstat_settings is not None else GBFStatSettings()
+        settings = self.fstat_settings
+        if not isinstance(self._basis_settings, STFTSettings):
+            raise NotImplementedError(
+                f"{type(self).__name__} searches on the STFT response only, not on "
+                f"{type(self._basis_settings).__name__}."
+            )
+        response = getattr(self.gb_stft_comp, "response", None)
+        if response != "dffr":
+            raise NotImplementedError(
+                f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
+            )
+        if settings.save_search_records not in self.RECORD_LEVELS:
+            raise ValueError(
+                f"fstat_settings: save_search_records must be one of {list(self.RECORD_LEVELS)}, not "
+                f"{settings.save_search_records!r}"
+            )
+        if settings.save_search_records != "none" and settings.output_dir is None:
+            raise ValueError(
+                "fstat_settings: save_search_records needs output_dir; the recipe builders set "
+                "<run>_artifacts/fstat_search/"
+            )
+        # index of the next saved record, counted on from the files in output_dir at the first save
+        self._next_record = None
 
     def setup(self, model, branches):
-        assert isinstance(self.search_kwargs, dict)
-        nwalkers: int = self.search_kwargs["nwalkers"]
-        ntemps: int = self.search_kwargs["ntemps"]
-        shutoff_band_iteration: int = self.search_kwargs["shutoff_band_iteration"]
-        shutoff_frequency_threshold: float = self.search_kwargs["shutoff_frequency_threshold"]
-        burn_1: int = self.search_kwargs["burn_1"]
-        nsteps_1: int = self.search_kwargs["nsteps_1"]
-        snr_threshold: float = self.search_kwargs["snr_threshold"]
-        burn_2: int = self.search_kwargs["burn_2"]
-        nsteps_2: int = self.search_kwargs["nsteps_2"]
+        """Search the bands at every propose of the move."""
+        self._search(model, branches)
 
-        # FOR FAST TESTING/DEBUGGING
-        # import pickle
-        # with open("gmm_tmp.pickle", "rb") as fp:
-        #     full_gmm = pickle.load(fp)
+    # ==================================================================================================================
+    # The search, in its steps
+    # ==================================================================================================================
 
-        # rj_dist = ProbDistContainer(
-        #     {
-        #         ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
-        #         "phi0": uniform_dist(0.0, 2 * np.pi),
-        #         "psi": uniform_dist(0.0, np.pi),
-        #     },
-        #     use_cupy=True,
-        # )
-        # rj_dist.reset_key_order(["A", "f0", "fdot", "phi0", "cos_iota", "psi", "alpha", "sin_delta"])
-        # return
+    def _search(self, model, branches):
+        """One search, in the steps of the class docstring. The steps' outputs go into one dict, from which
+        :meth:`_finish_search` writes the logs and the record."""
+        time_start = time.perf_counter()
+        holder = model.analysis_container_arr
+        walker = int(np.argmax(asnumpy(holder.likelihood())))
+        search = {"walker": walker, "num_proposals": int(self.num_proposals), "bands": self._search_bands()}
+        if not search["bands"]["active"].any():
+            self.rj_proposal_distribution = self.gpu_priors if self.backend.uses_cupy else self.priors
+            self._finish_search(search, time_start, "every band is shut off; the prior is the proposal")
+            return
+        search["stage_1"], search["likelihood_1"] = self._run_stage_1(holder, walker, search["bands"])
+        search["gate"] = self._apply_gate(search["stage_1"], search["bands"])
+        if not search["gate"]["detected"].any():
+            self._finish_search(search, time_start, "no band passes; the latest proposal stays")
+            return
+        search["start"] = self._stage_2_start(search["likelihood_1"], search["stage_1"], search["gate"])
+        search["stage_2"], search["likelihood_2"] = self._run_stage_2(
+            holder, walker, search["bands"], search["gate"], search["start"])
+        search["mixtures"] = self._build_proposal(search["stage_2"])
+        if search["mixtures"]["proposal"] is None:
+            self._finish_search(
+                search, time_start, "no passing band has a usable stage-2 chain; the latest proposal stays", warn=True)
+            return
+        self.rj_proposal_distribution = {"gb": search["mixtures"]["proposal"]}
+        self._finish_search(search, time_start, f"{int(search['mixtures']['usable'].sum())} bands in the proposal")
 
-        # run paraensemble MCMC.
-        max_logl_walker = np.argmax(model.analysis_container_arr.likelihood()).item()
-        self.gb.d_d = model.analysis_container_arr.inner_product()[max_logl_walker] # 0.0
-        ndim = branches["gb"].ndim
-        priors_global = self.priors if not self.backend.uses_cuda else self.gpu_priors            
+    def _search_bands(self):
+        """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
+        those searched, which leaves out the bands above the foreground's edge that found nothing in the last
+        ``shutoff_band_iteration`` searches."""
+        settings = self.fstat_settings
+        edges_mhz = asnumpy(self.band_edges) * 1e3
+        ids = np.array([0]) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+        low, high = edges_mhz[ids], edges_mhz[ids + 1]
+        active = np.ones(len(ids), dtype=bool)
+        history = getattr(self, "found_source_in_band", None)
+        iterations = int(settings.shutoff_band_iteration)
+        if history is not None and len(history) >= iterations:
+            silent = np.all(~history[-iterations:], axis=0)
+            if settings.shutoff_frequency_threshold is not None:
+                silent &= low * 1e-3 >= float(settings.shutoff_frequency_threshold)
+            active = ~silent
+        return {"ids": ids, "low_mhz": low, "high_mhz": high, "active": active}
 
-        if self.num_bands == 1:
-            f0_max = self.band_edges[1:]
-            f0_min = self.band_edges[:-1]
-        else:
-            f0_max = self.band_edges[2:-1]
-            f0_min = self.band_edges[1:-2]
+    def _band_mask(self, low_mhz, high_mhz):
+        """The band restriction of the run prior for Eryn's samplers, one band per sampler."""
+        # below the run prior's f0 range, where the joint prior is -inf with finite fdot bounds
+        outside_f0 = 0.5 * float(self.joint_f0_fdot_prior(self.priors["gb"]).f0_min)
+        return BandMaskTransform(low_mhz, high_mhz, outside_f0)
 
-        # logic to shutoff bands #? Think about how this should change when we change SNR_thresh and with changing noise
-        if self.num_proposals >= shutoff_band_iteration:
-            bands_to_shutoff = np.all(~self.found_source_in_band[-shutoff_band_iteration:, :], axis=0)
+    def _run_stage_1(self, holder, walker, bands):
+        """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
+        restricted to each band. Returns the samplers' outputs and the likelihood, whose terms the maximizers reuse."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_1, dtype=float)
+        low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
+        mask = np.zeros(self.NDIM, dtype=bool)
+        mask[list(self.SAMPLED_COLUMNS)] = True
+        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, walker, self.parameter_transforms,
+                                           fstat=True)
+        start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
+        output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
+                                        self.periodic, int(settings.burn_1), int(settings.nsteps_1), betas)
+        return output, likelihood
 
-            if shutoff_frequency_threshold is not None:
-                min_freqs = getattr(f0_min, "get")() if hasattr(f0_min, "get") else f0_min
-                freq_mask = min_freqs >= shutoff_frequency_threshold
-                bands_to_shutoff = bands_to_shutoff & freq_mask
+    def _apply_gate(self, stage_1, bands):
+        """The gate on each searched band's stage-1 maximum, and the shutoff history's row of this search. Returns the
+        decisions, the thresholds, the targets and sqrt(2F) of the stored cold samples."""
+        settings = self.fstat_settings
+        # sqrt(2F) is the optimal SNR of the template at the F-statistic maximum
+        snr = np.sqrt(np.maximum(2.0 * stage_1["cold_ll"], 0.0))
+        # * the gate reads the maximum: the stage-1 cold walkers sit on several peaks without mixing, so the median and
+        # * the minimum read the lower peaks
+        detected, thresholds, targets = self.detection_gate(
+            snr, bands["low_mhz"][bands["active"]] * 1e-3, float(settings.snr_eff_threshold),
+            settings.shutoff_frequency_threshold, float(settings.galfor_inflation_factor))
+        found_row = np.zeros(len(bands["ids"]), dtype=bool)
+        found_row[np.flatnonzero(bands["active"])[detected]] = True
+        history = getattr(self, "found_source_in_band", None)
+        self.found_source_in_band = found_row[None] if history is None else np.vstack([history, found_row])
+        return {"detected": detected, "thresholds": thresholds, "targets": targets, "snr": snr}
 
-            if np.all(bands_to_shutoff):
-                logger.info(f"No sources found across all bands for {shutoff_band_iteration} iterations, reverting to priors")
-                self.rj_proposal_distribution = priors_global
-                return
-
-            else:
-                shutoff_mask = ~bands_to_shutoff
-                f0_max = f0_max[shutoff_mask]
-                f0_min = f0_min[shutoff_mask]
-                ngroups = np.sum(shutoff_mask)
-
-        else:
-            ngroups = max(1, self.num_bands - 2)
-            assert f0_max.shape[0] == ngroups
-            assert f0_min.shape[0] == ngroups
-            bands_to_shutoff = None
-
-        logger.info(f"The current number of active bands is {ngroups}")
-
-        fdot_max = get_fdot_mojito(f0_max, sign="+")
-        fdot_min = get_fdot_mojito(f0_max, sign="-")
-
-        # * The search samples f0 and fdot on the unit cube. The run prior may hold them as one
-        # * joint entry, so the dictionary is rebuilt in order rather than updated in place.
-        priors_in = {}
-        for prior_key, prior_here in deepcopy(priors_global)["gb"].priors_in.items():
-            if prior_key in ("f0", ("f0", "fdot")):
-                priors_in["f0"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
-                priors_in["fdot"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
-            elif prior_key != "fdot":
-                priors_in[prior_key] = prior_here
-        priors = {
-            "gb": ProbDistContainer(priors_in, return_gpu=True, use_cupy=self.backend.uses_cupy)
+    def _stage_2_start(self, likelihood, stage_1, gate):
+        """Stage 2's start in the passing bands: the last stage-1 cold rows with the four analytic columns at their
+        maximizers. Returns the rows (bands, walkers, 8), F there, the rows replaced and the seconds."""
+        time_start = time.perf_counter()
+        nwalkers = int(self.fstat_settings.nwalkers)
+        n_detected = int(gate["detected"].sum())
+        last = stage_1["last_cold"][gate["detected"]].reshape(-1, self.NDIM)
+        rows, fstat, replaced = self._maximized_rows(likelihood, last)
+        return {
+            "rows": rows.reshape(n_detected, nwalkers, self.NDIM), "fstat": fstat.reshape(n_detected, nwalkers),
+            "replaced": replaced.reshape(n_detected, nwalkers), "seconds": time.perf_counter() - time_start,
         }
-        start_params = priors["gb"].rvs(size=(ngroups, ntemps, nwalkers))
-        prior_transform_fn = PriorTransformFn(f0_min * 1e3, f0_max * 1e3, fdot_min, fdot_max)
-        prior_transform_fn.transform_from_prior_basis(start_params, self.xp.arange(ngroups))
 
-        #? print("phase maximizing here right now (?)")
-        ll_args = (
-            self.gb,
-            model.analysis_container_arr,
-            max_logl_walker,
-            self.parameter_transforms,
-            True,  # self.phase_maximize,
-            self.waveform_kwargs,
-        )
+    def _maximized_rows(self, likelihood, coords):
+        """Rows with ln A, phi0, cos iota and psi at the F-statistic maximum, F there, and the rows replaced.
 
-        ll_args_2 = (
-            self.gb,
-            model.analysis_container_arr,
-            max_logl_walker,
-            self.parameter_transforms,
-            self.phase_maximize, # False, #
-            self.waveform_kwargs,
-        )
+        A row keeps its old values where it cannot be scored, where the maximum has no amplitude, or where the maximized
+        point falls outside the run prior; an amplitude beyond the prior's range is clipped into it first.
+        """
+        xp = likelihood.engine.xp
+        transform = self.parameter_transforms
+        coords = np.asarray(coords, dtype=float)
+        params_phys = transform.both_transforms(coords)
+        projections, overlaps, two_f, keep = likelihood.terms(xp.asarray(params_phys))
+        amplitudes = self.fstat_amplitudes(projections, overlaps, keep)
+        amplitude, cos_iota, psi, phi0 = (np.asarray(asnumpy(value), dtype=float)
+                                          for value in self.extrinsics_from_amplitudes(amplitudes))
+        fstat = np.asarray(asnumpy(xp.where(keep, 0.5 * two_f, self.REJECTED_LL)), dtype=float)
+        fstat[~np.isfinite(fstat)] = self.REJECTED_LL
+        maximized_phys = params_phys.copy()
+        maximized_phys[:, self.PHYS_AMP] = amplitude
+        maximized_phys[:, self.PHYS_PHI0] = phi0
+        maximized_phys[:, self.PHYS_IOTA] = np.arccos(cos_iota)
+        maximized_phys[:, self.PHYS_PSI] = psi
+        scored = (fstat > self.REJECTED_LL) & (amplitude > 0.0) & np.isfinite(amplitude)
+        maximized = coords.copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            maximized[scored] = transform.both_inverse_transforms(maximized_phys[scored])
+        prior_container = self.priors["gb"]
+        bounds = self.one_column_bounds(prior_container, self.COL_LN_AMP)
+        if bounds is not None:
+            # a hair inside the box, so the clipped point is not on the edge the prior may exclude
+            margin = 1e-9 * (bounds[1] - bounds[0])
+            maximized[scored, self.COL_LN_AMP] = np.clip(maximized[scored, self.COL_LN_AMP], bounds[0] + margin,
+                                                         bounds[1] - margin)
+        outside = ~np.isfinite(asnumpy(prior_container.logpdf(maximized)))
+        maximized[outside] = coords[outside]
+        return maximized, fstat, scored & ~outside
 
-        # test_ll = para_log_like(
-        #     test_params,
-        #     *ll_args
-        # )
+    def _run_stage_2(self, holder, walker, bands, gate, start):
+        """Stage 2 in the passing bands: the full likelihood over every column (phi0 left to the analytic maximum when
+        phase_maximize), from the maximized rows at every temperature. Returns the samplers' outputs, with the cold
+        chains, and the likelihood."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_2, dtype=float)
+        passing = np.flatnonzero(bands["active"])[gate["detected"]]
+        low, high = bands["low_mhz"][passing], bands["high_mhz"][passing]
+        mask = np.ones(self.NDIM, dtype=bool)
+        if self.phase_maximize:
+            mask[self.COL_PHI0] = False
+        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, walker, self.parameter_transforms,
+                                           fstat=False, phase_maximize=self.phase_maximize,
+                                           waveform_kwargs=self.waveform_kwargs)
+        output = self.run_band_samplers(
+            likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
+            self._band_mask(low, high), mask, self.periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
+            record_cold_coords=True)
+        return output, likelihood
 
-        gibbs_sampling_setup = np.ones(8, dtype=bool)
-        gibbs_sampling_setup[np.array([0, 3, 4, 5])] = False
-        para_sampler = ParaEnsembleSampler(
-            ndim,
-            nwalkers,
-            ngroups,
-            para_log_like,
-            priors,
-            tempering_kwargs=dict(ntemps=ntemps, Tmax=np.inf),
-            args=ll_args,
-            # kwargs: dict = {},
-            gpu=self.gb.gpus[0],
-            periodic=self.periodic,
-            # backend: ParaBackend = None,  # add ParaHDFBackend
-            # update_fn: Callable = None,
-            # update_iterations=-1,
-            # stopping_fn: Callable = None,
-            # stopping_iterations: int=-1,
-            prior_transform_fn=prior_transform_fn,
-            name="gb",
-            gibbs_sampling_setup=gibbs_sampling_setup,
-            # provide_supplemental=False,
-        )
-
-        from eryn.state import ParaState
-
-        state = ParaState({"gb": start_params}, groups_running=self.xp.ones(ngroups, dtype=bool))
-        state.log_prior = para_sampler.compute_log_prior(state.branches_coords)
-        state.log_like = para_sampler.compute_log_like(state.branches_coords, logp=state.log_prior)
-
-        para_sampler.run_mcmc(state, nsteps_1, burn=burn_1, progress=True)
-
-        samples = self.xp.asarray(para_sampler.get_chain()[:, :, 0])
-        # Diagnostics disabled (stft_tof): computed-but-unused and each costs
-        # a full likelihood sweep over all samples.
-        # check_ll = para_sampler.get_log_like()[:, :, 0]
-        # sample_ll = asnumpy(
-        #     para_log_like(samples.reshape(-1, 8), *ll_args).reshape(samples.shape[:-1])
-        # )
-
-        # check_real_ll_phase_maximized = asnumpy(
-        #     para_log_like(samples.reshape(-1, 8), *ll_args, fstat=False)
-        #     .reshape(samples.shape[:-1])
-        # )
-        check_real_ll, opt_snr = para_log_like(
-            samples.reshape(-1, 8), *ll_args_2, fstat=False, return_snr=True
-        )
-        check_real_ll = asnumpy(check_real_ll.reshape(samples.shape[:-1]))
-        opt_snr = asnumpy(opt_snr.reshape(samples.shape[:-1]))
-
-        # np.save("opt_snr_from_ldc_parasampler_check.npy", opt_snr)
-        # np.save("samples_from_ldc_parasampler_check.npy", samples)
-
-        # TODO: make cut adjustable
-        groups_running_now = opt_snr.min(axis=(0, 2)) > snr_threshold
-
-        if self.num_proposals == 0:
-            self.found_source_in_band = groups_running_now
-        else:
-            if bands_to_shutoff is None:
-                self.found_source_in_band = np.vstack([self.found_source_in_band, groups_running_now])
-            else:
-                shutoff_temp = np.zeros(self.found_source_in_band.shape[1], dtype=bool)
-                shutoff_temp[~bands_to_shutoff] = groups_running_now
-                self.found_source_in_band = np.vstack([self.found_source_in_band, shutoff_temp])
-
-        logger.info(f"Found a source in {groups_running_now.sum()} out of {groups_running_now.shape[0]} active bands")
-        if not np.any(groups_running_now):
-            logger.info("Did not find any new sources.")
-            return
-
-        start_params_2 = np.tile(samples[-1][groups_running_now, None], (1, ntemps, 1, 1))
-        # Maybe not start from maximized values?
-        gibbs_sampling_setup_2 = np.ones(8, dtype=bool)
-        if ll_args_2[4]: # phase_maximization
-            gibbs_sampling_setup_2[np.array([3])] = False
-
-        prior_transform_fn_2 = PriorTransformFn(
-            f0_min[groups_running_now] * 1e3,
-            f0_max[groups_running_now] * 1e3,
-            fdot_min[groups_running_now],
-            fdot_max[groups_running_now],
-        )
-        ngroups_2 = groups_running_now.sum().item()
-        # prior_transform_fn_2.transform_from_prior_basis(start_params_2, self.xp.arange(ngroups_2))
-
-        para_sampler_2 = ParaEnsembleSampler(
-            ndim,
-            nwalkers,
-            ngroups_2,
-            para_log_like,
-            priors,
-            tempering_kwargs=dict(ntemps=ntemps, Tmax=np.inf),
-            args=ll_args_2,
-            kwargs=dict(fstat=False),
-            gpu=self.gb.gpus[0],
-            periodic=self.periodic,
-            # backend: ParaBackend = None,  # add ParaHDFBackend
-            # update_fn: Callable = None,
-            # update_iterations=-1,
-            # stopping_fn: Callable = None,
-            # stopping_iterations: int=-1,
-            prior_transform_fn=prior_transform_fn_2,
-            name="gb",
-            gibbs_sampling_setup=gibbs_sampling_setup_2,
-            # provide_supplemental=False,
-        )
-
-        new_state = ParaState(
-            {"gb": start_params_2}, groups_running=self.xp.ones(ngroups_2, dtype=bool)
-        )
-        new_state.log_prior = para_sampler_2.compute_log_prior(new_state.branches_coords)
-        new_state.log_like = para_sampler_2.compute_log_like(
-            new_state.branches_coords, logp=new_state.log_prior
-        )
-
-        if np.any(np.isinf(new_state.log_prior)):
-            breakpoint()
-
-        para_sampler_2.run_mcmc(new_state, nsteps_2, burn=burn_2, progress=True)
-
-        samples_2 = self.xp.asarray(para_sampler_2.get_chain()[:, :, 0])
-        # check_ll_2 = para_sampler_2.get_log_like()[:, :, 0]
-
-        # Diagnostics disabled (stft_tof): computed-but-unused likelihood sweeps.
-        # check_real_ll_phase_maximized_2 = asnumpy(
-        #     para_log_like(samples_2.reshape(-1, 8), *ll_args, fstat=False)
-        #     .reshape(samples_2.shape[:-1])
-        # )
-        # check_real_ll_2 = asnumpy(
-        #     para_log_like(samples_2.reshape(-1, 8), *ll_args_2, fstat=False)
-        #     .reshape(samples_2.shape[:-1])
-        # )
-
-        samples_2 = samples_2.transpose(1, 0, 2, 3)
-        # np.save("/workspace/rrondeel/erebor/testing/highf_gb/search2_samples_check.npy", samples_2)
-
-        st = time.perf_counter()
-        samples_2_tmp = samples_2.reshape(samples_2.shape[0], -1, samples_2.shape[-1])[
-            :, :, np.array([0, 1, 2, 4, 6, 7])
-        ]
-
-        if self.xp.isnan(samples_2_tmp).any() or self.xp.isinf(samples_2_tmp).any():
-            logger.warning(
-                f"samples_2_tmp contains NaN or Inf before GMM fitting. \
-                NaN count: {self.xp.isnan(samples_2_tmp).sum()}. \
-                Inf count: {self.xp.isinf(samples_2_tmp).sum()}. \
-                Skipping search..."
-            )
-            return
-            # breakpoint()
-            # raise ValueError(
-            #     f"samples_2_tmp contains NaN or Inf before GMM fitting. "
-            #     f"NaN count: {self.xp.isnan(samples_2_tmp).sum()}, "
-            #     f"Inf count: {self.xp.isinf(samples_2_tmp).sum()}"
-            # )
-
-        ranges = samples_2_tmp.max(axis=1) - samples_2_tmp.min(axis=1)  # (n_groups, n_features)
-        degenerate = (ranges == 0)
-        if degenerate.any():
-            bad_groups, bad_feats = self.xp.where(degenerate)
-            logger.warning(
-                f"Degenerate features (zero range) in groups {bad_groups} \
-                for features {bad_feats}. transform_to_gmm_basis will produce NaN. \
-                Skipping search..."
-            )
-            return
-            # breakpoint()
-            # raise ValueError(
-            #     f"Degenerate features (zero range) in groups {bad_groups} "
-            #     f"for features {bad_feats}. transform_to_gmm_basis will produce NaN."
-            # )
-
-        full_gmm = vec_fit_gmm_min_bic(
-            samples_2_tmp,
-            min_comp=1,
-            max_comp=30,
-            n_samp_bic_test=5000,
-            gpu=self.xp.cuda.runtime.getDevice(),
-            verbose=False,
-        )
-        # import pickle
-        # with open("gmm_tmp.pickle", "wb") as fp:
-        #     pickle.dump(full_gmm, fp, pickle.HIGHEST_PROTOCOL)
-
-        et = time.perf_counter()
-        logger.info(f"Runtime of GPU GMM FIT: {round(et - st,3)} seconds")
-
-        rj_dist = ProbDistContainer(
+    def _build_proposal(self, stage_2):
+        """The RJ proposal from the passing bands' stage-2 cold chains: one mixture per band over every column but phi0
+        and psi, which are drawn uniformly. Returns the usable bands, the proposal (None when no band is usable), the
+        mixture's seven component lists, the bands per fit chunk and the seconds."""
+        time_start = time.perf_counter()
+        cold_coords = stage_2["cold_coords"]
+        samples = cold_coords[..., list(self.GMM_COLUMNS)].reshape(cold_coords.shape[0], -1, len(self.GMM_COLUMNS))
+        # * a band whose chain never moved in a column (zero range, which the mixture's box map divides by) or holds a
+        # * value that is not finite is left out, not the search
+        usable = np.all(np.isfinite(samples), axis=(1, 2)) & np.all(np.ptp(samples, axis=1) > 0.0, axis=1)
+        if not usable.any():
+            return {"usable": usable, "proposal": None, "components": None, "chunk": None,
+                    "seconds": time.perf_counter() - time_start}
+        gpu = int(self.xp.cuda.runtime.getDevice()) if self.backend.uses_cupy else None
+        components, chunk = self.fit_band_mixtures(samples[usable], gpu)
+        full_gmm = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy)
+        proposal = ProbDistContainer(
             {
                 ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
-                "phi0": uniform_dist(0.0, 2 * np.pi),
-                # * the prior's psi range: on [0, pi) the move can neither propose nor remove a source in [pi, 2 pi)
-                "psi": uniform_dist(0.0, 2 * np.pi),
+                "phi0": uniform_dist(0.0, 2 * np.pi, use_cupy=self.backend.uses_cupy),
+                "psi": uniform_dist(0.0, 2 * np.pi, use_cupy=self.backend.uses_cupy),
             },
-            use_cupy=True,
+            use_cupy=self.backend.uses_cupy,
         )
-        rj_dist.reset_key_order(["A", "f0", "fdot", "phi0", "cos_iota", "psi", "alpha", "sin_delta"])
-        # if self.ranks_needed == 0:
-        #     gmms = [GMMFit(samples_2[i].get().reshape(-1, 8)) for i in range(samples_2.shape[0])[:10]]
-        #     gmm_info = gather_gmms(gmms)
+        proposal.reset_key_order(["A", "f0", "fdot", "phi0", "cos_iota", "psi", "alpha", "sin_delta"])
+        return {"usable": usable, "proposal": proposal, "components": components, "chunk": chunk,
+                "seconds": time.perf_counter() - time_start}
 
-        # else:
-        #     if self.comm_info is None:
-        #         # this only happens the first time through
-        #         self.comm_info = self.comm.recv(tag=232342)
+    # ==================================================================================================================
+    # Eryn's samplers of the search and the mixture fit
+    # ==================================================================================================================
 
-        #     gmm_info = fit_gmm(samples_2.get(), self.comm, self.comm_info)
+    @staticmethod
+    def run_band_samplers(log_like_fn, start, prior_container, transform, gibbs_mask, periodic, burn, nsteps, betas,
+                          record_cold_coords=False):
+        """One Eryn EnsembleSampler with one independent sampler per band; keeps the cold chain only.
 
-        # full_gmm = FullGaussianMixtureModel(*gmm_info, use_cupy=self.use_gpu)
-        # breakpoint()
+        ``start`` is (n_bands, ntemps, nwalkers, 8) and ``betas`` the start ladder (coldest first, the same for every
+        band), which Eryn adapts per sampler with its ends kept. The sampler stores nothing, since every temperature of
+        a full-band search would be large and only the cold rows serve. Returns ``cold_ll`` (n_bands, nsteps,
+        nwalkers), ``last_cold`` (n_bands, nwalkers, 8), ``cold_coords`` (n_bands, nsteps, nwalkers, 8) when asked, the
+        cold acceptance and the swap acceptance per band, the adapted ladders and the wall time.
+        """
+        n_bands, ntemps, nwalkers, ndim = start.shape
+        gibbs_mask = np.asarray(gibbs_mask, dtype=bool).reshape(1, ndim)
+        betas = np.asarray(betas, dtype=float)
+        if betas.shape != (ntemps,):
+            raise ValueError(f"the ladder has {betas.shape} betas, the start {ntemps} temperatures")
+        sampler = EnsembleSampler(
+            nwalkers, ndim, log_like_fn, {"gb": prior_container},
+            tempering_kwargs=dict(betas=betas) if ntemps > 1 else {},
+            branch_names=["gb"], nleaves_max=1,
+            moves=StretchMove(gibbs_sampling_setup=("gb", gibbs_mask)),
+            vectorize=True, periodic=periodic, nsamplers=n_bands,
+            prior_transform_fn={"gb": transform}, track_moves=False,
+        )
+        state = State({"gb": start[:, :, :, None, :].copy()}, nsamplers=n_bands)
+        # row s * ntemps of Eryn's folded leading axis is the cold chain of sampler s
+        cold_rows = np.arange(n_bands) * ntemps
+        cold_ll = np.zeros((n_bands, nsteps, nwalkers))
+        cold_coords = np.zeros((n_bands, nsteps, nwalkers, ndim)) if record_cold_coords else None
+        swaps_accepted = np.zeros((n_bands, max(ntemps - 1, 0)))
+        time_start = time.perf_counter()
+        for step, state in enumerate(sampler.sample(state, iterations=burn + nsteps, store=False)):
+            if ntemps > 1:
+                swaps_accepted += np.reshape(sampler.temperature_control.swaps_accepted, (n_bands, ntemps - 1))
+            if step >= burn:
+                cold_ll[:, step - burn] = state.log_like[cold_rows]
+                if record_cold_coords:
+                    cold_coords[:, step - burn] = state.branches["gb"].coords[cold_rows, :, 0]
+        move = sampler.moves[0]
+        steps = burn + nsteps
+        return {
+            "cold_ll": cold_ll,
+            "cold_coords": cold_coords,
+            "last_cold": state.branches["gb"].coords[cold_rows, :, 0].copy(),
+            "acceptance_cold": np.asarray(move.accepted)[cold_rows].mean(axis=-1) / max(move.num_proposals, 1),
+            "swap_acceptance": swaps_accepted / max(steps * nwalkers, 1),
+            "betas": (np.asarray(sampler.temperature_control.betas).reshape(n_bands, ntemps) if ntemps > 1
+                      else np.ones((n_bands, 1))),
+            "seconds": time.perf_counter() - time_start,
+            "steps": steps,
+        }
 
-        # gen_samp = self.xp.asarray(rj_dist.rvs(1000))
-        # gen_ll, gen_opt_snr = para_log_like(gen_samp, *ll_args, fstat=False, return_snr=True)
-        # print(gen_ll, self.gb.d_h / gen_opt_snr, gen_opt_snr)
-        # breakpoint()
-        self.rj_proposal_distribution = {"gb": rj_dist}
+    @classmethod
+    def fit_band_mixtures(cls, samples, gpu):
+        """``vec_fit_gmm_min_bic`` per chunk of bands: its seven component lists, one entry per band, and the chunk size.
+
+        ``samples`` is (n_bands, n_samples, n_columns). On a GPU a chunk holds as many bands as the free device memory
+        minus the headroom allows, from the estimate GMM_WORK_ARRAYS x (n_samples + BIC draws) x components x 8 bytes
+        per band, since all bands of a large search at once may not fit.
+        """
+        n_bands, n_samples, _ = samples.shape
+        if gpu is None:
+            chunk = n_bands
+            xp = np
+        else:
+            xp = cp
+            total = int(cp.cuda.runtime.memGetInfo()[1])
+            budget = free_device_bytes(cp) - max(cls.GMM_HEADROOM_BYTES, cls.GMM_HEADROOM_FRACTION * total)
+            per_band = 8 * (n_samples + cls.GMM_BIC_DRAWS) * cls.GMM_MAX_COMPONENTS * cls.GMM_WORK_ARRAYS
+            chunk = int(max(1, min(n_bands, budget // per_band)))
+        components = [[] for _ in range(7)]
+        for first in range(0, n_bands, chunk):
+            parts = vec_fit_gmm_min_bic(
+                xp.asarray(samples[first : first + chunk]), min_comp=cls.GMM_MIN_COMPONENTS,
+                max_comp=cls.GMM_MAX_COMPONENTS, n_samp_bic_test=cls.GMM_BIC_DRAWS, gpu=gpu, verbose=False,
+                return_components=True)
+            for target, part in zip(components, parts):
+                target.extend(part)
+        return components, chunk
+
+    # ==================================================================================================================
+    # The search's logs and record
+    # ==================================================================================================================
+
+    def _finish_search(self, search, time_start, outcome, warn=False):
+        """The search's line in the run log, its block in the search log and, when asked, its saved record."""
+        search["total_seconds"] = time.perf_counter() - time_start
+        search["outcome"] = outcome
+        (logger.warning if warn else logger.info)("[GB_FSTAT_SEARCH %s] %s", self.name, self._search_summary(search))
+        settings = self.fstat_settings
+        if settings.output_dir is None:
+            return
+        os.makedirs(settings.output_dir, exist_ok=True)
+        with open(os.path.join(settings.output_dir, self.SEARCH_LOG_NAME), "a") as handle:
+            handle.write(self._search_log_block(search))
+        if settings.save_search_records != "none":
+            self._save_record(self._search_record(search))
+
+    def _search_summary(self, search):
+        """One line: the propose, the walker, the bands searched and passing, the outcome and the times."""
+        active = search["bands"]["active"]
+        parts = [f"propose {search['num_proposals']}, walker {search['walker']}, {int(active.sum())} of "
+                 f"{len(active)} bands searched"]
+        if "gate" in search:
+            gate = search["gate"]
+            thresholds = ", ".join(f"{value:.2f}" for value in np.unique(gate["thresholds"]))
+            parts.append(f"{int(gate['detected'].sum())} pass (thresholds {thresholds})")
+        parts.append(search["outcome"])
+        times = [f"{name} {search[key]['seconds']:.1f} s" for name, key in
+                 (("stage 1", "stage_1"), ("stage 2", "stage_2"), ("mixtures", "mixtures")) if key in search]
+        times.append(f"total {search['total_seconds']:.1f} s")
+        return "; ".join(parts) + "; " + ", ".join(times)
+
+    def _search_log_block(self, search):
+        """The search's block in fstat_search.log: its line, the stages and one line per passing band."""
+        lines = [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.name}: {self._search_summary(search)}"]
+        if "stage_1" in search:
+            stage_1, likelihood = search["stage_1"], search["likelihood_1"]
+            lines.append(
+                f"  stage 1: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s in the "
+                f"F-statistic; cold acceptance {stage_1['acceptance_cold'].min():.3f} to "
+                f"{stage_1['acceptance_cold'].max():.3f}")
+        if "start" in search:
+            replaced = search["start"]["replaced"]
+            lines.append(f"  maximizers: {int(replaced.sum())} of {replaced.size} start rows moved to the maximum, "
+                         f"{search['start']['seconds']:.1f} s")
+        if "stage_2" in search:
+            likelihood = search["likelihood_2"]
+            lines.append(f"  stage 2: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s "
+                         "in the likelihood")
+        if "gate" in search and search["gate"]["detected"].any():
+            bands, gate = search["bands"], search["gate"]
+            searched = np.flatnonzero(bands["active"])
+            largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
+            mixtures = search.get("mixtures")
+            counts = iter([] if mixtures is None or mixtures["components"] is None
+                          else [len(asnumpy(weights)) for weights in mixtures["components"][0]])
+            for order, position in enumerate(np.flatnonzero(gate["detected"])):
+                band = searched[position]
+                line = (f"    band {bands['ids'][band]}: {bands['low_mhz'][band]:.6f} to {bands['high_mhz'][band]:.6f} "
+                        f"mHz, largest sqrt(2F) {largest[position]:.2f} against {gate['thresholds'][position]:.2f}")
+                if "stage_2" in search:
+                    line += f", stage-2 cold acceptance {search['stage_2']['acceptance_cold'][order]:.3f}"
+                if mixtures is not None:
+                    line += (f", {next(counts)} mixture components" if mixtures["usable"][order]
+                             else ", chain not usable")
+                lines.append(line)
+        return "\n".join(lines) + "\n"
+
+    def _search_record(self, search):
+        """The search's arrays, under the keys of the port's earlier record; at "summary" without CHAIN_KEYS."""
+        settings = self.fstat_settings
+        bands = search["bands"]
+        record = {
+            "walker": search["walker"], "num_proposals": search["num_proposals"], "band_ids": bands["ids"],
+            "band_low_mhz": bands["low_mhz"], "band_high_mhz": bands["high_mhz"], "active": bands["active"],
+            "settings": json.dumps(asdict(settings)), "outcome": search["outcome"],
+            "total_seconds": search["total_seconds"],
+        }
+        if "stage_1" in search:
+            stage_1, likelihood, gate = search["stage_1"], search["likelihood_1"], search["gate"]
+            snr = gate["snr"]
+            record.update({
+                "stage1_cold_fstat": stage_1["cold_ll"].astype(np.float32),
+                "stage1_snr_quantiles": np.quantile(snr.reshape(len(snr), -1), [0.0, 0.05, 0.5, 0.95, 1.0], axis=1).T,
+                "stage1_last_cold": stage_1["last_cold"], "stage1_acceptance_cold": stage_1["acceptance_cold"],
+                "stage1_swap_acceptance": stage_1["swap_acceptance"], "stage1_seconds": stage_1["seconds"],
+                "stage1_betas_start": np.asarray(settings.betas_1, dtype=float), "stage1_betas_end": stage_1["betas"],
+                "stage1_rows": likelihood.rows, "stage1_calls": likelihood.calls,
+                "stage1_likelihood_seconds": likelihood.seconds,
+                "detected": gate["detected"], "detection_rule": "maximum", "detection_thresholds": gate["thresholds"],
+                "detection_targets": gate["targets"],
+            })
+        if "start" in search:
+            start = search["start"]
+            record.update({"stage2_start": start["rows"], "stage2_start_fstat": start["fstat"],
+                           "stage2_start_replaced": start["replaced"], "maximize_seconds": start["seconds"]})
+        if "stage_2" in search:
+            stage_2, likelihood = search["stage_2"], search["likelihood_2"]
+            record.update({
+                "stage2_cold_coords": stage_2["cold_coords"], "stage2_cold_ll": stage_2["cold_ll"],
+                "stage2_acceptance_cold": stage_2["acceptance_cold"],
+                "stage2_swap_acceptance": stage_2["swap_acceptance"],
+                "stage2_betas_start": np.asarray(settings.betas_2, dtype=float), "stage2_betas_end": stage_2["betas"],
+                "stage2_seconds": stage_2["seconds"], "stage2_rows": likelihood.rows, "stage2_calls": likelihood.calls,
+                "stage2_likelihood_seconds": likelihood.seconds,
+            })
+        if "mixtures" in search:
+            mixtures = search["mixtures"]
+            record.update({"gmm_usable": mixtures["usable"], "gmm_seconds": mixtures["seconds"]})
+            if mixtures["components"] is not None:
+                record.update(self.padded_components(mixtures["components"]), gmm_chunk_bands=mixtures["chunk"])
+        if settings.save_search_records != "full":
+            for key in self.CHAIN_KEYS:
+                record.pop(key, None)
+        return record
+
+    @staticmethod
+    def padded_components(components):
+        """The seven component lists as padded numpy arrays for the record (NaN beyond a band's count)."""
+        weights, means, covs, _, _, mins, maxs = components
+        counts = np.array([len(asnumpy(weight)) for weight in weights], dtype=int)
+        n_bands, most, ncols = len(weights), int(counts.max()), int(asnumpy(means[0]).shape[-1])
+        padded = {
+            "gmm_counts": counts,
+            "gmm_weights": np.full((n_bands, most), np.nan),
+            "gmm_means": np.full((n_bands, most, ncols), np.nan),
+            "gmm_covs": np.full((n_bands, most, ncols, ncols), np.nan),
+            "gmm_mins": np.array([asnumpy(value) for value in mins]),
+            "gmm_maxs": np.array([asnumpy(value) for value in maxs]),
+        }
+        for band, count in enumerate(counts):
+            padded["gmm_weights"][band, :count] = asnumpy(weights[band])
+            padded["gmm_means"][band, :count] = asnumpy(means[band])
+            padded["gmm_covs"][band, :count] = asnumpy(covs[band])
+        return padded
+
+    def _save_record(self, record):
+        """The record as <move name>_search_<n>.npz in output_dir, n counting on from the files there, so that a
+        continued run adds to them."""
+        folder = self.fstat_settings.output_dir
+        prefix = f"{self.name.replace(' ', '_')}_search_"
+        if self._next_record is None:
+            taken = [int(name[len(prefix):-4]) for name in os.listdir(folder)
+                     if name.startswith(prefix) and name.endswith(".npz") and name[len(prefix):-4].isdigit()]
+            self._next_record = max(taken, default=-1) + 1
+        np.savez_compressed(os.path.join(folder, f"{prefix}{self._next_record:05d}.npz"), **record)
+        self._next_record += 1
+
+    # ==================================================================================================================
+    # Math of the search: the band-restricted start draws, the F-statistic algebra and the gate
+    # ==================================================================================================================
+
+    @classmethod
+    def joint_f0_fdot_prior(cls, prior_container):
+        """The joint (f0, fdot) entry of a prior container: its one distribution with a ``get_fdot_bounds`` method."""
+        found = [(columns, dist) for columns, dist in prior_container.priors if hasattr(dist, "get_fdot_bounds")]
+        if len(found) != 1:
+            raise ValueError(f"the prior container holds {len(found)} joint (f0, fdot) entries; the search needs one")
+        columns, dist = found[0]
+        if np.asarray(columns).reshape(-1).tolist() != [cls.COL_F0, cls.COL_FDOT]:
+            raise ValueError(
+                f"the joint (f0, fdot) prior sits on columns {columns}, not [{cls.COL_F0}, {cls.COL_FDOT}]")
+        return dist
+
+    @staticmethod
+    def one_column_bounds(prior_container, column):
+        """(minimum, maximum) of the one-column prior of ``column``, or None when the column has none."""
+        for columns, dist in prior_container.priors:
+            if np.asarray(columns).reshape(-1).tolist() == [column] and hasattr(dist, "minimum"):
+                return float(dist.minimum), float(dist.maximum)
+        return None
+
+    @classmethod
+    def band_start(cls, prior_container, f0_low_mhz, f0_high_mhz, ntemps, nwalkers):
+        """Draws of the run prior restricted to each band, shape (n_bands, ntemps, nwalkers, 8), numpy.
+
+        Every column comes from the run prior; then f0 is uniform in the band and fdot uniform between the joint
+        prior's bounds at that f0, which is the run prior restricted to the band.
+        """
+        f0_low = np.asarray(f0_low_mhz, dtype=float)
+        f0_high = np.asarray(f0_high_mhz, dtype=float)
+        shape = (len(f0_low), ntemps, nwalkers)
+        start = np.asarray(asnumpy(prior_container.rvs(size=shape)), dtype=float).copy()
+        f0_draws = np.random.uniform(f0_low[:, None, None], f0_high[:, None, None], size=shape)
+        fdot_low, fdot_high = cls.joint_f0_fdot_prior(prior_container).get_fdot_bounds(f0_draws)
+        start[..., cls.COL_F0] = f0_draws
+        start[..., cls.COL_FDOT] = np.random.uniform(asnumpy(fdot_low), asnumpy(fdot_high))
+        return start
+
+    @classmethod
+    def fstat_amplitudes(cls, projections, overlaps, keep):
+        """Maximum-likelihood filter amplitudes per row, the solution a of M a = N; rows not kept get zeros."""
+        xp = get_array_module(projections)
+        num_rows = projections.shape[0]
+        overlap_matrix = xp.zeros((num_rows, 4, 4))
+        overlap_matrix[:, xp.asarray(cls.TRIU[0]), xp.asarray(cls.TRIU[1])] = overlaps
+        overlap_matrix = overlap_matrix + xp.swapaxes(overlap_matrix, 1, 2)
+        diagonal = xp.arange(4)
+        # the symmetrisation counted the diagonal twice
+        overlap_matrix[:, diagonal, diagonal] *= 0.5
+        # rows not run hold zeros; the identity keeps the batched solve defined
+        overlap_matrix[~keep] = xp.eye(4)
+        return xp.linalg.solve(overlap_matrix, projections[..., None])[..., 0]
+
+    @staticmethod
+    def extrinsics_from_amplitudes(amplitudes):
+        """(A, cos iota, psi, phi0) of the template sum_i amplitudes_i A_i, by the map of ``GBGPU.get_fstat_ll``.
+
+        The four filters A_i are the templates at A = 2, iota = pi/2 with (psi, phase) = (0, 0), (pi/4, pi),
+        (0, 3 pi/2) and (pi/4, pi/2), as in the FD kernel. The DFFR waveform takes phi0 with the LDC sign, as GBGPU's
+        map does, but its inclination enters with the opposite sign, so cos iota is the negative of the FD map's.
+        """
+        xp = get_array_module(amplitudes)
+        first, second, third, fourth = (amplitudes[:, index] for index in range(4))
+        # harmonic projections
+        cos_minus = first + fourth
+        sin_minus = third - second
+        cos_plus = first - fourth
+        sin_plus = -(second + third)
+        # for the DFFR template norm_minus = A (1 + cos iota)^2 / 2 and norm_plus = A (1 - cos iota)^2 / 2
+        norm_minus = xp.hypot(cos_minus, sin_minus)
+        norm_plus = xp.hypot(cos_plus, sin_plus)
+        amp_plus = norm_minus + norm_plus
+        amp_cross = norm_minus - norm_plus
+        two_amp = amp_plus + 2.0 * xp.sqrt(norm_minus * norm_plus)
+        amplitude = 0.5 * two_amp
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # ! the FD map has -amp_cross here; the DFFR waveform needs the opposite sign
+            cos_iota = xp.clip(amp_cross / two_amp, -1.0, 1.0)
+        # theta_minus = 2 psi - phi0 and theta_plus = 2 psi + phi0
+        theta_minus = xp.arctan2(sin_minus, cos_minus)
+        theta_plus = xp.arctan2(sin_plus, cos_plus)
+        psi = (0.25 * (theta_plus + theta_minus)) % np.pi
+        phi0 = (0.5 * (theta_plus - theta_minus)) % (2.0 * np.pi)
+        return amplitude, cos_iota, psi, phi0
+
+    @classmethod
+    def detection_gate(cls, snr, band_low_hz, snr_eff_threshold, frequency_hz, inflation_factor):
+        """Bands whose largest stored cold sqrt(2F) passes the threshold of their effective-SNR target.
+
+        ``snr`` is (bands, steps, walkers). A band at or above ``frequency_hz`` (None puts every band there) has the
+        target ``snr_eff_threshold``. Below it the galactic foreground inflates the noise PSD by ``inflation_factor``,
+        which lowers a source's effective SNR by its square root, so the target is snr_eff_threshold /
+        sqrt(inflation_factor): both regimes pass the same SNR on the settled noise. The threshold on the maximum is
+        sqrt(target^2 + 8 - drop), with drop the median of the smallest chi2(4) drop among the stored samples. A
+        negative target passes every band. Returns the decisions, the thresholds and the targets.
+        """
+        snr = np.asarray(snr, dtype=float)
+        n_bands = snr.shape[0]
+        n_samples = int(np.prod(snr.shape[1:]))
+        drop = float(stats.chi2.ppf(1.0 - 0.5 ** (1.0 / n_samples), cls.GATE_DROP_DOF))
+        band_low_hz = np.asarray(band_low_hz, dtype=float)
+        foreground = np.zeros(n_bands, dtype=bool) if frequency_hz is None else band_low_hz < float(frequency_hz)
+        target = np.where(foreground, snr_eff_threshold / np.sqrt(inflation_factor), snr_eff_threshold)
+        threshold = np.where(target < 0.0, -np.inf,
+                             np.sqrt(np.maximum(target**2 + cls.GATE_PEAK_OFFSET - drop, 0.0)))
+        detected = snr.reshape(n_bands, -1).max(axis=1) > threshold
+        return detected, threshold, target
+
+
+# ======================================================================================================================
+# The objects the F-statistic search hands to Eryn
+# ======================================================================================================================
+
+
+class BandMaskTransform:
+    """Band restriction of the run prior through Eryn's per-sampler prior transform.
+
+    Eryn's ``EnsembleSampler(nsamplers=...)`` calls ``transform_to_prior_basis(coords, samplers_running_idx)`` on a copy
+    of the (n_running, ntemps, nwalkers, ndim) coordinates before it evaluates the prior, then ``adjust_logp(logp,
+    samplers_running_idx)``. Sampler s covers [f0_low[s], f0_high[s]] in mHz: an f0 outside it is moved to
+    ``outside_f0_mhz``, below the run prior's f0 range, where the prior is -inf. Inside the band the density is the run
+    prior's own, its f0-dependent fdot bounds included. The band's normalisation is one constant per sampler, which
+    neither the stretch nor the swaps inside a sampler see, so ``adjust_logp`` adds nothing.
+    """
+
+    def __init__(self, f0_low_mhz, f0_high_mhz, outside_f0_mhz):
+        self.f0_low = np.asarray(f0_low_mhz, dtype=float)
+        self.f0_high = np.asarray(f0_high_mhz, dtype=float)
+        if self.f0_low.shape != self.f0_high.shape or np.any(self.f0_high <= self.f0_low):
+            raise ValueError("every band needs f0_low < f0_high")
+        self.outside_f0 = float(outside_f0_mhz)
+
+    def transform_to_prior_basis(self, coords, samplers_running_idx):
+        low = self.f0_low[samplers_running_idx][:, None, None]
+        high = self.f0_high[samplers_running_idx][:, None, None]
+        # a view of the f0 column, so the assignment changes Eryn's buffer in place
+        f0_column = coords[..., GBFStatRJMove.COL_F0]
+        f0_column[(f0_column < low) | (f0_column > high)] = self.outside_f0
+
+    def adjust_logp(self, logp, samplers_running_idx):
+        return logp
+
+
+class FStatSearchLikelihood:
+    """Vectorized likelihood of a search sampler against one walker's residual: sampling-basis rows (numpy) to one
+    value per row (numpy).
+
+    ``fstat=True`` gives F (stage 1), ``fstat=False`` the full ln L of the band engine's ``get_ll`` (stage 2), both
+    against ``walker``'s row of ``holder``; :meth:`terms` gives the F-statistic terms that the maximizers solve. Counts
+    the calls, the rows and the seconds.
+    """
+
+    def __init__(self, engine, holder, walker, transform, fstat, phase_maximize=False, waveform_kwargs=None):
+        self.engine, self.holder, self.walker = engine, holder, int(walker)
+        self.transform, self.fstat = transform, bool(fstat)
+        self.phase_maximize = bool(phase_maximize)
+        self.waveform_kwargs = {} if waveform_kwargs is None else waveform_kwargs
+        self.calls, self.rows, self.seconds = 0, 0, 0.0
+
+    def terms(self, params_phys):
+        """F-statistic terms of waveform rows against the walker's residual row: N (n, 4), M (n, 10) and 2F (n).
+
+        One ``get_fstat_terms_stft`` call (the templates T+ and Tx of a row in one pass) per split of the band engine's
+        plan, with the split's own comp and window starts, as the engine's ``get_ll`` runs, so the search sees the
+        sampling's response, grid and noise. Rows whose f0 bin falls outside the grid are not run (the engine's
+        central-bin keep), and their terms stay zero. Returns N, the upper triangle of M (``numpy.triu_indices(4)``
+        order), 2F and the keep mask, in xp.
+        """
+        engine, holder = self.engine, self.holder
+        xp = engine.xp
+        params_phys = xp.atleast_2d(xp.asarray(params_phys, dtype=xp.float64))
+        num_rows = int(params_phys.shape[0])
+        projections = xp.zeros((num_rows, 4))
+        overlaps = xp.zeros((num_rows, 10))
+        two_f = xp.zeros(num_rows)
+        keep = engine._central_bin_keep(params_phys)
+        if bool(keep.any()):
+            rows_kept = xp.where(keep)[0]
+            walker_index = xp.full(int(rows_kept.shape[0]), self.walker, dtype=xp.int32)
+            # ! all rows read one walker, so they go to one split; a split on another device than the caller's reads
+            # ! params_phys across devices (peer access, which multi-GPU runs assume)
+            for split, sub_rows, intra_data, intra_noise, device in engine._split_plan(holder, walker_index,
+                                                                                        walker_index):
+                rows = rows_kept[sub_rows]
+                with holder.device_context(device):
+                    comp = engine._comp_for_split(holder, split, device)
+                    projections_split, overlaps_split, two_f_split = comp.get_fstat_terms_stft(
+                        params_phys[rows], data_index=intra_data, noise_index=intra_noise,
+                        start_freq_inds=engine._split_start_inds(holder, split))
+                projections[rows] = projections_split
+                overlaps[rows] = overlaps_split
+                two_f[rows] = two_f_split
+        return projections, overlaps, two_f, keep
+
+    def __call__(self, coords):
+        time_start = time.perf_counter()
+        xp = self.engine.xp
+        coords = np.atleast_2d(np.asarray(coords, dtype=float))
+        # the transform runs on the host: Eryn's arrays are numpy, and it is a few array operations per row
+        params_phys = xp.asarray(self.transform.both_transforms(coords))
+        if self.fstat:
+            _, _, two_f, keep = self.terms(params_phys)
+            values = xp.where(keep, 0.5 * two_f, GBFStatRJMove.REJECTED_LL)
+        else:
+            walker_index = xp.full(coords.shape[0], self.walker, dtype=xp.int32)
+            values = self.engine.get_ll(self.holder, params_phys, data_index=walker_index, noise_index=walker_index,
+                                        N_vals=None, phase_maximize=self.phase_maximize,
+                                        waveform_kwargs=self.waveform_kwargs)
+        out = np.asarray(asnumpy(values), dtype=float)
+        # Eryn refuses NaN; a value that is not finite means the row could not be scored
+        out[~np.isfinite(out)] = GBFStatRJMove.REJECTED_LL
+        self.calls += 1
+        self.rows += coords.shape[0]
+        self.seconds += time.perf_counter() - time_start
+        return out
+
+
+# * The name of the FD serial search, which settings files still import.
+GBSpecialRJSerialSearchMCMC = GBFStatRJMove
 
 
 class GBSpecialRJSearchMove(GBSpecialBase): #? only needed for mutli GPU usage
