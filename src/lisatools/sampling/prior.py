@@ -597,7 +597,21 @@ class FullGaussianMixtureModel(LISAToolsParallelModule):
         limit: Mapped-coordinate distance (in the unit-cube basis) beyond
             which a component contribution is dropped from ``logpdf``.
         use_cupy: If ``True``, store data on GPU and use the GPU backend.
+        periodic: Optional map from column to period. The draws of a
+            periodic column are taken modulo its period into ``[0, period)``,
+            and ``logpdf`` is the density of those draws: each component
+            summed over the period images of the point. The fit must have put
+            the column's samples into a window of one period
+            (``vec_fit_gmm_min_bic(..., periodic=...)``). The f0 column (1),
+            which the culling reads, cannot be periodic. ``None`` keeps the
+            compiled 6-column kernel and the xp mirror as they are.
     """
+
+    # * The image sum of a periodic density leaves out only terms below exp(-12^2 / 2) of the nearest image's.
+    PERIODIC_K_SIGMA = 12.0
+    # * Rows per vectorized block of the image sum, fewer when a block's image array would pass 256 MiB.
+    PERIODIC_BLOCK_ROWS = 8192
+    PERIODIC_BLOCK_BYTES = 2**28
 
     def __init__(
         self,
@@ -610,6 +624,7 @@ class FullGaussianMixtureModel(LISAToolsParallelModule):
         maxs,
         limit=10.0,
         use_cupy=False,
+        periodic=None,
     ):
 
         force_backend = "gpu" if use_cupy else "cpu"
@@ -663,6 +678,13 @@ class FullGaussianMixtureModel(LISAToolsParallelModule):
             self.indexing
         ].copy()
 
+        self.periodic = None
+        if periodic:
+            self.periodic = {int(column): float(period) for column, period in dict(periodic).items()}
+            if 1 in self.periodic:
+                raise ValueError("the f0 column (1) culls the components, so it cannot be periodic")
+            self._prepare_periodic_density(limit)
+
         """self.inds_sort_min_limit_f = xp.argsort(self.min_limit_f)
         self.inds_sort_max_limit_f = xp.argsort(self.max_limit_f)
         self.sorted_min_limit_f = self.min_limit_f[self.inds_sort_min_limit_f]
@@ -692,6 +714,9 @@ class FullGaussianMixtureModel(LISAToolsParallelModule):
 
         assert len(x.shape) == 2
         assert x.shape[1] == self.ndim
+
+        if self.periodic is not None:
+            return self._logpdf_periodic(x)
 
         k = self.ndim
 
@@ -832,6 +857,114 @@ class FullGaussianMixtureModel(LISAToolsParallelModule):
             out[s:e] = xp.where(xp.isfinite(m), val, -np.inf)
         return out
 
+    def _prepare_periodic_density(self, limit):
+        """Per sub-domain: each component's Gaussian split into the non-periodic columns and the periodic ones given
+        them, the period lattice in the mapped basis, the ring of images to sum, and the f0 window of the culling."""
+        xp = cp if self.use_cupy else np
+        periodic = sorted(self.periodic)
+        others = [column for column in range(self.ndim) if column not in self.periodic]
+        periods = np.array([self.periodic[column] for column in periodic])
+        indexing = asnumpy(self.indexing)
+        weights, means, covs, log_det_J = (
+            asnumpy(value) for value in (self.weights, self.means, self.covs, self.log_det_J)
+        )
+        mins, maxs = asnumpy(self.mins), asnumpy(self.maxs)
+        self._periodic_columns = xp.asarray(periodic)
+        self._other_columns = xp.asarray(others)
+        self._periodic_domains = []
+        for domain in range(mins.shape[0]):
+            components = np.flatnonzero(indexing == domain)
+            scale = 2.0 / (maxs[domain] - mins[domain])
+            # one period of each periodic column in the mapped basis
+            steps = scale[periodic] * periods
+            count, dims = len(components), len(periodic)
+            whiten_others = np.empty((count, len(others), len(others)))
+            regression = np.empty((count, dims, len(others)))
+            whiten_periodic = np.empty((count, dims, dims))
+            constants = np.empty(count)
+            reach = np.ones(dims, dtype=int)
+            for row, component in enumerate(components):
+                cov = covs[component]
+                cov_others = cov[np.ix_(others, others)]
+                cov_cross = cov[np.ix_(periodic, others)]
+                regression[row] = np.linalg.solve(cov_others, cov_cross.T).T
+                conditional = cov[np.ix_(periodic, periodic)] - regression[row] @ cov_cross.T
+                chol_others = np.linalg.cholesky(cov_others)
+                chol_conditional = np.linalg.cholesky(conditional)
+                whiten_others[row] = np.linalg.inv(chol_others)
+                whiten_periodic[row] = np.linalg.inv(chol_conditional)
+                log_det = 2.0 * (np.log(np.diag(chol_others)).sum() + np.log(np.diag(chol_conditional)).sum())
+                constants[row] = (
+                    np.log(weights[component]) - 0.5 * self.ndim * np.log(2.0 * np.pi) - 0.5 * log_det
+                    + log_det_J[component]
+                )
+                # images within PERIODIC_K_SIGMA conditional standard deviations, plus the rounding to the nearest
+                reach = np.maximum(
+                    reach, np.ceil(self.PERIODIC_K_SIGMA * np.sqrt(np.diag(conditional)) / steps + 0.5).astype(int)
+                )
+            grids = np.meshgrid(*[np.arange(-per_side, per_side + 1) for per_side in reach], indexing="ij")
+            ring = np.stack([grid.ravel() for grid in grids], axis=1)
+            bytes_per_row = 8 * count * len(ring) * dims
+            self._periodic_domains.append(
+                dict(
+                    mins=xp.asarray(mins[domain]),
+                    scale=xp.asarray(scale),
+                    means=xp.asarray(means[components]),
+                    whiten_others=xp.asarray(whiten_others),
+                    regression=xp.asarray(regression),
+                    whiten_periodic=xp.asarray(whiten_periodic),
+                    constants=xp.asarray(constants),
+                    steps=xp.asarray(steps),
+                    ring=xp.asarray(ring, dtype=float),
+                    block_rows=int(max(1, min(self.PERIODIC_BLOCK_ROWS, self.PERIODIC_BLOCK_BYTES // bytes_per_row))),
+                )
+            )
+        # * the f0 window of each sub-domain holds the rows the culling keeps for its components
+        self._periodic_f0_low = xp.asarray(self.map_back_frequency(-limit, mins[:, 1], maxs[:, 1]))
+        self._periodic_f0_high = xp.asarray(self.map_back_frequency(+limit, mins[:, 1], maxs[:, 1]))
+
+    def _logpdf_periodic(self, x):
+        """The density of the wrapped draws, sub-domain by sub-domain on the rows of its f0 window."""
+        xp = cp if self.use_cupy else np
+        x = xp.asarray(x)
+        out = xp.full(x.shape[0], -xp.inf)
+        order = xp.argsort(x[:, 1])
+        f0_sorted = x[order, 1]
+        starts = asnumpy(xp.searchsorted(f0_sorted, self._periodic_f0_low, side="left"))
+        ends = asnumpy(xp.searchsorted(f0_sorted, self._periodic_f0_high, side="right"))
+        for domain, start, end in zip(self._periodic_domains, starts, ends):
+            if end > start:
+                rows = order[start:end]
+                out[rows] = xp.logaddexp(out[rows], self._periodic_domain_logpdf(domain, x[rows], xp))
+        return out
+
+    def _periodic_domain_logpdf(self, domain, rows, xp):
+        """ln q of one sub-domain at ``rows``: per component the Gaussian of the non-periodic columns times the
+        conditional Gaussian of the periodic ones, the latter summed over the ring of images around the lattice point
+        nearest to the row's conditional mean."""
+        mapped = (rows - domain["mins"]) * domain["scale"] - 1.0
+        values = xp.empty(rows.shape[0])
+        block_rows = domain["block_rows"]
+        for start in range(0, rows.shape[0], block_rows):
+            delta = mapped[start : start + block_rows, None, :] - domain["means"][None]
+            delta_others = delta[..., self._other_columns]
+            white = xp.einsum("kij,bkj->bki", domain["whiten_others"], delta_others)
+            terms = domain["constants"][None, :, None] - 0.5 * xp.sum(white * white, axis=-1)[..., None]
+            residual = delta[..., self._periodic_columns] - xp.einsum(
+                "kij,bkj->bki", domain["regression"], delta_others
+            )
+            nearest = xp.rint(-residual / domain["steps"])
+            shifted = residual[:, :, None, :] + (nearest[:, :, None, :] + domain["ring"][None, None]) * domain["steps"]
+            white_periodic = xp.einsum("kij,bkrj->bkri", domain["whiten_periodic"], shifted)
+            terms = (terms - 0.5 * xp.sum(white_periodic * white_periodic, axis=-1)).reshape(delta.shape[0], -1)
+            peak = xp.max(terms, axis=1)
+            peak_safe = xp.where(xp.isfinite(peak), peak, 0.0)
+            with np.errstate(divide="ignore"):
+                values[start : start + block_rows] = (
+                    xp.log(xp.sum(xp.exp(terms - peak_safe[:, None]), axis=1)) + peak_safe
+                )
+        return values
+
     def map_input(self, x, mins, maxs):
         """Map physical coordinates into the :math:`[-1, 1]^d` box."""
         return ((x - mins) / (maxs - mins)) * 2.0 - 1.0
@@ -881,6 +1014,10 @@ class FullGaussianMixtureModel(LISAToolsParallelModule):
         mins_here = self.mins[index_here]
         maxs_here = self.maxs[index_here]
         new_points_mapped = self.map_back_frequency(new_points, mins_here, maxs_here)
+
+        if self.periodic is not None:
+            for column, period in self.periodic.items():
+                new_points_mapped[..., column] = xp.mod(new_points_mapped[..., column], period)
 
         return new_points_mapped
 
