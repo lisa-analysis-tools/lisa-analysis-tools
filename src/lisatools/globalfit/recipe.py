@@ -50,10 +50,11 @@ from .moves import (
 )
 from .moves.gbbandstructure import stft_store_window_layout
 from .moves.gbspecialmove import (
-    GBSpecialRJPriorMove, 
-    GBSpecialRJSerialSearchMCMC,
+    GBFStatRJMove,
+    GBFStatSettings,
+    GBSpecialRJPriorMove,
     GBSpecialRJRefitMove,
-    GBSpecialBase   
+    GBSpecialBase
 )
 # from .moves.gbspecialstretch import GBSpecialBase
 
@@ -1270,6 +1271,15 @@ def default_gb_debug_settings(debug_settings, artifacts_file_dir: str):
     )
 
 
+def default_fstat_settings(fstat_settings, artifacts_file_dir: str):
+    """``fstat_settings`` (the defaults when None) with the search's output folder in the run's artifacts when it names
+    none."""
+    settings = GBFStatSettings() if fstat_settings is None else fstat_settings
+    if settings.output_dir is not None:
+        return settings
+    return dataclasses.replace(settings, output_dir=os.path.join(artifacts_file_dir, "fstat_search", ""))
+
+
 def prepare_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
@@ -1718,14 +1728,11 @@ def build_gb_moves(
         if include_search is False:
             search_move_names = []
         elif include_search is True:
-            if isinstance(domain_settings, FDSettings):
-                search_move_names = ["rj_fstat_mcmc_search", "rj_prior_search"]
-            else:
-                search_move_names = ["rj_prior_search"]
+            search_move_names = ["rj_prior_search"]
         else:
             # search_move_names is None and include_search is None
             if isinstance(domain_settings, FDSettings):
-                search_move_names = ["rj_fstat_mcmc_search", "rj_prior_search"]
+                search_move_names = ["rj_prior_search"]
             else:
                 search_move_names = []
     else:
@@ -1738,23 +1745,27 @@ def build_gb_moves(
     # Resolve pe_move_names
     if pe_move_names is None:
         if isinstance(domain_settings, FDSettings):
-            pe_move_names = (
-                ["rj_prior", "rj_refit", "rj_fstat_mcmc"]
-                if _refit_available
-                else ["rj_prior", "rj_fstat_mcmc"]
-            )
+            pe_move_names = ["rj_prior", "rj_refit"] if _refit_available else ["rj_prior"]
         else:
             pe_move_names = ["rj_prior"]
     else:
         pe_move_names = list(pe_move_names)
 
     # Validate domain compatibility
-    fd_only_moves = {"rj_fstat_mcmc_search", "rj_fstat_mcmc", "rj_refit_search", "rj_refit"}
+    fd_only_moves = {"rj_refit_search", "rj_refit"}
     if not isinstance(domain_settings, FDSettings):
         for name in search_move_names + pe_move_names:
             if name in fd_only_moves:
                 raise NotImplementedError(
                     f"GB move '{name}' requires FD basis, but domain is {type(domain_settings).__name__}."
+                )
+    # * The F-statistic search runs on the STFT/DFFR response only; a run gets it only when it names it.
+    stft_only_moves = {"rj_fstat_mcmc_search", "rj_fstat_mcmc"}
+    if not isinstance(domain_settings, STFTSettings):
+        for name in search_move_names + pe_move_names:
+            if name in stft_only_moves:
+                raise NotImplementedError(
+                    f"GB move '{name}' requires the STFT basis, but domain is {type(domain_settings).__name__}."
                 )
 
     # Validate refit availability if explicitly requested
@@ -1784,7 +1795,7 @@ def build_gb_moves(
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc_search":
-            move = GBSpecialRJSerialSearchMCMC(
+            move = GBFStatRJMove(
                 *gb_move_args,
                 rj_proposal_distribution=None,
                 is_rj_prop=True,
@@ -1793,6 +1804,9 @@ def build_gb_moves(
                 phase_maximize=False,
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
+                fstat_settings=default_fstat_settings(
+                    move_settings.fstat_settings, general_info.artifacts_file_dir
+                ),
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit_search":
@@ -1821,7 +1835,7 @@ def build_gb_moves(
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc":
-            move = GBSpecialRJSerialSearchMCMC(
+            move = GBFStatRJMove(
                 *gb_move_args,
                 rj_proposal_distribution=None,
                 run_swaps=True,
@@ -1829,6 +1843,9 @@ def build_gb_moves(
                 phase_maximize=False,
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
+                fstat_settings=default_fstat_settings(
+                    move_settings.fstat_settings, general_info.artifacts_file_dir
+                ),
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit":
