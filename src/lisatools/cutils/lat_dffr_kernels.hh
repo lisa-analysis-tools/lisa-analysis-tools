@@ -4,7 +4,8 @@
 // lat_dffr_kernels.hh -- the Direct Fast Fresnel Response (DFFR) of the STFT likelihood: settings,
 // source contract, windowed chirp transform, TDI weights, segment table, the tile that hands the
 // pixels to the consumers of lat_stft_kernels.hh (get_ll, fill_global, swap_ll, the F-statistic and
-// both gradients), and two diagnostics of a batch of sources (compact template, segment table).
+// both gradients), the F-statistic of a galactic binary from two templates, and two diagnostics of
+// a batch of sources (compact template, segment table).
 // Ported from the standalone package direct-fast-fresnel-response at commit 01530a5
 // (src/dffr/cutils/dffr.cu). A source package (GBGPU for galactic binaries) instantiates the tile
 // and the diagnostics with its source model. docs/response/dffr/README.md describes the response
@@ -2126,6 +2127,299 @@ inline void dffr_information_matrix(double *info_out, const DFFRTileInputs<Sourc
   dffr_information_matrix_kernel<SourceT, Rows>(info_out, inputs, stft_launch, params_all,
                                                 noise_index_all, layout, num_bin, nparams,
                                                 start_freq_inds, host_arena.data());
+#endif
+}
+
+// ===========================================================================
+// The F-statistic of a galactic binary from two templates
+// ===========================================================================
+// F is the log-likelihood maximised over the four extrinsic amplitudes: 2F = N^T M^-1 N, with
+// N_i = Re(d|A_i) and M_ij = Re(A_i|A_j) for the four filters A_i of stft_get_fstat_ll_kernel, the
+// template at A = 2, iota = pi/2 and (psi, phi0) = (0, 0), (pi/4, pi), (0, 3 pi/2), (pi/4, pi/2).
+// d is the data row of the source's cell and (x|y) = 4 df sum conj(x) C^-1 y the consumers' inner
+// product over pixels and channels. Since phi0 enters a template only as exp(-i phi0), the filters
+// are T+, -Tx, i T+ and -i Tx, with T+ and Tx the templates at phi0 = 0 and psi = 0 or pi/4. From
+// D+ = (d|T+), Dx = (d|Tx), P+ = (T+|T+), Px = (Tx|Tx) and Q = (T+|Tx):
+//   N  = (Re D+, -Re Dx, -Im D+, Im Dx),
+//   M  = (Re P+, -Re Q, 0, Im Q, Re Px, -Im Q, 0, Re P+, -Re Q, Re Px), the upper triangle row by
+//        row; M13 and M24 are zero because P+ and Px are real,
+//   2F = (Px |D+|^2 + P+ |Dx|^2 - 2 Re(Q D+ conj(Dx))) / (P+ Px - |Q|^2).
+// * psi changes no reception state, so Tx is a variant of the Fisher matrix's build that reads the
+// * states of T+, and a pixel evaluates its windowed sums once for both templates.
+// ! The GB parameter slots and the filter values are fixed, as in stft_get_fstat_ll_kernel.
+// ! A row whose two templates are parallel on the support gets a non-finite 2F.
+
+constexpr int DFFR_FSTAT_NUM_PARAMS = 9;
+// Parameter slots of a galactic binary (amp, f0, fdot, fddot, phi0, iota, psi, lam, beta).
+constexpr int DFFR_FSTAT_SLOT_AMPLITUDE = 0;
+constexpr int DFFR_FSTAT_SLOT_PHASE = 4;
+constexpr int DFFR_FSTAT_SLOT_INCLINATION = 5;
+constexpr int DFFR_FSTAT_SLOT_POLARIZATION = 6;
+// Entries of the projections N and of the overlap upper triangle M, per row.
+constexpr int DFFR_FSTAT_NUM_PROJECTIONS = 4;
+constexpr int DFFR_FSTAT_NUM_OVERLAPS = 10;
+
+// The variant table of the Fisher matrix's build for T+ (variant 0, which writes the reception
+// states) and Tx (variant 1, psi shifted by pi/4, which reads them). Host and device alike.
+CUDA_CALLABLE_MEMBER inline DFFRFisherLayout dffr_fstat_layout() {
+  DFFRFisherLayout layout = {};
+  layout.num_variants = 2;
+  layout.num_states = 1;
+  layout.shared_states = 0;
+  for (int variant = 0; variant < 2; variant += 1) {
+    layout.variant_param[variant] = DFFR_FSTAT_SLOT_POLARIZATION;
+    layout.variant_states[variant] = 0;
+    layout.variant_writes_states[variant] = (variant == 0);
+  }
+  layout.variant_shift[0] = 0.0;
+  layout.variant_shift[1] = M_PI / 4.0;
+  return layout;
+}
+
+// The three channels of T+ and Tx at one pixel: the windowed sums once, then each template's
+// reference phasors and weights in the order of dffr_evaluate_pixel.
+template <int Rows>
+CUDA_DEVICE inline void dffr_fstat_pixel_values(const DFFRFisherReception<Rows> &states,
+                                                const DFFRFisherAnchors<Rows> &anchors,
+                                                const DFFRFisherAmplitude<Rows> *amplitudes,
+                                                const DFFRSettings &settings, int row,
+                                                int freq_j_here, double frequency,
+                                                cmplx *plus_values, cmplx *cross_values) {
+  const DFFRBandBinPhasors band_bin_phasors =
+      dffr_make_band_bin_phasors(settings, freq_j_here - states.start_freq_ind[row]);
+  const double bin_sign = (freq_j_here & 1) ? -1.0 : 1.0;
+  const cmplx origin_phasor = bin_sign * settings.origin_phasor_base;
+  const DFFRFisherAmplitude<Rows> &plus = amplitudes[0];
+  const DFFRFisherAmplitude<Rows> &cross = amplitudes[1];
+  const cmplx *plus_weights = plus.tdi_weights + row * DFFR_TDI_WEIGHTS;
+  const cmplx *cross_weights = cross.tdi_weights + row * DFFR_TDI_WEIGHTS;
+  for (int channel = 0; channel < DFFR_NUM_CHANNELS; channel += 1) {
+    plus_values[channel] = cmplx(0.0, 0.0);
+    cross_values[channel] = cmplx(0.0, 0.0);
+  }
+
+  // ! Not unrolled, as in dffr_evaluate_pixel: each iteration inlines a reception state.
+  for (int spacecraft_index = 0; spacecraft_index < DFFR_NUM_SPACECRAFT; spacecraft_index += 1) {
+    const int slot = row * DFFR_NUM_SPACECRAFT + spacecraft_index;
+    cmplx total, total_moment;
+    dffr_reception_sums(states, anchors, settings, slot, frequency, band_bin_phasors, &total,
+                        &total_moment);
+    const cmplx plus_overall = dffr_mul(plus.reference_phasor[slot], origin_phasor);
+    dffr_add_reception_state(plus_weights, spacecraft_index, dffr_mul(plus_overall, total),
+                             dffr_mul(plus_overall, total_moment), plus_values);
+    const cmplx cross_overall = dffr_mul(cross.reference_phasor[slot], origin_phasor);
+    dffr_add_reception_state(cross_weights, spacecraft_index, dffr_mul(cross_overall, total),
+                             dffr_mul(cross_overall, total_moment), cross_values);
+  }
+}
+
+// One block per row: N, the upper triangle of M and 2F into projections_out[row * 4 + i],
+// overlaps_out[row * 10 + k] and two_f_out[row]. Pixels, window and reduction as in
+// stft_eval_block_swap; the tile's doubling and the consumer's halving cancel exactly, so both are
+// left out.
+template <class SourceT, int Rows>
+CUDA_KERNEL void dffr_get_fstat_kernel(double *projections_out, double *overlaps_out,
+                                       double *two_f_out, DFFRTileInputs<SourceT> inputs,
+                                       STFTDomain *stft, const double *params_all,
+                                       const int *data_index_all, const int *noise_index_all,
+                                       DFFRFisherLayout layout, int num_bin, int nparams,
+                                       const int *start_freq_inds, unsigned char *host_arena) {
+  static_assert(SourceT::num_params == DFFR_FSTAT_NUM_PARAMS,
+                "the F-statistic kernel takes the nine parameters of a galactic binary");
+  static_assert(((SourceT::reception_invariant_params >> DFFR_FSTAT_SLOT_POLARIZATION) & 1u) != 0u,
+                "T+ and Tx share their reception states only if psi changes none of them");
+  using Map = StftBandBinMap<Rows>;
+
+  // Per-thread shares of the five products.
+  CUDA_SHARED cmplx d_plus_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx d_cross_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx plus_plus_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx cross_cross_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx plus_cross_sums[NUM_THREADS_HERE];
+  CUDA_SHARED double params[N_PARAMS_MAX];
+  CUDA_SHARED typename Map::Shared bands;
+#ifdef __CUDACC__
+  const int thread_index = threadIdx.x;
+#else
+  const int thread_index = 0;
+#endif
+
+  unsigned char *arena = stft_tile_arena(host_arena);
+  DFFRSettings *shared_settings = reinterpret_cast<DFFRSettings *>(arena);
+  DFFRFisherReception<Rows> *states =
+      reinterpret_cast<DFFRFisherReception<Rows> *>(arena + dffr_information_states_offset());
+  DFFRFisherAmplitude<Rows> *amplitudes = reinterpret_cast<DFFRFisherAmplitude<Rows> *>(
+      arena + dffr_information_amplitudes_offset<Rows>(layout));
+  DFFRFisherAnchors<Rows> *anchors = reinterpret_cast<DFFRFisherAnchors<Rows> *>(
+      arena + dffr_information_anchors_offset<Rows>(layout));
+  const DFFRSettings &settings = *shared_settings;
+  const DFFRFisherBands<Rows> band_context{&bands};
+  const int wave_variants = dffr_information_wave_variants<SourceT, Rows>(layout);
+
+  const int num_times = inputs.settings.num_time_segments;
+  const int num_freqs = stft->num_freqs;
+  const double df = stft->df;
+  const double f_min = stft->f_min;
+
+  // * The pixels read the settings from shared memory, as the tile does, to keep one pointer.
+  if (THREAD_START_X == 0) *shared_settings = inputs.settings;
+
+  for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X) {
+    const int data_index = data_index_all[bin_i];
+    const int noise_index = noise_index_all[bin_i];
+    // * Window start of the cell this row is evaluated against; 0 is the full grid.
+    const int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
+    CUDA_SYNC_THREADS;
+    for (int index = THREAD_START_X; index < nparams; index += BLOCK_INCR_X)
+      params[index] = params_all[(size_t)bin_i * nparams + index];
+    CUDA_SYNC_THREADS;
+    // T+; the layout shifts psi by pi/4 for Tx.
+    if (THREAD_START_X == 0) {
+      params[DFFR_FSTAT_SLOT_AMPLITUDE] = 2.0;
+      params[DFFR_FSTAT_SLOT_PHASE] = 0.0;
+      params[DFFR_FSTAT_SLOT_INCLINATION] = M_PI / 2.0;
+      params[DFFR_FSTAT_SLOT_POLARIZATION] = 0.0;
+    }
+    d_plus_sums[thread_index] = cmplx(0.0, 0.0);
+    d_cross_sums[thread_index] = cmplx(0.0, 0.0);
+    plus_plus_sums[thread_index] = cmplx(0.0, 0.0);
+    cross_cross_sums[thread_index] = cmplx(0.0, 0.0);
+    plus_cross_sums[thread_index] = cmplx(0.0, 0.0);
+    CUDA_SYNC_THREADS;
+
+    for (int row_base = 0; row_base < num_times; row_base += Rows) {
+      const int rows_here = (num_times - row_base < Rows) ? (num_times - row_base) : Rows;
+      dffr_information_build<SourceT, Rows>(states, amplitudes, anchors, inputs, layout,
+                                            wave_variants, params, nparams, row_base, rows_here);
+
+      // * Both templates have the carrier of T+, so a row's band is that of T+.
+      Map map(band_context, rows_here);
+      for (int row = map.first_row(); row < rows_here; row += map.row_stride()) {
+        const int band_start = states[0].start_freq_ind[row];
+        map.set_band(row, band_start, band_start + 2 * settings.num_side_bins);
+      }
+      map.finish_bands();
+
+      for (int pixel = map.first_pixel(); pixel < map.end_pixel(); pixel += map.pixel_stride()) {
+        int row, freq_j_here;
+        if (!map.locate(pixel, &row, &freq_j_here)) continue;
+        const int time_i = row_base + row;
+        const int freq_j_local = freq_j_here - start_j;
+        if ((freq_j_local < 0) || (freq_j_local > num_freqs - 1)) continue;
+        const double freq_here = f_min + freq_j_here * df;
+
+        cmplx plus_values[DFFR_NUM_CHANNELS];
+        cmplx cross_values[DFFR_NUM_CHANNELS];
+        dffr_fstat_pixel_values<Rows>(states[0], anchors[0], amplitudes, settings, row, freq_j_here,
+                                      freq_here, plus_values, cross_values);
+        const int noise_bin = stft->noise_bin(freq_j_here, freq_j_local);
+        // * The terms of add_ip_swap_contrib in its order, each inverse-CSD entry and data value
+        // * read once.
+        cmplx data_values[DFFR_NUM_CHANNELS];
+        for (int channel = 0; channel < DFFR_NUM_CHANNELS; channel += 1)
+          data_values[channel] = stft->get_data_value(time_i, freq_j_local, channel, data_index);
+        cmplx d_plus_value(0.0, 0.0);
+        cmplx d_cross_value(0.0, 0.0);
+        cmplx plus_plus_value(0.0, 0.0);
+        cmplx cross_cross_value(0.0, 0.0);
+        cmplx plus_cross_value(0.0, 0.0);
+        for (int channel = 0; channel < DFFR_NUM_CHANNELS; channel += 1) {
+          for (int other_channel = 0; other_channel < DFFR_NUM_CHANNELS; other_channel += 1) {
+            const cmplx inverse_csd = stft->get_invC_cross_value(time_i, noise_bin, channel,
+                                                                 other_channel, noise_index);
+            const cmplx weighted_plus = inverse_csd * plus_values[other_channel];
+            d_plus_value += gcmplx::conj(data_values[channel]) * weighted_plus;
+            plus_plus_value += gcmplx::conj(plus_values[channel]) * weighted_plus;
+            const cmplx weighted_cross = inverse_csd * cross_values[other_channel];
+            d_cross_value += gcmplx::conj(data_values[channel]) * weighted_cross;
+            cross_cross_value += gcmplx::conj(cross_values[channel]) * weighted_cross;
+            plus_cross_value += gcmplx::conj(plus_values[channel]) * weighted_cross;
+          }
+        }
+        d_plus_sums[thread_index] += d_plus_value;
+        plus_plus_sums[thread_index] += plus_plus_value;
+        d_cross_sums[thread_index] += d_cross_value;
+        cross_cross_sums[thread_index] += cross_cross_value;
+        plus_cross_sums[thread_index] += plus_cross_value;
+      }
+      map.finish_pass();
+    }
+    CUDA_SYNC_THREADS;
+
+#ifdef __CUDACC__
+    const cmplx d_plus = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(d_plus_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx d_cross = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(d_cross_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx plus_plus = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(plus_plus_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx cross_cross = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(cross_cross_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx plus_cross = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(plus_cross_sums);
+#else
+    const cmplx d_plus = 4.0 * stft->diff_comp * d_plus_sums[0];
+    const cmplx d_cross = 4.0 * stft->diff_comp * d_cross_sums[0];
+    const cmplx plus_plus = 4.0 * stft->diff_comp * plus_plus_sums[0];
+    const cmplx cross_cross = 4.0 * stft->diff_comp * cross_cross_sums[0];
+    const cmplx plus_cross = 4.0 * stft->diff_comp * plus_cross_sums[0];
+#endif
+
+    if (thread_index == 0) {
+      double *projections = projections_out + (size_t)bin_i * DFFR_FSTAT_NUM_PROJECTIONS;
+      projections[0] = d_plus.real();
+      projections[1] = -d_cross.real();
+      projections[2] = -d_plus.imag();
+      projections[3] = d_cross.imag();
+      double *overlaps = overlaps_out + (size_t)bin_i * DFFR_FSTAT_NUM_OVERLAPS;
+      overlaps[0] = plus_plus.real();
+      overlaps[1] = -plus_cross.real();
+      overlaps[2] = 0.0;
+      overlaps[3] = plus_cross.imag();
+      overlaps[4] = cross_cross.real();
+      overlaps[5] = -plus_cross.imag();
+      overlaps[6] = 0.0;
+      overlaps[7] = plus_plus.real();
+      overlaps[8] = -plus_cross.real();
+      overlaps[9] = cross_cross.real();
+
+      const double plus_norm = plus_plus.real();
+      const double cross_norm = cross_cross.real();
+      const double d_plus_squared = d_plus.real() * d_plus.real() + d_plus.imag() * d_plus.imag();
+      const double d_cross_squared =
+          d_cross.real() * d_cross.real() + d_cross.imag() * d_cross.imag();
+      const double plus_cross_squared =
+          plus_cross.real() * plus_cross.real() + plus_cross.imag() * plus_cross.imag();
+      const double mixed = dffr_mul(dffr_mul(plus_cross, d_plus), gcmplx::conj(d_cross)).real();
+      two_f_out[bin_i] = (cross_norm * d_plus_squared + plus_norm * d_cross_squared - 2.0 * mixed) /
+                         (plus_norm * cross_norm - plus_cross_squared);
+    }
+    CUDA_SYNC_THREADS;
+  }
+}
+
+// Host launcher of the F-statistic kernel.
+// ! Raises std::runtime_error when the device cannot hold the launch.
+template <class SourceT, int Rows>
+inline void dffr_get_fstat(double *projections_out, double *overlaps_out, double *two_f_out,
+                           const DFFRTileInputs<SourceT> &inputs, STFTDomain *stft_launch,
+                           const double *params_all, const int *data_index_all,
+                           const int *noise_index_all, int num_bin, int nparams,
+                           const int *start_freq_inds) {
+  if (num_bin < 1) return;
+  const DFFRFisherLayout layout = dffr_fstat_layout();
+  const size_t shared_bytes = dffr_information_bytes<SourceT, Rows>(layout);
+#ifdef __CUDACC__
+  stft_prepare_dynamic_shared(dffr_get_fstat_kernel<SourceT, Rows>, shared_bytes);
+  dffr_get_fstat_kernel<SourceT, Rows><<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
+      projections_out, overlaps_out, two_f_out, inputs, stft_launch, params_all, data_index_all,
+      noise_index_all, layout, num_bin, nparams, start_freq_inds, nullptr);
+  gpuErrchk(cudaGetLastError());
+#else
+  std::vector<unsigned char> host_arena(shared_bytes);
+  dffr_get_fstat_kernel<SourceT, Rows>(projections_out, overlaps_out, two_f_out, inputs,
+                                       stft_launch, params_all, data_index_all, noise_index_all,
+                                       layout, num_bin, nparams, start_freq_inds,
+                                       host_arena.data());
 #endif
 }
 
