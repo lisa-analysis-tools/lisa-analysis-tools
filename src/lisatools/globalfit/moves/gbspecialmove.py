@@ -4341,13 +4341,13 @@ class GBFStatRJMove(GBSpecialBase):
     2. a band passes when the largest stored cold sqrt(2F) exceeds the gate's threshold (:meth:`detection_gate`);
     3. stage 2 samples every column of the passing bands with the full likelihood, from the F-statistic maximizers at
        stage 1's last state;
-    4. one Gaussian mixture per passing band, fitted to its stage-2 cold chain in every column but phi0 and psi,
-       becomes the RJ proposal, which draws phi0 and psi uniformly.
+    4. one Gaussian mixture per passing band, fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
+       theta+-, lam periodic, becomes the RJ proposal (:class:`FStatPhaseProposal`).
 
     A search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
     ``save_search_records`` asks for one. The math (the start draws, the amplitudes and their map to the extrinsic
-    parameters, the gate) sits in static and class methods. Points are in the GB sampling basis, with the columns
-    ``COL_*``.
+    parameters, the gate, the theta rows) sits in static and class methods. Points are in the GB sampling basis, with
+    the columns ``COL_*``.
 
     Args:
         *args: :class:`GBSpecialBase`'s arguments.
@@ -4362,8 +4362,8 @@ class GBFStatRJMove(GBSpecialBase):
     PHYS_AMP, PHYS_PHI0, PHYS_IOTA, PHYS_PSI = 0, 4, 5, 6
     # Stage 1 samples the columns the F-statistic depends on; it maximizes the other four analytically
     SAMPLED_COLUMNS = (COL_F0, COL_FDOT, COL_LAM, COL_SIN_BETA)
-    # The proposal's mixture covers every column but phi0 and psi, which it draws uniformly
-    GMM_COLUMNS = (COL_LN_AMP, COL_F0, COL_FDOT, COL_COS_IOTA, COL_LAM, COL_SIN_BETA)
+    # The mixture's periodic columns, theta+ in phi0's column, theta- in psi's and lam, with their periods
+    GMM_PERIODIC = {COL_PHI0: 2.0 * np.pi, COL_PSI: 2.0 * np.pi, COL_LAM: 2.0 * np.pi}
     # The component counts that vec_fit_gmm_min_bic tries and the draws its BIC is scored on
     GMM_MIN_COMPONENTS, GMM_MAX_COMPONENTS, GMM_BIC_DRAWS = 1, 30, 5000
     # * The mixture fit runs in chunks of bands that fit the free device memory minus 1 GiB or 5 % of the device (the
@@ -4576,12 +4576,12 @@ class GBFStatRJMove(GBSpecialBase):
         return output, likelihood
 
     def _build_proposal(self, stage_2):
-        """The RJ proposal from the passing bands' stage-2 cold chains: one mixture per band over every column but phi0
-        and psi, which are drawn uniformly. Returns the usable bands, the proposal (None when no band is usable), the
-        mixture's seven component lists, the bands per fit chunk and the seconds."""
+        """The RJ proposal from the passing bands' stage-2 cold chains: one mixture per band over :meth:`theta_rows`
+        with theta+, theta- and lam periodic (:class:`FStatPhaseProposal`). Returns the usable bands, the proposal
+        (None when no band is usable), the mixture's seven component lists, the bands per fit chunk and the seconds."""
         time_start = time.perf_counter()
         cold_coords = stage_2["cold_coords"]
-        samples = cold_coords[..., list(self.GMM_COLUMNS)].reshape(cold_coords.shape[0], -1, len(self.GMM_COLUMNS))
+        samples = cold_coords.reshape(cold_coords.shape[0], -1, self.NDIM)
         # * a band whose chain never moved in a column (zero range, which the mixture's box map divides by) or holds a
         # * value that is not finite is left out, not the search
         usable = np.all(np.isfinite(samples), axis=(1, 2)) & np.all(np.ptp(samples, axis=1) > 0.0, axis=1)
@@ -4589,18 +4589,10 @@ class GBFStatRJMove(GBSpecialBase):
             return {"usable": usable, "proposal": None, "components": None, "chunk": None,
                     "seconds": time.perf_counter() - time_start}
         gpu = int(self.xp.cuda.runtime.getDevice()) if self.backend.uses_cupy else None
-        components, chunk = self.fit_band_mixtures(samples[usable], gpu)
-        full_gmm = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy)
-        proposal = ProbDistContainer(
-            {
-                ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
-                "phi0": uniform_dist(0.0, 2 * np.pi, use_cupy=self.backend.uses_cupy),
-                "psi": uniform_dist(0.0, 2 * np.pi, use_cupy=self.backend.uses_cupy),
-            },
-            use_cupy=self.backend.uses_cupy,
-        )
-        proposal.reset_key_order(["A", "f0", "fdot", "phi0", "cos_iota", "psi", "alpha", "sin_delta"])
-        return {"usable": usable, "proposal": proposal, "components": components, "chunk": chunk,
+        theta = self.theta_rows(cold_coords[usable].reshape(int(usable.sum()), -1, self.NDIM))
+        components, chunk = self.fit_band_mixtures(theta, gpu, periodic=self.GMM_PERIODIC)
+        mixture = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy, periodic=self.GMM_PERIODIC)
+        return {"usable": usable, "proposal": FStatPhaseProposal(mixture), "components": components, "chunk": chunk,
                 "seconds": time.perf_counter() - time_start}
 
     # ==================================================================================================================
@@ -4660,12 +4652,12 @@ class GBFStatRJMove(GBSpecialBase):
         }
 
     @classmethod
-    def fit_band_mixtures(cls, samples, gpu):
+    def fit_band_mixtures(cls, samples, gpu, periodic=None):
         """``vec_fit_gmm_min_bic`` per chunk of bands: its seven component lists, one entry per band, and the chunk size.
 
-        ``samples`` is (n_bands, n_samples, n_columns). On a GPU a chunk holds as many bands as the free device memory
-        minus the headroom allows, from the estimate GMM_WORK_ARRAYS x (n_samples + BIC draws) x components x 8 bytes
-        per band, since all bands of a large search at once may not fit.
+        ``samples`` is (n_bands, n_samples, n_columns) and ``periodic`` the fit's periodic columns. On a GPU a chunk
+        holds as many bands as the free device memory minus the headroom allows, from the estimate GMM_WORK_ARRAYS x
+        (n_samples + BIC draws) x components x 8 bytes per band, since all bands of a large search at once may not fit.
         """
         n_bands, n_samples, _ = samples.shape
         if gpu is None:
@@ -4682,7 +4674,7 @@ class GBFStatRJMove(GBSpecialBase):
             parts = vec_fit_gmm_min_bic(
                 xp.asarray(samples[first : first + chunk]), min_comp=cls.GMM_MIN_COMPONENTS,
                 max_comp=cls.GMM_MAX_COMPONENTS, n_samp_bic_test=cls.GMM_BIC_DRAWS, gpu=gpu, verbose=False,
-                return_components=True)
+                return_components=True, periodic=periodic)
             for target, part in zip(components, parts):
                 target.extend(part)
         return components, chunk
@@ -4798,7 +4790,8 @@ class GBFStatRJMove(GBSpecialBase):
             mixtures = search["mixtures"]
             record.update({"gmm_usable": mixtures["usable"], "gmm_seconds": mixtures["seconds"]})
             if mixtures["components"] is not None:
-                record.update(self.padded_components(mixtures["components"]), gmm_chunk_bands=mixtures["chunk"])
+                record.update(self.padded_components(mixtures["components"]), gmm_layout="theta_lam",
+                              gmm_chunk_bands=mixtures["chunk"])
         if settings.save_search_records != "full":
             for key in self.CHAIN_KEYS:
                 record.pop(key, None)
@@ -4837,7 +4830,7 @@ class GBFStatRJMove(GBSpecialBase):
         self._next_record += 1
 
     # ==================================================================================================================
-    # Math of the search: the band-restricted start draws, the F-statistic algebra and the gate
+    # Math of the search: the band-restricted start draws, the F-statistic algebra, the gate and the theta rows
     # ==================================================================================================================
 
     @classmethod
@@ -4947,9 +4940,27 @@ class GBFStatRJMove(GBSpecialBase):
         detected = snr.reshape(n_bands, -1).max(axis=1) > threshold
         return detected, threshold, target
 
+    @classmethod
+    def theta_rows(cls, rows, xp=np):
+        """A copy of sampling rows with theta+ = 2 psi + phi0 in phi0's column and theta- = 2 psi - phi0 in psi's; the
+        other columns stay, f0 in column 1, where the mixture's culling reads it."""
+        out = xp.asarray(rows, dtype=xp.float64).copy()
+        phi0, psi = out[..., cls.COL_PHI0].copy(), out[..., cls.COL_PSI].copy()
+        out[..., cls.COL_PHI0] = 2.0 * psi + phi0
+        out[..., cls.COL_PSI] = 2.0 * psi - phi0
+        return out
+
+    @staticmethod
+    def phases_from_theta(theta_plus, theta_minus, phase_copy, psi_copy, xp=np):
+        """(phi0, psi) in [0, 2 pi) of theta+- = 2 psi +- phi0, at the copy (phi0 + pi, psi + pi/2) where ``phase_copy``
+        is set and at psi + pi where ``psi_copy`` is set: the four points where the template is the same."""
+        phi0 = xp.mod(0.5 * (theta_plus - theta_minus) + np.pi * phase_copy, 2.0 * np.pi)
+        psi = xp.mod(0.25 * (theta_plus + theta_minus) + 0.5 * np.pi * phase_copy + np.pi * psi_copy, 2.0 * np.pi)
+        return phi0, psi
+
 
 # ======================================================================================================================
-# The objects the F-statistic search hands to Eryn
+# The objects the F-statistic search hands to Eryn and the band sorter
 # ======================================================================================================================
 
 
@@ -5054,6 +5065,37 @@ class FStatSearchLikelihood:
         self.rows += coords.shape[0]
         self.seconds += time.perf_counter() - time_start
         return out
+
+
+class FStatPhaseProposal:
+    """RJ birth proposal of the F-statistic move on sampling rows, from a mixture over the theta rows
+    (:meth:`GBFStatRJMove.theta_rows`).
+
+    ``mixture`` is a :class:`FullGaussianMixtureModel` with theta+, theta- and lam periodic. The template is the same at
+    the four points (phi0, psi), (phi0, psi + pi), (phi0 + pi, psi + pi/2) and (phi0 + pi, psi + 3 pi/2) of
+    [0, 2 pi)^2, where theta+- agree, and a draw takes one of them with probability 1/4. The map from (phi0, psi) to
+    (theta+, theta-) has Jacobian 4, so the density of a row is the mixture's at its theta+-.
+    """
+
+    def __init__(self, mixture):
+        self.mixture = mixture
+        self.xp = cp if mixture.use_cupy else np
+
+    def rvs(self, size=1):
+        xp = self.xp
+        move = GBFStatRJMove
+        shape = (size,) if isinstance(size, (int, np.integer)) else tuple(size)
+        rows = self.mixture.rvs(size=(int(np.prod(shape)),))
+        theta_plus, theta_minus = rows[:, move.COL_PHI0].copy(), rows[:, move.COL_PSI].copy()
+        # * one of the four points of the template's symmetry, each with probability 1/4
+        phase_copy = xp.random.rand(theta_plus.shape[0]) < 0.5
+        psi_copy = xp.random.rand(theta_plus.shape[0]) < 0.5
+        rows[:, move.COL_PHI0], rows[:, move.COL_PSI] = move.phases_from_theta(
+            theta_plus, theta_minus, phase_copy, psi_copy, xp=xp)
+        return rows.reshape(shape + (move.NDIM,))
+
+    def logpdf(self, x):
+        return self.mixture.logpdf(GBFStatRJMove.theta_rows(x, self.xp))
 
 
 # * The name of the FD serial search, which settings files still import.
