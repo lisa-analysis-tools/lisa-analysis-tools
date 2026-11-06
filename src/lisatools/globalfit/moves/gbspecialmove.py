@@ -4794,7 +4794,8 @@ class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
             {
                 ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
                 "phi0": uniform_dist(0.0, 2 * np.pi),
-                "psi": uniform_dist(0.0, np.pi),
+                # * the prior's psi range: on [0, pi) the move can neither propose nor remove a source in [pi, 2 pi)
+                "psi": uniform_dist(0.0, 2 * np.pi),
             },
             use_cupy=True,
         )
@@ -5058,7 +5059,8 @@ class GBSpecialRJRefitMove(GBSpecialBase):
             {
                 ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
                 "phi0": uniform_dist(0.0, 2 * np.pi),
-                "psi": uniform_dist(0.0, np.pi),
+                # * the prior's psi range: on [0, pi) the move can neither propose nor remove a source in [pi, 2 pi)
+                "psi": uniform_dist(0.0, 2 * np.pi),
             },
             use_cupy=True,
         )
