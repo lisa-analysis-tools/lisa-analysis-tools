@@ -464,20 +464,20 @@ time to the DFFR time, with the final Fisher kernel. The global fit runs 16 side
 
 ## Kernel resources on the A100 and the H100
 
-Registers, stack and shared memory of the kernels as GBGPU links them (`kernel_resources.py`;
-with relocatable device code a kernel gets the largest register count among itself and the
-functions it calls). Blocks of 128 threads per SM follow from 65 536 registers per SM (4 blocks up
-to 128 registers, 3 up to 168, 2 up to 255) and from the shared memory (164 kB per SM on the A100,
-228 kB on the H100). One DFFR template holds 32 segment rows of 1012 bytes, the source constants
-and the settings: 32 672 bytes.
+Registers, stack and shared memory of the kernels as GBGPU links them (`kernel_resources.py`,
+2026-11-05, with the 64-bit data and noise indices of `domains.hpp`; with relocatable device code
+a kernel gets the largest register count among itself and the functions it calls). Blocks of 128
+threads per SM follow from 65 536 registers per SM (4 blocks up to 128 registers, 3 up to 168, 2 up
+to 255) and from the shared memory (164 kB per SM on the A100, 228 kB on the H100). One DFFR
+template holds 32 segment rows of 1012 bytes, the source constants and the settings: 32 664 bytes.
 
 | Kernel | Linked registers, A100 / H100 | Blocks per SM by registers | Blocks per SM by shared memory, A100 / H100 |
 | --- | --- | --- | --- |
-| existing response, every STFT kernel and its Fisher (set by `STFTFresnelGPU::get_fourier_value`) | 244 / 222 | 2 | 16 and more |
-| DFFR `get_ll`, `fill_global`, `get_ll` gradient | 154 to 164 | 3 | 4 / 6 |
-| DFFR swap, F-statistic (set by `STFTDomainGPU::add_ip_swap_contrib`) | 220 / 222 | 2 | 2 / 3 at 32 rows, 3 / 5 at 16 |
+| existing response, every STFT kernel and its Fisher (set by `STFTFresnelGPU::get_fourier_value`) | 244 / 222; on the H100 238 for the swap, its gradient and the four-filter F-statistic (set by `STFTDomainGPU::add_ip_swap_contrib`) | 2 | 14 / 20 and more |
+| DFFR `get_ll`, `fill_global`, `get_ll` gradient | 156 to 166 / 156 to 164 | 3 | 4 / 6 |
+| DFFR swap, F-statistic (set by `STFTDomainGPU::add_ip_swap_contrib`) | 244 / 238 | 2 | 2 / 3 at 32 rows, 3 / 5 at 16 |
 | DFFR swap gradient (`Template::values` and `build` out of line) | 254 / 254 | 2 | 2 / 3 |
-| DFFR Fisher, 4 rows per pass, 8 / 9 parameters (66 272 / 77 088 bytes of dynamic shared memory) | 176 / 183 | 2 | 2 / 3 and 2 / 2 |
+| DFFR Fisher, 4 rows per pass, 8 / 9 parameters (66 256 / 77 072 bytes of dynamic shared memory) | 176 / 183 | 2 | 2 / 3 and 2 / 2 |
 | DFFR two-template F-statistic (`dffr_get_fstat_kernel`; 37 280 / 18 784 bytes of dynamic shared memory at 32 / 16 rows) | 164 / 169 | 3 / 2 | 3 / 4 at 32 rows, 5 / 7 at 16 |
 
 The two-template DFFR kernels take 65 344 bytes of dynamic shared memory at 32 rows, above the
