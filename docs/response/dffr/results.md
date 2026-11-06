@@ -453,6 +453,14 @@ time to the DFFR time, with the final Fisher kernel. The global fit runs 16 side
   costs per segment. Compiled at `-O3`, which the module's build does not apply, the DFFR code runs
   2.3 to 2.9 times faster and its outputs move at rounding level (templates within 8e-15 of their
   peaks, gradients 6e-11); the DFFR Fisher then takes 0.30 to 0.42 of the existing one.
+- The two-template F-statistic (`get_fstat_terms_stft`, DFFR only; 2026-11-05, the same fixture on
+  another A100 of the same model, three runs, in which `get_ll_stft`, `get_swap_ll_stft` and
+  `get_fstat_ll_stft` repeat the table above within 1 %): 12.5 µs per source at 10 000 sources,
+  22 times less than `get_fstat_ll_stft` (276 µs) and 1.6 times `get_ll_stft` (7.7 µs); 14.0 µs at
+  1000, 28.3 at 100 and 1.69 ms for one source. On 713 one-day segments, at the size of a full-band
+  stage-1 call of the F-statistic search (114 000 sources), it takes 33.5 µs per source against
+  71.5 µs for one `get_swap_ll_stft` call with T+ and Tx. 16 rows per pass are about 13 % slower
+  than 32.
 
 ## Kernel resources on the A100 and the H100
 
@@ -470,6 +478,7 @@ and the settings: 32 672 bytes.
 | DFFR swap, F-statistic (set by `STFTDomainGPU::add_ip_swap_contrib`) | 220 / 222 | 2 | 2 / 3 at 32 rows, 3 / 5 at 16 |
 | DFFR swap gradient (`Template::values` and `build` out of line) | 254 / 254 | 2 | 2 / 3 |
 | DFFR Fisher, 4 rows per pass, 8 / 9 parameters (66 272 / 77 088 bytes of dynamic shared memory) | 176 / 183 | 2 | 2 / 3 and 2 / 2 |
+| DFFR two-template F-statistic (`dffr_get_fstat_kernel`; 37 280 / 18 784 bytes of dynamic shared memory at 32 / 16 rows) | 164 / 169 | 3 / 2 | 3 / 4 at 32 rows, 5 / 7 at 16 |
 
 The two-template DFFR kernels take 65 344 bytes of dynamic shared memory at 32 rows, above the
 48 kB a launch gets by default; the launch path raises a kernel's limit within the device's opt-in
@@ -501,7 +510,12 @@ module for sm_90 with nvcc; no H100 timing was made.
   build and are left as they are: the compact template against the `fill_global` grid asks for
   bit equality, and on the A100 375 of 1080 elements differ by at most 3.8e-15 (two kernels
   compiled separately); the swap gradient against host differences at rtol 1e-6 misses in f̈ of
-  the added source by 5.2e-4, a component whose step changes the phase less than rounding.
+  the added source by 5.2e-4, a component whose step changes the phase less than rounding. The
+  two-template F-statistic (2026-11-05): its N and M against those assembled from swap(T+, Tx), bit
+  for bit on the CPU and within 1e-11 of each row's largest entry on the GPU (measured up to
+  1e-12), on two data and two noise rows and in a window that cuts the bands; 2F against the 4x4
+  solve within 1e-12 of max(1, 2F); against the four-filter F-statistic within the rounding of its
+  filters' shifted phases; an empty batch, and the other response refused.
 - GBGPU `tests/test_stft_gb.py`: the TDI-on-the-fly response with the DFFR setting it must ignore
   gives every output bit for bit; its exact amplitude and phase Fisher entries hold to 1.4e-6.
 - LAT `tests/test_gb_likelihood_engine.py`: the STFT band engine fills, evaluates, swaps and

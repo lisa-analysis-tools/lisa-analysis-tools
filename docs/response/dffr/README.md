@@ -60,7 +60,7 @@ Measured on one full A100 and on the CPU of SURF Spider; the details and the con
 | LAT | `domaincomputation.py` | `STFTComputationGroup.cpp_kinematics(cpp_orbits)` builds the table on the group's device on first use and keeps it, one per orbits object; `kinematics_fields` returns its arrays. |
 | LAT | `cutils/lat_fresnel.hh` | The Fresnel integrals, their auxiliary functions and the derivatives of these, with DFFR's numerics, shared by `STFTFresnel` and DFFR. The header records its branches, their accuracy and its assumptions. |
 | LAT | `cutils/lat_stft_kernels.hh` | The likelihood kernels, written against a tile of pixels so that both responses feed the same consumers (next section). `ColumnTile` feeds them the existing response; `StftBandBinMap` and the launch path above 48 kB of shared memory serve DFFR. The Fisher kernel of the existing response keeps its own loop. |
-| LAT | `cutils/lat_dffr_kernels.hh` | DFFR settings, the source-model contract, the windowed transform, the closed-form TDI weights of both generations, the segment table, `DFFRTile`, and the DFFR Fisher matrix. The header records the definitions, conventions, accuracy and assumptions. |
+| LAT | `cutils/lat_dffr_kernels.hh` | DFFR settings, the source-model contract, the windowed transform, the closed-form TDI weights of both generations, the segment table, `DFFRTile`, the DFFR Fisher matrix, and the two-template F-statistic of a galactic binary. The header records the definitions, conventions, accuracy and assumptions. |
 | LAT | `response/tdiconfig.py` | `TDIConfig.generation`: 1 or 2 for the stock combinations, `None` otherwise. |
 | LAT | `globalfit/recipe.py` | The optional keys `response` and `first_order_delays` of `gb_stft_kwargs`. |
 | GBGPU | `cutils/gb_physics.hh` | The GB phase, frequency and amplitude formulas, shared by `GBTDIonTheFly` and the DFFR source model. |
@@ -132,6 +132,18 @@ the build the tile uses (`dffr_build_rows`); every stencil template equals the t
 `fill_global_stft` writes for its shifted parameters, bit for bit, and the kernel agrees with a
 reference that differences those templates to 3.3e-15 of sqrt(F_ii F_jj). On the GPU a pass holds
 4 segment rows (66 kB of shared memory on 8 parameters, 77 kB on 9); the CPU uses one.
+
+**The two-template F-statistic.** `dffr_get_fstat_kernel`, behind `comp.get_fstat_terms_stft`
+(DFFR only), computes the F-statistic of a galactic binary from two templates, T+ and Tx, the
+templates at A = 2, ι = π/2, φ0 = 0 and ψ = 0 or π/4. The four filters of `get_fstat_ll_stft` are
+T+, -Tx, i T+ and -i Tx, since φ0 enters a template only as exp(-iφ0), so N and M follow from the
+five products (d|T+), (d|Tx), (T+|T+), (Tx|Tx) and (T+|Tx), and 2F from the closed form of the
+same problem with two complex amplitudes. ψ changes no reception state, so Tx is a variant of the
+Fisher matrix's build that reads the states of T+, and a pixel evaluates its windowed sums once for
+both. The kernel contracts the five products itself, in the term order of the swap, rather than
+through `add_ip_swap_contrib`, whose registers would bind it to two blocks per SM. N and M equal
+those assembled from `get_swap_ll_stft(T+, Tx)` bit for bit on the CPU and to rounding on the GPU.
+The method returns N and M in the layout of `get_fstat_ll_stft`, and 2F.
 
 ## How to select it
 
