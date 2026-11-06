@@ -4320,6 +4320,8 @@ class GBFStatSettings:
     shutoff_frequency_threshold: Optional[float] = 6e-3
     # Searches in a row without a detection after which a band above that edge is shut off
     shutoff_band_iteration: int = 2
+    # Proposes of the move from one search to the next; between searches the latest proposal stays
+    search_interval: int = 1
     # What each search saves to output_dir: "none", "summary" (per-band values, the mixtures, the times) or "full"
     # (also the chains, megabytes per search on tens of bands)
     save_search_records: str = "none"
@@ -4332,8 +4334,8 @@ class GBFStatRJMove(GBSpecialBase):
     """Reversible-jump GB move whose births come from an F-statistic search of the bands, on the STFT/DFFR response.
 
     It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back). :meth:`setup`
-    searches at every propose, and the search's mixture becomes the RJ proposal. A search runs on the residual of the
-    max-likelihood walker, in every interior band that is not shut off:
+    searches when the schedule of ``search_interval`` says so, and the search's mixture becomes the RJ proposal. A
+    search runs on the residual of the max-likelihood walker, in every interior band that is not shut off:
 
     1. stage 1 samples f0, fdot and the sky of each band with the F-statistic, which maximizes the four amplitude
        parameters analytically; one Eryn sampler per band (``nsamplers``) runs on the run's own prior restricted to
@@ -4402,6 +4404,9 @@ class GBFStatRJMove(GBSpecialBase):
             raise NotImplementedError(
                 f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
             )
+        interval = settings.search_interval
+        if int(interval) != interval or interval < 1:
+            raise ValueError(f"fstat_settings: search_interval must be a positive integer, not {interval}")
         if settings.save_search_records not in self.RECORD_LEVELS:
             raise ValueError(
                 f"fstat_settings: save_search_records must be one of {list(self.RECORD_LEVELS)}, not "
@@ -4416,7 +4421,18 @@ class GBFStatRJMove(GBSpecialBase):
         self._next_record = None
 
     def setup(self, model, branches):
-        """Search the bands at every propose of the move."""
+        """Search when this propose is due, else keep the proposal of the latest search.
+
+        The search runs at the move's proposes 0, M, 2M and so on, with M the setting ``search_interval`` (1: at every
+        propose). ``num_proposals`` counts the move's earlier proposes (``propose()`` raises it after ``setup()``). A
+        move without a proposal searches whatever the schedule, since ``propose()`` skips the whole propose of an RJ
+        move that has none: after a restart, which keeps no proposal, or after searches that found nothing.
+        """
+        interval = int(self.fstat_settings.search_interval)
+        if self.num_proposals % interval != 0 and self.rj_proposal_distribution is not None:
+            logger.info("[GB_FSTAT_SEARCH %s] propose %d: no search (interval %d); the latest proposal stays",
+                        self.name, self.num_proposals, interval)
+            return
         self._search(model, branches)
 
     # ==================================================================================================================
