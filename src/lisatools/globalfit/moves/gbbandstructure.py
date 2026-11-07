@@ -472,6 +472,19 @@ class STFTStoreWindows:
         power_of_two = 2 ** np.ceil(np.log2(own_width)).astype(np.int64)
         return np.minimum(np.maximum(power_of_two, STFT_MIN_CLASS_WIDTH), self.n_grid_bins)
 
+    @property
+    def noise_bins(self) -> int:
+        """Active bins, from bin 0, that hold every interior cell, for its class width and for ``buffer_width``.
+
+        A cell starts where :meth:`window_starts` puts it, so the noise rows of the cells may stop here.
+        """
+        bands = np.arange(1, self.j_lo.size - 1) if self.j_lo.size >= 3 else np.arange(self.j_lo.size)
+        cell_ends = [
+            np.clip(self.j_lo[bands], 0, self.n_grid_bins - width) + width
+            for width in (self.class_width[bands], self.buffer_width)
+        ]
+        return int(min(self.n_grid_bins, max(int(np.max(ends)) for ends in cell_ends)))
+
     def window_starts(self, band_inds, width: int) -> np.ndarray:
         """First active bin of the window of each cell in ``band_inds``, for ``width``-bin cells."""
         band_inds = np.asarray(asnumpy(band_inds), dtype=int)
