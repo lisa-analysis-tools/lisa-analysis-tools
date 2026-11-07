@@ -103,12 +103,28 @@ class ComputeSection(_Section):
             import jax
             jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in self.gpus))
 
-            if len(self.gpus) != len(jax.devices("gpu")):
+            visible = _keeping_current_device(lambda: jax.devices("gpu"))
+            if len(self.gpus) != len(visible):
                 raise ValueError(
-                    f"gpus {self.gpus} does not match the GPUs JAX sees: {jax.devices('gpu')}. "
+                    f"gpus {self.gpus} does not match the GPUs JAX sees: {visible}. "
                     "Check CUDA_VISIBLE_DEVICES or jax_cuda_visible_devices."
                 )
         return self
+
+
+def _keeping_current_device(call):
+    """``call()``, with the CUDA device that was current before it made current again after it."""
+    try:
+        import cupy
+    except ImportError:
+        return call()
+    # ! JAX's device discovery leaves the last card current on this thread: the general setup that follows would
+    # ! build its data, orbit table and sensitivity arrays on that card instead of on gpus[0].
+    device = cupy.cuda.runtime.getDevice()
+    try:
+        return call()
+    finally:
+        cupy.cuda.runtime.setDevice(device)
 
 class BlockConfig(BaseModel):
     """One source/noise block. Type-specific fields are validated in a later step."""
