@@ -48,7 +48,7 @@ from .moves import (
     # GBSpecialRJSerialSearchMCMC,
     # GBSpecialRJRefitMove,
 )
-from .moves.gbbandstructure import stft_store_window_layout
+from .moves.gbbandstructure import plot_band_layout, stft_store_window_layout
 from .moves.gbspecialmove import (
     GBFStatRJMove,
     GBFStatSettings,
@@ -1384,6 +1384,16 @@ def prepare_gb_moves(
             gb_info.stft_store_windows.tier_width,
             gb_info.stft_store_windows.buffer_width,
             int(acs.settings.NF_active),
+        )
+        # * The band layout the moves run on, with the sources of walker 0's cold chain per band.
+        gb_branch = state.branches["gb"]
+        walker_coords = gb_branch.coords[0, 0][gb_branch.inds[0, 0]]
+        source_f0_hz = (
+            gb_info.transform.both_transforms(walker_coords)[:, 1] if len(walker_coords) else np.zeros(0)
+        )
+        plot_band_layout(
+            band_structure, gb_info.stft_store_windows, source_f0_hz,
+            os.path.join(curr.general_info.artifacts_file_dir, "gb_band_layout.png"),
         )
 
     #* Make sure that priors are evaluated on gpus (when available).

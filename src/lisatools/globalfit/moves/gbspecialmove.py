@@ -1990,7 +1990,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
         rows["fim_age"][row_ids] += 1
 
-        if logger.isEnabledFor(logging.DEBUG):
+        debugging = getattr(getattr(self, "debug_settings", None), "enabled", False)
+        if debugging and logger.isEnabledFor(logging.DEBUG):
             n_src = len(row_ids)
             condition = diagnostics["condition"]
             largest = (

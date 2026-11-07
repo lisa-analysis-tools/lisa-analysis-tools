@@ -36,6 +36,7 @@ __all__ = [
     "STFT_F0_LIMIT_FRACTION",
     "STFT_TIER_SPLIT_HZ",
     "gb_band_structure",
+    "plot_band_layout",
     "stft_band_structure",
     "stft_band_width_hz",
     "stft_reach_hz",
@@ -472,6 +473,19 @@ class STFTStoreWindows:
         power_of_two = 2 ** np.ceil(np.log2(own_width)).astype(np.int64)
         return np.minimum(np.maximum(power_of_two, STFT_MIN_CLASS_WIDTH), self.n_grid_bins)
 
+    @property
+    def noise_bins(self) -> int:
+        """Active bins, from bin 0, that hold every interior cell, for its class width and for ``buffer_width``.
+
+        A cell starts where :meth:`window_starts` puts it, so the noise rows of the cells may stop here.
+        """
+        bands = np.arange(1, self.j_lo.size - 1) if self.j_lo.size >= 3 else np.arange(self.j_lo.size)
+        cell_ends = [
+            np.clip(self.j_lo[bands], 0, self.n_grid_bins - width) + width
+            for width in (self.class_width[bands], self.buffer_width)
+        ]
+        return int(min(self.n_grid_bins, max(int(np.max(ends)) for ends in cell_ends)))
+
     def window_starts(self, band_inds, width: int) -> np.ndarray:
         """First active bin of the window of each cell in ``band_inds``, for ``width``-bin cells."""
         band_inds = np.asarray(asnumpy(band_inds), dtype=int)
@@ -503,6 +517,44 @@ def stft_store_window_layout(structure: GBBandStructure,
     return STFTStoreWindows(j_lo=j_lo, j_hi=j_hi, tier=tier, tier_width=tier_width,
                             n_grid_bins=int(domain_settings.NF_active),
                             n_side_bins=int(n_side_bins))
+
+
+def plot_band_layout(structure: GBBandStructure, store_windows: STFTStoreWindows,
+                     source_f0_hz, filename: str) -> None:
+    """Save each band's width, store window, cell width and number of sources against frequency.
+
+    The widths are in pixels of the STFT frequency grid; ``source_f0_hz`` holds the f0 of the
+    sources to count, for example one walker's.
+    """
+    import matplotlib.pyplot as plt
+
+    edges_hz = asnumpy(structure.edges_hz)
+    band_inds = np.searchsorted(edges_hz, np.asarray(asnumpy(source_f0_hz), dtype=float), side="right") - 1
+    in_bands = (band_inds >= 0) & (band_inds < structure.n_bands)
+    sources_per_band = np.bincount(band_inds[in_bands], minlength=structure.n_bands)
+
+    figure, (width_axes, source_axes) = plt.subplots(
+        2, 1, sharex=True, height_ratios=(2, 1), figsize=(8.0, 6.0), layout="constrained"
+    )
+    # * Windows and cells of the interior bands only: the moves never build cells for the two guard bands.
+    interior = slice(1, -1) if structure.n_bands >= 3 else slice(None)
+    interior_edges_hz = edges_hz[1:-1] if structure.n_bands >= 3 else edges_hz
+    widths = (
+        ("band width", edges_hz, np.diff(edges_hz) / structure.grid_df_hz, "#2a78d6"),
+        ("store window", interior_edges_hz, (store_windows.j_hi - store_windows.j_lo + 1)[interior], "#eb6834"),
+        ("cell (width class)", interior_edges_hz, store_windows.class_width[interior], "#1baf7a"),
+    )
+    # ? baseline None: no drop to zero at the ends, which a log axis cannot show.
+    for label, stair_edges_hz, values, color in widths:
+        width_axes.stairs(values, stair_edges_hz, baseline=None, color=color, linewidth=1.2, label=label)
+    width_axes.set(xscale="log", yscale="log", ylabel="width [STFT bins]")
+    width_axes.legend(frameon=False)
+    source_axes.stairs(sources_per_band, edges_hz, color="#52514e", linewidth=1.2)
+    source_axes.set(xlabel="frequency [Hz]", ylabel="sources per band", xlim=(edges_hz[0], edges_hz[-1]))
+    for axes in (width_axes, source_axes):
+        axes.grid(color="#e1e0d9", linewidth=0.5)
+    figure.savefig(filename, dpi=150)
+    plt.close(figure)
 
 
 # ======================================================================

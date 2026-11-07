@@ -39,7 +39,10 @@ lifetime, and they never reach the settings tree (pickle-safety rule).
 
 **Cache keys** hold only ``id(prototype)``, so every cache VALUE keeps a
 strong reference to the prototype: a garbage-collected prototype could
-otherwise let a recycled id alias a stale replica.
+otherwise let a recycled id alias a stale replica. A configured orbit is keyed
+by the device pointer of its table instead, so all its copies share one
+replica per device; the strong reference keeps that table, and so its pointer,
+alive.
 
 .. note::
    On the ``dev`` branch these helpers live in
@@ -78,8 +81,9 @@ def device_local_orbits(orbits, xp, primary_device):
 
     CPU / single-GPU / the run's primary device reuse the shared ``orbits``
     (zero extra memory -- identical to the pre-multi-GPU path). A non-primary
-    device gets a lazily-built, cached ``orbits.__class__(*args, **kwargs)``
-    replica whose grid arrays land on the current device (the
+    device gets a cached ``orbits.__class__(*args, **kwargs)`` replica, one per
+    orbit table and device, configured when it is built, whose grid arrays land
+    on the current device (the
     :class:`~lisatools.domaincomputation.DomainComputationGroupArray`
     ``build_cpp_objects`` pattern), so anything built around it reads orbit
     data locally instead of via peer access off the primary device.
@@ -89,14 +93,28 @@ def device_local_orbits(orbits, xp, primary_device):
         return orbits
     if orbits is None:
         return orbits
-    key = (id(orbits), dev)
+    key = (_orbits_table_key(orbits), dev)
     hit = _DEVICE_ORBITS_REPLICAS.get(key)
     if hit is not None:
         return hit[1]
     with device_context(xp, dev):
         replica = orbits.__class__(*orbits.args, **orbits.kwargs)
+        replica._ensure_configured()
     _DEVICE_ORBITS_REPLICAS[key] = (orbits, replica)
     return replica
+
+
+def _orbits_table_key(orbits):
+    """The device pointer of a configured orbit's table, else the orbit's id.
+
+    The copies of a configured orbit share its arrays (``Orbits.__deepcopy__``), so they get one replica per device.
+    """
+    if getattr(orbits, "configured", False):
+        for array in getattr(orbits, "pycppdetector_args", None) or ():
+            pointer = getattr(getattr(array, "data", None), "ptr", None)
+            if pointer is not None:
+                return ("table", int(pointer))
+    return ("object", id(orbits))
 
 
 # ---------------------------------------------------------------------------
