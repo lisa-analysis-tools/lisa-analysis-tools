@@ -455,12 +455,12 @@ time to the DFFR time, with the final Fisher kernel. The global fit runs 16 side
   peaks, gradients 6e-11); the DFFR Fisher then takes 0.30 to 0.42 of the existing one.
 - The two-template F-statistic (`get_fstat_terms_stft`, DFFR only; 2026-11-05, the same fixture on
   another A100 of the same model, three runs, in which `get_ll_stft`, `get_swap_ll_stft` and
-  `get_fstat_ll_stft` repeat the table above within 1 %): 12.5 µs per source at 10 000 sources,
-  22 times less than `get_fstat_ll_stft` (276 µs) and 1.6 times `get_ll_stft` (7.7 µs); 14.0 µs at
-  1000, 28.3 at 100 and 1.69 ms for one source. On 713 one-day segments, at the size of a full-band
-  stage-1 call of the F-statistic search (114 000 sources), it takes 33.5 µs per source against
-  71.5 µs for one `get_swap_ll_stft` call with T+ and Tx. 16 rows per pass are about 13 % slower
-  than 32.
+  `get_fstat_ll_stft` repeat the table above within 1.3 %): 12.7 µs per source at 10 000 sources,
+  22 times less than `get_fstat_ll_stft` (277 µs) and 1.6 times `get_ll_stft` (7.8 µs); 14.4 µs at
+  1000 and 28.6 at 100, while a call of up to 10 sources costs 1.7 to 2.8 ms. At the size of a
+  full-band stage-1 call of the F-statistic search (114 000 to 166 176 sources, the same fixture),
+  it takes 12.7 µs per source against 43.0 µs for one `get_swap_ll_stft` call with T+ and Tx and
+  7.7 µs for `get_ll_stft`. 16 rows per pass are 17 % slower than 32.
 
 ## Kernel resources on the A100 and the H100
 
