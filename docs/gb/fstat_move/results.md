@@ -3,9 +3,11 @@
 The evidence behind the settings of `GBFStatRJMove` and the checks of its port ([`README.md`](README.md) describes the
 move), from November 2026.
 
-- **Benchmark group** (the settings): bands 1128 to 1138 of the 714-day band layout (2.83 to 2.87 mHz, 134 injected
-  sources), the resolved population outside the group subtracted, the noise frozen at the production fit, DFFR on the
-  STFT grid, searched from the production search's 92 candidates in the group.
+- **Benchmark group** (the settings and the end-to-end runs): bands 1128 to 1138 of the 714-day band layout (2.83 to
+  2.87 mHz, 134 injected sources), the resolved population outside the group subtracted, the noise frozen at the
+  production fit, DFFR on the STFT grid, searched from the production search's 92 candidates in the group. The
+  end-to-end runs take 500 proposes with 32 walkers and 12 temperatures, the move in half of them and the prior move
+  in the other half.
 - **Port check runs** (the checks): a copy of the L2D configuration `mojito_input/gb_psd_galfor_dffr` cut to 3.0 to
   3.2 mHz (43 searched bands, 379 start candidates, 32 walkers, 24 temperatures, one A100), with the F-statistic move
   and the prior move taking turns at 0.5; once through the YAML route and once through a settings file.
@@ -22,6 +24,7 @@ move), from November 2026.
 | stage 2 | 12 temperatures with $T = 10$, 400 + 500 steps | shorter chains kept only 8 to 38 % of the proposal's effective sample size (ESS), while stage 2 takes 6 to 16 % of a search |
 | proposal basis | $\theta_\pm$ with $\lambda$ periodic, the four copies drawn | 17.4 times the summed ESS of the FD move's six-column mixture with uniform phases, the gain coming from the phases; a proposal drawn with $\psi$ below $\pi$ and the same density at $\psi + \pi$ would be biased |
 | number of components | production's BIC choice | it reaches 77 to 86 % of the best summed ESS of a scan; a held-out selection fitted the chains better but gave less ESS |
+| `search_interval` | 1, a search at every propose of the move | end to end, at propose 500 a cold walker holds 52 % of the 70 injected sources the start candidates missed, against 48 and 47 % in two runs with a search at every fifth propose, at 183 s against 144 s per propose; per hour the two are level up to about 10 h, and at about 20 h every propose leads by 3 to 4 points, 1.5 times the scatter between the two runs |
 
 ## Checks of the port
 
@@ -45,6 +48,12 @@ bands (largest z 4.68). An importance-sampling check of the three proposals used
 largest z 2.49 to 2.82, mean weight $\pi/q$ of 0.9985 to 1.0009), so their density is right. Where a mixture covers the
 prior thinly ($\pi/q$ up to about 200) sources are born and removed rarely, and batch means of 140 sweeps then
 understate the errors. Every run with the prior move beside it, as in a production run, passes.
+
+**End to end.** With the move, a cold walker holds three times as many of the injected sources the start candidates
+missed as with the prior move alone (47 to 52 % against 16 % at propose 500), keeps the ones they found (97 % in every
+run) and keeps fewer of the false candidates (54 to 57 % against 64 %). A found source enters the chain mostly at its
+search's propose: 63 to 68 % of the cold walkers hold it right after, against 4 to 10 % before, and 73 to 81 % after
+eight more proposes of the move.
 
 ## Cost
 
