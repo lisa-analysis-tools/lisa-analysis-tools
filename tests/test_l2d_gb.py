@@ -268,6 +268,10 @@ class GBBuildTest(_GBConfig):
         self.assertIsInstance(interface, GBSearchInterface)
         self.assertEqual((interface.evolve_to_data_start, interface.max_resample_tries), (False, 2000))
         self.assertEqual(interface.search_path, str(self.run_dir / CANDIDATES_FILE))
+        # * The block seeds at the four copies of the phases unless its search kwargs turn it off.
+        self.assertTrue(interface.seed_phase_copies)
+        _, build_off = self.build({"search": gb_search(kwargs={"seed_phase_copies": False})})
+        self.assertFalse(build_off.setup.search_interface.seed_phase_copies)
         # * The candidates reach the sampling basis inside the setup's prior over the proposed bands.
         seed = interface.get_catalog_values(curr=None)
         self.assertEqual(seed.shape, (2, 8))

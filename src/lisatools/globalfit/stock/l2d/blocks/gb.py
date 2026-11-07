@@ -6,7 +6,9 @@ engine-owned arguments (``recipe.prepare_gb_moves``). The in-model proposals bel
 takes no ``inner_moves`` and no ``flow``. ``waveform.runtime_kwargs`` and ``stft`` hold the knobs of
 ``GBWaveformSettings`` and ``GBSTFTSettings``; the builder fills their time grid, window, orbits and domain
 from the ``GeneralSetup``. ``extra_moves`` adds GB moves that take turns with ``pe_move`` (``EXTRA_MOVES``, the
-F-statistic RJ move ``GBFStatRJMove`` among them), each in its share of the burn-in and the PE iterations.
+F-statistic RJ move ``GBFStatRJMove`` among them), each in its share of the burn-in and the PE iterations. The
+search seeds each source's walkers at the four copies of (phi0, psi) where the template is the same
+(``seed_phase_copies`` of ``GBSearchInterface``) unless its ``kwargs`` set ``seed_phase_copies: false``.
 """
 from __future__ import annotations
 
@@ -42,6 +44,8 @@ GB_MOVE_DATACLASSES = {
     "sighet_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBSigHetSettings"),
     "fstat_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBFStatSettings"),
 }
+# GBSearchInterface arguments the block sets unless its search kwargs do: the walkers start at every copy of the phases
+GB_SEARCH_DEFAULTS = {"seed_phase_copies": True}
 
 
 class ExtraMove(NamedTuple):
@@ -193,7 +197,7 @@ class GBBlock(SourceBlock):
             num_repeat_proposals=self.num_prop_repeats,
             **{name: value for name, value in gb_move_kwargs(self).items() if name in move_fields},
         )
-        search_interface = make_search_interface(self, info)
+        search_interface = make_search_interface(self, info, defaults=GB_SEARCH_DEFAULTS)
         settings = GBSettings.from_general_setup(
             general_setup,
             priors=info["priors"],

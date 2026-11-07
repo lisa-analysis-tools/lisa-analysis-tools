@@ -786,12 +786,60 @@ class GBSearchInterface(BaseSearchInterface):
     reference_time: float or None
         The epoch of the GB kernels' parameters (``t_ref``); ``None`` takes the mojito catalogue epoch.
         The STFT GB computations do not use it.
+    seed_phase_copies: bool
+        If True, the walkers scattered around a point (``catalog``, ``point_estimate``, ``samples``) are spread over
+        the four copies of (phi0, psi) where the template is the same, (phi0, psi), (phi0, psi + pi),
+        (phi0 + pi, psi + pi/2) and (phi0 + pi, psi + 3 pi/2), each with probability 1/4; it needs phi0 and psi
+        among the periodic columns. If False, every walker starts in the copy of its point. The L2D GB block sets it.
     """
 
-    def __init__(self, evolve_to_data_start: bool = True, reference_time: typing.Optional[float] = None, **kwargs):
+    # The search types whose walkers scatter around a point, which seed_phase_copies spreads over the copies
+    PHASE_COPY_SEARCH_TYPES = ("catalog", "point_estimate", "samples")
+
+    def __init__(self, evolve_to_data_start: bool = True, reference_time: typing.Optional[float] = None,
+                 seed_phase_copies: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.evolve_to_data_start = evolve_to_data_start
         self.reference_time = reference_time
+        self.seed_phase_copies = bool(seed_phase_copies)
+        if self.seed_phase_copies:
+            # (column, period) of phi0 and of psi in the sampling basis
+            self._phase_columns = []
+            for name in ("phi0", "psi"):
+                column = list(self.sampling_basis).index(name) if name in self.sampling_basis else None
+                if column is None or self.periodic is None or column not in self.periodic:
+                    raise ValueError(
+                        f"seed_phase_copies needs {name} as a periodic column of the {self.branch_name} branch's "
+                        f"sampling basis {list(self.sampling_basis)}"
+                    )
+                self._phase_columns.append((column, float(self.periodic[column])))
+
+    def generate_initial_draws(self, curr: CurrentInfoGlobalFit, num_walkers: int,
+                               betas: typing.Union[np.ndarray, list[float]],
+                               num_leaves_max: typing.Optional[int] = None, **kwargs) -> np.ndarray:
+        """The base class's draws; with ``seed_phase_copies`` the scattered draws spread over the four copies."""
+        draws = super().generate_initial_draws(curr, num_walkers, betas, num_leaves_max=num_leaves_max, **kwargs)
+        if not self.seed_phase_copies or self.search_type not in self.PHASE_COPY_SEARCH_TYPES:
+            return draws
+        (phi0_column, phi0_period), (psi_column, psi_period) = self._phase_columns
+        # * drawn after the scatter, so the scatter is the same as without the switch and only the phases move
+        phase_copy = np.random.rand(*draws.shape[:-1]) < 0.5
+        psi_copy = np.random.rand(*draws.shape[:-1]) < 0.5
+        draws[..., phi0_column], draws[..., psi_column] = self.phase_copies(
+            draws[..., phi0_column], draws[..., psi_column], phase_copy, psi_copy, phi0_period, psi_period)
+        shares = np.bincount((2 * phase_copy + psi_copy).ravel(), minlength=4) / phase_copy.size
+        logger.info(f"Seeded the {self.branch_name} walkers at the four copies of (phi0, psi), shares "
+                    + ", ".join(f"{share:.3f}" for share in shares))
+        return draws
+
+    @staticmethod
+    def phase_copies(phi0, psi, phase_copy, psi_copy, phi0_period=2.0 * np.pi, psi_period=2.0 * np.pi):
+        """(phi0, psi) moved to the copy (phi0 + pi, psi + pi/2) where ``phase_copy`` is set and by psi + pi where
+        ``psi_copy`` is set, wrapped into [0, period); the template is the same at the four copies. With a psi
+        period of pi the psi + pi move maps a point to itself."""
+        phi0 = np.mod(phi0 + np.pi * phase_copy, phi0_period)
+        psi = np.mod(psi + 0.5 * np.pi * phase_copy + np.pi * psi_copy, psi_period)
+        return phi0, psi
 
     @property
     def branch_name(self):

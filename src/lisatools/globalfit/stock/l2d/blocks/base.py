@@ -537,11 +537,12 @@ def make_betas(tempering: TemperingSpec | None, default_ntemps: int):
         betas[-1] = 1.0 / tempering.Tmax
     return betas
 
-def make_search_interface(block: BlockBase, info: dict[str, Any]):
+def make_search_interface(block: BlockBase, info: dict[str, Any], defaults: dict[str, Any] | None = None):
     """The block's search interface, or ``None`` without ``search``.
 
     The prior supplies what the interface needs to seed through the inverse transform: its transform and
-    its (branch-keyed) periodicity.
+    its (branch-keyed) periodicity. ``defaults`` are interface arguments the block sets unless its search
+    kwargs do.
     """
     spec = block.search if block.search is not None else block.DEFAULT_SEARCH
     if spec is None:
@@ -562,7 +563,7 @@ def make_search_interface(block: BlockBase, info: dict[str, Any]):
         is_eryn_backend=spec.is_eryn_backend,
         periodic=info["periodic"],
         max_resample_tries=spec.max_resample_tries,
-        **deepcopy(spec.kwargs),
+        **{**(defaults or {}), **deepcopy(spec.kwargs)},
     )
 
 def engine_waveform_kwargs(ctx: BuildContext) -> dict[str, Any]:
