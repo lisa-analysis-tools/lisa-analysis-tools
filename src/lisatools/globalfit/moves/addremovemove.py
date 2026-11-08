@@ -254,6 +254,30 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         weights = np.where(self._has_flow, 0.0, self.move_weights)
         return weights / weights.sum()
 
+    def apply_settings(self, num_repeats: int | None = None, weights=None) -> None:
+        """Change the proposals per leaf visit and the inner-move weights (e.g. at a recipe step).
+
+        ``weights`` follows ``self.moves`` (unnormalised, >= 0, positive sum); ``None`` keeps the current value.
+        A zero weight switches a move off; during ``flow_burnin`` some move without a flow must keep a weight.
+        """
+        if num_repeats is not None:
+            if isinstance(num_repeats, bool) or int(num_repeats) != num_repeats or num_repeats < 1:
+                raise ValueError(f"{self.branch_name}: num_repeats must be a positive integer, not {num_repeats!r}.")
+            self.num_repeats = int(num_repeats)
+        if weights is None:
+            return
+        weights = np.asarray(weights, dtype=float)
+        if weights.shape != (len(self.moves),):
+            raise ValueError(f"{self.branch_name}: {len(self.moves)} inner moves, got weights {weights.tolist()}.")
+        if (weights < 0).any() or not np.isfinite(weights).all() or weights.sum() <= 0:
+            raise ValueError(f"{self.branch_name}: weights must be finite, >= 0 and not all 0; got {weights.tolist()}.")
+        if self._iterations < self.flow_burnin and self._has_flow.any() and weights[~self._has_flow].sum() <= 0:
+            raise ValueError(
+                f"{self.branch_name}: during flow_burnin ({self.flow_burnin} iterations) a move without a flow "
+                f"needs a weight; got {weights.tolist()}."
+            )
+        self.move_weights = weights / weights.sum()
+
     @staticmethod
     def _check_no_gibbs_setup(move):
         """Inner moves propose on every parameter of the leaf: reject a ``gibbs_sampling_setup``."""
