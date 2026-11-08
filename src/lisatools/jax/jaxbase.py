@@ -51,6 +51,11 @@ except (ImportError, ModuleNotFoundError):
     import numpy as jnp # type: ignore
     jax_available = False
 
+# XLA imports a DLPack device buffer zero-copy only if its address is a multiple of this (bytes); a view at an
+# odd offset (e.g. one column of a (1, ndim) coords array, which cupy.ascontiguousarray does not copy) fails
+# inside the first JAX op with "Address of buffer ... must be a multiple of 10".
+DLPACK_ALIGNMENT = 16
+
 
 class JaxBase:
     """Base class for JAX-backed waveforms and computations.
@@ -71,6 +76,8 @@ class JaxBase:
         if isinstance(x, cp.ndarray) and cupy_available:
             if do_synchronize:
                 x.device.synchronize()
+            if x.data.ptr % DLPACK_ALIGNMENT:
+                x = x.copy()  # a fresh cupy allocation is aligned; aligned inputs stay zero-copy
             return jax.dlpack.from_dlpack(x)
     
         elif isinstance(x, (float, int, np.ndarray)):
