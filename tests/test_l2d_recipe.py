@@ -558,8 +558,9 @@ class SetupFunctionTest(_Runtime):
             self.events.append(("moves", ctx.wave_gens))
             return {"psd": BranchMoves([], ["pe"])}
 
-        def add_steps(recipe_self, recipe, moves):
+        def add_steps(recipe_self, recipe, moves, move_settings=None):
             self.events.append(("steps", recipe, moves))
+            self.move_settings = move_settings
 
         def signal_gens(ctx, td_generators, curr_, state):
             self.events.append(("signal_gens", ctx.wave_gens, td_generators))

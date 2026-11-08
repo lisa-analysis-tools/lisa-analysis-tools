@@ -88,7 +88,7 @@ class MBHBlock(SourceBlock):
         if not any(move.class_name == "SkyMove" for move in self.inner_moves or []):
             return {}
         ind_map = sky_ind_map(info["basis"], self.SKY_BASIS)
-        to_lisa, from_lisa = make_sky_wrappers(ctx.general.orbits, ctx.cfg.data.reference_time, ind_map)
+        to_lisa, from_lisa = make_sky_wrappers(ctx.general.orbits, self.waveform_t0(ctx), ind_map)
         return {
             "SkyMove": dict(
                 ind_map=ind_map, coord_frame="icrs", to_lisa_frame=to_lisa, from_lisa_frame=from_lisa

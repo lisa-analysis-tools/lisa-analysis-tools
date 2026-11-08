@@ -540,6 +540,14 @@ class GFHDFBackend(eryn_HDFBackend):
 
                 f[self.name].attrs["has_recipe"] = True
 
+    def recipe_step_start(self, step_name, iteration):
+        """The iteration ``step_name`` started at: recorded on its first start, read back afterwards (restarts)."""
+        with self.open("a") as f:
+            attrs = f[self.name]["recipe"][step_name].attrs
+            if "start iteration" not in attrs:
+                attrs["start iteration"] = int(iteration)
+            return int(attrs["start iteration"])
+
     def completed_recipe_step(self, step_name):
         """Mark ``step_name`` as completed in the on-disk recipe metadata."""
         with self.open("a") as f:
