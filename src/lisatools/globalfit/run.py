@@ -44,6 +44,7 @@ from .searches import seed_from_search_interfaces
 from .state import GFState
 from .stock.erebor import Setup
 from .utils import BasicResidualacsLikelihood
+from ..utils.device import gpu_memory_report
 
 
 logger = getLogger(__name__)
@@ -216,8 +217,7 @@ def subtract_state_templates(acs: AnalysisContainerArray, state: GFState, signal
 
     ``signal_gen_map`` is ``{branch name: fn(*sampling_params) -> DomainBase}`` (``Settings.signal_gen``).
     One leaf at a time, with the domain-aware ``DomainBase.add_signal`` (a template may cover only part of
-    the data), as ``subtract_initial_signal`` does; a generator with ``supports_batch`` is called once per
-    leaf with 1-D params over the walkers (one template per walker).
+    the data), as ``subtract_initial_signal`` does.
     """
     acs_flat = acs.flatten()
     for name, gen in signal_gen_map.items():
@@ -227,13 +227,10 @@ def subtract_state_templates(acs: AnalysisContainerArray, state: GFState, signal
             walkers = np.flatnonzero(inds0[:, leaf])
             if walkers.size == 0:
                 continue
-            if getattr(gen, "supports_batch", False):
-                templates = gen(*coords0[walkers, leaf].T)
-            else:
-                templates = [gen(*coords0[w, leaf]) for w in walkers]
-            for w, template in zip(walkers, templates):
+            for w in walkers:
+                template = gen(*coords0[w, leaf])
                 acs_flat[w].data.add_signal(template, sign=-1)
-            del templates
+            del template
             acs.free_gpu_memory()
         logger.info(f"rebuilt {name} residuals from {int(inds0.sum())} active leaves (cold chain).")
 
@@ -662,6 +659,18 @@ class GlobalFit:
         """EngineInfo object containing branch configuration for the sampler engine."""
         return self.curr.engine_info
 
+    def log_gpu_memory(self, acs: AnalysisContainerArray, when: str) -> None:
+        """Log (debug) each sampling GPU's memory occupation and walker count (``utils.device.gpu_memory_report``)."""
+        if not self.logger.isEnabledFor(logging.DEBUG) or acs.gpus is None:
+            return
+        gpus, counts = np.unique(acs.gpu_map, return_counts=True)  # gpu_map: each walker's device id
+        walkers = {int(g): int(c) for g, c in zip(gpus, counts)}
+        g = self.curr.general_info
+        self.logger.debug(
+            f"GPU memory {when} ({g.nwalkers} walkers x {g.ntemps} temperatures):\n  "
+            + "\n  ".join(gpu_memory_report(acs.xp, acs.gpus, walkers))
+        )
+
     def run_global_fit(self):
         """Execute the main global fit MCMC sampling run.
 
@@ -1017,6 +1026,7 @@ class GlobalFit:
                 gf_plotter = GlobalFitPlotter(curr=self.curr)
                 gf_plotter.save_input_data()
 
+            self.log_gpu_memory(acs, "before the MCMC")
             sampler_mix.run_mcmc(state, self.curr.general_info.num_iterations, thin_by=1, progress=True, store=True)
 
             try:
