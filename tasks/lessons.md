@@ -47,3 +47,15 @@ the point". **Pattern**: a performance fix to a shared backend must cover every
 model component the code supports (galaxy foreground, splines, asymmetric noise,
 aliasing). Split explicitly into exact vs approximate paths and say which is which;
 never ship a fast path that silently only works for one configuration.
+
+## 2026-11-06 — a time anchor is a convention for every source, not a column shift
+Planned `time_reference: data_start` only for blocks with a time column (MBH t_c),
+reasoning that EMRI phases "can't be shifted". User: it must apply to every block
+with a waveform_t0 — for EMRIs the time the reference phases refer to is set by the
+search settings. **Pattern**: a reference-time option declares the frame of the
+waveform AND of the block's search results; it is not a parameter transform. Only
+externally-anchored inputs (the MOJITO catalogue) need conversion, and where that
+is impossible (phases) raise for that input, don't restrict the option.
+Follow-up: user then rejected converting catalogue values at all — data_start +
+catalog search is a ValueError at load. Prefer refusing an inconsistent combination
+over silently converting inputs between conventions.

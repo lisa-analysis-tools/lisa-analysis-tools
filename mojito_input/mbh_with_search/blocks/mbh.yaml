@@ -12,13 +12,23 @@ waveform:
       rtol: 1e-4
     tdi_generation: 2nd generation
     tdi_channels: XYZ
-    order: 30
-    Tobs: 2629845.8136287993  # 1 / 12 * YRSID_SI: waveform length only, not the data's
+    order: 15
+    Tobs: 5259692  # seconds: waveform length only, not the data's. 2629846 = 1 month
     start_freq: 5e-5
     use_reference_time: true
     buffer_time: 15000
     fft_batch_size: 4
 num_prop_repeats: 50
+# per recipe stage (names from recipe.kwargs.stages); left-out keys take the values above.
+# inner_move_weights follow inner_moves; flow_weight is the flow's; 0 switches a move off for the stage.
+stages:
+  burn-in: {num_prop_repeats: 100, inner_move_weights: [0.4, 0.2, 0.2, 0.1], flow_weight: 0.0}
+  pe: {num_prop_repeats: 50, inner_move_weights: [0.55, 0.1, 0.1, 0.05], flow_weight: 0.2}
+  pe_with_flow: {num_prop_repeats: 30, inner_move_weights: [0.35, 0.1, 0.1, 0.05], flow_weight: 0.4}
+# what waveform_t0 (and so t_c, phi_ref with use_coalescence_time: false, and the search results) refers to:
+# mojito (data.reference_time, default) or data_start (start of the preprocessed data). A catalog search
+# needs mojito.
+time_reference: mojito
 tempering: {ratio: 1.2}  # over sampler.ntemps
 inner_moves:
   - {class: StretchMove, weight: 0.55}
@@ -28,7 +38,7 @@ inner_moves:
 flow:
   weight: 0.2
   # the flow on the unimodal parameters only, a stretch on the degenerate ones (one CombineMove):
-  parameters: [logM, logq, s1z, s2z, d_L, phi_ref, t_c]
+  parameters: [logM, q, s1z, s2z, d_L, phi_ref, t_c]
   gaussian: {adapt_cov: true, flow_prob: 0.5}
   model:
     class: ZukoFlow
@@ -52,7 +62,7 @@ search:
   spread: [1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-1, 1e-1, 1e-2, 1e-2, 1e-1]
 pe_move: 
   class: TDMBHSpecialMove
-  kwargs: {permute_every: 20, pad_out_of_prior: true, run_async: true, run_threaded: true, randomize_split: true}
+  kwargs: {permute_every: 20, pad_out_of_prior: true, run_async: true, run_threaded: true, randomize_split: true, batch_size_per_gpu: 64}
 links:
   waveform_model_code_link: https://github.com/Erebor-L2D/LISAanalysistools/blob/9d63bb1e63e7b8f640d3780551d9421df5245992/src/lisatools/sources/bbh/waveform.py#L130
   prior_model_code_link: https://priors-database-f0027f.gitlab.io/mojito_light_1a.html#massive-black-hole-binaries-mbhb

@@ -1,17 +1,17 @@
 schema_version: 1
 run:
-  name: mbh_from_search_lowtol
+  name: mbh_with_search_test
   output_dir: /data/asantini/globalfit/erebor_org_setup/mojito_runs/
   seed: 103209
   num_iterations: 500
   backup_iter: 5
 
 sampler:
-  nwalkers: 20
-  ntemps: 12
+  nwalkers: 16
+  ntemps: 16
 
 compute:
-  gpus: [0, 1]
+  gpus: [0]
   backend: cuda12x
   head_rank: 1
   main_rank: 0
@@ -60,3 +60,13 @@ metadata:
   comment: ""
 
 # recipe: absent -> StockRecipe (psd search, then joint PE), as the settings file's setup_recipe
+# recipe stages: each stage is a recipe step (its start iteration is stored in the backend, so a restart
+# resumes it); the last stage has no `iterations` and runs to run.num_iterations. Blocks set per-stage
+# PE-move settings under `stages:` (see blocks/mbh.yaml).
+recipe:
+  class: StockRecipe
+  kwargs:
+    stages:
+      - {name: burn-in, iterations: 20}
+      - {name: pe, iterations: 200}
+      - {name: pe_with_flow}

@@ -103,3 +103,28 @@ class ToJaxDevicePlacementTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_N_GPU >= 1, "needs cupy + JAX with a visible GPU")
+class ToJaxAlignmentTest(unittest.TestCase):
+    """cupy views at an offset that is not a multiple of 16 bytes must still reach JAX.
+
+    Regression test: a single-source ``SignalGen`` call hands phentax 1-element columns of a ``(1, ndim)``
+    coords array (``cupy.ascontiguousarray`` does not copy them), at offsets of 8 bytes; zero-copy DLPack
+    then failed inside the first JAX op ("Address of buffer ... must be a multiple of 10").
+    """
+
+    def setUp(self):
+        self.j = _J()
+
+    def test_offset_views(self):
+        coords = cp.arange(1.0, 12.0).reshape(1, 11)
+        for col in range(coords.shape[1]):
+            view = cp.ascontiguousarray(coords[:, col])
+            out = jnp.abs(self.j._to_jax(view))
+            self.assertEqual(float(out[0]), col + 1.0)
+
+    def test_aligned_input_stays_zero_copy(self):
+        x = cp.arange(4.0)
+        y = self.j._to_jax(x)
+        self.assertEqual(y.unsafe_buffer_pointer(), x.data.ptr)
