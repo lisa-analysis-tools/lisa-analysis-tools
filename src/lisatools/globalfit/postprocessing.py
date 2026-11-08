@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 from datetime import datetime, timezone
 from logging import getLogger
+import shutil
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import h5py
@@ -1672,6 +1673,17 @@ class SubmissionWriter(BackendConsumer):
             )
 
             _save_metadata_attributes(f, metadata)
+
+        # copy prior file in the submission folder if it exists
+        if metadata.prior_model_config_file:
+            prior_file_path = os.path.join(self.curr.general_info.artifacts_file_dir, metadata.prior_model_config_file)
+            if os.path.exists(prior_file_path):
+                prior_file_dest = os.path.join(self.run_metadata.submission_folder, metadata.prior_model_config_file)
+                if not os.path.exists(prior_file_dest):
+                    shutil.copy(prior_file_path, prior_file_dest)
+                    logger.info(f"Copied prior model config file '{metadata.prior_model_config_file}' to submission folder.")
+                else:
+                    logger.info(f"Prior model config file '{metadata.prior_model_config_file}' already exists in submission folder. Skipping copy.")
 
         logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
 
