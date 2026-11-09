@@ -853,6 +853,43 @@ class VGBSearchInterface(GBSearchInterface):
         """
         return "VGB"
 
+def sobhb_catalogue_to_gwtf_basis(catalogue_entry: dict, delta_t: float = 0.0) -> np.ndarray:
+    """One Mojito SOBHB catalogue entry in the ``GWTF_generator`` waveform basis.
+
+    ``[m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec]``, the output basis of
+    erebor-priors ``SOBHBPrior``. Masses are reordered so that ``m1 >= m2`` (spins follow);
+    the catalogue ``GW22FrequencySSBFrame`` is evolved by ``delta_t`` seconds (reference epoch ->
+    data start) with :func:`~lisatools.sources.utils.evolve_sobhb`; ``phi_coal`` is the gwtf coalescence phase of the
+    catalogue ``TrueAnomaly`` (:func:`~lisatools.sources.utils.sobhb_coalescence_phase` + ``SOBHB_GWTF_PHASE_OFFSET``).
+
+    Args:
+        catalogue_entry: catalogue parameters of one SOBHB source.
+        delta_t: time (s) from the catalogue reference epoch to the data start (gwtf t=0).
+    """
+    from ..sources.utils import SOBHB_GWTF_PHASE_OFFSET, evolve_sobhb, sobhb_coalescence_phase
+
+    m1 = float(catalogue_entry["PrimaryMassSSBFrame"])
+    m2 = float(catalogue_entry["SecondaryMassSSBFrame"])
+    s1 = float(catalogue_entry["PrimarySpinCompZ"])
+    s2 = float(catalogue_entry["SecondarySpinCompZ"])
+    if m2 > m1:
+        m1, m2, s1, s2 = m2, m1, s2, s1
+
+    dist = float(catalogue_entry["LuminosityDistance"]) * 1e-3  # Mpc -> Gpc
+    iota = float(catalogue_entry["InclinationAngle"])
+    f_ref = float(catalogue_entry["GW22FrequencySSBFrame"])
+    f0 = evolve_sobhb(0.0, delta_t, m1, m2, s1, s2, f_ref) if delta_t != 0.0 else f_ref
+
+    phi_coal = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, float(catalogue_entry["TrueAnomaly"]))
+    phi_coal = (phi_coal + SOBHB_GWTF_PHASE_OFFSET) % (2 * np.pi)
+
+    psi = float(catalogue_entry["PolarisationAngle"]) % (2 * np.pi)
+    ra = float(catalogue_entry["RightAscension"]) % (2 * np.pi)
+    dec = float(catalogue_entry["Declination"])
+
+    return np.array([m1, m2, s1, s2, dist, iota, f0, phi_coal, psi, ra, dec])
+
+
 class SOBHBSearchInterface(BaseSearchInterface):
     """
     Search interface for SOBHB sources.
@@ -869,7 +906,7 @@ class SOBHBSearchInterface(BaseSearchInterface):
 
     @property
     def branch_name(self):
-        return "sobh"
+        return "sobbh"
 
     @property
     def catalog_source_name(self) -> str:
@@ -886,11 +923,12 @@ class SOBHBSearchInterface(BaseSearchInterface):
         return [
             "PrimaryMassSSBFrame",
             "SecondaryMassSSBFrame",
-            "InclinationAngle",
-            "LuminosityDistance",
-            "GW22FrequencySSBFrame",
             "PrimarySpinCompZ",
             "SecondarySpinCompZ",
+            "LuminosityDistance",
+            "InclinationAngle",
+            "GW22FrequencySSBFrame",
+            "TrueAnomaly",
             "PolarisationAngle",
             "RightAscension",
             "Declination"
@@ -898,29 +936,16 @@ class SOBHBSearchInterface(BaseSearchInterface):
 
     def unpack_catalog_entries(self, catalog_entry: dict, curr: CurrentInfoGlobalFit) -> np.ndarray:
         """
-        Unpacks the catalog entries for the specific source type.
+        Unpacks the catalog entries into the GWTF_generator basis
+        ``m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec``.
+
+        ``phi_coal`` is the gwtf coalescence phase mapped from the catalogue ``TrueAnomaly`` (orbital
+        phase where ``f == GW22FrequencySSBFrame``), including the gwtf strain-sign offset.
         """
-        m1 = float(catalog_entry['PrimaryMassSSBFrame'])
-        m2 = float(catalog_entry['SecondaryMassSSBFrame'])
-        s1 = float(catalog_entry['PrimarySpinCompZ'])
-        s2 = float(catalog_entry['SecondarySpinCompZ'])
-        iota = float(catalog_entry['InclinationAngle'])
-        dist = float(catalog_entry['LuminosityDistance'])
-        f0 = float(catalog_entry['GW22FrequencySSBFrame'])
-        psi = float(catalog_entry['PolarisationAngle']) % (2 * np.pi)  # ensure polarization is within [0, 2*pi]
-        ra = float(catalog_entry['RightAscension']) % (2 * np.pi)
-        dec = float(catalog_entry['Declination'])
-
-        phi_coal = 0.0
-
+        delta_t = 0.0
         if self.evolve_to_data_start:
-            from ..sources.utils import evolve_sobhb
-
-            t_start = float(catalog_entry["TimeReferenceSSBFrame"])
-            t_end = curr.general_info.data_t0
-            f0 = evolve_sobhb(t_start, t_end, m1, m2, s1, s2, f0)
-
-        return np.array([m1, m2, iota, dist, f0, s1, s2, phi_coal, psi, ra, dec])
+            delta_t = curr.general_info.data_t0 - float(catalog_entry["TimeReferenceSSBFrame"])
+        return sobhb_catalogue_to_gwtf_basis(catalog_entry, delta_t)
 
 class NoiseSearchInterface(BaseSearchInterface):
     """

@@ -683,8 +683,11 @@ def mbh_catalogue_to_sampling_basis(
 def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: float = 0.0) -> np.ndarray:
     """Convert a single Mojito SOBHB catalogue entry to the SOBBH (gwtf) sampling basis.
 
-    The sampling basis is the ``GWTF_generator`` parameter order:
-    ``[Mc, eta, cos_iota, dist [Mpc], f0, s1z, s2z, phi_coal, psi, ra, dec]``
+    The sampling basis is the input basis of erebor-priors ``SOBHBPrior`` (the default of
+    :class:`~lisatools.globalfit.stock.erebor.SOBBHTFSetup`):
+    ``[Mc, eta, s1, s2, d_L [Gpc], cos_iota, f0, phi_coal, psi, alpha, sin_delta]``.
+    Its transform gives the ``GWTF_generator`` basis, built here by
+    :func:`~lisatools.globalfit.searches.sobhb_catalogue_to_gwtf_basis`.
 
     Parameters
     ----------
@@ -702,37 +705,14 @@ def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: fl
         Parameter vector of shape ``(11,)`` in the SOBBH sampling basis
         (masses in Msun, SSB frame; sky / polarization in ICRS).
     """
-    from lisatools.sources.utils import evolve_sobhb
+    from .searches import sobhb_catalogue_to_gwtf_basis
 
-    m1 =float(catalogue_entry['PrimaryMassSSBFrame'])
-    m2 = float(catalogue_entry['SecondaryMassSSBFrame'])
-    s1 = float(catalogue_entry['PrimarySpinCompZ'])
-    s2 = float(catalogue_entry['SecondarySpinCompZ'])
-
-    # Ensure m1 >= m2 (spins follow their masses)
-    if m2 > m1:
-        m1, m2 = m2, m1
-        s1, s2 = s2, s1
-
-    Mc = (m1 * m2)**0.6 / (m1 + m2)**0.2
-    eta = m1 * m2 / (m1 + m2)**2
-
-    cos_iota = np.cos(float(catalogue_entry['InclinationAngle']))
-    dist = float(catalogue_entry['LuminosityDistance'])  # Mpc (GWTF_generator converts to pc)
-
-    # Catalogue f0 is at the Mojito reference time; the gwtf basis f0 is at the start of the data.
-    # Evolve it with the TaylorT3Spin time-to-merger relation used by the waveform model.
-    f0 = evolve_sobhb(0.0, trim_plus_shift, m1, m2, s1, s2, float(catalogue_entry['GW22FrequencySSBFrame']))
-
-    # The catalogue has no phase in the gwtf phi_coal convention; it is fixed to 0 here
-    # (SOBBH_move_test.ipynb maximises <d|h> over it instead).
-    phi_coal = 0.0
-
-    psi = float(catalogue_entry['PolarisationAngle']) % np.pi  # ensure polarization is within [0, pi]
-    ra = float(catalogue_entry['RightAscension']) % (2 * np.pi)
-    dec = float(catalogue_entry['Declination'])
-
-    return np.array([Mc, eta, cos_iota, dist, f0, s1, s2, phi_coal, psi, ra, dec])
+    m1, m2, s1, s2, dist, iota, f0, phi_coal, psi, ra, dec = sobhb_catalogue_to_gwtf_basis(
+        catalogue_entry, trim_plus_shift
+    )
+    Mc = (m1 * m2) ** 0.6 / (m1 + m2) ** 0.2
+    eta = m1 * m2 / (m1 + m2) ** 2
+    return np.array([Mc, eta, s1, s2, dist, np.cos(iota), f0, phi_coal, psi, ra, np.sin(dec)])
 
 
 def emri_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float = 0.0) -> np.ndarray:

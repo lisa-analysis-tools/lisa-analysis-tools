@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import typing
-from functools import partial
 from typing import Any, Optional
 
 import h5py
@@ -21,7 +20,7 @@ import logging
 from eryn.backends import HDFBackend as eryn_Backend
 from eryn.moves.tempering import make_ladder
 from eryn.prior import uniform_dist, log_uniform
-from eryn.priors import ProbDistContainer, GenericFunctionalDistribution
+from eryn.priors import ProbDistContainer
 from eryn.state import State as ErynState
 from eryn.state import Branch as ErynBranch
 from eryn.utils import TransformContainer
@@ -30,7 +29,6 @@ from gbgpu.utils.utility import get_fdot, get_N
 from lisatools.sources.utils import ecliptic_to_icrs
 from lisatools.utils.utility import AET, detrend, tukey
 from lisatools.utils.constants import YRSID_SI, PC_SI
-from lisatools.utils.utility import ErynEtaMcPrior
 
 from ...domains import DomainSettingsBase, FDSettings, WDMSettings, STFTSettings
 from ..engine import Settings, Setup, GeneralSetup
@@ -1275,102 +1273,19 @@ class SOBBHSetup(Setup):
             self.branch_backend = SOBBHHDFBackend
 
 
-# Sampling basis of the gwtf (time-frequency) SOBBH branch. Identical to the
-# ``GWTF_generator`` parameter order (``waveform_gwtf._split_parameters``) and to
-# the output of ``recipe.sobhb_catalogue_to_sampling_basis``.
-SOBBHTF_BASIS = [
-    "Mc",        # chirp mass (Msun, SSB frame)
-    "eta",       # symmetric mass ratio
-    "cosinc",    # cos(inclination)
-    "dist",      # luminosity distance (Mpc)
-    "f0",        # GW frequency (Hz) at the start of the data (gwtf t=0)
-    "s1",        # primary aligned spin
-    "s2",        # secondary aligned spin
-    "phi_coal",  # coalescence phase
-    "psi",       # polarisation angle (ICRS)
-    "ra",        # right ascension (ICRS)
-    "dec",       # declination (ICRS)
-]
-
-# Default prior range for each sampling parameter; ``<name>_lims`` in
-# :class:`SOBBHTFSettings` overrides it. The prior *shape* is fixed per
-# parameter (see ``SOBBHTFSetup.setup_priors``): joint (Mc, eta) uniform in
-# component masses, volumetric in dist, cos(dec) in dec, uniform otherwise.
-SOBBHTF_DEFAULT_LIMS = {
-    "Mc": (5.0, 100.0),
-    "eta": (0.1, 0.2499999),
-    "cosinc": (-1.0, 1.0),
-    "dist": (10.0, 1000.0),
-    "f0": (1.0e-3, 0.08),
-    "s1": (-0.99, 0.99),
-    "s2": (-0.99, 0.99),
-    "phi_coal": (0.0, 2 * np.pi),
-    "psi": (0.0, np.pi),
-    "ra": (0.0, 2 * np.pi),
-    "dec": (-np.pi / 2, np.pi / 2),
-}
-
-
-# Analytic pdf / inverse-cdf pairs for GenericFunctionalDistribution. Module
-# level (bound with functools.partial) so the priors stay picklable.
-def _volumetric_pdf(x, lo, hi):
-    """p(x) = 3 x^2 / (hi^3 - lo^3) on [lo, hi]."""
-    return 3.0 * x**2 / (hi**3 - lo**3)
-
-
-def _volumetric_inv_cdf(u, lo, hi):
-    ''''
-    Inverse CDF of the volumetric distribution on [lo, hi].
-    
-    '''
-    return np.cbrt(lo**3 + u * (hi**3 - lo**3))
-
-
-def _cos_dec_pdf(x, lo, hi):
-    """p(x) = cos(x) / (sin(hi) - sin(lo)) on [lo, hi] (uniform on the sphere)."""
-    return np.cos(x) / (np.sin(hi) - np.sin(lo))
-
-
-def _cos_dec_inv_cdf(u, lo, hi):
-    '''
-    Inverse CDF of the cos(dec) distribution on [lo, hi].
-    '''
-    return np.arcsin(np.sin(lo) + u * (np.sin(hi) - np.sin(lo)))
-
-
-def _functional_prior(pdf, inv_cdf, lo, hi):
-    '''
-    Partial function fixes the lower and upper bounds of the distribution for use in GenericFunctionalDistribution.
-    So the pdf and inv_cdf are just functions of one variable each. 
-    '''
-    return GenericFunctionalDistribution(
-        partial(pdf, lo=lo, hi=hi), partial(inv_cdf, lo=lo, hi=hi), lo, hi
-    )
-
-
-def make_sobbhtf_transform_container():
-    """Identity :class:`TransformContainer` for the gwtf SOBBH branch.
-
-    The sampling basis is the ``GWTF_generator`` basis, so ``both_transforms``
-    only reorders/copies. It still has to be a real container: the add/remove
-    move and ``subtract_initial_signal`` call ``transform.both_transforms``.
-
-    For now this is basically the identity transform. But for sampling should be extended. 
-    """
-    return TransformContainer(
-        input_basis=SOBBHTF_BASIS,
-        output_basis=SOBBHTF_BASIS,
-    )
-
-
 @dataclasses.dataclass
 class SOBBHTFSettings(Settings):
     """Settings dataclass for the gwtf (time-frequency) SOBBH branch.
 
-    Mirrors :class:`SOBBHSettings` but in the ``GWTF_generator`` conventions:
-    11 params ``Mc, eta, cosinc, dist [Mpc], f0 [Hz, at data start], s1, s2,
-    phi_coal, psi, ra, dec`` (sky/polarisation in ICRS), sampled directly
-    with an identity transform.
+    The prior, transform, periodicity and ``ndim`` come from erebor-priors
+    ``mojitolight.SOBHBPrior``: sampling basis ``Mc, eta, s1, s2, d_L [Gpc], cos_iota,
+    f0 [Hz, at data start], phi_coal, psi, alpha, sin_delta``, transformed to the
+    ``GWTF_generator`` / ``SOBBHTaylorT3TDIWaveform`` basis ``m1, m2, s1, s2, dist [Gpc],
+    inc, f0, phi_coal, psi, ra, dec`` (sky/polarisation in the frame of the orbits).
+
+    Injected ``priors`` (e.g. from an l2d YAML block) take precedence and then need
+    ``transform``. Otherwise ``SOBHBPrior.prior_factory`` is built from ``f0_lims`` and
+    ``Mc_lims`` when given (its defaults otherwise).
 
     ``branch_name`` is the key used for ``priors`` / ``periodic``; it must
     match the branch name the recipe and ``GlobalFitSettings.source_info`` use.
@@ -1378,18 +1293,7 @@ class SOBBHTFSettings(Settings):
 
     branch_name: str = "sobbh"
     Mc_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    eta_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    dist_lims: typing.List[float] = dataclasses.field(default_factory=list)
     f0_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    s1_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    s2_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    cosinc_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    phi_coal_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    psi_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    ra_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    dec_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    # Component-mass box [m_min, m_max] (Msun) cutting the joint (Mc, eta) prior.
-    component_mass_lims: typing.List[float] = dataclasses.field(default_factory=lambda: [5.0, 130.0])
     # GWTF_generator.get_signal_for_residuals takes no kwargs, and
     # subtract_initial_signal splats these into it -> must stay a (empty) dict.
     waveform_kwargs: dict = dataclasses.field(default_factory=dict)
@@ -1404,7 +1308,7 @@ class SOBBHTFSetup(Setup):
     """:class:`Setup` for the gwtf (time-frequency) SOBBH branch.
 
     Args:
-        sobbhtf_settings: Settings dataclass with gwtf SOBBH parameter ranges
+        sobbhtf_settings: Settings dataclass with gwtf SOBBH prior ranges
             and sampling knobs.
     """
 
@@ -1424,27 +1328,28 @@ class SOBBHTFSetup(Setup):
         self.init_setup()
 
     def init_sampling_info(self):
-        """Build the identity transform, prior, periodicity and defaults.
+        """Default the prior, transform, periodicity and ``ndim`` from ``SOBHBPrior``.
 
-        ``betas`` is left as given: ``None`` lets the recipe build a ladder
-        matching the general ``ntemps`` (``make_ladder``).
+        Each is only filled when not given. ``betas`` is left as given: ``None`` lets the
+        recipe build a ladder matching the general ``ntemps`` (``make_ladder``).
         """
         if self.waveform_kwargs is None:
             self.waveform_kwargs = {}
 
-        if self.transform is None:
-            self.transform = make_sobbhtf_transform_container()
+        if self.priors is None:
+            prior = self.make_default_prior()
+            self.priors = {self.branch_name: prior}
+            if self.transform is None:
+                self.transform = prior.get_transforms()
+            if self.periodic is None:
+                self.periodic = {self.branch_name: prior.get_periodic()}
+        else:
+            self.logger.info("Using custom priors for the SOBBHTF branch")
+            if self.transform is None:
+                raise ValueError("SOBBHTFSettings: custom priors need a matching transform.")
 
-        if self.periodic is None:
-            self.periodic = {
-                self.branch_name: {
-                    "phi_coal": 2 * np.pi,
-                    "psi": np.pi,
-                    "ra": 2 * np.pi,
-                }
-            }
-
-        self.setup_priors(SOBBHTF_BASIS)
+        if self.ndim is None:
+            self.ndim = self.priors[self.branch_name].ndim
 
         if self.betas is not None:
             self.logger.info(f"Using betas: {self.betas} in SOBBHTF branch")
@@ -1465,44 +1370,19 @@ class SOBBHTFSetup(Setup):
 
             self.inner_moves = [(StretchMove(), 1.0)]
 
-    def setup_priors(self, input_basis):
-        """Build the gwtf SOBBH prior.
+    def make_default_prior(self):
+        """``SOBHBPrior.prior_factory`` with ``f0_lims`` / ``Mc_lims`` when given."""
+        from ereborpriors.stock.mojitolight import SOBHBPrior
 
-        Ranges come from ``SOBBHTF_DEFAULT_LIMS``, overridden by any non-empty
-        ``<name>_lims`` setting. Shapes are fixed per parameter: (Mc, eta)
-        jointly uniform in component masses (cut by ``component_mass_lims``),
-        dist volumetric, dec uniform on the sphere, the rest uniform.
-        """
-        # ProbDistContainer assigns columns by insertion order, not by name, so
-        # the joint (Mc, eta) entry must come first to land on columns 0, 1.
-        assert list(input_basis[:2]) == ["Mc", "eta"], input_basis
-
-        lims = {}
-        for key in input_basis:
-            cfg = getattr(self, f"{key}_lims")
-            if cfg is not None and len(cfg) == 2:
-                self.logger.info(f"Setting prior limits for parameter {key} to {cfg}")
-                lims[key] = tuple(cfg)
-            else:
-                lims[key] = SOBBHTF_DEFAULT_LIMS[key]
-
-        priors_sobbhtf = {
-            ("Mc", "eta"): ErynEtaMcPrior(*lims["Mc"], *lims["eta"], *self.component_mass_lims),
-        }
-
-        # If key is "dist" or "dec", use the functional prior defined for that parameter; otherwise uniform.
-        for key in input_basis[2:]:
-            if key == "dist":
-                priors_sobbhtf[key] = _functional_prior(_volumetric_pdf, _volumetric_inv_cdf, *lims[key])
-            elif key == "dec":
-                priors_sobbhtf[key] = _functional_prior(_cos_dec_pdf, _cos_dec_inv_cdf, *lims[key])
-            else:
-                priors_sobbhtf[key] = uniform_dist(*lims[key])
-
-        prior_container = ProbDistContainer(priors_sobbhtf)
-        assert prior_container.key_order == list(input_basis), prior_container.key_order
-
-        self.priors = {self.branch_name: prior_container}
+        kwargs = {}
+        for lims, (lo, hi) in ((self.f0_lims, ("f0_min", "f0_max")), (self.Mc_lims, ("chirp_mass_min", "chirp_mass_max"))):
+            if lims is not None and len(lims) == 2:
+                kwargs[lo], kwargs[hi] = (float(v) for v in lims)
+        self.logger.info(f"Default SOBHBPrior with {kwargs or 'its default limits'}")
+        prior = SOBHBPrior.prior_factory(**kwargs)
+        if prior.branch_name != self.branch_name:
+            raise ValueError(f"SOBHBPrior branch {prior.branch_name!r} != settings branch {self.branch_name!r}.")
+        return prior
 
     def init_setup(self):
         self.init_sampling_info()
