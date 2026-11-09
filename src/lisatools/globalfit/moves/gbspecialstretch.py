@@ -36,13 +36,6 @@ from ...sensitivity import SensitivityMatrixBase
 from ...utils.parallelbase import LISAToolsParallelModule
 from ...utils.utility import asnumpy
 from ..galaxyglobal import fit_each_leaf, make_gmm, run_gb_bulk_search
-from gbgpu.gb_likelihood import (
-    BandLikelihoodEngine,
-    FDBandLikelihoodEngine,
-    SwapLLResult,
-    WDMBandLikelihoodEngine,
-    make_band_likelihood_engine,
-)
 from .globalfitmove import GFCombineMove, GlobalFitMove
 from ..priors.gbpriors import get_fdot_mojito
 

@@ -38,8 +38,6 @@ except ImportError as _bbhx_err:
     def SSB_to_LISA(*args, _err=_bbhx_err, **kwargs):
         raise ImportError("SSB_to_LISA requires bbhx, which is not installed.") from _err
 from gbgpu.gbgpu import GBGPU
-from gbgpu.gbcomps import STFTGBComputations
-from gbgpu.gb_likelihood import make_band_likelihood_engine
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer
 
@@ -152,8 +150,22 @@ class Recipe:
         if self._current_iter >= len(self.recipe):
             raise ValueError("Recipe is already finished.")
 
-        self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+        self._start_current_step(iteration, last_sample, sampler)
         self._has_setup_first_step = True
+
+    def _start_current_step(self, iteration, last_sample, sampler):
+        """Set the current step's ``start_iteration`` (absolute) and run its ``setup_run``.
+
+        The start is recorded in the backend the first time the step starts, so a restart in the middle of a
+        step keeps counting from where it began (eryn's own ``iteration`` restarts at 0 with every run).
+        """
+        step = self._current_recipe_step
+        start = int(getattr(sampler, "iteration", iteration))
+        if self.backend_added and hasattr(self.backend, "recipe_step_start"):
+            start = self.backend.recipe_step_start(step["name"], start)
+        step["adjust"].start_iteration = start
+        logger.info(f"Starting recipe step {step['name']!r} (from iteration {start}).")
+        step["adjust"].setup_run(iteration, last_sample, sampler)
 
     @property
     def current_recipe_step(self):
@@ -181,7 +193,7 @@ class Recipe:
 
             if self._current_iter >= len(self.recipe):
                 return True
-            self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+            self._start_current_step(iteration, last_sample, sampler)
 
         return False
 
@@ -197,6 +209,8 @@ class RecipeStep:
         moves: List of MCMC moves to use during this recipe step.
         weights: List of weights matching ``moves``. Defaults to uniform.
     """
+
+    start_iteration: int | None = None  # absolute sampler iteration the step started at (set by Recipe)
 
     def __init__(self, moves=None, weights=None):
         if moves is not None:
@@ -238,22 +252,45 @@ class RecipeStep:
         raise NotImplementedError
 
 class BaseRecipeStep(RecipeStep):
-    """Default :class:`RecipeStep` that simply assigns moves to the sampler.
+    """Default :class:`RecipeStep` that assigns moves to the sampler.
 
     Args:
         moves: List of MCMC moves to use during this recipe step.
         weights: List of weights matching ``moves``.
+        move_settings: ``{branch_name: kwargs}`` for ``apply_settings`` of the moves of that branch (e.g.
+            ``{"mbh": {"num_repeats": 15, "weights": [...]}}``), applied whenever the step starts (also on a
+            restart). The moves may sit inside a ``CombineMove``.
     """
 
-    def __init__(self, moves=None, weights=None):
+    def __init__(self, moves=None, weights=None, move_settings: dict[str, dict] | None = None):
         super().__init__(moves=moves, weights=weights)
+        self.move_settings = move_settings or {}
+
+    def apply_move_settings(self):
+        """Hand each branch's ``move_settings`` to its moves' ``apply_settings``."""
+        from eryn.moves import CombineMove
+
+        settings = getattr(self, "move_settings", None) or {}
+        applied = set()
+        for move in self.moves:
+            move = move[0] if isinstance(move, tuple) else move
+            for sub in move.sub_moves if isinstance(move, CombineMove) else [move]:
+                branch = getattr(sub, "branch_name", None)
+                if branch in settings and hasattr(sub, "apply_settings"):
+                    sub.apply_settings(**settings[branch])
+                    applied.add(branch)
+                    logger.info(f"{branch} move settings: {settings[branch]}")
+        missing = sorted(set(settings) - applied)
+        if missing:
+            raise ValueError(f"move_settings for {missing}: no move of these branches takes settings in this step.")
 
     def setup_run(self, iteration, last_sample, sampler):
-        """Install :attr:`moves`/:attr:`weights` on the sampler.
+        """Apply :attr:`move_settings` and install :attr:`moves`/:attr:`weights` on the sampler.
 
         Each move that lacks an explicit periodicity setting inherits the
         sampler's periodicity.
         """
+        self.apply_move_settings()
         for move in self.moves:
             if sampler.periodic is not None and move.periodic is None:
                 logger.debug(f"Setting periodicity of move {move} to {sampler.periodic}")
@@ -292,18 +329,24 @@ class PERecipeStep(BaseRecipeStep):
 class IterationCountRecipeStep(BaseRecipeStep):
     """Recipe step that runs for N iterations before moving to the next step."""
 
-    def __init__(self, moves: list, weights: typing.Optional[list] = None, num_iters: int = 100):
-        super().__init__(moves, weights)
+    def __init__(
+        self,
+        moves: list,
+        weights: typing.Optional[list] = None,
+        num_iters: int = 100,
+        move_settings: dict[str, dict] | None = None,
+    ):
+        super().__init__(moves, weights, move_settings=move_settings)
         self.num_iters = num_iters
 
     def setup_run(self, iteration, last_sample, sampler):
         super().setup_run(iteration, last_sample, sampler)
-
-        self.start_iteration = iteration
+        if self.start_iteration is None:  # outside a Recipe, which sets it (restart-aware)
+            self.start_iteration = int(sampler.iteration)
 
     def stopping_function(self, iteration, last_sample, sampler):
-        """Stop after num_iters iterations."""
-        stop = (iteration - self.start_iteration) >= self.num_iters
+        """Stop after num_iters stored iterations (absolute count: eryn's ``iteration`` restarts per run)."""
+        stop = (int(sampler.iteration) - self.start_iteration) >= self.num_iters
         if stop:
             logger.info(f"IterationCountRecipeStep stopping after {self.num_iters} iterations.")
 
@@ -600,7 +643,7 @@ def mbh_catalogue_to_sampling_basis(
 
     s1z = float(catalogue_entry["PrimarySpinCompZ"])
     s2z = float(catalogue_entry["SecondarySpinCompZ"])
-    dist = float(catalogue_entry["LuminosityDistance"]) / 1e3  # Mpc -> Gpc
+    dist = float(catalogue_entry["LuminosityDistance"]) * 1e-3  # Mpc -> Gpc
     phi_ref = float(catalogue_entry["PhaseReferenceSourceFrame"]) % (2 * np.pi)
     cos_iota = np.cos(float(catalogue_entry["InclinationAngle"]))
 
@@ -1177,6 +1220,7 @@ def build_psd_moves(
     num_repeats: int = 60,
     permute_every: int = 50,
     Tmax: float = 1e6,
+    betas: typing.Optional[np.ndarray] = None,
 ) -> tuple[PSDMove, PSDMove]:
     """Build PSD search and PE moves.
 
@@ -1198,6 +1242,8 @@ def build_psd_moves(
         Number of internal PSD move repeats. Default 60.
     Tmax : float, optional
         Maximum temperature for ``TemperatureControl``. Default 1e6.
+    betas : np.ndarray, optional
+        Explicit ladder for ``TemperatureControl``; overrides ``Tmax``.
 
     Returns
     -------
@@ -1212,7 +1258,7 @@ def build_psd_moves(
 
     effective_ndim = engine_info.ndims["psd"] if galfor_info is None else engine_info.ndims["galfor"] + engine_info.ndims["psd"] 
     temperature_control = TemperatureControl(
-        effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
+        effective_ndim, nwalkers, ntemps=ntemps, betas=betas, Tmax=Tmax, permute=False
     )
 
     psd_move_kwargs = dict(
@@ -1388,6 +1434,7 @@ def build_gb_moves(
     #* Setting up gbgpu on the correct backend and (if any) gpu(s).
     #* CPU path keeps numpy and avoids the cupy-only setDevice call.
     from gbgpu.gbgpu import GBGPU
+    from gbgpu.gbcomps import STFTGBComputations
     import gbgpu
 
     gb_force_backend = general_info.force_backend
@@ -1579,6 +1626,8 @@ def build_gb_moves(
             )
             
             xp = gb_info.gb_stft_comp.xp
+
+            from gbgpu.gb_likelihood import make_band_likelihood_engine
 
             make_band_likelihood_engine(
                 domain_settings,
@@ -1942,10 +1991,13 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         # ladder on the source info and the tiled ladder on the sub-state.
         info.betas = betas
         betas_all = np.tile(betas, (info.nleaves_max, 1))
-        state.sub_states[self.branch_name].betas_all = betas_all
+        # the state (and its backend) keeps every temperature: pad a subset ladder with its last rung
+        padded = np.concatenate([betas, np.full(ntemps - len(betas), betas[-1])])
+        state.sub_states[self.branch_name].betas_all = np.tile(padded, (info.nleaves_max, 1))
         logger.debug(f"{self.branch_name} betas: {betas}")
 
-        coords_shape = (ntemps, nwalkers, info.nleaves_max, info.ndim)
+        # the move may run on a subset ladder (the first len(betas) temperatures)
+        coords_shape = (len(betas), nwalkers, info.nleaves_max, info.ndim)
 
         wf_gen_kw = (
             self.waveform_gen_kwargs
@@ -2053,11 +2105,15 @@ class PSDMoveBuilder(SourceMoveBuilder):
 
     branch_name = "psd"
 
-    def __init__(self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6):
+    def __init__(
+        self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6,
+        betas: typing.Optional[np.ndarray] = None,
+    ):
         super().__init__(branch_name="psd")
         self.num_repeats = num_repeats
         self.permute_every = permute_every
         self.Tmax = Tmax
+        self.betas = betas
 
     def build(self, engine_info, curr, acs, priors, state):
         search_move, pe_move = build_psd_moves(
@@ -2068,5 +2124,6 @@ class PSDMoveBuilder(SourceMoveBuilder):
             num_repeats=self.num_repeats,
             permute_every=self.permute_every,
             Tmax=self.Tmax,
+            betas=self.betas,
         )
         return [search_move], [pe_move]
