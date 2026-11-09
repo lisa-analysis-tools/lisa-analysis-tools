@@ -549,7 +549,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         if isinstance(self.permute_every, bool):
             return self.permute_every and repeat == self.num_repeats - 1
         
-        return self.permute_every > 0 and (repeat % self.permute_every == 0 or repeat == self.num_repeats - 1)
+        return self.permute_every > 0 and repeat > 0 and (repeat % self.permute_every == 0 or repeat == self.num_repeats - 1)
 
     def _verify_entry_vs_acs(self, prev_logl, cold_ref, leaf):
         """The expose invariant: the cold-chain ``prev_logl`` scored against the
