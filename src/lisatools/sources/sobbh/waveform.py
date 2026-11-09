@@ -405,14 +405,17 @@ def tau_to_x(tau, sigma, delta, eta, s):
 
 
 def _pn_amp_phase_core(
-    m1, m2, D, f_low, s1, s2, times, reference_phase=0.0
+    m1, m2, D, f_low, s1, s2, times, reference_phase=0.0, phase_at_coalescence=False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Shared 3.5PN core: ``(A, Phi, t_subset)`` for an aligned-spin inspiral.
 
     ``A`` is the GW strain amplitude ``(2 M eta x)/D`` (WITHOUT the
-    inclination factors), ``Phi`` is the orbital phase anchored at the
-    reference epoch, and ``t_subset`` is the subset of ``times`` strictly
-    before the estimated coalescence time ``tc``.
+    inclination factors), ``Phi`` is the orbital phase, and ``t_subset`` is
+    the subset of ``times`` strictly before the estimated coalescence time ``tc``.
+
+    ``reference_phase`` is the orbital phase at the reference epoch (default),
+    or the coalescence phase if ``phase_at_coalescence`` (see
+    :func:`_orbital_phase`).
 
     Both the polarization path (:func:`waveform_generate_h_plus_cross`, which
     folds in ``inc`` and builds ``hp``/``hx``) and the amplitude/phase path
@@ -434,28 +437,39 @@ def _pn_amp_phase_core(
     tau = eta * (tc - t_subset) / (5 * M)
 
     x = tau_to_x(tau, sigma, delta, eta, s)
-    # Anchor the orbital phase at the REFERENCE epoch (t == reference_time,
-    # i.e. tau == tau_ref), NOT at coalescence. `phase(x)` is referenced to
-    # merger (phase=0 at x_merger), so `- phase(x) + phase(x_ref)` makes
-    # `Phi(reference) == reference_phase` exactly. The catalogue TrueAnomaly
-    # is the orbital phase at the reference epoch.
-    #
-    # We anchor on `phase(tau_to_x(tau_ref))` -- the x the inspiral ACTUALLY
-    # has at the reference epoch in its own tau-parametrization. With the
-    # tau_to_x-consistent tc above, `tau_to_x(tau_ref) == x0` to machine
-    # precision, so this equals `phase(x0)`; the explicit form keeps the anchor
-    # exact regardless of the tc solver tolerance.
     tau_ref = eta * tc / (5 * M)  # tau at the reference epoch (t_subset == 0)
-    x_ref = tau_to_x(tau_ref, sigma, delta, eta, s)
-    Phi = (
-        reference_phase
-        - phase(x, sigma, delta, eta, s)
-        + phase(x_ref, sigma, delta, eta, s)
+    Phi = _orbital_phase(
+        reference_phase, x, tau_ref, M, eta, sigma, delta, s, phase_at_coalescence
     )
 
     A = (2 * M * eta * x) / D
 
     return A, Phi, t_subset
+
+
+def _orbital_phase(reference_phase, x, tau_ref, M, eta, sigma, delta, s, phase_at_coalescence):
+    """Orbital phase ``Phi`` along ``x``; the GW phase is ``2*Phi``.
+
+    ``phase(x)`` is referenced to coalescence (``phase -> 0`` at merger), so:
+
+    * ``phase_at_coalescence=False`` (default): ``reference_phase`` is the
+      orbital phase at the REFERENCE epoch (``tau == tau_ref``, where
+      ``f == f_low``; the catalogue ``TrueAnomaly``):
+      ``Phi = reference_phase - phase(x) + phase(x_ref)``. The anchor is
+      ``phase(tau_to_x(tau_ref))`` -- the x the inspiral ACTUALLY has at the
+      reference epoch -- which equals ``phase(x0)`` to machine precision with
+      the tau_to_x-consistent ``tc`` of :func:`_pn_intrinsics`, but stays exact
+      regardless of the tc solver tolerance.
+    * ``phase_at_coalescence=True``: ``reference_phase`` is the coalescence
+      phase, ``Phi = reference_phase - phase(x)``. This is the pygwtf
+      TaylorT3Spin ``phi_coal`` convention (``GWTF_generator``). The two are
+      related by ``phi_coal = phi0 + phase(x_ref)``.
+    """
+    Phi = reference_phase - phase(x, sigma, delta, eta, s)
+    if phase_at_coalescence:
+        return Phi
+    x_ref = tau_to_x(tau_ref, sigma, delta, eta, s)
+    return Phi + phase(x_ref, sigma, delta, eta, s)
 
 
 def _pn_intrinsics(m1, m2, f_low, s1, s2):
@@ -510,7 +524,9 @@ def _pn_intrinsics(m1, m2, f_low, s1, s2):
     return M, eta, sigma, s, delta, tc
 
 
-def _pn_amp_phase_masked(m1, m2, D, f_low, s1, s2, times, reference_phase=0.0):
+def _pn_amp_phase_masked(
+    m1, m2, D, f_low, s1, s2, times, reference_phase=0.0, phase_at_coalescence=False
+):
     """Vectorized, fixed-shape counterpart of :func:`_pn_amp_phase_core`.
 
     Instead of truncating ``times`` at ``tc`` (data-dependent shape), the
@@ -524,6 +540,8 @@ def _pn_amp_phase_masked(m1, m2, D, f_low, s1, s2, times, reference_phase=0.0):
             :func:`waveform_generate_h_plus_cross`; ``D`` in parsec).
         times: PN times (s) measured from the reference epoch, shape
             ``(Ntimes,)`` (shared) or ``(Nbatch, Ntimes)``.
+        phase_at_coalescence: ``reference_phase`` is the coalescence phase
+            instead of the reference-epoch phase (see :func:`_orbital_phase`).
 
     Returns:
         ``(A, Phi, mask)``, each of shape ``(Nbatch, Ntimes)``; ``A`` is zero
@@ -545,11 +563,8 @@ def _pn_amp_phase_masked(m1, m2, D, f_low, s1, s2, times, reference_phase=0.0):
     tau = jnp.where(mask, eta * (tc - times) / (5 * M), tau_ref)
 
     x = tau_to_x(tau, sigma, delta, eta, s)
-    x_ref = tau_to_x(tau_ref, sigma, delta, eta, s)
-    Phi = (
-        reference_phase
-        - phase(x, sigma, delta, eta, s)
-        + phase(x_ref, sigma, delta, eta, s)
+    Phi = _orbital_phase(
+        reference_phase, x, tau_ref, M, eta, sigma, delta, s, phase_at_coalescence
     )
     A = jnp.where(mask, (2 * M * eta * x) / D, 0.0)
 
@@ -557,7 +572,7 @@ def _pn_amp_phase_masked(m1, m2, D, f_low, s1, s2, times, reference_phase=0.0):
 
 
 def waveform_generate_h_plus_cross(
-    m1, m2, D, inc, f_low, s1, s2, times, reference_phase=0.0
+    m1, m2, D, inc, f_low, s1, s2, times, reference_phase=0.0, phase_at_coalescence=False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Generate ``(hp, hx)`` for an aligned-spin SOBBH PN inspiral.
 
@@ -574,13 +589,17 @@ def waveform_generate_h_plus_cross(
             ``f_low`` / ``x0``), in rad. This is the catalogue convention
             (``TrueAnomaly`` is the phase at the reference epoch), so the
             inspiral is anchored there rather than at coalescence.
+        phase_at_coalescence: if True, ``reference_phase`` is the coalescence
+            phase instead (pygwtf ``phi_coal`` convention, see
+            :func:`_orbital_phase`).
 
     Returns:
         ``(hp, hx, t_subset)`` with ``hp``/``hx`` of length ``len(t_subset)``,
         which is the subset of ``times`` strictly before the estimated tc.
     """
     A, Phi, t_subset = _pn_amp_phase_core(
-        m1, m2, D, f_low, s1, s2, times, reference_phase=reference_phase
+        m1, m2, D, f_low, s1, s2, times, reference_phase=reference_phase,
+        phase_at_coalescence=phase_at_coalescence,
     )
     C = jnp.cos(inc)
     A_plus = A * (1 + C**2)
@@ -593,7 +612,7 @@ def waveform_generate_h_plus_cross(
 
 
 def waveform_generate_amp_phase(
-    m1, m2, D, f_low, s1, s2, times, reference_phase=0.0
+    m1, m2, D, f_low, s1, s2, times, reference_phase=0.0, phase_at_coalescence=False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Generate ``(gw_amp, gw_phase, t_subset)`` for a SOBBH PN inspiral.
 
@@ -624,7 +643,8 @@ def waveform_generate_amp_phase(
         ``(gw_amp, gw_phase, t_subset)``, each of length ``len(t_subset)``.
     """
     A, Phi, t_subset = _pn_amp_phase_core(
-        m1, m2, D, f_low, s1, s2, times, reference_phase=reference_phase
+        m1, m2, D, f_low, s1, s2, times, reference_phase=reference_phase,
+        phase_at_coalescence=phase_at_coalescence,
     )
     return A, 2.0 * Phi, t_subset
 
@@ -864,19 +884,31 @@ class SOBBHTaylorT3TDIWaveform(TDPyResponseWaveformBase, JaxBase):
     Parameter order (sampling basis)::
 
         m1, m2 (M_sun), s1, s2 (aligned spins), dist (Gpc), inc (rad),
-        f_low (Hz), phi0 (orbital phase at the reference epoch, rad),
-        psi (rad), ra, dec (rad, in the frame of ``orbits``)
+        f_low (Hz), phi0 (orbital phase at the reference epoch, rad; the
+        coalescence phase if ``phase_at_coalescence``), psi (rad),
+        ra, dec (rad, in the frame of ``orbits``)
 
     ``ra`` / ``dec`` can also be given as keyword arguments.
 
     Args:
         *args: Positional arguments forwarded to :class:`TDPyResponseWaveformBase`.
+        phase_at_coalescence: if True, ``phi0`` is the coalescence phase
+            (the pygwtf ``phi_coal`` convention of ``GWTF_generator``) instead of
+            the orbital phase at ``waveform_t0``. (default: False)
         **kwargs: Keyword arguments forwarded to :class:`TDPyResponseWaveformBase`.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, phase_at_coalescence: bool = False, **kwargs: Any) -> None:
         TDPyResponseWaveformBase.__init__(self, *args, **kwargs)
         JaxBase.__init__(self)
+        self.phase_at_coalescence = phase_at_coalescence
+
+    @property
+    def wrapper_kwargs(self) -> dict:
+        """Settings used to initialize the waveform, for reproducibility and debugging."""
+        base_kwargs = super().wrapper_kwargs
+        base_kwargs["phase_at_coalescence"] = self.phase_at_coalescence
+        return base_kwargs
 
     @property
     def kwargs(self) -> dict:
@@ -926,6 +958,7 @@ class SOBBHTaylorT3TDIWaveform(TDPyResponseWaveformBase, JaxBase):
             self._to_jax(s2),
             self._to_jax(t_pn),
             reference_phase=self._to_jax(phi0),
+            phase_at_coalescence=self.phase_at_coalescence,
         )
         inc = jnp.atleast_1d(self._to_jax(inc))[:, None]
         psi = jnp.atleast_1d(self._to_jax(psi))[:, None]
@@ -974,7 +1007,8 @@ class SOBBHTaylorT3TDIWaveform(TDPyResponseWaveformBase, JaxBase):
             dist: luminosity distance (Gpc).
             inc: inclination (rad).
             f_low: GW frequency at the reference epoch ``waveform_t0`` (Hz).
-            phi0: orbital phase at the reference epoch (rad).
+            phi0: orbital phase at the reference epoch (rad), or the
+                coalescence phase if ``phase_at_coalescence``.
             psi: polarization angle (rad).
             ra, dec: sky position (unused here; consumed by the response).
             merger_time: duration from ``waveform_t0`` to the end of the data,

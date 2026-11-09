@@ -209,10 +209,16 @@ class GWTF_generator:
 
     def _to_gwtf_parameters(self, params):
         """
-        Convert the lisatools parameters to the gwtf waveform and response parameter arrays.
+        Convert the lisatools parameters to the gwtf (TaylorT3Spin) parameters.
 
-        params: (#nSources, 11) array of parameters, where the columns are:
-        0: m1, 1: m2, 2: s1, 3: s2, 4: dist (Gpc), 5: inc, 6: f0, 7: phi_coal, 8: psi, 9: ra, 10: dec
+        params: (#nSources, 11) array of parameters (the SOBBHTaylorT3TDIWaveform basis), where the columns are:
+        0: m1 (Msun), 1: m2 (Msun), 2: s1, 3: s2 (aligned spins), 4: dist (Gpc), 5: inc (rad),
+        6: f0 (Hz, GW frequency at the data start settings.t0, i.e. gwtf t=0),
+        7: phi_coal (rad, coalescence orbital phase: Phi(x) = phi_coal - P(x); gwtf strain sign, see
+           lisatools.sources.utils.SOBHB_GWTF_PHASE_OFFSET), 8: psi (rad),
+        9: ra, 10: dec (rad, in the frame of the orbits)
+
+        Returns Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec (distance in pc).
         """
         m1, m2, s1, s2, dist, inc, f0, phi_coal, psi, ra, dec = params.T
 
@@ -225,12 +231,12 @@ class GWTF_generator:
 
     def _split_parameters(self, params):
         """
-        Split the gwtf parameters into waveform and response parameter arrays.
+        Split the lisatools parameters into the gwtf waveform and response parameter arrays.
 
-        params: (#nSources, 11) array of parameters, where the columns are:
-        0: Mc, 1: eta, 2: cosinc, 3: D (Mpc), 4: f0, 5: s1, 6: s2, 7: phi_coal, 8: psi, 9: sky_lon (RA), 10: sky_lat (DEC)
+        params: (#nSources, 11) array of parameters, see _to_gwtf_parameters.
 
-        Returns the gwtf waveform and response parameter arrays.
+        Returns the gwtf waveform parameters (M, eta, cosinc, D (pc), f0, s1, s2, phi_coal) and
+        response parameters (cosinc, psi, ra, dec).
         """
         params = self.xp.asarray(params)
 
@@ -247,7 +253,7 @@ class GWTF_generator:
         """
         Compute the time-frequency waveform for each source.
 
-        params: (#nSources, 11) array of parameters, see _split_parameters.
+        params: (#nSources, 11) array of parameters, see _to_gwtf_parameters.
 
         channel_basis: "AET" (gwtf's native output) or "XYZ" (the basis of the lisatools data/residuals).
 
@@ -289,10 +295,10 @@ class GWTF_generator:
         
         return stft_waveform_filled
 
-    def get_signal_for_residuals(self, *params):
+    def get_signals_for_residuals(self, *params):
         """
         Waveform for residual add/remove in the global fit (the move's waveform_gen_method).
-        params: the 11 parameters in _split_parameters order, as separate arguments. Either scalars
+        params: the 11 parameters in _to_gwtf_parameters order, as separate arguments. Either scalars
                 (one source) or equal-length 1-D arrays (a batch,
                 the move's get_waveforms_here path).
 
@@ -306,7 +312,7 @@ class GWTF_generator:
         single = all(np.ndim(p) == 0 for p in params)
 
         # Rewire into the (#nSources, 11) array of parameters, where the columns are:
-        # 0: Mc, 1: eta, 2: cosinc, 3: D (Mpc), 4: f0, 5: s1, 6: s2, 7: phi_coal, 8: psi, 9: sky_lon (RA), 10: sky_lat (DEC)
+        # 0: m1, 1: m2, 2: s1, 3: s2, 4: dist (Gpc), 5: inc, 6: f0, 7: phi_coal, 8: psi, 9: ra, 10: dec
         params_arr = self.xp.stack([self.xp.atleast_1d(self.xp.asarray(p, dtype=self.xp.float64)) for p in params], axis=1) # (nSources, 11)
 
         # Compute the time-frequency waveform in XYZ (the basis of the lisatools residuals) on the settings backend.
@@ -318,7 +324,7 @@ class GWTF_generator:
         """
         Per time-segment inner products.
 
-        params: (#nSources, 11) array of parameters, see _split_parameters.
+        params: (#nSources, 11) array of parameters, see _to_gwtf_parameters.
 
         data_indices: (#nSources,) array of indices corresponding to walker for the data and psd arrays for each source.
 
@@ -347,7 +353,7 @@ class GWTF_generator:
         Compute inner products <d|h> and <h|h> for each source, summed over time segments.
 
         Args:
-            params: (#nSources, 11) array of parameters, see _split_parameters.
+            params: (#nSources, 11) array of parameters, see _to_gwtf_parameters.
             data_indices: (#nSources,) array of indices corresponding to walker for the data and psd arrays for each source.
             data, psd: (#nWalkers, #nT, #nF, #nChannels) on the gwtf grid.
 

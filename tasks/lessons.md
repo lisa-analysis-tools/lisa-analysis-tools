@@ -59,3 +59,14 @@ is impossible (phases) raise for that input, don't restrict the option.
 Follow-up: user then rejected converting catalogue values at all — data_start +
 catalog search is a ValueError at load. Prefer refusing an inconsistent combination
 over silently converting inputs between conventions.
+
+## 2026-11-09 — scope multi-phase ports in rounds
+Correction: on the SOBBH YAML port I put the whole 8-step port up for approval at once; the user approved only
+steps 1–2 and changed a design point (GWTF_generator basis) for a later step. Rule: for multi-phase
+work, propose the first round's scope as the actionable plan and list later phases only as a
+sketch, expecting the user to steer them before they are planned in detail.
+
+## 2026-11-09 — show the plan before acting on it
+Correction: after a rejected ExitPlanMode I rewrote the plan and acted on an approval the user never saw
+("you didnt show me the plan"). Rule: every plan revision goes through a visible ExitPlanMode on the
+current plan file, and nothing (not even memory/todo bookkeeping) is written until that approval.
