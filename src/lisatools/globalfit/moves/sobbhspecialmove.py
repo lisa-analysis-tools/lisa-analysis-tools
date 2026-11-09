@@ -142,11 +142,23 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
                 ll[pos] = out[i]
 
         # Reject templates merging within tc_min_days (Newtonian tc from Mc, f0).
-        if self.tc_min_days is not None:
-            Mc, f0 = asnumpy(coords_in[:, 0]), asnumpy(coords_in[:, 4])
+        if self.tc_min_days is not None:            
             # 0PN merger time in seconds.
-            tc = 5 / 256 * (Mc * MTSUN_SI) ** (-5 / 3) * (np.pi * f0) ** (-8 / 3)
+            tc = self.compute_tc(coords_in)
+
             ll[tc < self.tc_min_days * 86400] = -1e300
 
         # Guard against any NaN or inf values in the log-likelihood array.
         return np.where(np.isfinite(ll), ll, -1e300)
+
+    def compute_tc(self, coords):
+        '''
+        Compute the Newtonian merger time for each source in coords. 
+        coords: (nwalkers, ndim) array of parameters. 
+        Returns: (nwalkers,) array of merger times in seconds. 
+        '''
+        m1, m2, s1, s2, dist, inc, f0, phi_coal, psi, ra, dec = asnumpy(coords).T    
+        Mc = (m1 * m2)**(3/5) / (m1 + m2)**(1/5)
+        
+        tc = 5 / 256 * (Mc * MTSUN_SI) ** (-5 / 3) * (np.pi * f0) ** (-8 / 3)
+        return tc

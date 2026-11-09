@@ -207,8 +207,26 @@ class GWTF_generator:
         out = self.xp.ascontiguousarray(self.to_gwtf_layout(S_aet))  # (nW, nT, nF, 3 AET)
         return out if batched else out[0]
 
+    def _to_gwtf_parameters(self, params):
+        """
+        Convert the lisatools parameters to the gwtf waveform and response parameter arrays.
+
+        params: (#nSources, 11) array of parameters, where the columns are:
+        0: m1, 1: m2, 2: s1, 3: s2, 4: dist (Gpc), 5: inc, 6: f0, 7: phi_coal, 8: psi, 9: ra, 10: dec
+        """
+        m1, m2, s1, s2, dist, inc, f0, phi_coal, psi, ra, dec = params.T
+
+        Mc = (m1 * m2)**(3/5) / (m1 + m2)**(1/5)
+        eta = (m1 * m2) / (m1 + m2)**2
+        cosinc = self.xp.cos(inc)
+        dist_pc = dist * 1.0e9 # Convert distance from Gpc to pc
+
+        return Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec
+
     def _split_parameters(self, params):
         """
+        Split the gwtf parameters into waveform and response parameter arrays.
+
         params: (#nSources, 11) array of parameters, where the columns are:
         0: Mc, 1: eta, 2: cosinc, 3: D (Mpc), 4: f0, 5: s1, 6: s2, 7: phi_coal, 8: psi, 9: sky_lon (RA), 10: sky_lat (DEC)
 
@@ -216,22 +234,12 @@ class GWTF_generator:
         """
         params = self.xp.asarray(params)
 
-        Mc = params[:,0]
-        eta = params[:,1]
-        cosinc = params[:,2]
-        D = params[:,3]*1.e+6 # Convert distance from Mpc to pc
-        f0 = params[:,4]
-        s1 = params[:,5]
-        s2 = params[:,6]
-        phi_coal = params[:,7]
-        psi = params[:,8]
-        sky_lon = params[:,9] # RA. in radians
-        sky_lat = params[:,10] # DEC. in radians
+        Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec = self._to_gwtf_parameters(params)
 
         M = Mc * (eta)**(-3/5)
 
-        wf_params = self.xp.column_stack((M, eta, cosinc, D, f0, s1, s2, phi_coal))
-        resp_params = self.xp.column_stack((cosinc, psi, sky_lon, sky_lat))
+        wf_params = self.xp.column_stack((M, eta, cosinc, dist_pc, f0, s1, s2, phi_coal))
+        resp_params = self.xp.column_stack((cosinc, psi, ra, dec))
 
         return wf_params, resp_params
 
