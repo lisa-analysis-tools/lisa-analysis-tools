@@ -39,7 +39,7 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
         # Reject proposals merging less than tc_min_days after data start (None = off).
         self.tc_min_days = tc_min_days
 
-        waveform_gen_method: str = "get_signal_for_residuals"
+        waveform_gen_method: str = "get_signals_for_residuals"
         waveform_like_method: str = "compute_inner_products"
 
         if not hasattr(waveform_gen, waveform_gen_method):
