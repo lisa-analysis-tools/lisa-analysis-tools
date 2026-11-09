@@ -702,12 +702,9 @@ def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: fl
         Parameter vector of shape ``(11,)`` in the SOBBH sampling basis
         (masses in Msun, SSB frame; sky / polarization in ICRS).
     """
-    import pygwtf
-    from pygwtf import models
+    from lisatools.sources.utils import evolve_sobhb
 
-    MT = pygwtf.constants.MTsun
-
-    m1 = float(catalogue_entry['PrimaryMassSSBFrame'])
+    m1 =float(catalogue_entry['PrimaryMassSSBFrame'])
     m2 = float(catalogue_entry['SecondaryMassSSBFrame'])
     s1 = float(catalogue_entry['PrimarySpinCompZ'])
     s2 = float(catalogue_entry['SecondarySpinCompZ'])
@@ -725,15 +722,7 @@ def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: fl
 
     # Catalogue f0 is at the Mojito reference time; the gwtf basis f0 is at the start of the data.
     # Evolve it with the TaylorT3Spin time-to-merger relation used by the waveform model.
-    def recompute_f0(m1, m2, f0, s1, s2):
-        m1, m2 = m1 * MT, m2 * MT
-        M = m1 + m2; eta = m1 * m2 / M**2
-        sigma = (m2 * s2 - m1 * s1) / M; s = (m1**2 * s1 + m2**2 * s2) / M**2; delta = (m1 - m2) / M
-        tc = models.taylort3spin.common.time_to_merger((np.pi * M * f0)**(2/3), sigma, delta, eta, s) * M
-        x = models.taylort3spin.common.tau_to_x(eta * (tc - trim_plus_shift) / (5 * M), sigma, delta, eta, s)
-        return x**1.5 / (np.pi * M)
-
-    f0 = float(recompute_f0(m1, m2, float(catalogue_entry['GW22FrequencySSBFrame']), s1, s2))
+    f0 = evolve_sobhb(0.0, trim_plus_shift, m1, m2, s1, s2, float(catalogue_entry['GW22FrequencySSBFrame']))
 
     # The catalogue has no phase in the gwtf phi_coal convention; it is fixed to 0 here
     # (SOBBH_move_test.ipynb maximises <d|h> over it instead).

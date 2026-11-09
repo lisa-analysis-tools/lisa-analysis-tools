@@ -741,16 +741,24 @@ def evolve_sobhb(
         s1 (float): Spin of the first black hole (dimensionless).
         s2 (float): Spin of the second black hole (dimensionless).
         f_start (float): Start/initial frequency of the SOBHB before evolving.
+
+    All arguments broadcast against each other (scalars or arrays, numpy or cupy); the result is on the
+    inputs' array module, a float for all-scalar input. Uses the pygwtf TaylorT3Spin PN relations and mass
+    constant, so it matches the gwtf waveform model. Sources that merge before ``t_end`` give NaN.
     """
-
-    # Convert masses to SI units
-    from lisatools.utils.constants import MTSUN_SI
     try:
-        from gwtf import models
-    except (ImportError, ModuleNotFoundError):
-        raise ImportError("The gwtf package is required for this function. Please install it via pip or conda.")
+        from pygwtf import constants, models
+    except ImportError as err:
+        raise ImportError("evolve_sobhb requires pygwtf (https://github.com/cchapmanbird/gwtf).") from err
 
-    m1_seconds, m2_seconds = m1 * MTSUN_SI, m2 * MTSUN_SI
+    from ..utils.utility import asnumpy
+
+    args = (t_start, t_end, m1, m2, s1, s2, f_start)
+    # return on the device if any input is a cupy array (computed on the host either way)
+    xp = next((get_array_module(a) for a in args if hasattr(a, "get")), np)
+    t_start, t_end, m1, m2, s1, s2, f_start = (np.asarray(asnumpy(a), dtype=np.float64) for a in args)
+
+    m1_seconds, m2_seconds = m1 * constants.MTsun, m2 * constants.MTsun
     total_mass_seconds = m1_seconds + m2_seconds
     eta = m1_seconds * m2_seconds / total_mass_seconds**2
 
@@ -759,10 +767,18 @@ def evolve_sobhb(
     delta = (m1_seconds - m2_seconds) / total_mass_seconds
     delta_t = t_end - t_start
 
-    tc = models.taylort3spin.common.time_to_merger((np.pi * total_mass_seconds * f_start)**(2/3), sigma, delta, eta, s) * total_mass_seconds
-    x = models.taylort3spin.common.tau_to_x(eta * (tc - delta_t) / (5 * total_mass_seconds), sigma, delta, eta, s)
+    # the pygwtf PN relations are scalar numba functions: vectorize them over the broadcast inputs
+    common = models.taylort3spin.common
+    time_to_merger = np.vectorize(common.time_to_merger, otypes=[np.float64])
+    tau_to_x = np.vectorize(common.tau_to_x, otypes=[np.float64])
 
-    return x**1.5 / (np.pi * total_mass_seconds)
+    tc = time_to_merger((np.pi * total_mass_seconds * f_start)**(2/3), sigma, delta, eta, s) * total_mass_seconds
+    x = tau_to_x(eta * (tc - delta_t) / (5 * total_mass_seconds), sigma, delta, eta, s)
+
+    f_end = x**1.5 / (np.pi * total_mass_seconds)
+    if f_end.ndim == 0:
+        return float(f_end)
+    return f_end if xp is np else xp.asarray(f_end)
 
 def psi_rotation_icrs_to_ecliptic(lam_ecl, beta_ecl):
     """Polarization-basis rotation ``chi`` such that ``psi_ecl = psi_icrs - chi``.

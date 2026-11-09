@@ -20,7 +20,8 @@ import logging
 
 from eryn.backends import HDFBackend as eryn_Backend
 from eryn.moves.tempering import make_ladder
-from eryn.prior import ProbDistContainer, uniform_dist, log_uniform, GenericFunctionalDistribution
+from eryn.prior import uniform_dist, log_uniform
+from eryn.priors import ProbDistContainer, GenericFunctionalDistribution
 from eryn.state import State as ErynState
 from eryn.state import Branch as ErynBranch
 from eryn.utils import TransformContainer

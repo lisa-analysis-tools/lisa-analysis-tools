@@ -162,6 +162,7 @@ _REMOVED_PARAMS_REGISTRY: Dict[str, List[str]] = {
     "gb": ["frequency_double_dot"],
     "mbh": [],
     "emri": [],
+    "sobbh": [],
     "psd": [],
     "galfor": [],
 }
@@ -170,7 +171,7 @@ source_types_names = dict(
     gb="GB",  # todo: separate the verification binaries into their own source type
     mbh="MBHB",
     emri="EMRI",
-    sobh="SOBHB",
+    sobbh="SOBHB",
     psd="NOISE",
     galfor="NOISE",  # todo: should we merge noise and stochastic together under a common "stochastic" source type?
 )
