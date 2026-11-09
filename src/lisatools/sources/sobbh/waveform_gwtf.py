@@ -35,12 +35,15 @@ class GWTF_generator:
                  T_obs,
                  fresnel_kernel_width = 10,
                  use_GPU = True,
-                 psd_drop_bands = DEFAULT_PSD_DROP_BANDS):
+                 psd_drop_bands = DEFAULT_PSD_DROP_BANDS,
+                 tukey_alpha = None):
         """
         Assumptions:
         - PSD and data are already pre-processed and in the correct shape corresponding to the tf grid provided.
           Use to_gwtf_layout to map lisatools STFT arrays onto the gwtf grid.
         - PSD is clipped around the zeros as expected.
+        - tukey_alpha: None -> box-car Fresnel kernel. Otherwise the Tukey-windowed Fresnel kernel with this taper
+          fraction, which should match the per-segment STFT window of the data (window_taper_duration / dT).
 
         Frequency grid: gwtf bin k is centred on (k+1)*dF, i.e. the grid always starts at dF (no DC bin).
         The gwtf grid therefore covers lisatools STFT bins 1..settings.ind_max, and bins below settings.ind_min
@@ -51,13 +54,16 @@ class GWTF_generator:
         # (it rebuilds the generator as GWTF_generator(**self.kwargs) with "orbits" swapped for that device's orbits).
 
         self.psd_drop_bands = psd_drop_bands
+        self.tukey_alpha = tukey_alpha
+        self.use_tukey = tukey_alpha is not None
 
         self.kwargs = dict(settings=settings,
                            orbits=orbits,
                            T_obs=T_obs,
                            fresnel_kernel_width=fresnel_kernel_width,
                            use_GPU=use_GPU,
-                           psd_drop_bands=self.psd_drop_bands)
+                           psd_drop_bands=self.psd_drop_bands,
+                           tukey_alpha=self.tukey_alpha)
 
 
         self.settings = settings
@@ -93,6 +99,8 @@ class GWTF_generator:
                   'dF':self.dF,
                   'fmin': float(settings.f_arr[0]),        # centre of active bin 0 = ind_min*dF
                   'kernel_width':fresnel_kernel_width}
+        if self.use_tukey:
+            config['alpha'] = float(tukey_alpha)
 
         if use_GPU:
             backend = 'gpu'
@@ -115,6 +123,7 @@ class GWTF_generator:
                                                                 spacecraft_ltts=self.spacecraft_LTTs,
                                                                 block_vectorised_gpu = True, # Block vectorised mode, better for small batches -> global fit
                                                                 gf_mode = True, # Use the GF mode, allowing for one PSD and DATA array per walker.
+                                                                use_tukey = self.use_tukey,
                                                                 )
 
         # Waveform-only generator (non-gf_mode), built lazily in compute_time_frequency_waveform.
@@ -249,6 +258,7 @@ class GWTF_generator:
                                                                     backend=self.backend,
                                                                     spacecraft_orbits=self.spacecraft_positions,
                                                                     spacecraft_ltts=self.spacecraft_LTTs,
+                                                                    use_tukey=self.use_tukey,
                                                                     )
 
         waveform_array = self.waveform_gen_object(parameters=wf_params,
