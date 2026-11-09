@@ -940,7 +940,12 @@ def select_gb_injection_subset_by_snr(
     # physical rows must come from the fdot-basis transform -- the RUN's
     # transform would read slot 2 as Mc on chirp-mass runs (fdot ~1e-15 as
     # Mc -> template fdot ~ 0; fdot < 0 -> (neg)^(5/3) = NaN template).
-    from .stock.erebor.transforms import make_gb_transform_container
+    try:
+        from .stock.erebor.transforms import make_gb_transform_container # type: ignore
+    except ImportError:
+        raise ImportError(
+            "GB SNR-cut injection requires the 'erebor' package (pip install erebor)."
+        )
 
     _tc_fdot = make_gb_transform_container(use_chirp_mass=False)
     _xp = gb_wdm_comp.xp
@@ -1114,7 +1119,12 @@ def subtract_gb_neighbors_from_data(
     # FDOT-basis physical rows (same contract note as in
     # select_gb_injection_subset_by_snr: the run transform would misread
     # slot 2 as Mc on chirp-mass runs and NaN the fdot < 0 sources).
-    from .stock.erebor.transforms import make_gb_transform_container
+    try:
+        from .stock.erebor.transforms import make_gb_transform_container # type: ignore
+    except ImportError:
+        raise ImportError(
+            "GB neighbor subtraction requires the 'erebor' package (pip install erebor)."
+        )
 
     _tc_fdot = make_gb_transform_container(use_chirp_mass=False)
     xp = gb_wdm_comp.xp
