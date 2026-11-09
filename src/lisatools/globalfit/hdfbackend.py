@@ -272,8 +272,10 @@ class GFHDFBackend(eryn_HDFBackend):
 
         self.sub_backend = sub_backend
         if self.sub_backend is not None:
+            # Sub-backends read/write under f[self.name]["sub_backend"], so they
+            # must share the main group name (eryn's own default is "mcmc").
             self.sub_backend = {
-                key: self.sub_backend[key](*args, **kwargs)
+                key: self.sub_backend[key](*args, name=self.name, **kwargs)
                 for key in self.sub_backend
                 if self.sub_backend[key] is not None
             }

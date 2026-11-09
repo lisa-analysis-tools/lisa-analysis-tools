@@ -22,3 +22,8 @@ from .response import (  # noqa: F401
     get_sobbh_response_wrapper,
     get_sobbh_tdionfly_gen,
 )
+
+
+from .waveform_gwtf import (  # noqa: F401
+    GWTF_generator,
+)

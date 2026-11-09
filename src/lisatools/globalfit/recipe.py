@@ -31,10 +31,12 @@ except ModuleNotFoundError:
 from lisatools.domains import FDSettings, STFTSettings, WDMSettings
 from lisatools.response.tdiconfig import TDIConfig
 
-try:  # optional: only MBH settings files need bbhx
+# bbhx is optional (only MBH branches need it); a stub raises on first use.
+try:
     from bbhx.utils.transform import SSB_to_LISA
-except ImportError:
-    SSB_to_LISA = None
+except ImportError as _bbhx_err:
+    def SSB_to_LISA(*args, _err=_bbhx_err, **kwargs):
+        raise ImportError("SSB_to_LISA requires bbhx, which is not installed.") from _err
 from gbgpu.gbgpu import GBGPU
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer
@@ -677,6 +679,71 @@ def mbh_catalogue_to_sampling_basis(
     # Erebor's stock MBH transform (MBHSetup.init_sampling_info /
     # make_mbh_transform_container) uses the same direct-ICRS basis.
     return np.array([logM, Q, s1z, s2z, dist, phi_ref, cos_iota, psi_icrs, ra, sin_dec, t_ssb])
+
+def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: float = 0.0) -> np.ndarray:
+    """Convert a single Mojito SOBHB catalogue entry to the SOBBH (gwtf) sampling basis.
+
+    The sampling basis is the ``GWTF_generator`` parameter order:
+    ``[Mc, eta, cos_iota, dist [Mpc], f0, s1z, s2z, phi_coal, psi, ra, dec]``
+
+    Parameters
+    ----------
+    catalogue_entry : dict
+        Dictionary of catalogue parameters for one SOBHB source, as
+        stored by ``L1DataLoader.catalogue['sobhb'][source_id]``.
+    trim_plus_shift : float
+        Time [s] from the catalogue reference epoch (``MOJITO_REFERENCE_TIME``)
+        to the start of the data (gwtf t=0). The catalogue GW22 frequency is
+        given at the reference epoch and is evolved forward by this amount.
+
+    Returns
+    -------
+    np.ndarray
+        Parameter vector of shape ``(11,)`` in the SOBBH sampling basis
+        (masses in Msun, SSB frame; sky / polarization in ICRS).
+    """
+    import pygwtf
+    from pygwtf import models
+
+    MT = pygwtf.constants.MTsun
+
+    m1 = float(catalogue_entry['PrimaryMassSSBFrame'])
+    m2 = float(catalogue_entry['SecondaryMassSSBFrame'])
+    s1 = float(catalogue_entry['PrimarySpinCompZ'])
+    s2 = float(catalogue_entry['SecondarySpinCompZ'])
+
+    # Ensure m1 >= m2 (spins follow their masses)
+    if m2 > m1:
+        m1, m2 = m2, m1
+        s1, s2 = s2, s1
+
+    Mc = (m1 * m2)**0.6 / (m1 + m2)**0.2
+    eta = m1 * m2 / (m1 + m2)**2
+
+    cos_iota = np.cos(float(catalogue_entry['InclinationAngle']))
+    dist = float(catalogue_entry['LuminosityDistance'])  # Mpc (GWTF_generator converts to pc)
+
+    # Catalogue f0 is at the Mojito reference time; the gwtf basis f0 is at the start of the data.
+    # Evolve it with the TaylorT3Spin time-to-merger relation used by the waveform model.
+    def recompute_f0(m1, m2, f0, s1, s2):
+        m1, m2 = m1 * MT, m2 * MT
+        M = m1 + m2; eta = m1 * m2 / M**2
+        sigma = (m2 * s2 - m1 * s1) / M; s = (m1**2 * s1 + m2**2 * s2) / M**2; delta = (m1 - m2) / M
+        tc = models.taylort3spin.common.time_to_merger((np.pi * M * f0)**(2/3), sigma, delta, eta, s) * M
+        x = models.taylort3spin.common.tau_to_x(eta * (tc - trim_plus_shift) / (5 * M), sigma, delta, eta, s)
+        return x**1.5 / (np.pi * M)
+
+    f0 = float(recompute_f0(m1, m2, float(catalogue_entry['GW22FrequencySSBFrame']), s1, s2))
+
+    # The catalogue has no phase in the gwtf phi_coal convention; it is fixed to 0 here
+    # (SOBBH_move_test.ipynb maximises <d|h> over it instead).
+    phi_coal = 0.0
+
+    psi = float(catalogue_entry['PolarisationAngle']) % np.pi  # ensure polarization is within [0, pi]
+    ra = float(catalogue_entry['RightAscension']) % (2 * np.pi)
+    dec = float(catalogue_entry['Declination'])
+
+    return np.array([Mc, eta, cos_iota, dist, f0, s1, s2, phi_coal, psi, ra, dec])
 
 
 def emri_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float = 0.0) -> np.ndarray:
