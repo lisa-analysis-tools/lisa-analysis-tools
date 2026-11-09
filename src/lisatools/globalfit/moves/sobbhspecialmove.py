@@ -14,14 +14,6 @@ if TYPE_CHECKING:
     from ...sources.sobbh import GWTF_generator
 
 
-def update_fn(i, last_sample, sampler):
-    """Search-mode update hook that copies the cold chain into the hottest chain."""
-    print("max logl:", last_sample.log_like.max())
-    last_sample.branches_coords["mbh"][-1] = last_sample.branches_coords["mbh"][0]
-    last_sample.log_like[-1] = last_sample.log_like[0]
-    last_sample.log_prior[-1] = last_sample.log_prior[0]
-
-
 class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
     def __init__(
         self, 
