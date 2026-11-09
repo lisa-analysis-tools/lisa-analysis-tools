@@ -208,7 +208,7 @@ def get_sobbh_erebor_settings(general_set: GeneralSetup) -> SOBBHTFSetup:
         nleaves_max=nleaves_max_sobbh,# Fixed dimensionality for the sobbh
         nleaves_min=nleaves_max_sobbh,# Fixed dimensionality for the sobbh
         ndim=11,
-        num_prop_repeats=300,
+        num_prop_repeats=1000,
         betas=betas,
         inner_moves=[(StretchMove(), 1.0)],
         # transform / periodic / priors default inside SOBBHTFSetup (identity,
@@ -267,10 +267,10 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     head_dir = "/data/diganta/Mojito_Search/Integration_GF/Run/"  # trailing slash: paths are built by string concatenation
     data_input_path = "/data/asantini/globalfit/MOJITO_DATA/mojito_light_2p5s/"
-    base_file_name = "SOBBH_only_MOJITO_light_2p5s_GF_correct_priors_13th_oct"
+    base_file_name = "SOBBH_only_MOJITO_light_2p5s_GF_more_in_model_14th_oct_permute_every"
     file_store_dir = head_dir
 
-    gpus = [0]
+    gpus = [1]
     cp.cuda.runtime.setDevice(gpus[0])
     # Restrict JAX to only see the target GPU — must be set before JAX backend init
     import jax

@@ -115,8 +115,21 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         # Store injection truths for diagnostic plots
         curr.source_info["sobbh"].injection = injection_params
 
-        # Per-parameter spread for the Gaussian scatter
-        spread = 1e-8
+        # Per-parameter spread for the Gaussian scatter (absolute, sampling basis).
+        # Order: [Mc, eta, cosinc, dist, f0, s1, s2, phi_coal, psi, ra, dec]
+        spread = np.array([
+            1e-5,   # Mc
+            1e-2,   # eta
+            0.1,    # cosinc
+            10.0,   # dist [Mpc]
+            1e-9,   # f0 [Hz]
+            0.1,    # s1
+            0.1,    # s2
+            0.0,    # phi_coal -> drawn from its prior below
+            0.3,    # psi
+            5e-3,   # ra
+            5e-3,   # dec
+        ])
 
         scatter_around_injection(
             state,
@@ -125,6 +138,11 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
             spread,
             priors=priors,
         )
+
+        # phi_coal is unconstrained and slow-mixing: seed it from its prior rather than at the
+        # catalogue value (fixed to 0, not the gwtf convention), which would freeze it.
+        sobbh_coords = state.branches_coords["sobbh"]
+        sobbh_coords[..., 7] = np.random.uniform(0.0, 2 * np.pi, size=sobbh_coords.shape[:-1])
         
     from lisatools.sources.sobbh.waveform_gwtf import GWTF_generator
 
@@ -158,12 +176,13 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         priors=priors,
         inner_moves=sobhb_info.inner_moves,
         betas_all=betas_all,# *starting* inverse temperatures
-        permute_every=25,# swaps between temperatures. any value <= turns it off
+        permute_every=0,# swaps between temperatures. any value <= turns it off
         pad_out_of_prior=True, # Out of prior points are replaced by a copy of a random in-prior point.
         run_async=True, #unused in sobbh block. 
         run_threaded=True, # threaded allowing for threaded execution of the likelihoods over GPUs. 
         randomize_split=True, # eryn setting 
         batch_size_per_gpu=None, # Maximum number of walkers per GPU to run in parallel. Setting None 
+        tc_min_days=60, # Reject proposals merging less than tc_min_days after data start (None = off).
     )
 
     sobhb_pe_move = SOBBHSpecialMove(**sobhb_move_kwargs)
@@ -193,7 +212,7 @@ def get_psd_erebor_settings(general_set: GeneralSetup) -> PSDSetup:
         prior_fn = log_uniform
     else:
         raise ValueError(f"Unsupported prior model: {prior_model}")
-    
+
     prior_model_config = {
         "S_oms": (6.0e-12, 20.0e-11),
         "S_tm": (1.0e-15, 20.0e-14),
@@ -246,7 +265,7 @@ def get_sobbh_erebor_settings(general_set: GeneralSetup) -> SOBBHTFSetup:
     # and gpu_orbits exists. MultiGPUResidualAddRemoveMove rebuilds one replica
     # per GPU from GWTF_generator.kwargs with "orbits" swapped per device.
     use_GPU = gpu_available and general_set.force_backend != "cpu"
-    fresnel_kernel_width = 50  # as validated in dev/SOBBH_move_test.ipynb
+    fresnel_kernel_width = 16  
 
     waveform_init_kwargs = dict(
         settings=general_set.domain_settings,
@@ -260,8 +279,8 @@ def get_sobbh_erebor_settings(general_set: GeneralSetup) -> SOBBHTFSetup:
     waveform_runtime_kwargs = dict()
 
     # None -> setup_recipe builds make_ladder(ndim, ntemps=general ntemps).
-    #TODO: temporary
-    betas = None
+    betas = [1/1.0, 1/1.1, 1/1.22, 1/1.4, 1/1.65, 1/2.0, 1/2.6, 1/3.5]
+
 
     # The catalogue source-type key is "sobhb" (L1ProcessingStep), the branch is "sobbh".
     # Number of leaves is the number of sources in the catalogue. The catalogue is read in setup_recipe.
@@ -276,7 +295,7 @@ def get_sobbh_erebor_settings(general_set: GeneralSetup) -> SOBBHTFSetup:
         nleaves_max=nleaves_max_sobbh,# Fixed dimensionality for the sobbh
         nleaves_min=nleaves_max_sobbh,# Fixed dimensionality for the sobbh
         ndim=11,
-        num_prop_repeats=200,
+        num_prop_repeats=300,
         betas=betas,
         inner_moves=[(StretchMove(), 1.0)],
         # transform / periodic / priors default inside SOBBHTFSetup (identity,
@@ -320,7 +339,7 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     submission_folder = None #"/work/asantini/globalfit/erebor_org_setup/mojito_runs/"
 
-    num_iterations = 5
+    num_iterations = 500
 
     source_ids = dict(
         sobhb=[0, 1, 2, 3, 4, 5]
@@ -335,7 +354,7 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     head_dir = "/data/diganta/Mojito_Search/Integration_GF/Run/"  # trailing slash: paths are built by string concatenation
     data_input_path = "/data/asantini/globalfit/MOJITO_DATA/mojito_light_2p5s/"
-    base_file_name = "SOBBH_PSD_MOJITO_light_2p5s"
+    base_file_name = "SOBBH_PSD_MOJITO_light_2p5s_GF_setup_bands_dropped_11th_oct"
     file_store_dir = head_dir
 
     gpus = [1]
@@ -347,7 +366,7 @@ def get_general_erebor_settings() -> GeneralSetup:
 
     backend = "cuda12x" if gpus is not None else "cpu"
     nwalkers = 10
-    ntemps = 2
+    ntemps = 8
 
     window_type = "tukey"
     window_taper_duration = 864 # s 
@@ -410,6 +429,7 @@ def get_general_erebor_settings() -> GeneralSetup:
         Tobs=Tobs,
     )
 
+    # PSD is sampled via the "psd" branch, so no fixed_psd_kwargs (run.py ignores it when a psd branch exists).
     sensitivity_init_kwargs = dict(tdi_generation=2, mask_percentage=0.02, average_transfer_functions=True)
 
     general_settings = GeneralSettings(
