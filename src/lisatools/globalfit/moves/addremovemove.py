@@ -33,7 +33,6 @@ except ImportError:
     class ConditionalFlowMove:  # placeholder so isinstance checks are simply False
         pass
 
-from eryn.moves import Move, StretchMove, TemperatureControl, RedBlueMove
 from eryn.moves import CombineMove, Move, StretchMove, TemperatureControl, RedBlueMove
 from eryn.prior import ProbDistContainer
 from eryn.utils.transform import TransformContainer
@@ -803,10 +802,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 # log debug information for flow move
                 logger.debug(f"Flow move {move_name} accepted {np.sum(keep)} out of {len(keep.flatten())} proposals for leaf {leaf}.")
 
-                logger.debug(f"MH factors: {factors.flatten()}")
-                logger.debug(f"prev_logP: {prev_logP_here.flatten()}")
-                logger.debug(f"logP: {logP.flatten()}")
-                logger.debug(f"lnpdiff: {lnpdiff.flatten()}")
+                # logger.debug(f"MH factors: {factors.flatten()}")
+                # logger.debug(f"prev_logP: {prev_logP_here.flatten()}")
+                # logger.debug(f"logP: {logP.flatten()}")
+                # logger.debug(f"lnpdiff: {lnpdiff.flatten()}")
 
         return accepted
 
@@ -833,7 +832,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         # snapshot the cold-chain counters so the end-of-step log reports this
         # step's acceptance rather than the cumulative fraction since launch
         acc_start = {
-            id(m): (np.array(m.accepted[0], copy=True), m.num_proposals) for m in self.moves
+            id(m): (np.array(m.accepted[0], copy=True), m.num_proposals) for m in self._proposing_moves
         }
         self_acc_start = (np.array(self.accepted[0], copy=True), self.num_proposals)
 
@@ -1128,20 +1127,19 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             n = num_proposals - n0
             return float(np.mean((accepted[0] - acc0) / n)) if n > 0 else -1.0
 
-        step_fractions = {
-            m.__class__.__name__: _step_fraction(m.accepted, m.num_proposals, acc_start[id(m)])
-            for m in self.moves
-        }
+        step_fractions = dict(zip(self._moves_names, [_step_fraction(m.accepted, m.num_proposals, acc_start[id(m)]) for m in self._proposing_moves]))
         logger.info(
             f"{self.branch_name} inner moves acceptance fractions (this step, cold chain): "
             f"{step_fractions}. elapsed: {time.time() - tic:.1f}s"
         )
-        logger.info(
-            f"{self.branch_name} mean accepted fraction (this step, cold chain): "
-            f"{_step_fraction(self.accepted, self.num_proposals, self_acc_start):.4f}"
+
+        # logger.info(
+        #     f"{self.branch_name} mean accepted fraction (this step, cold chain): "
+        #     f"{_step_fraction(self.accepted, self.num_proposals, self_acc_start):.4f}"
+        # )
+
         logger.debug(
-            "inner moves acceptance fractions: "
-            # f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self._proposing_moves} }. "
+            "Cumulative inner moves acceptance fractions: "
             f"{dict(zip(self._moves_names, [float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0 for m in self._proposing_moves]))}. "
             f"elapsed: {time.time() - tic}"
         )
