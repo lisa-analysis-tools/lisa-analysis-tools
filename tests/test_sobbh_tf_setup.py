@@ -83,11 +83,11 @@ class CatalogueConversionTest(unittest.TestCase):
 
     def test_waveform_basis_values(self):
         from lisatools.globalfit.searches import sobhb_catalogue_to_gwtf_basis
-        from lisatools.sources.utils import SOBHB_GWTF_PHASE_OFFSET, evolve_sobhb, sobhb_coalescence_phase
+        from lisatools.sources.utils import evolve_sobhb, sobhb_coalescence_phase
 
         out = sobhb_catalogue_to_gwtf_basis(ENTRY, 7.2e5)
         m1, m2, s1, s2 = 35.0, 20.0, -0.3, 0.1
-        phi_coal = (sobhb_coalescence_phase(m1, m2, s1, s2, 0.012, 1.3) + SOBHB_GWTF_PHASE_OFFSET) % (2 * np.pi)
+        phi_coal = sobhb_coalescence_phase(m1, m2, s1, s2, 0.012, 1.3)
         expected = [m1, m2, s1, s2, 0.3, 2.4, evolve_sobhb(0.0, 7.2e5, m1, m2, s1, s2, 0.012), phi_coal,
                     4.0, 7.0 % (2 * np.pi), -0.2]
         np.testing.assert_allclose(out, expected, rtol=1e-14)

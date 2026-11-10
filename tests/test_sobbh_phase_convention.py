@@ -156,5 +156,78 @@ class WaveformKwargsTest(unittest.TestCase):
         self.assertTrue(SOBBHTaylorT3TDIWaveform(**gen.kwargs).phase_at_coalescence)
 
 
+@unittest.skipUnless(HAVE_PYGWTF, "pygwtf not installed")
+class GWTFMatchesTDTest(unittest.TestCase):
+    """``GWTF_generator`` and ``SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True)`` give the same signal for the
+    same parameters (CPU, 3 days; the GPU version with more sources is scripts/sobbh/sobbh_gwtf_td_convention_check.py).
+
+    The only expected phase difference is gwtf's unrefined coalescence time: arg <gwtf|TD> = 2 pi f0 (tc_gwtf - tc_TD).
+    A strain-sign mismatch (e.g. SOBHB_GWTF_PHASE_OFFSET dropped or doubled, or pygwtf fixing its sign) gives arg ~ pi.
+    """
+
+    DT, BIG_DT, T0, DAYS = 5.0, 86400.0, 1.0e5, 3
+    # m1, m2, s1, s2, dist [Gpc], inc, f0 [Hz, data start], phi_coal, psi, ra, dec
+    SOURCE = np.array([25.0, 18.0, -0.5, 0.4, 0.05, 2.1, 0.018, 0.3, 1.3, 4.5, -0.8])
+
+    @classmethod
+    def setUpClass(cls):
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.domains import TDSettings, get_stft_settings
+        from lisatools.sources.sobbh import SOBBHTaylorT3TDIWaveform
+        from lisatools.sources.sobbh.waveform_gwtf import GWTF_generator
+
+        times = cls.T0 + np.arange(int(cls.DAYS * 86400 / cls.DT)) * cls.DT
+        cls.settings = get_stft_settings(times, big_dt=cls.BIG_DT, min_freq=4e-3, max_freq=4e-2, force_backend="cpu")
+        n = int(round(cls.settings.NT * cls.settings.dt / cls.DT))
+        cls.grid = TDSettings(N=n, dt=cls.DT, t0=cls.settings.t0, force_backend="cpu")
+        cls.gwtf = GWTF_generator(
+            settings=cls.settings, orbits=EqualArmlengthOrbits(force_backend="cpu"), T_obs=n * cls.DT,
+            fresnel_kernel_width=16, use_GPU=False,
+        )
+        common = dict(
+            data_td_settings=cls.grid, tdi_generation="2nd generation", tdi_channels="XYZ",
+            sampling_frequency=1.0 / cls.DT, orbits=EqualArmlengthOrbits(force_backend="cpu"), order=25,
+            buffer_time=1.0e4, force_backend="cpu", waveform_t0=cls.settings.t0,
+        )
+        cls.td = SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True, **common)
+        cls.td_reference = SOBBHTaylorT3TDIWaveform(**common)
+
+    def overlap(self, gwtf_params, td, td_params):
+        g = np.asarray(self.gwtf.get_signals_for_residuals(*gwtf_params).arr)
+        t = np.asarray(td.get_td_signals(*td_params, td_settings=self.grid).transform(self.settings).arr)
+        self.assertEqual(g.shape, t.shape)
+        return np.sum(np.conj(g) * t) / np.sqrt(np.sum(np.abs(g) ** 2) * np.sum(np.abs(t) ** 2))
+
+    def expected_arg(self, m1, m2, s1, s2, f0):
+        from pygwtf.models.taylort3spin.common import time_to_merger
+
+        M, eta, sigma, s, delta, tc_td = (float(v) for v in _pn_intrinsics(m1, m2, f0, s1, s2))
+        tc_gwtf = time_to_merger((np.pi * M * f0) ** (2 / 3), sigma, delta, eta, s) * M
+        return 2 * np.pi * f0 * (tc_gwtf - tc_td)
+
+    def assertSameSignal(self, ov, m1, m2, s1, s2, f0):
+        self.assertGreater(abs(ov), 0.95)  # gwtf's time-frequency approximation: ~1-2 % mismatch
+        self.assertAlmostEqual(np.angle(ov), self.expected_arg(m1, m2, s1, s2, f0), delta=0.02)
+
+    def test_same_parameters_same_signal(self):
+        m1, m2, s1, s2, _, _, f0 = self.SOURCE[:7]
+        self.assertSameSignal(self.overlap(self.SOURCE, self.td, self.SOURCE), m1, m2, s1, s2, f0)
+
+    def test_catalogue_phase_mapping(self):
+        """TD in the mojito convention (phi0 = TrueAnomaly) vs gwtf seeded through sobhb_catalogue_to_gwtf_basis."""
+        from lisatools.globalfit.searches import sobhb_catalogue_to_gwtf_basis
+
+        m1, m2, s1, s2, dist, inc, f0, _, psi, ra, dec = self.SOURCE
+        true_anomaly = 2.2
+        entry = dict(
+            PrimaryMassSSBFrame=m1, SecondaryMassSSBFrame=m2, PrimarySpinCompZ=s1, SecondarySpinCompZ=s2,
+            LuminosityDistance=dist * 1e3, InclinationAngle=inc, GW22FrequencySSBFrame=f0, TrueAnomaly=true_anomaly,
+            PolarisationAngle=psi, RightAscension=ra, Declination=dec,
+        )
+        td_params = [m1, m2, s1, s2, dist, inc, f0, true_anomaly, psi, ra, dec]
+        ov = self.overlap(sobhb_catalogue_to_gwtf_basis(entry), self.td_reference, td_params)
+        self.assertSameSignal(ov, m1, m2, s1, s2, f0)
+
+
 if __name__ == "__main__":
     unittest.main()
