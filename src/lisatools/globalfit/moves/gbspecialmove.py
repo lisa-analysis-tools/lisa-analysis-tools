@@ -5046,16 +5046,23 @@ class FStatSearchLikelihood:
         if bool(keep.any()):
             rows_kept = xp.where(keep)[0]
             walker_index = xp.full(int(rows_kept.shape[0]), self.walker, dtype=xp.int32)
-            # ! all rows read one walker, so they go to one split; a split on another device than the caller's reads
-            # ! params_phys across devices (peer access, which multi-GPU runs assume)
-            for split, sub_rows, intra_data, intra_noise, device in engine._split_plan(holder, walker_index,
-                                                                                        walker_index):
-                rows = rows_kept[sub_rows]
+            plan = engine._split_plan(holder, walker_index, walker_index)
+            plan_rows = [rows_kept[sub_rows] for _split, sub_rows, _data, _noise, _device in plan]
+            # ! All rows read one walker, so they go to one split. A split on another card than the caller's runs on
+            # ! its own stream: it waits for the caller's rows and parameters, and the caller waits for its outputs
+            # ! before copying them, as the engine's get_ll does; without the waits the copies read zero-filled outputs.
+            caller_ready = engine._stream_event(plan[0][4]) if plan else None
+            launched = []
+            for (split, _sub_rows, intra_data, intra_noise, device), rows in zip(plan, plan_rows):
                 with holder.device_context(device):
+                    engine._wait_events(caller_ready)
                     comp = engine._comp_for_split(holder, split, device)
-                    projections_split, overlaps_split, two_f_split = comp.get_fstat_terms_stft(
+                    outputs = comp.get_fstat_terms_stft(
                         params_phys[rows], data_index=intra_data, noise_index=intra_noise,
                         start_freq_inds=engine._split_start_inds(holder, split))
+                    launched.append((rows, outputs, engine._stream_event(device)))
+            for rows, (projections_split, overlaps_split, two_f_split), ready in launched:
+                engine._wait_events(ready)
                 projections[rows] = projections_split
                 overlaps[rows] = overlaps_split
                 two_f[rows] = two_f_split
