@@ -30,6 +30,9 @@ try:
 except ImportError:
     flow_move_available = False
 
+    class ConditionalFlowMove:  # placeholder so isinstance checks are simply False
+        pass
+
 from eryn.moves import CombineMove, Move, StretchMove, TemperatureControl, RedBlueMove
 from eryn.prior import ProbDistContainer
 from eryn.utils.transform import TransformContainer
@@ -253,6 +256,30 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             return self.move_weights
         weights = np.where(self._has_flow, 0.0, self.move_weights)
         return weights / weights.sum()
+
+    def apply_settings(self, num_repeats: int | None = None, weights=None) -> None:
+        """Change the proposals per leaf visit and the inner-move weights (e.g. at a recipe step).
+
+        ``weights`` follows ``self.moves`` (unnormalised, >= 0, positive sum); ``None`` keeps the current value.
+        A zero weight switches a move off; during ``flow_burnin`` some move without a flow must keep a weight.
+        """
+        if num_repeats is not None:
+            if isinstance(num_repeats, bool) or int(num_repeats) != num_repeats or num_repeats < 1:
+                raise ValueError(f"{self.branch_name}: num_repeats must be a positive integer, not {num_repeats!r}.")
+            self.num_repeats = int(num_repeats)
+        if weights is None:
+            return
+        weights = np.asarray(weights, dtype=float)
+        if weights.shape != (len(self.moves),):
+            raise ValueError(f"{self.branch_name}: {len(self.moves)} inner moves, got weights {weights.tolist()}.")
+        if (weights < 0).any() or not np.isfinite(weights).all() or weights.sum() <= 0:
+            raise ValueError(f"{self.branch_name}: weights must be finite, >= 0 and not all 0; got {weights.tolist()}.")
+        if self._iterations < self.flow_burnin and self._has_flow.any() and weights[~self._has_flow].sum() <= 0:
+            raise ValueError(
+                f"{self.branch_name}: during flow_burnin ({self.flow_burnin} iterations) a move without a flow "
+                f"needs a weight; got {weights.tolist()}."
+            )
+        self.move_weights = weights / weights.sum()
 
     @staticmethod
     def _check_no_gibbs_setup(move):
@@ -525,7 +552,7 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         if isinstance(self.permute_every, bool):
             return self.permute_every and repeat == self.num_repeats - 1
         
-        return self.permute_every > 0 and (repeat % self.permute_every == 0 or repeat == self.num_repeats - 1)
+        return self.permute_every > 0 and repeat > 0 and (repeat % self.permute_every == 0 or repeat == self.num_repeats - 1)
 
     def _verify_entry_vs_acs(self, prev_logl, cold_ref, leaf):
         """The expose invariant: the cold-chain ``prev_logl`` scored against the
@@ -775,10 +802,10 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 # log debug information for flow move
                 logger.debug(f"Flow move {move_name} accepted {np.sum(keep)} out of {len(keep.flatten())} proposals for leaf {leaf}.")
 
-                logger.debug(f"MH factors: {factors.flatten()}")
-                logger.debug(f"prev_logP: {prev_logP_here.flatten()}")
-                logger.debug(f"logP: {logP.flatten()}")
-                logger.debug(f"lnpdiff: {lnpdiff.flatten()}")
+                # logger.debug(f"MH factors: {factors.flatten()}")
+                # logger.debug(f"prev_logP: {prev_logP_here.flatten()}")
+                # logger.debug(f"logP: {logP.flatten()}")
+                # logger.debug(f"lnpdiff: {lnpdiff.flatten()}")
 
         return accepted
 
@@ -801,6 +828,13 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         self._dbg_step += 1
         draw_weights = self._draw_weights()  # flow moves are left out during flow_burnin
         self._iterations += 1
+
+        # snapshot the cold-chain counters so the end-of-step log reports this
+        # step's acceptance rather than the cumulative fraction since launch
+        acc_start = {
+            id(m): (np.array(m.accepted[0], copy=True), m.num_proposals) for m in self._proposing_moves
+        }
+        self_acc_start = (np.array(self.accepted[0], copy=True), self.num_proposals)
 
         if not np.any(state.branches[self.branch_name].inds):
             ntemps, nwalkers = state.branches[self.branch_name].shape[:2]
@@ -1086,13 +1120,29 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         self.free_gpu_memory()
 
+        def _step_fraction(accepted, num_proposals, start):
+            acc0, n0 = start
+            if num_proposals < n0 or np.shape(acc0) != np.shape(accepted[0]):  # re-seeded mid-step
+                acc0, n0 = 0.0, 0
+            n = num_proposals - n0
+            return float(np.mean((accepted[0] - acc0) / n)) if n > 0 else -1.0
+
+        step_fractions = dict(zip(self._moves_names, [_step_fraction(m.accepted, m.num_proposals, acc_start[id(m)]) for m in self._proposing_moves]))
+        logger.info(
+            f"{self.branch_name} inner moves acceptance fractions (this step, cold chain): "
+            f"{step_fractions}. elapsed: {time.time() - tic:.1f}s"
+        )
+
+        # logger.info(
+        #     f"{self.branch_name} mean accepted fraction (this step, cold chain): "
+        #     f"{_step_fraction(self.accepted, self.num_proposals, self_acc_start):.4f}"
+        # )
+
         logger.debug(
-            "inner moves acceptance fractions: "
-            # f"{ {m.__class__.__name__: (float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0) for m in self._proposing_moves} }. "
+            "Cumulative inner moves acceptance fractions: "
             f"{dict(zip(self._moves_names, [float(np.mean(m.acceptance_fraction[0])) if m.num_proposals else -1.0 for m in self._proposing_moves]))}. "
             f"elapsed: {time.time() - tic}"
         )
-        logger.debug(f"mean accepted fraction: {np.mean(self.accepted[0] / self.num_proposals)}. elapsed: {time.time() - tic}")
 
 
 

@@ -95,7 +95,7 @@ class ResolveTDGeneratorTest(_TD):
         block = {**MBH_BLOCK, "td_waveform": {"class": "PhenomTHMTDIOnFlyWaveform", "kwargs": {"start_freq": 7e-5}}}
         cfg = self.config({"mbh": block})
         engine = {"waveform_t0": T0, "force_backend": "cpu", "not_a_constructor_argument": 1}
-        with mock.patch.object(blocks_base, "engine_waveform_kwargs", lambda ctx: engine):
+        with mock.patch.object(blocks_base, "engine_waveform_kwargs", lambda ctx, block: engine):
             td = resolve_td_generator(cfg.blocks["mbh"], ctx=None)
         self.assertEqual(td.init_kwargs, {"start_freq": 7e-5, "waveform_t0": T0, "force_backend": "cpu"})
 

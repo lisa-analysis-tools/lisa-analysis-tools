@@ -13,13 +13,14 @@ from __future__ import annotations
 import importlib.util
 import inspect
 from copy import deepcopy
+from functools import partial
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 import numpy as np
 
-from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock
+from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock, make_proposal_priors
 from .blocks.gb import GBBlock, gb_move_kwargs
 from .blocks.utility import check_kwargs, find_class
 from .generators import SignalGen
@@ -60,6 +61,8 @@ class RecipeContext:
     # seeded source branch -> ``fn(*sampling_params, td_settings=None) -> TDSignal`` (unwindowed TDI)
     td_signal_gens: dict[str, Any] = field(default_factory=dict)
     td_ac: Any = None  # the shared CPU time-domain AnalysisContainer (data.keep_td), walker 0's residual
+    # stage name -> {branch: apply_settings kwargs} from the blocks' ``stages`` (a recipe step's move_settings)
+    move_settings: Callable[[str], dict[str, dict]] | None = None
 
     def block_moves(self, engine_info, curr, acs, priors, state) -> dict[str, BranchMoves]:
         return build_block_moves(self, engine_info, curr, acs, priors, state)
@@ -67,17 +70,58 @@ class RecipeContext:
 
 # --- the recipes --- #
 
+def _positive_int(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
 class StockRecipe:
-    """psd max-likelihood search (when there is a psd block), optional burn-in, then joint PE until ``run.num_iterations``."""
+    """psd max-likelihood search (when there is a psd block), then the joint PE in ``stages``.
 
-    def __init__(self, burn_in_iterations: int | None = None):
-        if burn_in_iterations is not None and (
-            isinstance(burn_in_iterations, bool) or not isinstance(burn_in_iterations, int) or burn_in_iterations < 1
-        ):
-            raise ValueError(f"burn_in_iterations must be a positive integer, not {burn_in_iterations!r}.")
-        self.burn_in_iterations = burn_in_iterations
+    ``stages`` is a list of ``{name, iterations}``: each stage runs ``iterations`` iterations, the last one has
+    none and runs until ``run.num_iterations``. All stages share one joint PE move; what changes between them
+    are the blocks' ``stages`` settings (proposal repeats, inner-move weights). Default: one stage, ``pe``.
+    ``burn_in_iterations: N`` is short for ``[{name: burn-in, iterations: N}, {name: pe}]``.
+    """
 
-    def add_steps(self, recipe, moves: dict[str, BranchMoves]) -> None:
+    RESERVED = ("psd search",)  # step names the recipe uses itself
+
+    def __init__(self, stages: list[dict[str, Any]] | None = None, burn_in_iterations: int | None = None):
+        if burn_in_iterations is not None:
+            if not _positive_int(burn_in_iterations):
+                raise ValueError(f"burn_in_iterations must be a positive integer, not {burn_in_iterations!r}.")
+            if stages is not None:
+                raise ValueError("give stages or burn_in_iterations, not both (burn-in is a stage).")
+            stages = [{"name": "burn-in", "iterations": burn_in_iterations}, {"name": "pe"}]
+        self.stages = self._checked(stages if stages is not None else [{"name": "pe"}])
+
+    @classmethod
+    def _checked(cls, stages) -> list[dict[str, Any]]:
+        if not isinstance(stages, list) or not stages:
+            raise ValueError(f"stages must be a non-empty list of {{name, iterations}}, not {stages!r}.")
+        out = []
+        for i, stage in enumerate(stages):
+            if not isinstance(stage, dict) or set(stage) - {"name", "iterations"} or "name" not in stage:
+                raise ValueError(f"stage {stage!r} must be {{name, iterations}} (iterations left out on the last).")
+            name, iterations = stage["name"], stage.get("iterations")
+            if not isinstance(name, str) or not name or name in cls.RESERVED:
+                raise ValueError(f"stage name {name!r} must be a non-empty string other than {list(cls.RESERVED)}.")
+            last = i == len(stages) - 1
+            if last and iterations is not None:
+                raise ValueError(f"the last stage ({name!r}) runs until run.num_iterations; leave out its iterations.")
+            if not last and not _positive_int(iterations):
+                raise ValueError(f"stage {name!r} needs iterations (a positive integer), not {iterations!r}.")
+            out.append({"name": name, "iterations": iterations})
+        names = [stage["name"] for stage in out]
+        if len(set(names)) != len(names):
+            raise ValueError(f"stage names must be unique: {names}.")
+        return out
+
+    @property
+    def stage_names(self) -> list[str]:
+        return [stage["name"] for stage in self.stages]
+
+    def add_steps(self, recipe, moves: dict[str, BranchMoves], move_settings=None) -> None:
+        """Add the steps; ``move_settings(stage name) -> {branch: settings}`` gives each stage's move settings."""
         from lisatools.globalfit.moves import GFCombineMove
         from lisatools.globalfit.recipe import IterationCountRecipeStep, PERecipeStep, SearchRecipeStep
 
@@ -90,6 +134,7 @@ class StockRecipe:
         if search:
             logger.info("Adding psd search")
             recipe.add_recipe_component(SearchRecipeStep(moves=search), name="psd search")
+        #from here
         alternating = [name for name, branch in moves.items() if branch.alternatives]
         if not alternating:
             combined = GFCombineMove(moves=pe, share_temperature_control=False)
@@ -135,9 +180,45 @@ class StockRecipe:
         pe_moves, pe_weights = phase("weight")
         logger.info(f"Adding joint PE, the {name} PE moves taking turns with weights {pe_weights}")
         recipe.add_recipe_component(PERecipeStep(moves=pe_moves, weights=pe_weights), name="pe")
+        #to here
+        combined = GFCombineMove(moves=pe, share_temperature_control=False)
+        for stage in self.stages:
+            name, iterations = stage["name"], stage["iterations"]
+            settings = move_settings(name) if move_settings is not None else None
+            if iterations is None:
+                step = PERecipeStep(moves=[combined], move_settings=settings)
+            else:
+                step = IterationCountRecipeStep(moves=[combined], num_iters=iterations, move_settings=settings)
+            logger.info(f"Adding joint PE stage {name!r}" + ("" if iterations is None else f" ({iterations} iterations)"))
+            recipe.add_recipe_component(step, name=name)
+         # to here
 
 
 STOCK_RECIPES: dict[str, type] = {"StockRecipe": StockRecipe}
+
+
+def stage_move_settings(cfg: RunConfig, curr, stage: str) -> dict[str, dict]:
+    """``{branch: apply_settings kwargs}`` for one stage, for every block with ``stages`` and a PE move.
+
+    The weights follow the PE move's inner moves (``Settings.inner_moves``: the YAML ``inner_moves``, or the
+    Setup's default, then the flow move); a stage's left-out keys take the block's own values.
+    """
+    out = {}
+    for name, block in enabled_blocks(cfg).items():
+        if not getattr(block, "stages", None) or block.search is None:  # no stages, or no moves (unseeded)
+            continue
+        stage_spec = block.stages.get(stage)
+        info = curr.source_info[name]
+        weights = [w for _move, w in info.inner_moves]
+        repeats = block.num_prop_repeats
+        if stage_spec is not None:
+            if stage_spec.inner_move_weights is not None:
+                weights[: len(stage_spec.inner_move_weights)] = stage_spec.inner_move_weights
+            if stage_spec.flow_weight is not None:
+                weights[-1] = stage_spec.flow_weight  # the flow move is appended last (blocks.base.build_source)
+            repeats = stage_spec.num_prop_repeats or repeats
+        out[name] = {"num_repeats": repeats, "weights": weights}
+    return out
 
 
 def make_stock_recipe(name: str, kwargs: dict[str, Any]):
@@ -320,6 +401,9 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     betas = np.asarray(info.betas, dtype=float)
     wave_gen = ctx.wave_gens[name]
     kwargs = deepcopy(block.pe_move.kwargs)
+    if block.proposal_priors is not None:
+        # this branch's move proposes under per-leaf priors; the sampler and the other branches keep the shared dict
+        priors = {**priors, name: make_proposal_priors(block, ctx.cfg, priors[name])}
 
     if is_generic(block):
         # the builder reads the rest from curr.source_info
@@ -472,7 +556,7 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
     def setup_recipe(recipe, engine_info, curr, acs, priors, state):
         # the state was seeded by load_info and the residuals built from it by setup_acs
         select_device(curr.general_info)
-        ctx = RecipeContext(cfg, prepare_branches(cfg, curr, state))
+        ctx = RecipeContext(cfg, prepare_branches(cfg, curr, state), move_settings=partial(stage_move_settings, cfg, curr))
         attach_signal_gens(ctx, td_generators, curr, state)
         # * After attach_signal_gens: a GB entry holds the band machinery, not a waveform with a signal_gen.
         ctx.wave_gens.update(prepare_gb_branches(cfg, waveform_classes, engine_info, curr, acs, priors, state))
@@ -483,7 +567,7 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
             extra = {"l2d": ctx} if "l2d" in inspect.signature(fn).parameters else {}
             return fn(recipe, engine_info, curr, acs, priors, state, **extra)
         make_stock_recipe(spec.class_name, spec.kwargs).add_steps(
-            recipe, ctx.block_moves(engine_info, curr, acs, priors, state)
+            recipe, ctx.block_moves(engine_info, curr, acs, priors, state), ctx.move_settings
         )
 
     return setup_recipe

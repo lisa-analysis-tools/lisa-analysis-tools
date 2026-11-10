@@ -6,6 +6,8 @@ import typing
 from typing import Tuple
 
 import numpy as np
+from scipy.integrate import cumulative_trapezoid
+from scipy.interpolate import CubicSpline
 
 try:
     import cupy as cp
@@ -55,19 +57,6 @@ def windowfun(winType, N, alpha=0.01, xp=None):
     z       = (xp.arange(0,N,1)/N) * 2.0 * xp.pi
     N       = int(N)
     winType = winType.lower() # Be a little more robust on the inputs
-
-    # Tukey window
-    def tukey(N, alpha):
-        # alpha -- parameter the defines the shape of the window
-        w         = xp.zeros(N, dtype=float)
-        i         = xp.arange(0,N,1)
-        r         = (2.0*i)/(alpha*(N-1))
-        l1        = int(xp.rint((alpha*(N-1))/2.0))
-        l2        = int(xp.rint((N-1)*(1.0-alpha/2.0)))
-        w[0:l1]   = 0.5*(1.0 + xp.cos(xp.pi*(r[0:l1] - 1.0)))
-        w[l1:l2]  = 1.0
-        w[l2:N-1] = 0.5*(1+xp.cos(xp.pi*(r[l2:N-1] - 2.0/alpha + 1.0)))
-        return w
 
     # planck window
     def planck(N, epsilon):
@@ -138,7 +127,7 @@ def windowfun(winType, N, alpha=0.01, xp=None):
     if winType == 'blackman-harris' or winType == 'bh92':
         winvals = bh(z)
     elif winType == 'tukey':
-        winvals = tukey(N,alpha)
+        winvals = tukey(N, alpha, xp=xp)
     elif winType == 'planck':
         winvals = planck(N, alpha)
     elif winType == 'hamming':
@@ -555,3 +544,152 @@ autodoc_type_aliases = {
     "Iterable": "Iterable",
     "ArrayLike": "ArrayLike",
 }
+
+
+class ErynEtaMcPrior(object):
+    r'''
+    Class to handle the prior for the Eryn PE, specifically over the mass parameters. 
+
+    Sampling in chirp mass and symmetric mass ratio. 
+
+    Defined such that the prior is uniform in *component masses, with limits in the component masses*. 
+
+    p(mc,eta) \propto Mc/(eta^(6/5) * (1-4*eta)^(1/2))
+        
+    The prior is defined as:
+        - mc: [mc_min, mc_max]
+        - eta: [eta_min, eta_max]
+        - m_limits: [m_min, m_max]
+    '''
+    def __init__(self, 
+                 mc_min, 
+                 mc_max, 
+                 eta_min, 
+                 eta_max,
+                 m_min, 
+                 m_max,
+                 npoints_spline = 10000):
+        self.mc_min = mc_min
+        self.mc_max = mc_max
+        self.eta_min = eta_min
+        self.eta_max = eta_max
+        self.m_min = m_min
+        self.m_max = m_max
+
+        self.generate_invcdf_splines(num_points=npoints_spline)
+
+    def logpdf(self, x):
+        '''
+        Compute the log prior for the given parameters.
+        IGNORING NORMALISATION CONSTANT.         
+        '''
+
+        Mc, eta = x[:,0], x[:,1]
+        
+        m1 = Mc * eta**(-3/5) * 0.5 * (1 + np.sqrt(1 - 4*eta))
+        m2 = Mc * eta**(-3/5) * 0.5 * (1 - np.sqrt(1 - 4*eta))
+
+        mask_validity = ((Mc >= self.mc_min) & (Mc <= self.mc_max) 
+                         & (eta >= self.eta_min) & (eta <= self.eta_max)
+                         & (m1>self.m_min) & (m2>self.m_min) & (m1<self.m_max) & (m2<self.m_max))
+
+        lprior = np.log(Mc) - ((6/5)*np.log(eta)) - (0.5*np.log(1-4*eta))
+
+        lprior[~mask_validity] = -np.inf
+
+        return(lprior)
+    
+    def generate_invcdf_splines(self,num_points = 100000):
+        
+         # --- analytic inverse-CDF for  p(Mc) ∝ Mc  on [Mc_low, Mc_high] ---
+
+        fac_mc = (self.mc_max**2 - self.mc_min**2)/2
+        Amp_Mc = 1/fac_mc
+        
+        Mcs = np.linspace(self.mc_min, self.mc_max, num_points)
+        
+        CDF_Mc = Amp_Mc * ((Mcs**2)/2 - (self.mc_min**2)/2)
+
+        self.inv_cdf_spline_Mc = CubicSpline(CDF_Mc, Mcs)
+        self.pdf_spline_Mc = CubicSpline(Mcs, Amp_Mc * Mcs)
+
+        # ---- analytic inverse-CDF for  p(eta) ∝ 1/(eta^(6/5) * (1-4*eta)^(1/2))  on [eta_low, eta_high] ---
+
+            # Normalise + build the CDF by trapezoidal integration of the PDF over
+            # the allowed eta range. cumulative_trapezoid(..., initial=0) anchors the
+            # CDF at exactly 0 at low_eta (so the inverse spline covers u in [0, 1])
+            # and its final value is the normalisation integral.
+        etas = np.linspace(self.eta_min, self.eta_max, num_points)
+        pdf_eta = etas**(-6/5) * (1 - 4*etas)**(-1/2)
+    
+        cum_eta = cumulative_trapezoid(pdf_eta, etas, initial=0.0)
+        fac_eta = cum_eta[-1]
+        Amp_eta = 1/fac_eta
+
+        CDF_eta = Amp_eta * cum_eta
+
+        self.inv_cdf_spline_eta = CubicSpline(CDF_eta, etas)
+        self.pdf_spline_eta = CubicSpline(etas, Amp_eta * pdf_eta)
+
+    def draw_mcs(self, size=1):
+        '''
+        Draw samples of Mc from the prior using inverse transform sampling.
+        '''
+        u_mc = np.random.uniform(size=size)
+        mc_samples = self.inv_cdf_spline_Mc(u_mc)
+        # The cubic inverse-CDF spline can overshoot the bounds by ~1e-6 near the
+        # endpoints; clip so every draw stays inside the logpdf support (else those
+        # draws would get -inf prior and seed dead walkers).
+        return np.clip(mc_samples, self.mc_min, self.mc_max)
+
+    def draw_etas(self, size=1):
+        '''
+        Draw samples of eta from the prior using inverse transform sampling.
+        '''
+        u_eta = np.random.uniform(size=size)
+        eta_samples = self.inv_cdf_spline_eta(u_eta)
+        # Clip endpoint overshoot (see draw_mcs); critical at eta_max where the
+        # density diverges, so the spline overshoots most there.
+        return np.clip(eta_samples, self.eta_min, self.eta_max)
+
+    def rvs(self, size=1):
+        '''
+        Generate random variates from the prior using inverse transform sampling.
+
+        ``size`` may be an int or a tuple of ints. eryn's ProbDistContainer calls
+        this with the full block shape (e.g. ``(ntemps, nwalkers)``) and expects an
+        output of shape ``size + (2,)`` (the two columns are Mc and eta).
+        '''
+
+        # Normalise size to a tuple, and the total number of draws needed.
+        size = (size,) if isinstance(size, (int, np.integer)) else tuple(size)
+        n = int(np.prod(size)) if len(size) else 1
+
+        # --- rejection loop on the joint box constraint ---
+        out_Mc, out_eta = [], []
+        kept = 0
+        while kept < n:
+            Mc  = self.draw_mcs(n)
+            eta = self.draw_etas(n)
+
+            M    = Mc * eta**(-3/5)
+            disc = np.sqrt(np.clip(1 - 4*eta, 0.0, None))
+            m1   = 0.5 * M * (1 + disc)
+            m2   = 0.5 * M * (1 - disc)
+
+
+            mass_bound_mask = ((m1>self.m_min) & (m2>self.m_min) & (m1<self.m_max) & (m2<self.m_max))
+
+            out_Mc.append(Mc[mass_bound_mask])
+            out_eta.append(eta[mass_bound_mask])
+
+            kept += int(mass_bound_mask.sum())
+
+        Mc  = np.concatenate(out_Mc)[:n]
+        eta = np.concatenate(out_eta)[:n]
+
+        # Stack to (n, 2) then reshape the leading axis back to the requested block
+        # shape, giving size + (2,) as eryn expects.
+        return np.stack((Mc, eta), axis=-1).reshape(size + (2,))
+
+        

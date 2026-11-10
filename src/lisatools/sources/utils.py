@@ -741,16 +741,24 @@ def evolve_sobhb(
         s1 (float): Spin of the first black hole (dimensionless).
         s2 (float): Spin of the second black hole (dimensionless).
         f_start (float): Start/initial frequency of the SOBHB before evolving.
+
+    All arguments broadcast against each other (scalars or arrays, numpy or cupy); the result is on the
+    inputs' array module, a float for all-scalar input. Uses the pygwtf TaylorT3Spin PN relations and mass
+    constant, so it matches the gwtf waveform model. Sources that merge before ``t_end`` give NaN.
     """
-
-    # Convert masses to SI units
-    from lisatools.utils.constants import MTSUN_SI
     try:
-        from gwtf import models
-    except (ImportError, ModuleNotFoundError):
-        raise ImportError("The gwtf package is required for this function. Please install it via pip or conda.")
+        from pygwtf import constants, models
+    except ImportError as err:
+        raise ImportError("evolve_sobhb requires pygwtf (https://github.com/cchapmanbird/gwtf).") from err
 
-    m1_seconds, m2_seconds = m1 * MTSUN_SI, m2 * MTSUN_SI
+    from ..utils.utility import asnumpy
+
+    args = (t_start, t_end, m1, m2, s1, s2, f_start)
+    # return on the device if any input is a cupy array (computed on the host either way)
+    xp = next((get_array_module(a) for a in args if hasattr(a, "get")), np)
+    t_start, t_end, m1, m2, s1, s2, f_start = (np.asarray(asnumpy(a), dtype=np.float64) for a in args)
+
+    m1_seconds, m2_seconds = m1 * constants.MTsun, m2 * constants.MTsun
     total_mass_seconds = m1_seconds + m2_seconds
     eta = m1_seconds * m2_seconds / total_mass_seconds**2
 
@@ -759,10 +767,70 @@ def evolve_sobhb(
     delta = (m1_seconds - m2_seconds) / total_mass_seconds
     delta_t = t_end - t_start
 
-    tc = models.taylort3spin.common.time_to_merger((np.pi * total_mass_seconds * f_start)**(2/3), sigma, delta, eta, s) * total_mass_seconds
-    x = models.taylort3spin.common.tau_to_x(eta * (tc - delta_t) / (5 * total_mass_seconds), sigma, delta, eta, s)
+    # the pygwtf PN relations are scalar numba functions: vectorize them over the broadcast inputs
+    common = models.taylort3spin.common
+    time_to_merger = np.vectorize(common.time_to_merger, otypes=[np.float64])
+    tau_to_x = np.vectorize(common.tau_to_x, otypes=[np.float64])
 
-    return x**1.5 / (np.pi * total_mass_seconds)
+    tc = time_to_merger((np.pi * total_mass_seconds * f_start)**(2/3), sigma, delta, eta, s) * total_mass_seconds
+    x = tau_to_x(eta * (tc - delta_t) / (5 * total_mass_seconds), sigma, delta, eta, s)
+
+    f_end = x**1.5 / (np.pi * total_mass_seconds)
+    if f_end.ndim == 0:
+        return float(f_end)
+    return f_end if xp is np else xp.asarray(f_end)
+
+
+# Orbital-phase offset between the pygwtf and the mojito / TD (``SOBBHTaylorT3TDIWaveform``) strain
+# conventions: for the same coalescence phase the pygwtf waveform is the negative of the TD one, i.e.
+# pygwtf(phi_coal + pi/2) == TD(phi_coal). ``GWTF_generator`` adds it internally, so its public phi_coal
+# is in the mojito / TD convention. Measured by scripts/sobbh/sobbh_gwtf_td_convention_check.py; see
+# tasks/sobbh_gwtf_td_discrepancies.md. Set to 0 once pygwtf matches.
+SOBHB_GWTF_PHASE_OFFSET = np.pi / 2
+
+
+def sobhb_coalescence_phase(
+        m1: float,
+        m2: float,
+        s1: float,
+        s2: float,
+        f_ref: float,
+        phi_ref: float,
+    ):
+    """Coalescence orbital phase of a SOBHB from its orbital phase at a reference epoch.
+
+    TaylorT3 writes the orbital phase as ``Phi(x) = phi_coal - P(x)`` with ``P -> 0`` at merger, so
+    ``phi_coal = phi_ref + P(x_ref)`` with ``x_ref = (pi M f_ref)^(2/3)``. Use it to map the catalogue
+    ``TrueAnomaly`` (the orbital phase where ``f == GW22FrequencySSBFrame``) to the coalescence phase of
+    ``SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True)`` and ``GWTF_generator`` (which applies
+    :data:`SOBHB_GWTF_PHASE_OFFSET` internally). Only the reference frequency enters, not the reference time.
+
+    Args:
+        m1, m2: component masses (Msun). s1, s2: aligned spins.
+        f_ref: GW frequency at the reference epoch (Hz). phi_ref: orbital phase there (rad).
+
+    Returns:
+        ``phi_coal`` in ``[0, 2 pi)``; numpy arrays broadcast (float for all-scalar input).
+        ``P(x_ref)`` is ~1e7-1e8 rad, so the result carries ~1e-8 rad of float64 rounding.
+    """
+    try:
+        from pygwtf import constants, models
+    except ImportError as err:
+        raise ImportError("sobhb_coalescence_phase requires pygwtf (https://github.com/cchapmanbird/gwtf).") from err
+
+    m1, m2, s1, s2, f_ref, phi_ref = (np.asarray(a, dtype=np.float64) for a in (m1, m2, s1, s2, f_ref, phi_ref))
+    m1_seconds, m2_seconds = m1 * constants.MTsun, m2 * constants.MTsun
+    total_mass_seconds = m1_seconds + m2_seconds
+    eta = m1_seconds * m2_seconds / total_mass_seconds**2
+    sigma = (m2_seconds * s2 - m1_seconds * s1) / total_mass_seconds
+    s = (m1_seconds**2 * s1 + m2_seconds**2 * s2) / total_mass_seconds**2
+    delta = (m1_seconds - m2_seconds) / total_mass_seconds
+
+    phase = np.vectorize(models.taylort3spin.common.phase, otypes=[np.float64])
+    x_ref = (np.pi * total_mass_seconds * f_ref) ** (2 / 3)
+    phi_coal = np.mod(phi_ref + phase(x_ref, sigma, delta, eta, s), 2 * np.pi)
+    return float(phi_coal) if phi_coal.ndim == 0 else phi_coal
+
 
 def psi_rotation_icrs_to_ecliptic(lam_ecl, beta_ecl):
     """Polarization-basis rotation ``chi`` such that ``psi_ecl = psi_icrs - chi``.

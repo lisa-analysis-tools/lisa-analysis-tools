@@ -19,7 +19,8 @@ import logging
 
 from eryn.backends import HDFBackend as eryn_Backend
 from eryn.moves.tempering import make_ladder
-from eryn.prior import ProbDistContainer, uniform_dist, log_uniform
+from eryn.prior import uniform_dist, log_uniform
+from eryn.priors import ProbDistContainer
 from eryn.state import State as ErynState
 from eryn.state import Branch as ErynBranch
 from eryn.utils import TransformContainer
@@ -662,10 +663,20 @@ def m1_m2_to_mT_Q(m1, m2):
     return (m1 + m2, m1 / m2)
 
 
-try:  # frame helpers kept for settings files; the stock MBH basis is direct ICRS (optional: bbhx only needed for MBHs)
+# Frame helpers kept for settings files; the stock MBH basis is direct ICRS.
+# bbhx is optional (only MBH branches need it); stubs raise on first use.
+try:
     from bbhx.utils.transform import LISA_to_SSB, SSB_to_LISA, mT_q
-except ImportError:
-    LISA_to_SSB = SSB_to_LISA = mT_q = None
+except ImportError as _bbhx_err:
+    def _bbhx_missing(name, err):
+        def _stub(*args, **kwargs):
+            raise ImportError(f"{name} requires bbhx, which is not installed.") from err
+        _stub.__name__ = name
+        return _stub
+
+    LISA_to_SSB = _bbhx_missing("LISA_to_SSB", _bbhx_err)
+    SSB_to_LISA = _bbhx_missing("SSB_to_LISA", _bbhx_err)
+    mT_q = _bbhx_missing("mT_q", _bbhx_err)
 from eryn.moves import Move
 
 
@@ -1381,6 +1392,131 @@ class SOBBHSetup(Setup):
 
     def init_state_backend_info(self):
         """Default the SOBBH state and backend to :class:`SOBBHState` / :class:`SOBBHHDFBackend`."""
+        if self.branch_state is None:
+            self.branch_state = SOBBHState
+
+        if self.branch_backend is None:
+            self.branch_backend = SOBBHHDFBackend
+
+
+@dataclasses.dataclass
+class SOBBHTFSettings(Settings):
+    """Settings dataclass for the gwtf (time-frequency) SOBBH branch.
+
+    The prior, transform, periodicity and ``ndim`` come from erebor-priors
+    ``mojitolight.SOBHBPrior``: sampling basis ``Mc, eta, s1, s2, d_L [Gpc], cos_iota,
+    f0 [Hz, at data start], phi_coal, psi, alpha, sin_delta``, transformed to the
+    ``GWTF_generator`` / ``SOBBHTaylorT3TDIWaveform`` basis ``m1, m2, s1, s2, dist [Gpc],
+    inc, f0, phi_coal, psi, ra, dec`` (sky/polarisation in the frame of the orbits).
+
+    Injected ``priors`` (e.g. from an l2d YAML block) take precedence and then need
+    ``transform``. Otherwise ``SOBHBPrior.prior_factory`` is built from ``f0_lims`` and
+    ``Mc_lims`` when given (its defaults otherwise).
+
+    ``branch_name`` is the key used for ``priors`` / ``periodic``; it must
+    match the branch name the recipe and ``GlobalFitSettings.source_info`` use.
+    """
+
+    branch_name: str = "sobbh"
+    Mc_lims: typing.List[float] = dataclasses.field(default_factory=list)
+    f0_lims: typing.List[float] = dataclasses.field(default_factory=list)
+    # GWTF_generator.get_signals_for_residuals takes no kwargs, and
+    # subtract_initial_signal splats these into it -> must stay a (empty) dict.
+    waveform_kwargs: dict = dataclasses.field(default_factory=dict)
+    injection: Optional[np.ndarray] = None
+    fill_values: np.ndarray = dataclasses.field(default_factory=lambda: np.array([]))
+    betas: Optional[np.ndarray] = None
+    inner_moves: Optional[typing.List[Move]] = None
+    num_prop_repeats: Optional[int] = 10
+    search_interface: Optional[SOBHBSearchInterface] = None
+
+
+class SOBBHTFSetup(Setup):
+    """:class:`Setup` for the gwtf (time-frequency) SOBBH branch.
+
+    Args:
+        sobbhtf_settings: Settings dataclass with gwtf SOBBH prior ranges
+            and sampling knobs.
+    """
+
+    def __init__(self, sobbhtf_settings: SOBBHTFSettings):
+
+        super().__init__(sobbhtf_settings)
+
+        level = logging.DEBUG
+        name = "SOBBHTFSetup"
+        self.logger = init_logger(
+            filename="sobbhtf_setup.log",
+            level=level,
+            name=name,
+            log_dir=getattr(self, "log_dir", None),
+        )
+
+        self.init_setup()
+
+    def init_sampling_info(self):
+        """Default the prior, transform, periodicity and ``ndim`` from ``SOBHBPrior``.
+
+        Each is only filled when not given. ``betas`` is left as given: ``None`` lets the
+        recipe build a ladder matching the general ``ntemps`` (``make_ladder``).
+        """
+        if self.waveform_kwargs is None:
+            self.waveform_kwargs = {}
+
+        if self.priors is None:
+            prior = self.make_default_prior()
+            self.priors = {self.branch_name: prior}
+            if self.transform is None:
+                self.transform = prior.get_transforms()
+            if self.periodic is None:
+                self.periodic = {self.branch_name: prior.get_periodic()}
+        else:
+            self.logger.info("Using custom priors for the SOBBHTF branch")
+            if self.transform is None:
+                raise ValueError("SOBBHTFSettings: custom priors need a matching transform.")
+
+        if self.ndim is None:
+            self.ndim = self.priors[self.branch_name].ndim
+
+        if self.betas is not None:
+            self.logger.info(f"Using betas: {self.betas} in SOBBHTF branch")
+
+        if self.other_tempering_kwargs is None:
+            self.other_tempering_kwargs = dict(permute=False)
+
+        if "permute" not in self.other_tempering_kwargs:
+            self.other_tempering_kwargs["permute"] = False
+
+        assert not self.other_tempering_kwargs["permute"]
+
+        if self.initialize_kwargs is None:
+            self.initialize_kwargs = {}
+
+        if self.inner_moves is None:
+            from eryn.moves import StretchMove
+
+            self.inner_moves = [(StretchMove(), 1.0)]
+
+    def make_default_prior(self):
+        """``SOBHBPrior.prior_factory`` with ``f0_lims`` / ``Mc_lims`` when given."""
+        from ereborpriors.stock.mojitolight import SOBHBPrior
+
+        kwargs = {}
+        for lims, (lo, hi) in ((self.f0_lims, ("f0_min", "f0_max")), (self.Mc_lims, ("chirp_mass_min", "chirp_mass_max"))):
+            if lims is not None and len(lims) == 2:
+                kwargs[lo], kwargs[hi] = (float(v) for v in lims)
+        self.logger.info(f"Default SOBHBPrior with {kwargs or 'its default limits'}")
+        prior = SOBHBPrior.prior_factory(**kwargs)
+        if prior.branch_name != self.branch_name:
+            raise ValueError(f"SOBHBPrior branch {prior.branch_name!r} != settings branch {self.branch_name!r}.")
+        return prior
+
+    def init_setup(self):
+        self.init_sampling_info()
+        self.init_state_backend_info()
+
+    def init_state_backend_info(self):
+        """Default the state and backend to :class:`SOBBHState` / :class:`SOBBHHDFBackend`."""
         if self.branch_state is None:
             self.branch_state = SOBBHState
 

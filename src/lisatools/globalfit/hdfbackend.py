@@ -272,8 +272,10 @@ class GFHDFBackend(eryn_HDFBackend):
 
         self.sub_backend = sub_backend
         if self.sub_backend is not None:
+            # Sub-backends read/write under f[self.name]["sub_backend"], so they
+            # must share the main group name (eryn's own default is "mcmc").
             self.sub_backend = {
-                key: self.sub_backend[key](*args, **kwargs)
+                key: self.sub_backend[key](*args, name=self.name, **kwargs)
                 for key in self.sub_backend
                 if self.sub_backend[key] is not None
             }
@@ -539,6 +541,14 @@ class GFHDFBackend(eryn_HDFBackend):
                     recipe_step_group.attrs["order num"] = i + 1
 
                 f[self.name].attrs["has_recipe"] = True
+
+    def recipe_step_start(self, step_name, iteration):
+        """The iteration ``step_name`` started at: recorded on its first start, read back afterwards (restarts)."""
+        with self.open("a") as f:
+            attrs = f[self.name]["recipe"][step_name].attrs
+            if "start iteration" not in attrs:
+                attrs["start iteration"] = int(iteration)
+            return int(attrs["start iteration"])
 
     def completed_recipe_step(self, step_name):
         """Mark ``step_name`` as completed in the on-disk recipe metadata."""

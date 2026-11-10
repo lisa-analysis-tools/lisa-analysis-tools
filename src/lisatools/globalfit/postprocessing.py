@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 from datetime import datetime, timezone
 from logging import getLogger
+import shutil
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import h5py
@@ -161,6 +162,7 @@ _REMOVED_PARAMS_REGISTRY: Dict[str, List[str]] = {
     "gb": ["frequency_double_dot"],
     "mbh": [],
     "emri": [],
+    "sobbh": [],
     "psd": [],
     "galfor": [],
 }
@@ -169,7 +171,7 @@ source_types_names = dict(
     gb="GB",  # todo: separate the verification binaries into their own source type
     mbh="MBHB",
     emri="EMRI",
-    sobh="SOBHB",
+    sobbh="SOBHB",
     psd="NOISE",
     galfor="NOISE",  # todo: should we merge noise and stochastic together under a common "stochastic" source type?
 )
@@ -888,6 +890,9 @@ def _extract_sensitivity_metadata(gi) -> tuple[dict, dict]:
     kwargs.pop("orbits")
     kwargs.pop("settings")
     kwargs.pop("window_values")
+    if kwargs["data_td_settings"] is not None:
+            kwargs.pop("data_td_settings")
+
     kwargs["force_backend"] = "cpu"
 
     domain_metadata = {
@@ -1213,6 +1218,10 @@ class RunMetadata(MetadataBase):
             )
 
         window_values, _ = windowfun(self.window_type, N, alpha=self.window_alpha)
+
+        if "data_td_settings" not in sensitivity_kwargs:
+            data_td_settings = self.get_data_td_settings()
+            sensitivity_kwargs["data_td_settings"] = data_td_settings
 
         return sensitivity_class(
             orbits=orbits,
@@ -1665,6 +1674,17 @@ class SubmissionWriter(BackendConsumer):
             )
 
             _save_metadata_attributes(f, metadata)
+
+        # copy prior file in the submission folder if it exists
+        if metadata.prior_model_config_file:
+            prior_file_path = os.path.join(self.curr.general_info.artifacts_file_dir, metadata.prior_model_config_file)
+            if os.path.exists(prior_file_path):
+                prior_file_dest = os.path.join(self.run_metadata.submission_folder, metadata.prior_model_config_file)
+                if not os.path.exists(prior_file_dest):
+                    shutil.copy(prior_file_path, prior_file_dest)
+                    logger.info(f"Copied prior model config file '{metadata.prior_model_config_file}' to submission folder.")
+                else:
+                    logger.info(f"Prior model config file '{metadata.prior_model_config_file}' already exists in submission folder. Skipping copy.")
 
         logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from gpubackendtools.exceptions import MissingDependency
 from gpubackendtools.gpubackendtools import Backend
+from gpubackendtools.jax.backend import GBTJaxBackend
 
 from ..cutils import LISAToolsBackend, LISAToolsBackendMethods
 
@@ -67,17 +68,41 @@ def _check_orbits_jax(*args, **kwargs):
 def _jax_methods_loader() -> LISAToolsBackendMethods:
     jnp = _check_jax()
     from .orbits import OrbitsWrapJAX
+    from .response.tdi_config import TDIConfigWrapJAX
+    from gpubackendtools.jax.cubic_spline import CubicSplineWrapJAX
 
     return LISAToolsBackendMethods(
         OrbitsWrap=OrbitsWrapJAX,
         Orbits=OrbitsWrapJAX,                          # JAX side: same class
         check_orbits=_check_orbits_jax,
         # SensitivityMatrixWrap=_unimplemented("SensitivityMatrixWrap"),  # XYZBackend disabled
+        SensitivityMatrixWrap=None,
+        GalacticGridSetup=None,
+        GalacticGridWrap=None,
+        # 2026-06 domains consolidation: STFT/FD domain wraps.
+        STFTDomainWrap=None,
+        FDDomainForStftWrap=None,
+        STFTFresnelWrap=None,
+        psd_likelihood=None,
+        compute_logpdf=None,
+        # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
+        TDSplineTDIWaveformWrap=None,
+        FDSplineTDIWaveformWrap=None,
+        LISAResponseWrap=None,
+        LISAResponse=None,
+        TDIConfigWrap=TDIConfigWrapJAX,
+        TDIConfig=TDIConfigWrapJAX,
+        # GBT is the single registrant for CubicSplineWrap.
+        CubicSplineWrap=CubicSplineWrapJAX,
+        WDMSettingsWrap=None,
+        WDMDomainWrap=None,
+        FDDomainWrap=None,
+        TDITypeDict=None,
         xp=jnp,
     )
 
 
-class LISAToolsJaxBackend(Backend, LISAToolsBackend):
+class LISAToolsJaxBackend(GBTJaxBackend, LISAToolsBackend):
     """JAX backend object plugged into ``Globals().backends_manager``."""
 
     _backend_name: str = "lisatools_backend_jax"
@@ -85,11 +110,10 @@ class LISAToolsJaxBackend(Backend, LISAToolsBackend):
 
     def __init__(self, *args, **kwargs):
         methods = _jax_methods_loader()
-        Backend.__init__(
+        GBTJaxBackend.__init__(
             self,
-            name=self._name,
-            methods=methods,
-            features=Backend.Feature.NUMPY,
+            *args,
+            **kwargs,
         )
         LISAToolsBackend.__init__(self, methods)
 
