@@ -1,11 +1,12 @@
 """Does the catalogue phase mapping land on the data? (gwtf SOBBH, L2D run folder)
 
 Builds the run folder's GlobalFit up to the recipe (data, sensitivity, seeded state), then on the raw data
-(no templates subtracted) scans, per catalogue source, the coalescence phase around the mapped truth:
+(no templates subtracted) scans, per catalogue source, the phase parameter (phi_0 or phi_coal, the run's phase_at_coalescence) around the
+mapped truth:
 
     log L(phi) = Re<d|h(phi)> - <h|h>/2   (gwtf inner products on walker 0's data and PSD, as SOBBHSpecialMove)
 
-and reports where it peaks relative to the mapped phi_coal (``sobhb_catalogue_to_gwtf_basis``), with the SNR
+and reports where it peaks relative to the mapped phase (``sobhb_catalogue_to_gwtf_basis``), with the SNR
 ``sqrt(<h|h>)`` and the matched-filter SNR ``Re<d|h>/sqrt(<h|h>)`` at the truth. The peak should sit within a few
 hundredths of a radian of the mapped phase (gwtf's coalescence-time offset), not pi/2 away (a sign error).
 
@@ -72,10 +73,12 @@ with acs.device_context(acs.gpus[0] if acs.gpus else None):
 
 data_t0 = curr.general_info.data_t0
 catalogue = curr.general_info.catalogue["SOBHB"]
-offsets = np.linspace(-np.pi / 2, np.pi / 2, args.nphi, endpoint=False)  # phi_coal enters as 2*phi: period pi
+offsets = np.linspace(-np.pi / 2, np.pi / 2, args.nphi, endpoint=False)  # the phase enters as 2*phi: period pi
 print(f"{'id':>3} {'f0 [Hz]':>9} {'SNR':>7} {'MF SNR':>7} {'peak - mapped [rad]':>20} {'dlogL(mapped)':>14}")
 for sid, entry in sorted(catalogue.items()):
-    truth = sobhb_catalogue_to_gwtf_basis(entry, data_t0 - float(entry["TimeReferenceSSBFrame"]))
+    truth = sobhb_catalogue_to_gwtf_basis(
+        entry, data_t0 - float(entry["TimeReferenceSSBFrame"]), phase_at_coalescence=gen.phase_at_coalescence
+    )
     params = np.tile(truth, (args.nphi, 1))
     params[:, 7] = truth[7] + offsets
     idx = gen.xp.zeros(args.nphi, dtype=gen.xp.int32)

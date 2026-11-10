@@ -10,8 +10,9 @@ The two codes place the chirp differently in time (gwtf's tc is the unrefined ``
 tc is Newton-refined): gwtf runs late by dtc = tc_gwtf - tc_TD, so arg <gwtf|TD> = phase_TD - phase_gwtf is expected
 near +2*pi*f0*dtc (printed as ``pred``), on top of any convention offset.
 
-``GWTF_generator`` adds ``SOBHB_GWTF_PHASE_OFFSET`` (pi/2, the pygwtf strain sign) internally, so with it in
-place the "as is" variant should have arg ~ pred and the other variants should not.
+pygwtf uses the mojito polarisation convention (``POL_CONVENTION = -1`` in pygwtf/response/transfer.py) and
+``GWTF_generator`` passes phi_coal through unchanged, so the "as is" variant should have arg ~ pred and the
+other variants should not.
 
 Usage: python scripts/sobbh/sobbh_gwtf_td_convention_check.py [--days 32] [--backend cuda12x]
 """
@@ -49,7 +50,7 @@ N = int(round(settings.NT * settings.dt / DT))  # whole segments only
 
 orbits = EqualArmlengthOrbits(force_backend=args.backend)
 gwtf = GWTF_generator(settings=settings, orbits=orbits, T_obs=N * DT, fresnel_kernel_width=16,
-                      use_GPU=args.backend != "cpu")
+                      use_GPU=args.backend != "cpu", phase_at_coalescence=True)  # same phi_coal as the TD below
 td = SOBBHTaylorT3TDIWaveform(
     waveform_t0=settings.t0,
     data_td_settings=TDSettings(N=N, dt=DT, t0=settings.t0, force_backend=args.backend),
@@ -112,7 +113,7 @@ for p in SOURCES:
 
 # ---------------------------------------------------------------- catalogue phase mapping
 # TD in its default (reference-epoch, mojito) convention with phi0 = TrueAnomaly, vs gwtf seeded with
-# sobhb_catalogue_to_gwtf_basis (coalescence phase; GWTF_generator adds its sign offset). The catalogue reference
+# sobhb_catalogue_to_gwtf_basis (coalescence phase, as this gwtf takes it). The catalogue reference
 # epoch is the data start here (delta_t = 0), so only the tc offset should remain in arg.
 from lisatools.globalfit.searches import sobhb_catalogue_to_gwtf_basis  # noqa: E402
 
@@ -123,7 +124,7 @@ for p, ta in zip(SOURCES, (0.4, 2.2, 5.1)):
     entry = dict(PrimaryMassSSBFrame=m1, SecondaryMassSSBFrame=m2, PrimarySpinCompZ=s1, SecondarySpinCompZ=s2,
                  LuminosityDistance=dist * 1e3, InclinationAngle=inc, GW22FrequencySSBFrame=f0, TrueAnomaly=ta,
                  PolarisationAngle=psi, RightAscension=ra, Declination=dec)
-    g = gwtf_stft(sobhb_catalogue_to_gwtf_basis(entry))
+    g = gwtf_stft(sobhb_catalogue_to_gwtf_basis(entry, phase_at_coalescence=True))
     t = asnumpy(td_ref.get_td_signals(m1, m2, s1, s2, dist, inc, f0, ta, psi, ra, dec,
                                       td_settings=data_grid).transform(settings).arr)
     ov = inner(g, t) / np.sqrt(inner(g, g).real * inner(t, t).real)

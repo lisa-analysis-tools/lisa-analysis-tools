@@ -440,6 +440,10 @@ class SourceBlock(MoveBlock):
         """The absolute SSB time (s) the block's waveforms are referenced to (``time_reference``)."""
         return ctx.cfg.data.reference_time if self.time_reference == "mojito" else ctx.general.data_t0
 
+    def search_interface_kwargs(self) -> dict[str, Any]:
+        """Extra constructor arguments of the block's search interface (``SEARCH_INTERFACE``); none by default."""
+        return {}
+
     def engine_waveform_kwargs(self, ctx: BuildContext) -> dict[str, Any]:
         """The builder-filled constructor arguments of the block's waveform (``ENGINE_WAVEFORM_KWARGS``).
 
@@ -631,6 +635,7 @@ def make_search_interface(block: BlockBase, info: dict[str, Any]):
         spread=None if spec.spread is None else np.asarray(spec.spread, dtype=float),
         is_eryn_backend=spec.is_eryn_backend,
         periodic=info["periodic"],
+        **(block.search_interface_kwargs() if isinstance(block, SourceBlock) else {}),
     )
 
 def engine_waveform_kwargs(ctx: BuildContext, block: SourceBlock) -> dict[str, Any]:

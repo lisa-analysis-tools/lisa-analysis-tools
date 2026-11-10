@@ -14,7 +14,7 @@ from pygwtf.generator import AnalyticTimeFrequencyWaveform
 
 from ...utils.constants import C_SI
 from ...utils.utility import asnumpy
-from ..utils import SOBHB_GWTF_PHASE_OFFSET
+from ..utils import sobhb_coalescence_phase
 from ...detector import Orbits
 from ...domains import STFTSettings, STFTSignal
 
@@ -37,7 +37,8 @@ class GWTF_generator:
                  fresnel_kernel_width = 10,
                  use_GPU = True,
                  psd_drop_bands = DEFAULT_PSD_DROP_BANDS,
-                 tukey_alpha = None):
+                 tukey_alpha = None,
+                 phase_at_coalescence: bool = False):
         """
         Assumptions:
         - PSD and data are already pre-processed and in the correct shape corresponding to the tf grid provided.
@@ -49,6 +50,20 @@ class GWTF_generator:
         Frequency grid: gwtf bin k is centred on (k+1)*dF, i.e. the grid always starts at dF (no DC bin).
         The gwtf grid therefore covers lisatools STFT bins 1..settings.ind_max, and bins below settings.ind_min
         (outside the active band) are zero-filled in the data and given infinite PSD by to_gwtf_layout.
+
+        Parameters:
+            settings: STFTSettings object, which contains the STFT grid and windowing information.
+            orbits: Orbits object, which contains the spacecraft positions and light travel times.
+            T_obs: Observation time in seconds.
+            fresnel_kernel_width: Width of the Fresnel kernel in number of frequency bins (default 10).
+            use_GPU: Whether to use GPU (cupy) or CPU (numpy)
+            psd_drop_bands: List of (f_lo, f_hi) tuples, where the PSD is set to infinity (zero information) in these bands.
+            tukey_alpha: Tukey window alpha parameter for the Fresnel kernel. 
+                If None, a box-car kernel is used. Otherwise, the Tukey windowed Fresnel kernel is used.
+            phase_at_coalescence: meaning of parameter column 7. False (default): phi_0, the orbital phase at the
+                data start settings.t0 (where the GW frequency is f0), converted internally to the coalescence
+                phase pygwtf takes. True: phi_coal, the coalescence phase, passed through. Same convention as
+                SOBBHTaylorT3TDIWaveform(phase_at_coalescence=...).
         """
 
         # Constructor arguments, used by MultiGPUResidualAddRemoveMove to build one replica per GPU
@@ -57,6 +72,7 @@ class GWTF_generator:
         self.psd_drop_bands = psd_drop_bands
         self.tukey_alpha = tukey_alpha
         self.use_tukey = tukey_alpha is not None
+        self.phase_at_coalescence = bool(phase_at_coalescence)
 
         self.kwargs = dict(settings=settings,
                            orbits=orbits,
@@ -64,7 +80,8 @@ class GWTF_generator:
                            fresnel_kernel_width=fresnel_kernel_width,
                            use_GPU=use_GPU,
                            psd_drop_bands=self.psd_drop_bands,
-                           tukey_alpha=self.tukey_alpha)
+                           tukey_alpha=self.tukey_alpha,
+                           phase_at_coalescence=self.phase_at_coalescence)
 
 
         self.settings = settings
@@ -212,24 +229,34 @@ class GWTF_generator:
         """
         Convert the lisatools parameters to the gwtf (TaylorT3Spin) parameters.
 
+        Note this is in the waveform basis not the sampling basis. This is simply converting the variables internally.
+
         params: (#nSources, 11) array of parameters (the SOBBHTaylorT3TDIWaveform basis), where the columns are:
         0: m1 (Msun), 1: m2 (Msun), 2: s1, 3: s2 (aligned spins), 4: dist (Gpc), 5: inc (rad),
         6: f0 (Hz, GW frequency at the data start settings.t0, i.e. gwtf t=0),
-        7: phi_coal (rad, coalescence orbital phase, Phi(x) = phi_coal - P(x), in the mojito /
-           SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True) strain convention), 8: psi (rad),
-        9: ra, 10: dec (rad, in the frame of the orbits)
+        7: the orbital phase (rad, mojito / SOBBHTaylorT3TDIWaveform strain convention):
+           phi_0, the phase at the data start (where the GW frequency is f0), if not self.phase_at_coalescence;
+           phi_coal, the coalescence phase (Phi(x) = phi_coal - P(x)), if self.phase_at_coalescence,
+        8: psi (rad), 9: ra, 10: dec (rad, in the frame of the orbits)
 
-        Returns Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec (distance in pc), with
-        phi_coal shifted by SOBHB_GWTF_PHASE_OFFSET: the pygwtf strain has the opposite sign
-        (tasks/sobbh_gwtf_td_discrepancies.md), so gwtf(phi_coal + pi/2) == TD(phi_coal).
+        Returns Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec (distance in pc). phi_0 is converted
+        to phi_coal = phi_0 + P(x0) (sobhb_coalescence_phase, on the host); phi_coal is passed through. pygwtf
+        uses the mojito polarisation convention, so gwtf(phi_coal) == TD(phi_coal) with no phase offset.
         """
-        m1, m2, s1, s2, dist, inc, f0, phi_coal, psi, ra, dec = params.T
+        m1, m2, s1, s2, dist, inc, f0, phase, psi, ra, dec = params.T
 
         Mc = (m1 * m2)**(3/5) / (m1 + m2)**(1/5)
         eta = (m1 * m2) / (m1 + m2)**2
         cosinc = self.xp.cos(inc)
         dist_pc = dist * 1.0e9 # Convert distance from Gpc to pc
-        phi_coal = phi_coal + SOBHB_GWTF_PHASE_OFFSET  # pygwtf strain sign -> mojito / TD convention
+
+        if self.phase_at_coalescence:
+            phi_coal = phase
+        else:
+            # sobhb_coalescence_phase is numpy-only: evaluate on the host, return on this generator's backend
+            phi_coal = self.xp.asarray(np.atleast_1d(sobhb_coalescence_phase(
+                *(asnumpy(a) for a in (m1, m2, s1, s2, f0, phase))
+            )))
 
         return Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec
 
