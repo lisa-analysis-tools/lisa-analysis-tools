@@ -38,7 +38,6 @@ def _domain_factory(domain):
 def _processor_init_kwargs(cfg: RunConfig) -> dict:
     orbits = cfg.data.orbits
     orbits_kwargs = orbits.model_dump(exclude={"type"}, exclude_none=True)
-    # orbits_kwargs["force_backend"] = "cpu"
     return dict(
         L1_folder=str(cfg.data.path),
         source_types=list(cfg.data.source_types),
