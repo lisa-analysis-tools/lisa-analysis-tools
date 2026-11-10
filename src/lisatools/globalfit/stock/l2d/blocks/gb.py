@@ -83,6 +83,7 @@ class GBBlock(SourceBlock):
     SEARCH_INTERFACE: ClassVar[str] = "GBSearchInterface"
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("catalog", "point_estimate")
     FULL_LADDER: ClassVar[bool] = True  # the band temperatures span every temperature
+    STAGES_HINT: ClassVar[str] = " Set the moves' shares per stage in extra_moves.<name>.stage_weights."
     # ? The STFT computations take the parameters at the mojito catalogue epoch, not at data.reference_time.
     NEEDS_REFERENCE_TIME: ClassVar[bool] = False
     PE_MOVES: ClassVar[dict[str, PEMove]] = {

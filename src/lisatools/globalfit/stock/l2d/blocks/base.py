@@ -362,6 +362,7 @@ class MoveBlock(BlockBase):
 
     PE_MOVES: ClassVar[dict[str, PEMove]]  # classes this block may name in pe_move
     FULL_LADDER: ClassVar[bool] = False  # True -> tempering.ntemps must equal sampler.ntemps
+    STAGES_HINT: ClassVar[str] = ""  # what a block whose pe_move takes no stage settings uses instead
 
     # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
     pe_move: ClassSpec
@@ -456,8 +457,13 @@ class SourceBlock(MoveBlock):
     def _stages_fit_the_moves(self):
         if not self.stages:
             return self
-        if self.PE_MOVES[self.pe_move.class_name].module != SPECIAL_MOVES:
-            raise ValueError(f"stages: need a special pe_move; {self.pe_move.class_name} takes no stage settings.")
+        # * The capability, not where the class lives: stage settings reach the move through apply_settings.
+        cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
+        if not hasattr(cls, "apply_settings"):
+            raise ValueError(
+                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings)."
+                + self.STAGES_HINT
+            )
         for name, stage in self.stages.items():
             weights = stage.inner_move_weights
             if weights is not None and self.inner_moves is None:

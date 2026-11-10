@@ -230,6 +230,12 @@ class GBSchemaTest(_GBConfig):
     def test_the_data_holds_the_galaxy(self):
         self.assertConfigError("needs 'gb' in data.source_types", source_types=["noise"])
 
+    def test_stages_are_rejected_at_load(self):
+        # * The GB moves have no apply_settings: per-stage settings would crash at recipe setup, after the bands.
+        self.assertConfigError(
+            "extra_moves.<name>.stage_weights", {"stages": {"pe": {"num_prop_repeats": 10}}}
+        )
+
     def test_direct_betas_span_every_temperature(self):
         from lisatools.globalfit.stock.l2d.blocks.base import make_betas
 
