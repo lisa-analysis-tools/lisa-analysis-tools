@@ -390,6 +390,20 @@ class RunConfig(_Section):
         return self
 
     @model_validator(mode="after")
+    def _extra_moves_fit_the_domain(self):
+        """An extra move the block's table marks ``stft_only`` needs an STFT domain (the block cannot see it)."""
+        for name, block in self.blocks.items():
+            if not block.enabled:
+                continue
+            for key, spec in (getattr(block, "extra_moves", None) or {}).items():
+                if block.EXTRA_MOVES[spec.class_name].stft_only and self.domain.type != "stft":
+                    raise ValueError(
+                        f"block {name!r}: extra_moves {key} ({spec.class_name}) runs on an stft domain only, not "
+                        f"{self.domain.type}."
+                    )
+        return self
+
+    @model_validator(mode="after")
     def _blocks_fit_the_run(self):
         """Check the blocks against the data section (reference time, source ids and types)."""
         data = self.data

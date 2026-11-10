@@ -55,6 +55,8 @@ class ExtraMove(NamedTuple):
     # True: the band sorter draws the move's dead rows from the prior, as for pe_move; False: the move builds its own
     # proposal (the F-statistic move at its first search)
     prior_proposal: bool
+    # True: the move runs on an STFT domain only (checked against the run's domain at load, io.RunConfig)
+    stft_only: bool = False
 
 
 class ExtraMoveSpec(ClassSpec):
@@ -91,7 +93,7 @@ class GBBlock(SourceBlock):
     }
     # * The classes extra_moves may name; the recipe fills GB_SPECIAL_MOVE_FILLED for them as for pe_move
     EXTRA_MOVES: ClassVar[dict[str, ExtraMove]] = {
-        "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False),
+        "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False, stft_only=True),
     }
 
     nleaves: PositiveInt = 8000  # the most sources at once (nleaves_max); the least is 0

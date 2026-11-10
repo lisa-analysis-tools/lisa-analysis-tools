@@ -235,6 +235,14 @@ class GBSchemaTest(_GBConfig):
     def test_the_data_holds_the_galaxy(self):
         self.assertConfigError("needs 'gb' in data.source_types", source_types=["noise"])
 
+    def test_fstat_move_needs_an_stft_domain(self):
+        raw = gb_raw({"extra_moves": {"fstat": {"class": "GBFStatRJMove", "weight": 0.1}}})
+        raw["domain"] = {"type": "fd", "min_freq": 1e-4, "max_freq": 2.9e-2}
+        with self.assertRaises(ValidationError) as caught, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            RunConfig.model_validate(raw, context={"run_dir": self.run_dir})
+        self.assertIn("runs on an stft domain only, not fd", str(caught.exception))
+
     def test_stages_are_rejected_at_load(self):
         # * The GB moves have no apply_settings: per-stage settings would crash at recipe setup, after the bands.
         self.assertConfigError(
