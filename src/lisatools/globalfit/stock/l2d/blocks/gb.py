@@ -178,6 +178,19 @@ class GBBlock(SourceBlock):
         return self
 
     @model_validator(mode="after")
+    def _move_settings_are_valid(self):
+        """Build the moves' settings dataclasses as the builder does (``gb_move_kwargs``), so their own value rules
+        (e.g. ``GBFStatSettings.__post_init__``) fail at load, not after the band setup. After the key checks above."""
+        merged = [("pe_move", None)]
+        merged += [(f"extra_moves {key}", {**self.pe_move.kwargs, **spec.kwargs}) for key, spec in self.extra_moves.items()]
+        for where, kwargs in merged:
+            try:
+                gb_move_kwargs(self, kwargs)
+            except (TypeError, ValueError) as err:  # pydantic reports only ValueError as a config error
+                raise ValueError(f"{where}: {err}") from err
+        return self
+
+    @model_validator(mode="after")
     def _catalog_reads_a_file(self):
         if self.search is not None and self.search.search_type == "catalog" and self.search.search_path is None:
             raise ValueError(

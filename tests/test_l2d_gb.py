@@ -183,6 +183,11 @@ class GBSchemaTest(_GBConfig):
             (extra(kwargs={"fstat_search": {}}), "does not accept"),
             (extra(kwargs={"fstat_settings": {"nsteps": 10}}), "GBFStatSettings does not accept"),
             (extra(kwargs={"fstat_settings": True}), "must be a mapping"),
+            # * the settings' own value rules, at load (GBFStatSettings.__post_init__ through gb_move_kwargs)
+            (extra(kwargs={"fstat_settings": {"search_interval": 0}}), "search_interval must be a positive integer"),
+            (extra(kwargs={"fstat_settings": {"search_interval": 1.5}}), "search_interval must be a positive integer"),
+            (extra(kwargs={"fstat_settings": {"save_search_records": "fulll"}}), "save_search_records must be one of"),
+            (extra(kwargs={"fstat_settings": {"shutoff_low_frequency_threshold": 1e-2}}), "must lie below"),
             (extra(kwargs={"debug_settings": True}), "must be a mapping"),
             ({**extra(), "stft": {"response": "tdi_on_the_fly"}}, "stft response dffr only"),
         ):
