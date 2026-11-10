@@ -4325,6 +4325,8 @@ class GBFStatSettings:
     shutoff_band_iteration: int = 2
     # Proposes of the move from one search to the next; between searches the latest proposal stays
     search_interval: int = 1
+    # Eryn's progress bar for each stage's band samplers: one bar of its burn-in and stored steps over all bands
+    progress: bool = True
     # What each search saves to output_dir: "none", "summary" (per-band values, the mixtures, the times) or "full"
     # (also the chains, megabytes per search on tens of bands)
     save_search_records: str = "none"
@@ -4585,7 +4587,8 @@ class GBFStatRJMove(GBSpecialBase):
                                            fstat=True)
         start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
         output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
-                                        self.periodic, int(settings.burn_1), int(settings.nsteps_1), betas)
+                                        self.periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
+                                        progress=bool(settings.progress))
         return output, likelihood
 
     def _apply_gate(self, stage_1, bands):
@@ -4671,7 +4674,7 @@ class GBFStatRJMove(GBSpecialBase):
         output = self.run_band_samplers(
             likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
             self._band_mask(low, high), mask, self.periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
-            record_cold_coords=True)
+            record_cold_coords=True, progress=bool(settings.progress))
         return output, likelihood
 
     def _build_proposal(self, stage_2):
@@ -4700,12 +4703,13 @@ class GBFStatRJMove(GBSpecialBase):
 
     @staticmethod
     def run_band_samplers(log_like_fn, start, prior_container, transform, gibbs_mask, periodic, burn, nsteps, betas,
-                          record_cold_coords=False):
+                          record_cold_coords=False, progress=True):
         """One Eryn EnsembleSampler with one independent sampler per band; keeps the cold chain only.
 
         ``start`` is (n_bands, ntemps, nwalkers, 8) and ``betas`` the start ladder (coldest first, the same for every
         band), which Eryn adapts per sampler with its ends kept. The sampler stores nothing, since every temperature of
-        a full-band search would be large and only the cold rows serve. Returns ``cold_ll`` (n_bands, nsteps,
+        a full-band search would be large and only the cold rows serve. ``progress`` shows Eryn's progress bar over the
+        burn + nsteps steps. Returns ``cold_ll`` (n_bands, nsteps,
         nwalkers), ``last_cold`` (n_bands, nwalkers, 8), ``cold_coords`` (n_bands, nsteps, nwalkers, 8) when asked, the
         cold acceptance and the swap acceptance per band, the adapted ladders and the wall time.
         """
@@ -4729,7 +4733,7 @@ class GBFStatRJMove(GBSpecialBase):
         cold_coords = np.zeros((n_bands, nsteps, nwalkers, ndim)) if record_cold_coords else None
         swaps_accepted = np.zeros((n_bands, max(ntemps - 1, 0)))
         time_start = time.perf_counter()
-        for step, state in enumerate(sampler.sample(state, iterations=burn + nsteps, store=False)):
+        for step, state in enumerate(sampler.sample(state, iterations=burn + nsteps, store=False, progress=progress)):
             if ntemps > 1:
                 swaps_accepted += np.reshape(sampler.temperature_control.swaps_accepted, (n_bands, ntemps - 1))
             if step >= burn:

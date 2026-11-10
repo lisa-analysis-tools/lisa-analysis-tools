@@ -47,6 +47,7 @@ The move takes one dataclass, `fstat_settings` (a `GBFStatSettings`; None takes 
 | `shutoff_low_frequency_threshold` | 6e-4 Hz | bands wholly below it can be shut off |
 | `shutoff_band_iteration` | 2 | searches without a detection before a band in a shutoff range is shut off |
 | `search_interval` | 1 | proposes of the move from one search to the next |
+| `progress` | True | Eryn's progress bar for each search stage |
 | `save_search_records` | `"none"` | what each search saves: `"none"`, `"summary"` or `"full"` |
 | `output_dir` | None | folder of the search log and the records; the recipe builders set `<run>_artifacts/fstat_search/` |
 
