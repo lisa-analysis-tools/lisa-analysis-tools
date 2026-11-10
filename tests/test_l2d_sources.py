@@ -587,7 +587,8 @@ class SkyWiringTest(unittest.TestCase):
 
     def test_wrappers_round_trip_and_touch_only_the_sky_columns(self):
         ind_map = sky_ind_map(self.BASIS, MBHBlock.SKY_BASIS)
-        to_lisa, from_lisa = make_sky_wrappers(EqualArmlengthOrbits(), REFERENCE_TIME, ind_map)
+        # * the host orbits, as MBHBlock passes them (ctx.general.orbits): the coords are numpy
+        to_lisa, from_lisa = make_sky_wrappers(EqualArmlengthOrbits(force_backend="cpu"), REFERENCE_TIME, ind_map)
 
         rng = np.random.default_rng(3)
         n = 50
