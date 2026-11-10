@@ -52,6 +52,8 @@ class Recorder:
 
     def __init__(self, *args, **kwargs):
         self.args, self.kwargs = args, kwargs
+        # * as the real PE moves (ResidualAddOneRemoveOneMove): the inner moves they were given, on .moves
+        self.moves = list(kwargs.get("inner_moves") or [])
 
 
 class _Recipe(_Sources):
