@@ -123,14 +123,28 @@ class TemperingSpec(_Spec):
     ratio: float = Field(default=1.2, gt=1.0)  # geometric ladder: betas = ratio ** -arange(ntemps)
     # the hottest rung's temperature: its beta becomes 1 / Tmax, the other rungs stay ratio ** -k
     Tmax: float | None = Field(default=None, gt=1.0)
-    betas: list[float] | None = None  # overrides the ladder; must be sorted, positive and <= 1.0
+    # the ladder itself, coldest first (strictly decreasing, in (0, 1]); replaces ntemps, ratio and Tmax
+    betas: list[float] | None = None
 
     @model_validator(mode="after")
     def _ladder_is_consistent(self):
-        if self.betas is not None:
-            betas = np.asarray(self.betas, dtype=float)
-            if betas.ndim != 1 or not np.all(np.diff(betas) < 0) or betas[0] > 1.0 or betas[-1] <= 0.0:
-                raise ValueError(f"tempering.betas {self.betas} must be a sorted, positive array <= 1.0.")
+        if self.betas is None:
+            return self
+        # * by value, not by fields set: a snapshot writes every field out (ratio at its default, the others None)
+        clashing = [key for key in ("ntemps", "ratio", "Tmax") if getattr(self, key) != type(self).model_fields[key].default]
+        if clashing:
+            raise ValueError(f"tempering.betas gives the ladder itself; leave out {clashing}.")
+        betas = np.asarray(self.betas, dtype=float)
+        if betas.size == 0 or np.any(np.diff(betas) >= 0) or betas[0] > 1.0 or betas[-1] <= 0.0:
+            raise ValueError(
+                f"tempering.betas {self.betas} must be a non-empty, strictly decreasing list in (0, 1]."
+            )
+        return self
+
+    @property
+    def rungs(self) -> int | None:
+        """The ladder's number of rungs when the spec fixes it (betas or ntemps); None -> sampler.ntemps."""
+        return len(self.betas) if self.betas is not None else self.ntemps
 
 class FlowSpec(_Spec):
     """A normalizing-flow proposal (``ConditionalFlowMove``) trained online by a ``ProcessExecutor``.
@@ -635,7 +649,6 @@ def make_betas(tempering: TemperingSpec | None, default_ntemps: int):
         return None
     if tempering.betas is not None:
         return np.asarray(tempering.betas, dtype=float)
-    
     ntemps = tempering.ntemps or default_ntemps
     betas = 1.0 / tempering.ratio ** np.arange(ntemps)
     if tempering.Tmax is not None:

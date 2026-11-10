@@ -264,6 +264,28 @@ class SourceSchemaTest(_Sources):
             blocks={"mbh": {**MBH_BLOCK, "tempering": {"ntemps": too_many}}},
         )
 
+    def test_direct_betas_schema(self):
+        sampler_ntemps = self.config({}).sampler.ntemps
+        tempering = self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": [1.0, 0.5]}}}).blocks["mbh"].tempering
+        self.assertEqual((tempering.betas, tempering.rungs), ([1.0, 0.5], 2))
+        # a snapshot writes every field out (ratio at its default, ntemps and Tmax None) and reloads
+        self.assertEqual(type(tempering).model_validate(tempering.model_dump()), tempering)
+        for betas, msg in (
+            (list(0.5 ** np.arange(sampler_ntemps + 1)), "length of tempering.betas"),
+            ([], "non-empty, strictly decreasing"),
+            ([1.0, 1.0], "non-empty, strictly decreasing"),
+            ([0.5, 1.0], "non-empty, strictly decreasing"),
+            ([1.5, 0.5], "non-empty, strictly decreasing"),
+            ([1.0, 0.0], "non-empty, strictly decreasing"),
+        ):
+            with self.subTest(betas=betas), self.assertRaises(ValidationError) as ctx:
+                self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": betas}}})
+            self.assertIn(msg, str(ctx.exception))
+        for extra in ({"ntemps": 2}, {"ratio": 1.5}, {"Tmax": 10.0}):
+            with self.subTest(extra=extra), self.assertRaises(ValidationError) as ctx:
+                self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": [1.0, 0.5], **extra}}})
+            self.assertIn("gives the ladder itself", str(ctx.exception))
+
     def test_disabled_blocks_skip_the_run_checks(self):
         cfg = self.config(mbh_block(enabled=False), reference_time=None, source_ids={}, source_types=["noise"])
         self.assertFalse(cfg.blocks["mbh"].enabled)
@@ -333,6 +355,11 @@ class MBHBuildTest(_Built):
     def test_subset_ladder(self):
         _, built = self.build({"mbh": {**MBH_BLOCK, "tempering": {"ntemps": 3, "ratio": 2.0}}})
         np.testing.assert_allclose(built["mbh"].setup.betas, [1.0, 0.5, 0.25])
+
+    def test_direct_betas(self):
+        # the ladder as given, also a subset of the sampler's temperatures (padded in the state by pad_ladder)
+        _, built = self.build({"mbh": {**MBH_BLOCK, "tempering": {"betas": [1.0, 0.3, 0.01]}}})
+        np.testing.assert_array_equal(built["mbh"].setup.betas, [1.0, 0.3, 0.01])
 
     def test_waveform_init_kwargs_get_the_engine_values(self):
         _, built = self.build({"mbh": MBH_BLOCK})

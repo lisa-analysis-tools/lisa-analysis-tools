@@ -265,6 +265,15 @@ class PSDBuildTest(_Built):
         ntemps = cfg.sampler.ntemps  # tempering.ntemps defaults to sampler.ntemps
         np.testing.assert_allclose(built["psd"].setup.betas, 1.5 ** -np.arange(ntemps, dtype=float))
 
+    def test_direct_betas(self):
+        # the psd moves run on every temperature: the ladder must have sampler.ntemps rungs
+        ntemps = self.config_only().sampler.ntemps
+        betas = list(0.3 ** np.arange(ntemps))
+        _, built = self.build(priors=NOISE_PRIOR, tempering={"betas": betas})
+        np.testing.assert_array_equal(built["psd"].setup.betas, betas)
+        with self.assertRaisesRegex(ValueError, "length of tempering.betas .* must equal sampler.ntemps"):
+            self.build(priors=NOISE_PRIOR, tempering={"betas": betas[:-1]})
+
     def test_explicit_tempering_ntemps(self):
         cfg = self.config_only()
         _, built = self.build(priors=NOISE_PRIOR, tempering={"ntemps": cfg.sampler.ntemps, "ratio": 2.0})

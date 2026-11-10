@@ -230,6 +230,16 @@ class GBSchemaTest(_GBConfig):
     def test_the_data_holds_the_galaxy(self):
         self.assertConfigError("needs 'gb' in data.source_types", source_types=["noise"])
 
+    def test_direct_betas_span_every_temperature(self):
+        from lisatools.globalfit.stock.l2d.blocks.base import make_betas
+
+        ntemps = self.config().sampler.ntemps
+        betas = list(0.4 ** np.arange(ntemps))
+        # * Given in the YAML, the ladder replaces the block's default (Tmax 1e4) and reaches make_betas as is.
+        tempering = self.config({"tempering": {"betas": betas}}).blocks["gb"].tempering
+        np.testing.assert_array_equal(make_betas(tempering, ntemps), betas)
+        self.assertConfigError("must equal sampler.ntemps", {"tempering": {"betas": betas[:-1]}})
+
     def test_tmax_must_stay_above_the_second_hottest_rung(self):
         ntemps = self.config().sampler.ntemps
         second_hottest = 1.2 ** (ntemps - 2)
@@ -297,6 +307,11 @@ class GBBuildTest(_GBConfig):
         _, build = self.build({"search": gb_search(), "tempering": {"ratio": 1.2, "Tmax": 10.0}})
         np.testing.assert_allclose(build.setup.betas[:-1], 1.0 / 1.2 ** np.arange(ntemps - 1), rtol=1e-12)
         self.assertEqual(build.setup.betas[-1], 0.1)
+
+        # * The ladder as given (replacing the block's default Tmax); the bands span every temperature.
+        betas = list(0.4 ** np.arange(ntemps))
+        _, build = self.build({"search": gb_search(), "tempering": {"betas": betas}})
+        np.testing.assert_array_equal(build.setup.betas, betas)
 
 
 class GBRunFolderTest(_GBConfig):

@@ -401,14 +401,15 @@ class RunConfig(_Section):
                 continue
             # a ladder may use a subset of the sampler's temperatures, never more (galfor has none: the psd move's)
             tempering = getattr(block, "tempering", None)
-            ntemps = None if tempering is None else tempering.ntemps
+            ntemps = None if tempering is None else tempering.rungs  # len(betas) or ntemps
+            what = "the length of tempering.betas" if tempering is not None and tempering.betas else "tempering.ntemps"
             if ntemps is not None and ntemps > self.sampler.ntemps:
                 raise ValueError(
-                    f"block {name!r}: tempering.ntemps ({ntemps}) is above sampler.ntemps ({self.sampler.ntemps})."
+                    f"block {name!r}: {what} ({ntemps}) is above sampler.ntemps ({self.sampler.ntemps})."
                 )
             if ntemps is not None and block.FULL_LADDER and ntemps != self.sampler.ntemps:
                 raise ValueError(
-                    f"block {name!r}: its ladder spans every temperature; tempering.ntemps ({ntemps}) "
+                    f"block {name!r}: its ladder spans every temperature; {what} ({ntemps}) "
                     f"must equal sampler.ntemps ({self.sampler.ntemps}) or be left out."
                 )
             if tempering is not None and tempering.Tmax is not None:
