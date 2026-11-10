@@ -781,11 +781,11 @@ def evolve_sobhb(
     return f_end if xp is np else xp.asarray(f_end)
 
 
-# Orbital-phase offset between the gwtf (``GWTF_generator``) and the mojito / TD
-# (``SOBBHTaylorT3TDIWaveform``) strain conventions: for the same coalescence phase the gwtf
-# waveform is the negative of the TD one, i.e. gwtf(phi_coal + pi/2) == TD(phi_coal).
-# Measured by scripts/sobbh/sobbh_gwtf_td_convention_check.py; see
-# tasks/sobbh_gwtf_td_discrepancies.md.
+# Orbital-phase offset between the pygwtf and the mojito / TD (``SOBBHTaylorT3TDIWaveform``) strain
+# conventions: for the same coalescence phase the pygwtf waveform is the negative of the TD one, i.e.
+# pygwtf(phi_coal + pi/2) == TD(phi_coal). ``GWTF_generator`` adds it internally, so its public phi_coal
+# is in the mojito / TD convention. Measured by scripts/sobbh/sobbh_gwtf_td_convention_check.py; see
+# tasks/sobbh_gwtf_td_discrepancies.md. Set to 0 once pygwtf matches.
 SOBHB_GWTF_PHASE_OFFSET = np.pi / 2
 
 
@@ -802,8 +802,8 @@ def sobhb_coalescence_phase(
     TaylorT3 writes the orbital phase as ``Phi(x) = phi_coal - P(x)`` with ``P -> 0`` at merger, so
     ``phi_coal = phi_ref + P(x_ref)`` with ``x_ref = (pi M f_ref)^(2/3)``. Use it to map the catalogue
     ``TrueAnomaly`` (the orbital phase where ``f == GW22FrequencySSBFrame``) to the coalescence phase of
-    ``SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True)``; ``GWTF_generator`` additionally needs
-    :data:`SOBHB_GWTF_PHASE_OFFSET`. Only the reference frequency enters, not the reference time.
+    ``SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True)`` and ``GWTF_generator`` (which applies
+    :data:`SOBHB_GWTF_PHASE_OFFSET` internally). Only the reference frequency enters, not the reference time.
 
     Args:
         m1, m2: component masses (Msun). s1, s2: aligned spins.

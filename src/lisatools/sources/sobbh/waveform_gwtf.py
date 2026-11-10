@@ -14,6 +14,7 @@ from pygwtf.generator import AnalyticTimeFrequencyWaveform
 
 from ...utils.constants import C_SI
 from ...utils.utility import asnumpy
+from ..utils import SOBHB_GWTF_PHASE_OFFSET
 from ...detector import Orbits
 from ...domains import STFTSettings, STFTSignal
 
@@ -121,7 +122,7 @@ class GWTF_generator:
                                                                 backend=backend,
                                                                 spacecraft_orbits=self.spacecraft_positions,
                                                                 spacecraft_ltts=self.spacecraft_LTTs,
-                                                                block_vectorised_gpu = True, # Block vectorised mode, better for small batches -> global fit
+                                                                block_vectorised_gpu = use_GPU, # Block vectorised mode (GPU only), better for small batches -> global fit
                                                                 gf_mode = True, # Use the GF mode, allowing for one PSD and DATA array per walker.
                                                                 use_tukey = self.use_tukey,
                                                                 )
@@ -214,11 +215,13 @@ class GWTF_generator:
         params: (#nSources, 11) array of parameters (the SOBBHTaylorT3TDIWaveform basis), where the columns are:
         0: m1 (Msun), 1: m2 (Msun), 2: s1, 3: s2 (aligned spins), 4: dist (Gpc), 5: inc (rad),
         6: f0 (Hz, GW frequency at the data start settings.t0, i.e. gwtf t=0),
-        7: phi_coal (rad, coalescence orbital phase: Phi(x) = phi_coal - P(x); gwtf strain sign, see
-           lisatools.sources.utils.SOBHB_GWTF_PHASE_OFFSET), 8: psi (rad),
+        7: phi_coal (rad, coalescence orbital phase, Phi(x) = phi_coal - P(x), in the mojito /
+           SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True) strain convention), 8: psi (rad),
         9: ra, 10: dec (rad, in the frame of the orbits)
 
-        Returns Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec (distance in pc).
+        Returns Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec (distance in pc), with
+        phi_coal shifted by SOBHB_GWTF_PHASE_OFFSET: the pygwtf strain has the opposite sign
+        (tasks/sobbh_gwtf_td_discrepancies.md), so gwtf(phi_coal + pi/2) == TD(phi_coal).
         """
         m1, m2, s1, s2, dist, inc, f0, phi_coal, psi, ra, dec = params.T
 
@@ -226,6 +229,7 @@ class GWTF_generator:
         eta = (m1 * m2) / (m1 + m2)**2
         cosinc = self.xp.cos(inc)
         dist_pc = dist * 1.0e9 # Convert distance from Gpc to pc
+        phi_coal = phi_coal + SOBHB_GWTF_PHASE_OFFSET  # pygwtf strain sign -> mojito / TD convention
 
         return Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec
 
