@@ -272,11 +272,12 @@ class SourceSchemaTest(_Sources):
         self.assertEqual(type(tempering).model_validate(tempering.model_dump()), tempering)
         for betas, msg in (
             (list(0.5 ** np.arange(sampler_ntemps + 1)), "length of tempering.betas"),
-            ([], "non-empty, strictly decreasing"),
-            ([1.0, 1.0], "non-empty, strictly decreasing"),
-            ([0.5, 1.0], "non-empty, strictly decreasing"),
-            ([1.5, 0.5], "non-empty, strictly decreasing"),
-            ([1.0, 0.0], "non-empty, strictly decreasing"),
+            ([], "strictly decreasing list from 1.0"),
+            ([1.0, 1.0], "strictly decreasing list from 1.0"),
+            ([0.5, 1.0], "strictly decreasing list from 1.0"),
+            ([1.5, 0.5], "strictly decreasing list from 1.0"),
+            ([1.0, 0.0], "strictly decreasing list from 1.0"),
+            ([0.9, 0.5], "strictly decreasing list from 1.0"),  # the cold chain would sample at T = 1.11
         ):
             with self.subTest(betas=betas), self.assertRaises(ValidationError) as ctx:
                 self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": betas}}})

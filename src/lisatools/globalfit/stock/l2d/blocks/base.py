@@ -135,9 +135,11 @@ class TemperingSpec(_Spec):
         if clashing:
             raise ValueError(f"tempering.betas gives the ladder itself; leave out {clashing}.")
         betas = np.asarray(self.betas, dtype=float)
-        if betas.size == 0 or np.any(np.diff(betas) >= 0) or betas[0] > 1.0 or betas[-1] <= 0.0:
+        # * The cold chain samples the posterior: the ladder starts at beta 1, as the ratio and Tmax ladders do.
+        if betas.size == 0 or np.any(np.diff(betas) >= 0) or betas[0] != 1.0 or betas[-1] <= 0.0:
             raise ValueError(
-                f"tempering.betas {self.betas} must be a non-empty, strictly decreasing list in (0, 1]."
+                f"tempering.betas {self.betas} must be a strictly decreasing list from 1.0 (the cold chain), "
+                "positive to the end."
             )
         return self
 
