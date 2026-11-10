@@ -59,14 +59,16 @@ The move is opt-in.
   `GBMoveSettings.fstat_settings` holds the settings. The settings file lets the GB moves take turns, one
   `GFCombineMove` per GB move in a weighted step.
 - **L2D YAML:** the GB block's `extra_moves` lists the GB moves that take turns with its `pe_move`, each with its share
-  of the burn-in iterations and of the PE iterations; the `pe_move` takes the rest of each phase.
+  of the iterations of each recipe stage (`recipe.kwargs.stages`); the `pe_move` takes the rest of each stage. Every
+  stage's step holds one `GFCombineMove` per choice, each with the other blocks' PE moves.
 
 ```yaml
 extra_moves:
   fstat:                    # the move "gb fstat move"
     class: GBFStatRJMove
-    burn_in_weight: 0.3     # share of the burn-in iterations (left out: the same as weight; 0: none)
-    weight: 0.1             # share of the PE iterations
+    weight: 0.1             # share of the iterations of every stage not in stage_weights
+    stage_weights:          # stage name -> share of that stage (0: not in it); names must be recipe stages
+      burn-in: 0.3
     kwargs: {fstat_settings: {save_search_records: summary}}
 ```
 
