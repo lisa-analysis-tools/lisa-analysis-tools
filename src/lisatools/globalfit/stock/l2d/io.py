@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, PrivateAttr, field_validator, model_validator
 
 from typing import Annotated
 from pydantic import BeforeValidator, AfterValidator, ValidationInfo, Discriminator, Tag
@@ -344,12 +344,15 @@ class RecipeFile(_Section):
 
     file: RunPath
     function: str = "setup_recipe"
+    # whether the function takes the ``l2d`` RecipeContext (the blocks' moves and stage settings), read at load
+    _takes_l2d: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
     def _function_fits(self):
         from .build_recipe import load_recipe_function
 
-        load_recipe_function(self.file, self.function)
+        fn = load_recipe_function(self.file, self.function)
+        self._takes_l2d = "l2d" in inspect.signature(fn).parameters
         return self
 
 
@@ -486,8 +489,23 @@ class RunConfig(_Section):
     @model_validator(mode="after")
     def _block_stages_are_recipe_stages(self):
         """A block's ``stages`` keys, and the ``stage_weights`` keys of its ``extra_moves``, must be stages of the
-        stock recipe (a recipe file decides its own steps)."""
+        stock recipe.
+
+        A recipe file decides its own steps, so their names are checked once it has run
+        (``build_recipe.check_recipe_uses_the_blocks``); here, it must at least take ``l2d``, the only way it gets
+        the blocks' extra moves and stage settings.
+        """
         if not isinstance(self.recipe, StockRecipeSpec):
+            uses = sorted(
+                f"{name}.{key}" for name, block in self.blocks.items() if block.enabled
+                for key in ("stages", "extra_moves") if getattr(block, key, None)
+            )
+            if uses and not self.recipe._takes_l2d:
+                raise ValueError(
+                    f"{uses} are set, but the recipe function {self.recipe.function} takes no l2d argument, so it "
+                    "never gets them: add l2d to its parameters and build the steps from l2d.block_moves "
+                    "(build_recipe.JointPEMoves) and l2d.move_settings."
+                )
             return self
         from .build_recipe import make_stock_recipe  # local: build_recipe is the runtime side
 

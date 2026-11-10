@@ -67,9 +67,12 @@ class RecipeContext:
     td_ac: Any = None  # the shared CPU time-domain AnalysisContainer (data.keep_td), walker 0's residual
     # stage name -> {branch: apply_settings kwargs} from the blocks' ``stages`` (a recipe step's move_settings)
     move_settings: Callable[[str], dict[str, dict]] | None = None
+    # the moves block_moves built, for the check that the recipe's steps use them (check_recipe_uses_the_blocks)
+    built: dict[str, BranchMoves] | None = None
 
     def block_moves(self, engine_info, curr, acs, priors, state) -> dict[str, BranchMoves]:
-        return build_block_moves(self, engine_info, curr, acs, priors, state)
+        self.built = build_block_moves(self, engine_info, curr, acs, priors, state)
+        return self.built
 
 
 # --- the recipes --- #
@@ -559,12 +562,53 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
         ctx.wave_gens.update(prepare_gb_branches(cfg, waveform_classes, engine_info, curr, acs, priors, state))
         attach_flow_trainers(cfg, curr)
         spec = cfg.recipe
+        out = None
         if hasattr(spec, "file"):
             fn = load_recipe_function(spec.file, spec.function)
             extra = {"l2d": ctx} if "l2d" in inspect.signature(fn).parameters else {}
-            return fn(recipe, engine_info, curr, acs, priors, state, **extra)
-        make_stock_recipe(spec.class_name, spec.kwargs).add_steps(
-            recipe, ctx.block_moves(engine_info, curr, acs, priors, state), ctx.move_settings
-        )
+            out = fn(recipe, engine_info, curr, acs, priors, state, **extra)
+        else:
+            make_stock_recipe(spec.class_name, spec.kwargs).add_steps(
+                recipe, ctx.block_moves(engine_info, curr, acs, priors, state), ctx.move_settings
+            )
+        # * before the first iteration: what the blocks set must be used by the steps the recipe added
+        check_recipe_uses_the_blocks(recipe, cfg, ctx.built)
+        return out
 
     return setup_recipe
+
+
+def check_recipe_uses_the_blocks(recipe, cfg: RunConfig, built: dict[str, BranchMoves] | None) -> None:
+    """Raise when the recipe's steps leave out what the blocks set: a ``stages`` or ``stage_weights`` key that names
+    no step (its settings would never apply), or a built extra move in no step (it would never run).
+
+    The stock recipe passes by construction (its stage names are checked at load); a recipe file decides its own
+    steps, so this is where its use of the blocks is checked, after setup and before the first iteration.
+    """
+    from eryn.moves import CombineMove
+
+    steps = [step["name"] for step in recipe.recipe]
+    for name, block in enabled_blocks(cfg).items():
+        named = {"stages": set(getattr(block, "stages", None) or ())}
+        for key, spec in (getattr(block, "extra_moves", None) or {}).items():
+            named[f"extra_moves {key} stage_weights"] = set(spec.stage_weights)
+        for where, stages in named.items():
+            unknown = sorted(stages - set(steps))
+            if unknown:
+                raise ValueError(f"block {name!r}: {where} {unknown} name no recipe step {steps}.")
+
+    alternatives = {name: branch.alternatives for name, branch in (built or {}).items() if branch.alternatives}
+    wanted = [name for name, block in enabled_blocks(cfg).items() if getattr(block, "extra_moves", None)]
+    if built is None and wanted:
+        raise ValueError(f"blocks {wanted} set extra_moves, but the recipe never built the block moves (l2d.block_moves).")
+    used = set()
+    for step in recipe.recipe:
+        for move in step["adjust"].moves:
+            move = move[0] if isinstance(move, tuple) else move
+            used.add(id(move))
+            if isinstance(move, CombineMove):
+                used.update(id(sub) for sub in move.sub_moves)
+    for name, branch_alternatives in alternatives.items():
+        missing = [getattr(a.move, "name", repr(a.move)) for a in branch_alternatives if id(a.move) not in used]
+        if missing:
+            raise ValueError(f"block {name!r}: the extra moves {missing} are in no recipe step, so they would never run.")
