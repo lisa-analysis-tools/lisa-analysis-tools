@@ -4,11 +4,11 @@ from typing import Annotated
 
 from pydantic import Field
 
-from . import emri, galfor, mbh, psd
+from . import emri, galfor, mbh, psd, sobbh
 from .base import BlockBuild, BuildContext, SourceBlock
 
 BlockSpec = Annotated[
-    psd.PSDBlock | galfor.GalForBlock | mbh.MBHBlock | emri.EMRIBlock, Field(discriminator="type")
+    psd.PSDBlock | galfor.GalForBlock | mbh.MBHBlock | emri.EMRIBlock | sobbh.SOBBHBlock, Field(discriminator="type")
 ]
 # block type -> builder(block, ctx); the source blocks share SourceBlock.build_source
 BUILDERS: dict[str, callable] = {
@@ -16,4 +16,5 @@ BUILDERS: dict[str, callable] = {
     "galfor": galfor.build,
     "mbh": SourceBlock.build_source,
     "emri": SourceBlock.build_source,
+    "sobbh": SourceBlock.build_source,
 }

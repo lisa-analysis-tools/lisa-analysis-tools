@@ -205,6 +205,22 @@ class StockPrior(_Spec):
         return self                                                                                                                                   
                                                                                                                                                     
                                                                                                                                                     
+class ProposalPriorsSpec(_Spec):
+    """Per-leaf priors for the PE move only: ``factory`` of a stock prior class returns one prior per source,
+    indexed by source id (``data.source_ids``); leaf j gets the one of the j-th sorted source id."""
+    class_name: str = Field(alias="class")
+    factory: str = "per_source_prior_factory"
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _factory_and_kwargs(self):
+        method = getattr(prior_class(self.class_name), self.factory, None)
+        if not callable(method):
+            raise ValueError(f"{self.class_name} has no factory {self.factory!r}.")
+        check_kwargs(self.kwargs, method, ENGINE_PRIOR_KWARGS)
+        return self
+
+
 class PriorFile(_Spec):                                                                                                                               
     """A prior file for ``GFBasePrior.from_yaml``; relative paths are relative to the run folder."""                                                  
     file: RunPath
@@ -361,6 +377,8 @@ class SourceBlock(MoveBlock):
     LIKE_KWARGS_FROM_WAVEFORM_KWARGS: ClassVar[bool] = False  # the likelihood call takes the waveform kwargs too
     # default method of the block's waveform for the TD generator; None -> no TD generator unless td_waveform
     TD_WAVEFORM_METHOD: ClassVar[str | None] = None
+    # constructor arguments of the block's waveform that the builder fills (engine_waveform_kwargs)
+    ENGINE_WAVEFORM_KWARGS: ClassVar[frozenset[str]] = ENGINE_WAVEFORM_KWARGS
 
     nleaves: Literal["auto"] | PositiveInt = "auto"
     waveform: WaveformSpec
@@ -375,6 +393,21 @@ class SourceBlock(MoveBlock):
     time_reference: Literal["mojito", "data_start"] = "mojito"
     # recipe stage name -> the PE move's settings in that stage (special pe_moves only; see StageSpec)
     stages: dict[str, StageSpec] = Field(default_factory=dict)
+    # per-leaf priors for the PE move (the branch prior `priors` stays for the transform, seeding and sampler)
+    proposal_priors: ProposalPriorsSpec | None = None
+
+    @model_validator(mode="after")
+    def _proposal_priors_fit_the_leaves(self):
+        if self.proposal_priors is None:
+            return self
+        if self.nleaves != "auto":
+            raise ValueError("proposal_priors: the leaves are the source ids, so nleaves must be 'auto'.")
+        if self.search is not None and self.search.search_type == "prior":
+            raise ValueError(
+                "proposal_priors: a prior search draws from the branch prior, outside the per-leaf priors; "
+                "seed from a catalog or point_estimate search."
+            )
+        return self
 
     @model_validator(mode="after")
     def _stages_fit_the_moves(self):
@@ -407,6 +440,15 @@ class SourceBlock(MoveBlock):
         """The absolute SSB time (s) the block's waveforms are referenced to (``time_reference``)."""
         return ctx.cfg.data.reference_time if self.time_reference == "mojito" else ctx.general.data_t0
 
+    def engine_waveform_kwargs(self, ctx: BuildContext) -> dict[str, Any]:
+        """The builder-filled constructor arguments of the block's waveform (``ENGINE_WAVEFORM_KWARGS``).
+
+        Default: the shared set (:func:`engine_waveform_kwargs`). A block whose waveform takes other
+        arguments overrides this and ``ENGINE_WAVEFORM_KWARGS``; a separate ``td_waveform`` class always
+        gets the shared set.
+        """
+        return engine_waveform_kwargs(ctx, self)
+
     @model_validator(mode="after")
     def _flow_fits_the_moves(self):
         if self.flow is None:
@@ -428,7 +470,7 @@ class SourceBlock(MoveBlock):
     @model_validator(mode="after")
     def _classes_and_kwargs(self):
         cls = resolve_class(self.waveform.class_name, self.WAVEFORM_MODULES)
-        check_kwargs(self.waveform.kwargs, cls, ENGINE_WAVEFORM_KWARGS)
+        check_kwargs(self.waveform.kwargs, cls, self.ENGINE_WAVEFORM_KWARGS)
         for move in self.inner_moves or []:
             cls = resolve_class(move.class_name, MOVE_MODULES)
             if cls.__name__ in ("ConditionalFlowMove", "FlowGaussianMove"):
@@ -484,7 +526,7 @@ class SourceBlock(MoveBlock):
 
         info = self.parse_prior_information(g)
         nleaves = self.resolve_nleaves(ctx.cfg)
-        init_kwargs = {**deepcopy(self.waveform.kwargs), **engine_waveform_kwargs(ctx, self)}
+        init_kwargs = {**deepcopy(self.waveform.kwargs), **self.engine_waveform_kwargs(ctx)}
         waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
         # seeded branches: the engine builds their residuals from the state (GlobalFitSettings.rebuild_residuals)
         # through this generator; the same objects as the Settings', so the engine's deep copy keeps them together
@@ -611,9 +653,9 @@ TIME_REFERENCE_NAMES = {"mojito": "MOJITO_REFERENCE_TIME", "data_start": "data_s
 
 
 def waveform_metadata_config(init_kwargs: dict, time_reference: str) -> dict:
-    """What SourceMetadata records: no live objects, CPU backend (as the settings files did), and what
-    ``waveform_t0`` is (the sampled times and phases are referenced to it)."""
-    config = {k: v for k, v in init_kwargs.items() if k not in ("data_td_settings", "orbits")}
+    """What SourceMetadata records: no live objects (data/STFT settings, orbits), CPU backend (as the settings
+    files did), and what ``waveform_t0`` is (the sampled times and phases are referenced to it)."""
+    config = {k: v for k, v in init_kwargs.items() if k not in ("data_td_settings", "settings", "orbits")}
     config["force_backend"] = "cpu"
     config["time_reference"] = TIME_REFERENCE_NAMES[time_reference]
     return config
@@ -719,6 +761,25 @@ def make_priors(block: BlockBase, general) -> GFBasePrior:
             block.links.prior_model_config_file = str(block.priors.output_file)
 
     return prior_cls
+
+def make_proposal_priors(block: SourceBlock, cfg, branch_prior) -> list:
+    """The PE move's per-leaf priors (``block.proposal_priors``): leaf j gets the factory's prior for the j-th
+    sorted source id, the order the catalogue seeds the leaves in."""
+    spec = block.proposal_priors
+    tiles = getattr(prior_class(spec.class_name), spec.factory)(**deepcopy(spec.kwargs))
+    ids = sorted(cfg.data.source_ids[block.SOURCE_IDS_KEY])
+    missing = [i for i in ids if i >= len(tiles)]
+    if missing:
+        raise ValueError(f"proposal_priors: {spec.factory} gives {len(tiles)} priors, none for source ids {missing}.")
+    basis = branch_prior.get_input_basis()
+    leaf_priors = [tiles[i] for i in ids]
+    for i, prior in zip(ids, leaf_priors):
+        if prior.get_input_basis() != basis:
+            raise ValueError(
+                f"proposal_priors: the prior of source {i} samples {prior.get_input_basis()}, the branch prior {basis}."
+            )
+    return leaf_priors
+
 
 def source_metadata(block: SourceBlock, init_kwargs: dict, general):
     from lisatools.globalfit.postprocessing import SourceMetadata

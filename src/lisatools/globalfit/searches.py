@@ -859,14 +859,15 @@ def sobhb_catalogue_to_gwtf_basis(catalogue_entry: dict, delta_t: float = 0.0) -
     ``[m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec]``, the output basis of
     erebor-priors ``SOBHBPrior``. Masses are reordered so that ``m1 >= m2`` (spins follow);
     the catalogue ``GW22FrequencySSBFrame`` is evolved by ``delta_t`` seconds (reference epoch ->
-    data start) with :func:`~lisatools.sources.utils.evolve_sobhb`; ``phi_coal`` is the gwtf coalescence phase of the
-    catalogue ``TrueAnomaly`` (:func:`~lisatools.sources.utils.sobhb_coalescence_phase` + ``SOBHB_GWTF_PHASE_OFFSET``).
+    data start) with :func:`~lisatools.sources.utils.evolve_sobhb`; ``phi_coal`` is the coalescence phase of the
+    catalogue ``TrueAnomaly`` (:func:`~lisatools.sources.utils.sobhb_coalescence_phase`, mojito / TD convention;
+    ``GWTF_generator`` applies its own strain-sign offset).
 
     Args:
         catalogue_entry: catalogue parameters of one SOBHB source.
         delta_t: time (s) from the catalogue reference epoch to the data start (gwtf t=0).
     """
-    from ..sources.utils import SOBHB_GWTF_PHASE_OFFSET, evolve_sobhb, sobhb_coalescence_phase
+    from ..sources.utils import evolve_sobhb, sobhb_coalescence_phase
 
     m1 = float(catalogue_entry["PrimaryMassSSBFrame"])
     m2 = float(catalogue_entry["SecondaryMassSSBFrame"])
@@ -881,7 +882,6 @@ def sobhb_catalogue_to_gwtf_basis(catalogue_entry: dict, delta_t: float = 0.0) -
     f0 = evolve_sobhb(0.0, delta_t, m1, m2, s1, s2, f_ref) if delta_t != 0.0 else f_ref
 
     phi_coal = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, float(catalogue_entry["TrueAnomaly"]))
-    phi_coal = (phi_coal + SOBHB_GWTF_PHASE_OFFSET) % (2 * np.pi)
 
     psi = float(catalogue_entry["PolarisationAngle"]) % (2 * np.pi)
     ra = float(catalogue_entry["RightAscension"]) % (2 * np.pi)
@@ -940,7 +940,7 @@ class SOBHBSearchInterface(BaseSearchInterface):
         ``m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec``.
 
         ``phi_coal`` is the gwtf coalescence phase mapped from the catalogue ``TrueAnomaly`` (orbital
-        phase where ``f == GW22FrequencySSBFrame``), including the gwtf strain-sign offset.
+        phase where ``f == GW22FrequencySSBFrame``), in the mojito / TD convention.
         """
         delta_t = 0.0
         if self.evolve_to_data_start:

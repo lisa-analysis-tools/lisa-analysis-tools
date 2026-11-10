@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 import numpy as np
 
-from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock
+from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock, make_proposal_priors
 from .blocks.utility import check_kwargs, find_class
 from .generators import SignalGen
 
@@ -319,6 +319,9 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     betas = np.asarray(info.betas, dtype=float)
     wave_gen = ctx.wave_gens[name]
     kwargs = deepcopy(block.pe_move.kwargs)
+    if block.proposal_priors is not None:
+        # this branch's move proposes under per-leaf priors; the sampler and the other branches keep the shared dict
+        priors = {**priors, name: make_proposal_priors(block, ctx.cfg, priors[name])}
 
     if is_generic(block):
         # the builder reads the rest from curr.source_info

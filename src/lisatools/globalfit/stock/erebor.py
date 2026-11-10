@@ -1294,7 +1294,7 @@ class SOBBHTFSettings(Settings):
     branch_name: str = "sobbh"
     Mc_lims: typing.List[float] = dataclasses.field(default_factory=list)
     f0_lims: typing.List[float] = dataclasses.field(default_factory=list)
-    # GWTF_generator.get_signal_for_residuals takes no kwargs, and
+    # GWTF_generator.get_signals_for_residuals takes no kwargs, and
     # subtract_initial_signal splats these into it -> must stay a (empty) dict.
     waveform_kwargs: dict = dataclasses.field(default_factory=dict)
     injection: Optional[np.ndarray] = None
@@ -1302,6 +1302,7 @@ class SOBBHTFSettings(Settings):
     betas: Optional[np.ndarray] = None
     inner_moves: Optional[typing.List[Move]] = None
     num_prop_repeats: Optional[int] = 10
+    search_interface: Optional[SOBHBSearchInterface] = None
 
 
 class SOBBHTFSetup(Setup):

@@ -369,6 +369,13 @@ class GeneralSetup(Setup, GeneralSettings):
                 psd_params=np.array([15e-12, 3e-15]),
                 galfor_params=None,
             )
+        else:
+            # the sensitivity backend slices these as arrays (psd_params[..., :n]); a YAML config gives lists
+            self.fixed_psd_kwargs = {
+                key: np.asarray(value, dtype=float) if key in ("psd_params", "galfor_params") and value is not None
+                else value
+                for key, value in self.fixed_psd_kwargs.items()
+            }
 
         self.logger.info(f"Using fixed PSD kwargs: {self.fixed_psd_kwargs}")
 
