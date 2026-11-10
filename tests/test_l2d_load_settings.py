@@ -29,6 +29,8 @@ from lisatools.globalfit.preprocessing import BaseProcessingStep, L1ProcessingSt
 from lisatools.globalfit.stock.l2d import load_settings
 from lisatools.globalfit.stock.l2d.io import RunConfig
 from lisatools.globalfit.stock.l2d.load_settings import load_general_setup, make_general_settings
+
+from tests.test_l2d_io import stand_in_jax_gpu_pin
 from lisatools.sensitivity import CompositeSensitivityBackend, XYZSensitivityBackend
 from lisatools.utils.constants import YRSID_SI
 
@@ -117,6 +119,7 @@ def run_1_raw(**changes):
 
 class _Config(unittest.TestCase):
     def setUp(self):
+        stand_in_jax_gpu_pin(self)  # the fixture is a cuda12x run on gpus [0]
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.run_dir = Path(tmp.name)

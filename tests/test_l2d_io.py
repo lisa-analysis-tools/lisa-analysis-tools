@@ -12,13 +12,19 @@ import typing as _typing
 
 _builtins.typing = _typing
 
+import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
+from lisatools.globalfit.stock.l2d import io as l2d_io
 from lisatools.globalfit.stock.l2d.io import Duration, RunConfig, load_run, read_yaml
 from lisatools.utils.constants import YRSID_SI
 
@@ -54,7 +60,22 @@ def error_keys(exc: ValidationError):
     return [(err["type"], ".".join(map(str, err["loc"]))) for err in exc.errors()]
 
 
+def stand_in_jax_gpu_pin(test: unittest.TestCase) -> None:
+    """For the test's duration, ComputeSection's JAX GPU pin sees exactly the GPUs a config asks for.
+
+    The pin is process-wide and first-come (``io._jax_gpus``): in a test process where JAX already started on other
+    cards, every config naming GPUs would fail, whatever it tests. Config tests use this stand-in; the pin itself is
+    tested in fresh processes (``ComputeGpuPinTest``).
+    """
+    patcher = mock.patch.object(l2d_io, "_jax_gpus", lambda gpus: list(gpus))
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class _RunFolder(unittest.TestCase):
+    def setUp(self):
+        stand_in_jax_gpu_pin(self)
+
     def make_run(self, global_text=None, blocks=None, blocks_dir=True):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -605,6 +626,52 @@ class SnapshotTest(_RunFolder):
         d = self.make_run(blocks_dir=False)
         (d / "run.yaml").write_text(global_yaml())
         self.assertEqual(load_run(d / "run.yaml").run.output_dir, d / "out")
+
+
+def _gpu_count() -> int:
+    try:
+        import cupy
+
+        return cupy.cuda.runtime.getDeviceCount()
+    except Exception:  # noqa: BLE001 -- no cupy / no driver / no GPU
+        return 0
+
+
+class ComputeGpuPinTest(unittest.TestCase):
+    """``ComputeSection`` pins JAX to ``gpus`` (``io._jax_gpus``). The pin is process-wide and first-come, so each
+    case runs in a fresh interpreter."""
+
+    def run_python(self, code: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(code)], capture_output=True, text=True, env=dict(os.environ),
+            timeout=600,
+        )
+
+    @unittest.skipUnless(_gpu_count() >= 1, "needs a GPU")
+    def test_a_fresh_process_is_pinned_to_the_run_gpus(self):
+        out = self.run_python("""
+            import jax
+            from lisatools.globalfit.stock.l2d.io import ComputeSection
+            ComputeSection(gpus=[0], backend="cuda12x")
+            print(len(jax.devices("gpu")))
+        """)
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "1")  # JAX sees (and preallocates on) gpus only
+
+    @unittest.skipUnless(_gpu_count() >= 2, "needs 2 GPUs")
+    def test_jax_started_on_other_gpus_is_refused(self):
+        out = self.run_python("""
+            import jax
+            jax.devices("gpu")  # JAX starts on every visible card before the config is read
+            from pydantic import ValidationError
+            from lisatools.globalfit.stock.l2d.io import ComputeSection
+            try:
+                ComputeSection(gpus=[0], backend="cuda12x")
+            except ValidationError as err:
+                print("REFUSED", "does not match the GPUs JAX sees" in str(err))
+        """)
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "REFUSED True")
 
 
 if __name__ == "__main__":

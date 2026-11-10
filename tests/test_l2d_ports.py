@@ -41,6 +41,7 @@ from lisatools.globalfit.stock.l2d.io import load_run
 from lisatools.globalfit.stock.l2d.load_settings import build_curr_info
 from lisatools.utils.constants import YRSID_SI
 
+from tests.test_l2d_io import stand_in_jax_gpu_pin
 from tests.test_l2d_load_settings import FakeL1
 from tests.test_l2d_run import fake_mpi4py, load_script
 from tests.test_l2d_sources import EMRI_WAVEFORM_MODULE, MBH_CATALOGUE_ENTRY, make_fake_emri_waveform_module
@@ -134,6 +135,7 @@ class FakeL1WithCatalogue(FakeL1):
 
 class _Port(unittest.TestCase):
     def setUp(self):
+        stand_in_jax_gpu_pin(self)  # the folders are written for GPUs (compute.gpus); on_cpu copies switch to cpu
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)

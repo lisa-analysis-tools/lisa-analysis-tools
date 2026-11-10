@@ -100,16 +100,25 @@ class ComputeSection(_Section):
     @model_validator(mode="after")
     def _validate_gpus(self):
         if self.gpus is not None:
-            import jax
-            jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in self.gpus))
-
-            visible = _keeping_current_device(lambda: jax.devices("gpu"))
+            visible = _jax_gpus(self.gpus)
             if len(self.gpus) != len(visible):
                 raise ValueError(
                     f"gpus {self.gpus} does not match the GPUs JAX sees: {visible}. "
                     "Check CUDA_VISIBLE_DEVICES or jax_cuda_visible_devices."
                 )
         return self
+
+
+def _jax_gpus(gpus: list[int]) -> list:
+    """Pin JAX to ``gpus`` and return the GPU devices it then sees.
+
+    The pin is process-wide and takes effect only before JAX starts its GPU backend: afterwards JAX keeps the
+    devices it started with (e.g. every card, each with its memory preallocated), which the count check reports.
+    """
+    import jax
+
+    jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in gpus))
+    return _keeping_current_device(lambda: jax.devices("gpu"))
 
 
 def _keeping_current_device(call):
