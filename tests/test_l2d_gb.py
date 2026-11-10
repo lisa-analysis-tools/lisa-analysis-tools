@@ -77,6 +77,8 @@ def gb_raw(block_changes=None, **data_changes):
     block = {"type": "gb", "priors": {"class": "mojitolight.GBPrior"}, **(block_changes or {})}
     raw = cpu_raw({"gb": block})
     raw["domain"] = dict(STFT_DOMAIN)
+    # * A small grid of 2 h segments: the auto taper (1/min_freq = 10000 s) would not fit one, so taper 1 h of each.
+    raw["window"] = {**raw.get("window", {}), "taper_duration": "1 h"}
     raw["data"] = {**raw["data"], "source_types": ["noise", "gb"], **data_changes}
     return raw
 

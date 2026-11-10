@@ -257,6 +257,12 @@ WindowType = Literal[
 ]
 
 
+# The fraction of its span a window's taper may take, for the types that read alpha = taper / span as a taper
+# (utility.windowfun): tukey asserts 0 < alpha < 1, planck tapers both ends by alpha. The others ignore it or read it
+# as a shape parameter (kaiser's beta).
+WINDOW_TAPER_LIMITS = {"tukey": 1.0, "planck": 0.5}
+
+
 class WindowSection(_Section):
     type: WindowType = "tukey"
     taper_duration: Literal["auto"] | Duration = "auto"  # auto -> 1/domain.min_freq (builder)
@@ -387,6 +393,38 @@ class RunConfig(_Section):
                 raise ValueError(
                     f"window.normalize has no effect: {self.sensitivity.class_name} takes no window_values."
                 )
+        return self
+
+    @property
+    def taper_duration(self) -> float:
+        """The window taper in seconds: ``window.taper_duration``, or ``1 / domain.min_freq`` when ``auto``."""
+        taper = self.window.taper_duration
+        return 1.0 / self.domain.min_freq if taper == "auto" else float(taper)
+
+    @model_validator(mode="after")
+    def _window_fits_the_domain(self):
+        """The taper must fit the span the window covers (GeneralSetup: alpha = taper / span).
+
+        STFT: the span is one segment, a whole number of data.dt steps, so the check is exact. FD: the span is the
+        preprocessed data, at most data.Tobs (trimming shortens it), so only taper < limit * Tobs is checked here.
+        """
+        if self.domain.type == "stft":
+            steps = self.domain.segment_duration / self.data.dt
+            if abs(steps - round(steps)) > 1e-10 * steps:
+                raise ValueError(
+                    f"domain.segment_duration ({self.domain.segment_duration} s) must be a whole number of "
+                    f"data.dt ({self.data.dt} s)."
+                )
+            span, what = float(self.domain.segment_duration), "an stft segment"
+        else:
+            span, what = float(self.data.Tobs), "the data (data.Tobs)"
+        limit = WINDOW_TAPER_LIMITS.get(self.window.type)
+        if limit is not None and not self.taper_duration < limit * span:
+            source = "auto = 1/domain.min_freq" if self.window.taper_duration == "auto" else "window.taper_duration"
+            raise ValueError(
+                f"the {self.window.type} taper ({source} = {self.taper_duration:g} s) must be below {limit:g} of "
+                f"{what} ({span:g} s): lengthen the segment or give a shorter window.taper_duration."
+            )
         return self
 
     @model_validator(mode="after")

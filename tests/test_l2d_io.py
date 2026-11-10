@@ -339,6 +339,33 @@ class WindowTest(_RunFolder):
             error_keys(ctx.exception),
         )
 
+    STFT_2H = "{type: stft, min_freq: 1e-4, max_freq: 2.9e-2, segment_duration: 2 h}"
+
+    def test_taper_must_fit_an_stft_segment(self):
+        # * auto = 1/min_freq = 10000 s does not fit a 7200 s segment (tukey alpha 1.39 asserted in GeneralSetup)
+        self.assertLoadError("value_error", "", msg="must be below 1 of an stft segment", domain=self.STFT_2H)
+        cfg = self.load(domain=self.STFT_2H, window="{taper_duration: 1 h}")
+        self.assertEqual(cfg.taper_duration, 3600.0)
+        self.assertEqual(self.load(domain=self.STFT_2H.replace("2 h", "1 day")).taper_duration, 1e4)  # auto
+        # * planck tapers both ends by alpha, so at most half a segment
+        self.assertLoadError(
+            "value_error", "", msg="must be below 0.5 of an stft segment",
+            domain=self.STFT_2H, window="{type: planck, taper_duration: 1 h}",
+        )
+        # * kaiser reads alpha as its shape, not a taper: no limit
+        self.load(domain=self.STFT_2H, window="{type: kaiser}")
+
+    def test_segment_is_a_whole_number_of_samples(self):
+        self.assertLoadError(
+            "value_error", "", msg="whole number of data.dt",
+            domain="{type: stft, min_freq: 1e-4, max_freq: 2.9e-2, segment_duration: 86402.5}",
+        )
+
+    def test_taper_must_fit_the_fd_data(self):
+        self.assertLoadError(
+            "value_error", "", msg="must be below 1 of the data (data.Tobs)", window="{taper_duration: 3e7}"  # > 9 months
+        )
+
     def test_normalize_needs_a_backend_taking_window_values(self):
         cfg = self.load(window="{normalize: true}", sensitivity="{class: XYZSensitivityBackend}")
         self.assertTrue(cfg.window.normalize)
