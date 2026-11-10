@@ -30,6 +30,9 @@ from lisatools.globalfit.stock.l2d.load_settings import load_blocks, load_genera
 from tests.test_l2d_load_settings import FakeL1, run_1_raw
 
 NOISE_PRIOR = {"class": "mojitolight.stochastic.NoisePrior", "kwargs": {"model_type": "parametric-symmetric"}}
+# The Mojito-light noise levels in the NoisePrior sampling basis (log10 of S_oms = 15e-12 and S_tm = 3e-15)
+LOG_S_OMS, LOG_S_TM = float(np.log10(15e-12)), float(np.log10(3e-15))
+PSD_INJECTION = {"logS_oms": LOG_S_OMS, "logS_tm": LOG_S_TM}
 
 
 def cpu_raw(blocks=None):
@@ -102,13 +105,13 @@ class PSDSchemaTest(_Blocks):
             priors=NOISE_PRIOR,
             enabled=False,
             num_prop_repeats=500,
-            injection={"S_oms": 15e-12, "S_tm": 3e-15},
+            injection=dict(PSD_INJECTION),
             tempering={"ntemps": 3, "ratio": 1.5},
             search={"search_type": "prior", "spread": [1e-4, 1e-3]},
         )
         self.assertFalse(block.enabled)
         self.assertEqual(block.num_prop_repeats, 500)
-        self.assertEqual(block.injection, {"S_oms": 15e-12, "S_tm": 3e-15})
+        self.assertEqual(block.injection, PSD_INJECTION)
         self.assertEqual((block.tempering.ntemps, block.tempering.ratio), (3, 1.5))
         self.assertEqual(block.search.search_type, "prior")
         self.assertEqual(block.search.spread, [1e-4, 1e-3])
@@ -229,7 +232,7 @@ class PSDBuildTest(_Built):
     def test_setup_and_settings(self):
         from lisatools.globalfit.stock.erebor import PSDSetup  # imported here: schema tests don't need it
 
-        cfg, built = self.build(priors=NOISE_PRIOR, num_prop_repeats=500, injection={"S_oms": 15e-12, "S_tm": 3e-15})
+        cfg, built = self.build(priors=NOISE_PRIOR, num_prop_repeats=500, injection=dict(PSD_INJECTION))
         build = built["psd"]
         setup = build.setup
         self.assertIsInstance(setup, PSDSetup)
@@ -245,16 +248,16 @@ class PSDBuildTest(_Built):
         priors = built["psd"].setup.priors
         self.assertEqual(list(priors), ["psd"])
         self.assertIsInstance(priors["psd"], GFBasePrior)
-        self.assertEqual(priors["psd"].get_input_basis(), ["S_oms", "S_tm"])
+        self.assertEqual(priors["psd"].get_input_basis(), ["logS_oms", "logS_tm"])
 
     def test_injection_follows_the_prior_basis(self):
         # Given in the "wrong" order on purpose: the array is ordered by the prior basis.
-        _, built = self.build(priors=NOISE_PRIOR, injection={"S_tm": 3e-15, "S_oms": 15e-12})
-        np.testing.assert_array_equal(built["psd"].setup.injection, [15e-12, 3e-15])
+        _, built = self.build(priors=NOISE_PRIOR, injection={"logS_tm": LOG_S_TM, "logS_oms": LOG_S_OMS})
+        np.testing.assert_array_equal(built["psd"].setup.injection, [LOG_S_OMS, LOG_S_TM])
 
     def test_injection_keys_must_match_the_basis(self):
         with self.assertRaisesRegex(ValueError, "do not match prior basis"):
-            self.build(priors=NOISE_PRIOR, injection={"S_oms": 15e-12})
+            self.build(priors=NOISE_PRIOR, injection={"logS_oms": LOG_S_OMS})
 
     def test_no_injection(self):
         _, built = self.build(priors=NOISE_PRIOR)
@@ -307,7 +310,7 @@ class PSDBuildTest(_Built):
         self.assertTrue(out.is_file())
         self.assertEqual(built["psd"].metadata.prior_model_config_file, str(out))
         reloaded = GFBasePrior.from_yaml(str(out))
-        self.assertEqual(reloaded.get_input_basis(), ["S_oms", "S_tm"])
+        self.assertEqual(reloaded.get_input_basis(), ["logS_oms", "logS_tm"])
 
     def test_prior_files_are_not_supported_yet(self):
         # TODO(l2d): from_yaml returns a bare GFBasePrior without transforms; fail clearly until it is done.
@@ -331,11 +334,11 @@ class PSDBuildTest(_Built):
 class PSDSearchSchemaTest(_Blocks):
     """``search:`` is the arguments of the branch's search interface; the interface's own rules hold at load."""
 
-    POINT = {"search_type": "point_estimate", "spread": [1e-13, 1e-16]}
+    POINT = {"search_type": "point_estimate", "spread": [1e-3, 1e-3]}  # spread in the sampling basis (log10)
 
     def point_file(self, name="psd_point.npy"):
         path = self.run_dir / name
-        np.save(path, np.array([1.5e-11, 3e-15]))
+        np.save(path, np.array([1.5e-11, 3e-15]))  # a point file holds physical values
         return path
 
     def test_no_search_by_default(self):
@@ -345,7 +348,7 @@ class PSDSearchSchemaTest(_Blocks):
         path = self.point_file()
         search = self.psd(priors=NOISE_PRIOR, search={**self.POINT, "search_path": str(path)}).search
         self.assertEqual(search.search_type, "point_estimate")
-        self.assertEqual(search.spread, [1e-13, 1e-16])
+        self.assertEqual(search.spread, [1e-3, 1e-3])
         self.assertEqual(search.parameters_searched, "all")
         self.assertFalse(search.is_eryn_backend)
         self.psd(priors=NOISE_PRIOR, search={"search_type": "prior"})
@@ -396,12 +399,12 @@ class PSDSearchSchemaTest(_Blocks):
 
 
 class PSDSearchBuildTest(_Built):
-    POINT = (1.5e-11, 3e-15)
+    POINT = (1.5e-11, 3e-15)  # physical S_oms, S_tm: the interface brings a point file to the sampling basis (log10)
 
     def point_search(self, **extra):
         path = self.run_dir / "psd_point_build.npy"
         np.save(path, np.array(self.POINT))
-        return {"search_type": "point_estimate", "search_path": str(path), "spread": [1e-13, 1e-16], **extra}
+        return {"search_type": "point_estimate", "search_path": str(path), "spread": [1e-3, 1e-3], **extra}
 
     def test_no_search_means_a_prior_interface(self):
         # load_info seeds through the interfaces: without `search:` psd starts on, from prior draws
@@ -422,10 +425,10 @@ class PSDSearchBuildTest(_Built):
         self.assertIs(iface.transform, setup.transform)
         self.assertEqual(iface.search_type, "point_estimate")
         self.assertEqual(iface.search_path, str(self.run_dir / "psd_point_build.npy"))
-        np.testing.assert_array_equal(iface.spread, [1e-13, 1e-16])
+        np.testing.assert_array_equal(iface.spread, [1e-3, 1e-3])
         np.testing.assert_array_equal(iface.parameters_searched, np.arange(2))  # "all": every sampling-basis column
         self.assertIsNone(iface.periodic)  # the noise prior has none
-        self.assertEqual(iface.sampling_basis, ["S_oms", "S_tm"])
+        self.assertEqual(iface.sampling_basis, ["logS_oms", "logS_tm"])
 
     def test_eryn_backend_flag_reaches_the_interface(self):
         path = self.run_dir / "psd_point_build.npy"
@@ -437,7 +440,7 @@ class PSDSearchBuildTest(_Built):
                 self.assertEqual(built["psd"].setup.search_interface.is_eryn_backend, flag)
 
     def test_parameters_searched(self):
-        _, built = self.build(priors=NOISE_PRIOR, search=self.point_search(parameters_searched=["S_tm"]))
+        _, built = self.build(priors=NOISE_PRIOR, search=self.point_search(parameters_searched=["logS_tm"]))
         np.testing.assert_array_equal(built["psd"].setup.search_interface.parameters_searched, [1])
 
     def test_unknown_parameter_searched(self):
@@ -462,8 +465,7 @@ class PSDSearchBuildTest(_Built):
         flat = draws.reshape(-1, 2)
         self.assertTrue(np.isfinite(setup.priors["psd"].logpdf(flat)).all())
         # hotter chains are scattered wider (covariance / beta), but all stay near the point
-        self.assertTrue(np.all(np.abs(flat[:, 0] - self.POINT[0]) < 2e-12))
-        self.assertTrue(np.all(np.abs(flat[:, 1] - self.POINT[1]) < 2e-15))
+        self.assertTrue(np.all(np.abs(flat - np.log10(self.POINT)) < 2e-2))  # around log10(POINT); 1e-3 spread, wider by 1/sqrt(beta)
 
 
 class ReferenceEquivalenceTest(_Built):
@@ -484,7 +486,7 @@ class ReferenceEquivalenceTest(_Built):
         settings = PSDSettings(
             Tobs=g.Tobs, dt=g.dt, initialize_kwargs={}, log_dir=g.artifacts_file_dir,
             priors={"psd": ProbDistContainer(priors_psd)}, ndim=2,
-            injection=np.array([15e-12, 3e-15]), num_prop_repeats=500,
+            injection=np.array([LOG_S_OMS, LOG_S_TM]), num_prop_repeats=500,  # log10, as the settings files
         )
         metadata = StochasticMetadata(
             model_config=dict(use_splines=False, num_params=2),
@@ -497,7 +499,7 @@ class ReferenceEquivalenceTest(_Built):
 
     def block(self):
         _, built = self.build(
-            priors=NOISE_PRIOR, num_prop_repeats=500, injection={"S_oms": 15e-12, "S_tm": 3e-15}
+            priors=NOISE_PRIOR, num_prop_repeats=500, injection=dict(PSD_INJECTION)
         )
         return built["psd"]
 

@@ -559,7 +559,7 @@ class SnapshotTest(_RunFolder):
             "enabled: false\n"
             "num_prop_repeats: 10\n"
             "tempering: {ntemps: 3, ratio: 1.5}\n"
-            "injection: {S_oms: 1.5e-11, S_tm: 3e-15}\n"
+            "injection: {logS_oms: -10.823908740944319, logS_tm: -14.522878745280337}\n"
             "search: {search_type: prior, spread: [1e-4, 1e-3]}\n"
             "priors: {class: mojitolight.stochastic.NoisePrior, kwargs: {model_type: parametric-symmetric}}\n"
         )

@@ -1,6 +1,6 @@
 type: psd
 priors: {class: mojitolight.NoisePrior, output_file: psd_prior.yaml, kwargs: {model_type: parametric-symmetric}}
 num_prop_repeats: 200
-injection: {S_oms: 15e-12, S_tm: 3e-15}
+injection: {logS_oms: -10.823908740944319, logS_tm: -14.522878745280337}  # log10 of the Mojito-light S_oms = 15e-12, S_tm = 3e-15 (the prior basis); for the plots only
 links:
   prior_model_code_link: "TODO"
