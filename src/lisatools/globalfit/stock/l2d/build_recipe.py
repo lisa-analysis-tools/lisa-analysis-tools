@@ -4,8 +4,9 @@
 ``(recipe, engine_info, curr, acs, priors, state)``). By then the engine has seeded the state through the
 blocks' search interfaces (``load_info``, fresh starts only) and built the residuals from it through each
 seeded branch's ``Settings.signal_gen`` (``setup_acs``, ``GlobalFitSettings.rebuild_residuals``). The library
-sets the per-leaf ladders, attaches the generators and starts the flow trainers; then a stock recipe, or the
-run's own recipe file, adds the steps. Heavy imports stay inside functions: ``io.py`` imports this module to validate ``recipe:``.
+sets the per-leaf ladders, attaches the generators, sets up the GB band machinery (which subtracts the GB start
+sources itself) and starts the flow trainers; then a stock recipe, or the run's own recipe file, adds the
+steps. Heavy imports stay inside functions: ``io.py`` imports this module to validate ``recipe:``.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 import numpy as np
 
 from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock, make_proposal_priors
+from .blocks.gb import GBBlock, gb_move_kwargs
 from .blocks.utility import check_kwargs, find_class
 from .generators import SignalGen
 
@@ -32,9 +34,20 @@ if TYPE_CHECKING:
 SETUP_ARGS = ("recipe", "engine_info", "curr", "acs", "priors", "state")
 
 logger = init_logger(__name__, level="DEBUG", name="RecipeBuilder")
+
+class Alternative(NamedTuple):
+    """One of a branch's PE moves that take turns, with its shares of the PE and the burn-in iterations."""
+
+    move: Any
+    weight: float
+    burn_in_weight: float
+
+
 class BranchMoves(NamedTuple):
     search: list  # one-shot moves run before PE (the psd max-likelihood search)
     pe: list
+    # PE moves that take (random) turns as the branch's PE move, one per iteration; None: pe runs every iteration
+    alternatives: list[Alternative] | None = None
 
 
 @dataclass
@@ -121,6 +134,53 @@ class StockRecipe:
         if search:
             logger.info("Adding psd search")
             recipe.add_recipe_component(SearchRecipeStep(moves=search), name="psd search")
+        #from here
+        alternating = [name for name, branch in moves.items() if branch.alternatives]
+        if not alternating:
+            combined = GFCombineMove(moves=pe, share_temperature_control=False)
+            if self.burn_in_iterations is not None:
+                recipe.add_recipe_component(
+                    IterationCountRecipeStep(moves=[combined], num_iters=self.burn_in_iterations), name="burn-in"
+                )
+            logger.info("Adding joint PE")
+            recipe.add_recipe_component(PERecipeStep(moves=[combined]), name="pe")
+            return
+
+        # * A GFCombineMove runs every move it holds, so a branch whose PE moves take turns gets one combined move per
+        # * alternative, each with every other branch's PE moves in the usual order. Each step picks one per iteration
+        # * with the alternatives' shares of its phase; an alternative without a share in a phase is left out of it.
+        #! Coen: "this should be updated in the future, now keeping same behaviour as previously."
+        if len(alternating) > 1:
+            raise ValueError(f"only one block may alternate its PE moves, not {alternating}.")
+        name = alternating[0]
+        alternatives = moves[name].alternatives
+        combined = []
+        for alternative in alternatives:
+            listed = [m for other, branch in moves.items() for m in ([alternative.move] if other == name else branch.pe)]
+            combined.append(GFCombineMove(moves=listed, share_temperature_control=False))
+
+        def phase(share: str) -> tuple[list, list]:
+            kept = [index for index, alternative in enumerate(alternatives) if getattr(alternative, share) > 0.0]
+            return [combined[index] for index in kept], [getattr(alternatives[index], share) for index in kept]
+
+        if self.burn_in_iterations is not None:
+            burn_in_moves, burn_in_weights = phase("burn_in_weight")
+            logger.info(f"Adding burn-in, the {name} PE moves taking turns with weights {burn_in_weights}")
+            recipe.add_recipe_component(
+                IterationCountRecipeStep(
+                    moves=burn_in_moves, weights=burn_in_weights, num_iters=self.burn_in_iterations
+                ),
+                name="burn-in",
+            )
+        elif any(alternative.weight == 0.0 for alternative in alternatives):
+            raise ValueError(
+                f"a {name} PE move has a share of the burn-in only, but the recipe has no burn-in step "
+                "(burn_in_iterations)."
+            )
+        pe_moves, pe_weights = phase("weight")
+        logger.info(f"Adding joint PE, the {name} PE moves taking turns with weights {pe_weights}")
+        recipe.add_recipe_component(PERecipeStep(moves=pe_moves, weights=pe_weights), name="pe")
+        #to here
         combined = GFCombineMove(moves=pe, share_temperature_control=False)
         for stage in self.stages:
             name, iterations = stage["name"], stage["iterations"]
@@ -131,6 +191,7 @@ class StockRecipe:
                 step = IterationCountRecipeStep(moves=[combined], num_iters=iterations, move_settings=settings)
             logger.info(f"Adding joint PE stage {name!r}" + ("" if iterations is None else f" ({iterations} iterations)"))
             recipe.add_recipe_component(step, name=name)
+         # to here
 
 
 STOCK_RECIPES: dict[str, type] = {"StockRecipe": StockRecipe}
@@ -264,6 +325,25 @@ def subtract_td_signals(td_ac, td_signal_gens: dict, state) -> None:
         logger.info(f"Subtracted {int(inds.sum())} {name} signals from the TD residual")
 
 
+def prepare_gb_branches(
+    cfg: RunConfig, waveform_classes: dict[str, type], engine_info, curr, acs, priors, state
+) -> dict[str, Any]:
+    """The band machinery of each seeded GB branch (``recipe.prepare_gb_moves``), which ``gb_moves`` runs on.
+
+    GBGPU has no per-source ``Settings.signal_gen``, so ``setup_acs`` leaves the GB start sources in the
+    residuals: ``prepare_gb_moves`` subtracts them with the band likelihood engine and sets the band temperatures.
+    """
+    from lisatools.globalfit.recipe import prepare_gb_moves
+
+    gb_parts = {}
+    for name, block in enabled_blocks(cfg).items():
+        if isinstance(block, GBBlock) and block.search is not None:  # unseeded: no moves, no machinery
+            gb_parts[name] = prepare_gb_moves(
+                engine_info, curr, acs, priors, state, waveform_class=waveform_classes[name]
+            )
+    return gb_parts
+
+
 def attach_flow_trainers(cfg: RunConfig, curr) -> None:
     """Start the trainer of each seeded branch's flow move (``blocks.base.make_flow_move`` keeps its arguments).
 
@@ -306,7 +386,9 @@ def build_block_moves(ctx: RecipeContext, engine_info, curr, acs, priors, state)
         cls = find_class(block.pe_move.class_name, (block.PE_MOVES[block.pe_move.class_name].module,))
         if isinstance(block, SourceBlock):
             if block.search is not None:
-                moves[name] = source_moves(block, cls, ctx, engine_info, curr, acs, priors, state)
+                # * The GB move runs on the band machinery prepare_gb_branches set up, not on a waveform generator.
+                make_moves = gb_moves if isinstance(block, GBBlock) else source_moves
+                moves[name] = make_moves(block, cls, ctx, engine_info, curr, acs, priors, state)
         else:
             moves[name] = psd_moves(block, cls, engine_info, curr, acs, priors, state)
     return moves
@@ -349,6 +431,68 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     logger.info(f"Built {name} PE move {move} with {len(move.moves)} inner moves")
     move.accepted = np.zeros((g.ntemps, g.nwalkers))
     return BranchMoves([], [move])
+
+
+def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, state) -> BranchMoves:
+    """The GB PE move: ``block.pe_move``'s class on the band machinery ``prepare_gb_branches`` set up
+    (``prepare_gb_moves``, which also subtracted the start sources and set the band temperatures)."""
+    from lisatools.globalfit.moves.gbdebug import GBDebugSettings
+    from lisatools.globalfit.recipe import default_gb_debug_settings
+
+    parts = ctx.wave_gens[block.type]
+    kwargs = gb_move_kwargs(block)
+    # * As the settings files: the debug defaults, with plots in the run's artifacts.
+    kwargs["debug_settings"] = default_gb_debug_settings(
+        kwargs.get("debug_settings") or GBDebugSettings(), curr.general_info.artifacts_file_dir
+    )
+    move = cls(
+        *parts.args,
+        **parts.kwargs,
+        rj_proposal_distribution=parts.gpu_priors,
+        num_repeat_proposals=block.num_prop_repeats,
+        # ! GBSpecialBase reads "fstat" and "refit" in its name; the prior RJ move needs neither.
+        name=f"{block.type} pe move",
+        **kwargs,
+    )
+    move.accepted = np.zeros((parts.ntemps, parts.nwalkers))
+    logger.info(f"Built {block.type} PE move {type(move).__name__} with {block.num_prop_repeats} proposals")
+    if not block.extra_moves:
+        return BranchMoves([], [move])
+
+    from lisatools.globalfit.recipe import default_fstat_settings
+
+    extras = []
+    for key, spec in block.extra_moves.items():
+        entry = block.EXTRA_MOVES[spec.class_name]
+        # * the pe_move's knobs (its in-model proposals among them) with the extra move's on top
+        extra_kwargs = gb_move_kwargs(block, {**block.pe_move.kwargs, **spec.kwargs})
+        extra_kwargs["debug_settings"] = default_gb_debug_settings(
+            extra_kwargs.get("debug_settings") or GBDebugSettings(), curr.general_info.artifacts_file_dir
+        )
+        if spec.class_name == "GBFStatRJMove":
+            # * as the settings files: the search's log and records in the run's artifacts
+            extra_kwargs["fstat_settings"] = default_fstat_settings(
+                extra_kwargs.get("fstat_settings"), curr.general_info.artifacts_file_dir
+            )
+        # * the same band machinery as the pe_move, so the moves share the GB ladder
+        extra = find_class(spec.class_name, (entry.module,))(
+            *parts.args,
+            **parts.kwargs,
+            rj_proposal_distribution=parts.gpu_priors if entry.prior_proposal else None,
+            num_repeat_proposals=block.num_prop_repeats,
+            name=f"{block.type} {key} move",
+            **extra_kwargs,
+        )
+        extra.accepted = np.zeros((parts.ntemps, parts.nwalkers))
+        extras.append(Alternative(extra, spec.weight, spec.burn_in_share))
+        logger.info(
+            f"Built {block.type} extra move {key} ({spec.class_name}), run in a share {spec.weight} of the PE "
+            f"iterations and {spec.burn_in_share} of the burn-in"
+        )
+    # * pe_move takes what the extra moves leave of each phase, more than 0 by the block's check
+    pe_share = 1.0 - sum(alternative.weight for alternative in extras)
+    burn_in_share = 1.0 - sum(alternative.burn_in_weight for alternative in extras)
+    return BranchMoves([], [move], [Alternative(move, pe_share, burn_in_share), *extras])
 
 
 def psd_moves(block, cls, engine_info, curr, acs, priors, state) -> BranchMoves:
@@ -404,6 +548,7 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
     A closure, not an object: ``CurrentInfoGlobalFit`` deep-copies its settings, and functions are copied
     by reference.
     """
+    waveform_classes = {name: build.waveform_class for name, build in builds.items()}
     td_generators = {
         name: build.td_generator for name, build in builds.items() if getattr(build, "td_generator", None)
     }
@@ -413,6 +558,8 @@ def make_setup_function(cfg: RunConfig, builds: dict[str, BlockBuild]):
         select_device(curr.general_info)
         ctx = RecipeContext(cfg, prepare_branches(cfg, curr, state), move_settings=partial(stage_move_settings, cfg, curr))
         attach_signal_gens(ctx, td_generators, curr, state)
+        # * After attach_signal_gens: a GB entry holds the band machinery, not a waveform with a signal_gen.
+        ctx.wave_gens.update(prepare_gb_branches(cfg, waveform_classes, engine_info, curr, acs, priors, state))
         attach_flow_trainers(cfg, curr)
         spec = cfg.recipe
         if hasattr(spec, "file"):

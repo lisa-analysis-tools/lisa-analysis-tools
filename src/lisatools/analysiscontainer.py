@@ -1281,6 +1281,11 @@ class BandView:
         return self._aca.data_shaped if self._kind == "data" else self._aca.psd_shaped
 
     @property
+    def _shared_noise_rows(self) -> bool:
+        """True when this view reads noise rows that several ACs may share."""
+        return self._kind == "psd" and bool(getattr(self._aca, "external_noise_rows", False))
+
+    @property
     def shape(self) -> tuple:
         per_band = tuple(self._shards[0].shape[1:])
         return (int(self._aca.acs_total_entries),) + per_band
@@ -1299,6 +1304,9 @@ class BandView:
     def _resolve_scalar(self, band: int) -> tuple:
         """``(shard_id, intra_shard_index)`` for a single band id."""
         shard = int(self._aca.split_map[int(band)])
+        if self._shared_noise_rows:
+            # ACs that read external noise rows can share one.
+            return shard, int(self._aca.noise_row_of_ac[int(band)])
         intra = int(np.where(self._aca.gpu_splits[shard] == int(band))[0][0])
         return shard, intra
 
@@ -1319,6 +1327,9 @@ class BandView:
                 self._aca.gpu_splits[s][order], bands_here
             )
             intra[rows] = order[ranks]
+        if self._shared_noise_rows:
+            # ACs that read external noise rows can share one.
+            intra = self._aca.noise_row_of_ac[band_inds].astype(int)
         return shard_ids, intra, band_inds
 
     def __getitem__(self, idx):
@@ -1471,6 +1482,9 @@ class BandView:
                     self._aca.gpu_splits[s][order], bands_here
                 )
                 intra_band = order[ranks]
+                if self._shared_noise_rows:
+                    # ACs that read external noise rows can share one.
+                    intra_band = self._aca.noise_row_of_ac[bands_here].astype(int)
                 shard_idx = tuple(
                     [intra_band] + [arr[rows] for arr in intra_flat]
                 )
@@ -1654,6 +1668,22 @@ def band_gpu_assignment(
     raise ValueError(f"Unknown band_gpu_assignment mode: {mode!r}")
 
 
+class NoiseRowSource:
+    """Inverse-CSD rows that an :class:`AnalysisContainerArray` reads instead of holding its own.
+
+    Args:
+        arrays: One flat array of whole rows per split of the array, on that split's device.
+        row_shape: Trailing shape of one row. A row holds ``prod(shape_sens) * prod(row_shape)``
+            entries; for an STFT parent, ``row_shape`` is its ``(NT, NF_active)``.
+        row_of_ac: The row that each container (global id) reads within the array of its split.
+    """
+
+    def __init__(self, arrays: list, row_shape: tuple, row_of_ac: np.ndarray) -> None:
+        self.arrays = list(arrays)
+        self.row_shape = tuple(int(size) for size in row_shape)
+        self.row_of_ac = np.asarray(row_of_ac, dtype=np.int32)
+
+
 class AnalysisContainerArray:
     """Container for multiple :class:`AnalysisContainer` objects.
 
@@ -1704,6 +1734,13 @@ class AnalysisContainerArray:
             strategies (:attr:`cpp_splits`). May also be set later through the
             :attr:`domain_group_kwargs` property (which invalidates the cached
             strategies).
+        noise_source: Optional :class:`NoiseRowSource`. When given, the containers read the
+            inverse-CSD rows it names instead of holding a copy each: no noise buffer is
+            allocated, and ``linear_psd_arr[split]`` is the source's array for that split. STFT
+            source rows hold the full active grid, while the data rows may be windows. Each
+            container's ``invC`` is then a view of its whole row, so the computation groups take
+            no ``(d|d)`` snapshot. Example usage: GB band buffer, whose cells read their walkers'
+            parent rows. The default ``None`` keeps one row per container.
 
     """
 
@@ -1721,6 +1758,7 @@ class AnalysisContainerArray:
         n_splits: Optional[int] = None,
         run_threaded: bool = False,
         domain_group_kwargs: Optional[dict] = None,
+        noise_source: Optional[NoiseRowSource] = None,
     ) -> None:
         self.run_threaded = bool(run_threaded)
         self._thread_pool = None
@@ -1859,7 +1897,9 @@ class AnalysisContainerArray:
                 int(n_splits) if (gpus is None and n_splits is not None)
                 else (1 if gpus is None else len(gpus))
             )
-            self.gpu_splits = gpu_splits = self.contiguous_splits(
+            # ! Through the class: SubBandBuffer holds an instance flag of the same name, which hides
+            # ! the method on self.
+            self.gpu_splits = gpu_splits = AnalysisContainerArray.contiguous_splits(
                 int(self.acs_total_entries), num_machines
             )
 
@@ -1878,12 +1918,14 @@ class AnalysisContainerArray:
                             dtype=self.data_dtype,
                         )
                     )
-                    self.linear_psd_arr.append(
-                        self.xp.zeros(
-                            self.data_length * np.prod(shape_sens) * len(split),
-                            dtype=self.noise_dtype,
+                    # An array on external noise rows holds no noise of its own.
+                    if noise_source is None:
+                        self.linear_psd_arr.append(
+                            self.xp.zeros(
+                                self.data_length * np.prod(shape_sens) * len(split),
+                                dtype=self.noise_dtype,
+                            )
                         )
-                    )
             else:
                 self.gpu_map[split] = 0
                 self.linear_data_arr.append(
@@ -1892,12 +1934,13 @@ class AnalysisContainerArray:
                         dtype=self.data_dtype,
                     )
                 )
-                self.linear_psd_arr.append(
-                    self.xp.zeros(
-                        self.data_length * np.prod(shape_sens) * len(split),
-                        dtype=self.noise_dtype,
+                if noise_source is None:
+                    self.linear_psd_arr.append(
+                        self.xp.zeros(
+                            self.data_length * np.prod(shape_sens) * len(split),
+                            dtype=self.noise_dtype,
+                        )
                     )
-                )
             self.split_map[split] = i
 
         # Routing table for the C++ likelihood coordinator: global AC id ->
@@ -1907,19 +1950,31 @@ class AnalysisContainerArray:
         for split_id, ids in enumerate(gpu_splits):
             self.ac_to_intra[ids] = np.arange(len(ids), dtype=np.int32)
 
-        # * One copy of both routing tables per shard, on that shard's own device, built here
+        # Noise row of each AC within its split: its own position, unless the ACs read the rows
+        # of an external noise array (external_noise_rows, set by the GB band buffer), where
+        # several ACs can share a row.
+        self.external_noise_rows = False
+        self.noise_row_of_ac = self.ac_to_intra.copy()
+        if noise_source is not None:
+            self._adopt_noise_source(noise_source)
+
+        # * One copy of the routing tables per shard, on that shard's own device, built here
         # * rather than per call: a kernel's index arrays are gathered from them inside the shard's
         # * context, and building them on the caller instead makes every launch copy across devices.
+        # The noise-row table maps a global AC id to the noise row of that AC within its split.
         if gpus is None:
             self.split_map_by_split = [self.split_map] * len(gpu_splits)
             self.ac_to_intra_by_split = [self.ac_to_intra] * len(gpu_splits)
+            self.noise_row_by_split = [self.noise_row_of_ac] * len(gpu_splits)
         else:
             self.split_map_by_split = []
             self.ac_to_intra_by_split = []
+            self.noise_row_by_split = []
             for split_id in range(len(gpu_splits)):
                 with self.xp.cuda.Device(int(gpus[split_id])):
                     self.split_map_by_split.append(self.xp.asarray(self.split_map))
                     self.ac_to_intra_by_split.append(self.xp.asarray(self.ac_to_intra))
+                    self.noise_row_by_split.append(self.xp.asarray(self.noise_row_of_ac))
 
         self.num_acs = len(acs.flatten())
         self.reset_linear_data_arr()
@@ -1934,6 +1989,95 @@ class AnalysisContainerArray:
             self.free_gpu_memory()
             # Restore whatever device the caller was on before __init__.
             self.xp.cuda.runtime.setDevice(self._main_device_at_init)
+
+    def num_noise_rows(self, split: int) -> int:
+        """Inverse-CSD rows of ``split``: one per AC, or the rows of its external noise array."""
+        
+        if getattr(self, "external_noise_rows", False):
+            return int(self.linear_psd_arr[split].size // self.noise_row_size)
+        
+        return len(self.gpu_splits[split])
+
+    def _adopt_noise_source(self, noise_source: NoiseRowSource) -> None:
+        """Take the noise arrays and rows of ``noise_source``, after checking them against the splits."""
+        arrays = list(noise_source.arrays)
+        row_size = int(np.prod(self.shape_sens)) * int(np.prod(noise_source.row_shape))
+        rows = np.asarray(noise_source.row_of_ac, dtype=np.int32)
+        
+        if len(arrays) != len(self.gpu_splits):
+            raise ValueError(
+                f"noise_source has {len(arrays)} arrays for {len(self.gpu_splits)} splits."
+            )
+        if rows.shape != (int(self.acs_total_entries),):
+            raise ValueError(
+                f"noise_source names rows for {rows.shape[0]} ACs; the array has "
+                f"{int(self.acs_total_entries)}."
+            )
+        for split, (array, ids) in enumerate(zip(arrays, self.gpu_splits)):
+            if array.ndim != 1 or array.size % row_size or array.dtype != np.dtype(self.noise_dtype):
+                raise ValueError(
+                    f"noise_source array of split {split} must be flat {np.dtype(self.noise_dtype)} "
+                    f"rows of {row_size} entries; got shape {array.shape}, dtype {array.dtype}."
+                )
+            if self.gpus is not None and int(array.device.id) != int(self.gpus[split]):
+                raise ValueError(
+                    f"noise_source array of split {split} is on device {array.device.id}, the "
+                    f"split on device {self.gpus[split]}."
+                )
+            rows_here = rows[np.asarray(ids, dtype=int)]
+            num_rows = array.size // row_size
+            if rows_here.size and (int(rows_here.min()) < 0 or int(rows_here.max()) >= num_rows):
+                raise ValueError(
+                    f"noise_source rows of split {split} must lie in [0, {num_rows})."
+                )
+        self.linear_psd_arr = arrays
+        
+        self.noise_row_shape = tuple(noise_source.row_shape)
+        self.noise_row_size = row_size
+        self.noise_row_of_ac = rows.copy()
+        self.external_noise_rows = True
+        # ! A container's invC is its whole row, not the window of its data, so the (d|d)
+        # ! snapshot of the computation groups cannot come from the containers.
+        self._skip_eager_dd = True
+
+    def _point_at_noise_rows(self, ac_ids) -> None:
+        """Set ``invC`` of the ACs ``ac_ids`` to views of their rows in their splits' noise arrays."""
+        all_acs = self.acs.flatten()
+        for ac_id in np.asarray(ac_ids, dtype=int).tolist():
+            split = int(self.split_map[ac_id])
+            start = int(self.noise_row_of_ac[ac_id]) * self.noise_row_size
+            all_acs[ac_id].sens_mat.invC = self.linear_psd_arr[split][
+                start:start + self.noise_row_size
+            ].reshape(self.shape_sens + self.noise_row_shape)
+
+    def set_noise_rows(self, ac_ids, rows) -> None:
+        """Point the ACs ``ac_ids`` at ``rows`` of their splits' external noise arrays, in place.
+
+        The host table and the per-split device tables are written in place, so the tables a kernel
+        gathers its noise indices from stay the same objects. Only for an array built on a
+        ``noise_source``.
+        """
+        if not getattr(self, "external_noise_rows", False):
+            raise RuntimeError("set_noise_rows needs an array built on a noise_source.")
+        ac_ids = np.asarray(ac_ids, dtype=int)
+        rows = np.asarray(rows, dtype=np.int32)
+        if ac_ids.size == 0:
+            return
+        
+        splits_of_ids = self.split_map[ac_ids]
+        for split in np.unique(splits_of_ids).tolist():
+            rows_here = rows[splits_of_ids == split]
+            num_rows = self.num_noise_rows(split)
+            if int(rows_here.min()) < 0 or int(rows_here.max()) >= num_rows:
+                raise ValueError(f"rows of split {split} must lie in [0, {num_rows}).")
+        
+        # Without GPUs every split's table is this same host array.
+        self.noise_row_of_ac[ac_ids] = rows
+        if self.gpus is not None:
+            for split, table in enumerate(self.noise_row_by_split):
+                with self.xp.cuda.Device(int(self.gpus[split])):
+                    table[self.xp.asarray(ac_ids)] = self.xp.asarray(rows)
+        self._point_at_noise_rows(ac_ids)
 
     @staticmethod
     def contiguous_splits(n_entries: int, num_splits: int) -> list:
@@ -2020,6 +2164,11 @@ class AnalysisContainerArray:
 
     def reset_linear_psd_arr(self):
         """Repack each container's inverse-PSD into the contiguous per-GPU PSD buffer."""
+        if getattr(self, "external_noise_rows", False):
+            # ! The rows belong to the noise source: packing would overwrite them. Point at them instead.
+            self._point_at_noise_rows(np.arange(int(self.acs_total_entries)))
+            return
+        
         if self.gpus is not None:
             main_gpu = self.xp.cuda.runtime.getDevice()
 
@@ -2511,7 +2660,11 @@ class AnalysisContainerArray:
             positions = np.where(split_of_each == split_id)[0]
             positions_per_split.append(positions)
             data_intra_per_split.append(self.ac_to_intra[data_index_cpu[positions]])
-            noise_intra_per_split.append(self.ac_to_intra[noise_index_cpu[positions]])
+            # Objects that borrow this method (test stand-ins) may lack the switch.
+            if getattr(self, "external_noise_rows", False):
+                noise_intra_per_split.append(self.noise_row_of_ac[noise_index_cpu[positions]])
+            else:
+                noise_intra_per_split.append(self.ac_to_intra[noise_index_cpu[positions]])
 
         return positions_per_split, data_intra_per_split, noise_intra_per_split
 
@@ -3295,9 +3448,26 @@ class AnalysisContainerArray:
     def gather_linear_psd_arr(self, target_gpu: Optional[int] = None):
         """Return the inverse-PSD buffer as a single flat array (concatenated across shards).
 
-        Same semantics as :meth:`gather_linear_data_arr` for the PSD side.
+        Same semantics as :meth:`gather_linear_data_arr` for the PSD side: one block per AC, so
+        ACs that share a noise row get a copy of it each.
         """
-        return self._gather_per_gpu_to_single(self.linear_psd_arr, target_gpu)
+        if not getattr(self, "external_noise_rows", False):
+            return self._gather_per_gpu_to_single(self.linear_psd_arr, target_gpu)
+        
+        # if noise is shared across ACS
+        # An external row is as long as the source's rows, which can be wider than the AC's data.
+        block = self.noise_row_size
+        per_ac = []
+        for split, ids in enumerate(self.gpu_splits):
+            rows = self.noise_row_of_ac[np.asarray(ids, dtype=int)]
+            if self.gpus is None:
+                per_ac.append(self.linear_psd_arr[split].reshape(-1, block)[rows].reshape(-1))
+                continue
+            with self.xp.cuda.Device(int(self.gpus[split])):
+                per_ac.append(
+                    self.linear_psd_arr[split].reshape(-1, block)[self.xp.asarray(rows)].reshape(-1)
+                )
+        return self._gather_per_gpu_to_single(per_ac, target_gpu)
 
     def gather_data_shaped(self):
         """Return the full ``(num_acs, nchannels, *end_shape)`` residual ndarray.
@@ -3315,9 +3485,14 @@ class AnalysisContainerArray:
         return self.data_shaped_view().gather()
 
     def gather_psd_shaped(self):
-        """Same as :meth:`gather_data_shaped` for the inverse-PSD buffer."""
+        """Same as :meth:`gather_data_shaped` for the inverse-PSD buffer, one entry per AC."""
         if len(self.linear_psd_arr) == 1:
-            return self.psd_shaped[0]
+            if not getattr(self, "external_noise_rows", False):
+                return self.psd_shaped[0]
+            
+            # A copy: ACs that share a noise row get one entry each.
+            return self.psd_shaped[0][self.xp.asarray(self.noise_row_of_ac)]
+        
         return self.psd_shaped_view().gather()
 
     def data_shaped_view(self) -> "BandView":
@@ -3357,6 +3532,12 @@ class AnalysisContainerArray:
     @property
     def psd_shaped(self):
         """Per-GPU PSD buffers reshaped to ``(n_acs_on_gpu, *shape_sens, *end_shape)``."""
+        if getattr(self, "external_noise_rows", False):
+            # One entry per row of the split's external noise array, in the rows' own shape.
+            return [
+                rows.reshape((-1,) + self.shape_sens + self.noise_row_shape)
+                for rows in self.linear_psd_arr
+            ]
         out = []
         if self.gpus is None:
             for tmp in self.linear_psd_arr:

@@ -18,6 +18,7 @@
 #include <nanobind/stl/string.h>
 #include "binding_detector.hpp"
 #include "binding_domains.hpp"       // STFTDomainWrap, FDDomainForStftWrap, STFTFresnelWrap
+#include "stft_cross_terms.hpp"      // stft_cross_terms_wrap (for tempering)
 
 // Phase 3J: this binding TU is the SOLE registration site for the shared
 // wrapper classes (OrbitsWrap, LISAResponseWrap, TDIConfigWrap, ...).
@@ -582,6 +583,35 @@ void detector_part(nb::module_ &m) {
 
     ;
 
+    // ---- KinematicsTableWrap ----
+    // ! noconvert: the wrap keeps raw pointers, so a converted temporary would leave them dangling.
+#if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
+    nb::class_<KinematicsTableWrap>(m, "KinematicsTableWrapGPU")
+#else
+    nb::class_<KinematicsTableWrap>(m, "KinematicsTableWrapCPU")
+#endif
+    .def(nb::init<double, double, int,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type>(),
+         nb::arg("first_segment_midpoint"), nb::arg("segment_time"), nb::arg("num_time_segments"),
+         nb::arg("position_receiver").noconvert(), nb::arg("velocity_receiver").noconvert(),
+         nb::arg("acceleration_receiver").noconvert(), nb::arg("position_sender").noconvert(),
+         nb::arg("velocity_sender").noconvert(), nb::arg("acceleration_sender").noconvert(),
+         nb::arg("light_travel_time").noconvert(), nb::arg("light_travel_time_rate").noconvert(),
+         nb::arg("light_travel_time_acceleration").noconvert(),
+         nb::arg("unit_direction").noconvert(), nb::arg("unit_direction_rate").noconvert())
+    .def("build", &KinematicsTableWrap::build, nb::arg("orbits"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Fill the table at the segment midpoints from an OrbitsWrap on the same device.")
+    .def_prop_ro("first_segment_midpoint",
+                 [](const KinematicsTableWrap &self) { return self.table.first_segment_midpoint; })
+    .def_prop_ro("segment_time",
+                 [](const KinematicsTableWrap &self) { return self.table.segment_time; })
+    .def_prop_ro("num_time_segments",
+                 [](const KinematicsTableWrap &self) { return self.table.num_time_segments; });
+
     // ---- GalacticGridSetup (host-side quadrature/sky-grid builder) ----
     // The C++ type is per-backend aliased (GalacticGridSetupGPU/CPU) so the
     // CPU and GPU plugin .so's register distinct typeids; the Python-facing
@@ -794,6 +824,63 @@ void detector_part(nb::module_ &m) {
 // 1/2/3 values).
 // ============================================================================
 
+// The lengths are checked in both builds: they are host metadata, and a short array would be read
+// past its end on the device.
+template <typename T>
+static T* cross_terms_pointer(array_type<T> input, const char* name, size_t expected) {
+    if (input.size() != expected)
+        throw std::invalid_argument(
+            std::string("compute_cross_terms: ") + name + " has length " +
+            std::to_string(input.size()) + ", expected " + std::to_string(expected) + ".");
+    return input.data();
+}
+
+// STFTDomainWrap.compute_cross_terms. A function here rather than a member of the wrap class,
+// because downstream packages compile binding_domains.hpp without stft_cross_terms.cu.
+static void stft_domain_compute_cross_terms(
+    STFTDomainWrap& self, array_type<double> cross_out, array_type<double> template_out,
+    array_type<double> residual_out, array_type<std::complex<double>> template_vals,
+    int num_freqs_template, array_type<int> residual_index, array_type<int> noise_index,
+    array_type<int> residual_start, array_type<int> template_index,
+    array_type<int> template_start, array_type<int> window_lo, array_type<int> window_hi,
+    int num_tables, int num_residuals, int num_templates, int max_window_width,
+    bool run_async)
+{
+    if ((num_tables < 0) || (num_residuals <= 0) || (num_templates <= 0) ||
+        (num_freqs_template <= 0))
+        throw std::invalid_argument(
+            "compute_cross_terms: needs num_tables >= 0 and at least one residual, one template "
+            "and one template bin.");
+    size_t tables = static_cast<size_t>(num_tables);
+    size_t residual_entries = tables * num_residuals;
+    size_t template_entries = tables * num_templates;
+    size_t template_row = static_cast<size_t>(self.domain->num_channels) *
+                          self.domain->num_times * num_freqs_template;
+    if (template_vals.size() % template_row != 0)
+        throw std::invalid_argument(
+            "compute_cross_terms: template_vals is not a whole number of template rows.");
+    int num_template_rows = static_cast<int>(template_vals.size() / template_row);
+
+    double* cross_ptr = cross_terms_pointer(cross_out, "cross_out", residual_entries * num_templates);
+    double* template_ptr =
+        cross_terms_pointer(template_out, "template_out", residual_entries * num_templates);
+    double* residual_ptr = cross_terms_pointer(residual_out, "residual_out", residual_entries);
+    int* residual_index_ptr = cross_terms_pointer(residual_index, "residual_index", residual_entries);
+    int* noise_index_ptr = cross_terms_pointer(noise_index, "noise_index", residual_entries);
+    int* residual_start_ptr = cross_terms_pointer(residual_start, "residual_start", residual_entries);
+    int* template_index_ptr = cross_terms_pointer(template_index, "template_index", template_entries);
+    int* template_start_ptr = cross_terms_pointer(template_start, "template_start", template_entries);
+    int* window_lo_ptr = cross_terms_pointer(window_lo, "window_lo", tables);
+    int* window_hi_ptr = cross_terms_pointer(window_hi, "window_hi", tables);
+
+    stft_cross_terms_wrap(
+        *self.domain, cross_ptr, template_ptr, residual_ptr,
+        reinterpret_cast<cmplx*>(template_vals.data()), num_template_rows, num_freqs_template,
+        residual_index_ptr, noise_index_ptr, residual_start_ptr, template_index_ptr,
+        template_start_ptr, window_lo_ptr, window_hi_ptr, num_tables, num_residuals,
+        num_templates, max_window_width, run_async);
+}
+
 void domains_part(nb::module_ &m) {
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
@@ -803,12 +890,13 @@ void domains_part(nb::module_ &m) {
 #endif
     .def(nb::init<int, int, int, double, double, double, double, double,
                   array_type<std::complex<double>>, array_type<std::complex<double>>,
-                  int, int, int>(),
+                  int, int, int, int, bool>(),
          nb::arg("num_times"), nb::arg("num_freqs"), nb::arg("num_channels"),
          nb::arg("t0"), nb::arg("f_min"), nb::arg("f_max"),
          nb::arg("dt"), nb::arg("df"),
          nb::arg("data"), nb::arg("invC"),
-         nb::arg("num_data"), nb::arg("num_noise"), nb::arg("tdi_type"))
+         nb::arg("num_data"), nb::arg("num_noise"), nb::arg("tdi_type"),
+         nb::arg("num_freqs_noise") = -1, nb::arg("noise_full_grid") = false)
     .def("compute_likelihood_terms", &STFTDomainWrap::compute_likelihood_terms,
          nb::arg("d_h_out"), nb::arg("h_h_out"), nb::arg("template_vals"),
          nb::arg("start_times"), nb::arg("start_freqs"), nb::arg("num_binaries"),
@@ -816,7 +904,18 @@ void domains_part(nb::module_ &m) {
          nb::arg("n_t_template"), nb::arg("n_f_template"),
          nb::arg("run_async") = false,
          nb::call_guard<nb::gil_scoped_release>(),
-         "Compute (d|h) and (h|h) likelihood terms for a batch of binaries.");
+         "Compute (d|h) and (h|h) likelihood terms for a batch of binaries.")
+    .def("compute_cross_terms", &stft_domain_compute_cross_terms,
+         nb::arg("cross_out"), nb::arg("template_out"), nb::arg("residual_out"),
+         nb::arg("template_vals"), nb::arg("num_freqs_template"),
+         nb::arg("residual_index"), nb::arg("noise_index"), nb::arg("residual_start"),
+         nb::arg("template_index"), nb::arg("template_start"),
+         nb::arg("window_lo"), nb::arg("window_hi"),
+         nb::arg("num_tables"), nb::arg("num_residuals"), nb::arg("num_templates"),
+         nb::arg("max_window_width"), nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Cross terms per table: (r_i|t_j), (t_j|t_j) and (r_i|r_i), each under the noise row\n"
+         "of residual i, summed over the table's bin window (see stft_cross_terms.hpp).");
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
     nb::class_<FDDomainForStftWrap>(m, "FDDomainForStftWrapGPU")
@@ -860,6 +959,15 @@ void domains_part(nb::module_ &m) {
          "  moment = the same integral with an extra tau in the integrand.\n"
          "Both are the quantities the windowed evaluator sums over its seven Tukey terms, so they\n"
          "can be compared directly with the integrals rather than with another implementation.")
+    .def("compute_fresnel_functions", &STFTFresnelWrap::compute_fresnel_functions,
+         nb::arg("cosine_out"), nb::arg("sine_out"), nb::arg("aux_f_out"),
+         nb::arg("aux_g_out"), nb::arg("slope_f_out"), nb::arg("slope_g_out"),
+         nb::arg("arguments"), nb::arg("num"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Diagnostic: the shared Fresnel functions of lat_fresnel.hh at each argument x.\n\n"
+         "cosine_out and sine_out receive C(x) and S(x); aux_f_out and aux_g_out the auxiliary\n"
+         "functions f and g at |x|, and slope_f_out and slope_g_out their derivatives in |x|.\n"
+         "f, g and their derivatives come from the auxiliary branch and hold for |x| > 1.6.")
     .def("compute_fourier_values", &STFTFresnelWrap::compute_fourier_values,
          nb::arg("output"), nb::arg("amps"), nb::arg("phase0s"),
          nb::arg("f0s"), nb::arg("fdot0s"), nb::arg("t0s"),

@@ -9,11 +9,17 @@
 
 #if defined(__CUDACC__) || defined(__CUDA_COMPILATION__)
 #define Orbits OrbitsGPU
+#define KinematicsTable KinematicsTableGPU
 #else
 #define Orbits OrbitsCPU
+#define KinematicsTable KinematicsTableCPU
 #endif
 
 #define Clight 299792458.
+
+// * Target step of the five-point orbit derivatives [s]; each grid uses the whole number of its
+// * cells closest to it, so that the five samples share one position within their cells.
+#define ORBIT_STENCIL_STEP 2000.0
 
 class Vec {
  public:
@@ -114,6 +120,40 @@ class Vec {
   }
 };
 
+// Constellation kinematics at the STFT segment midpoints. It does not depend on the source, so
+// one table serves every source on a grid. Structure of arrays, segment index fastest; the
+// arrays are owned by the caller. Link order and roles follow the Orbits link arrays.
+struct KinematicsTable {
+  double first_segment_midpoint;  // in the time frame of the orbits [s]
+  double segment_time;            // spacing of the midpoints [s]
+  int num_time_segments;
+
+  // Receiver at the midpoint, [(spacecraft * 3 + xyz) * num_time_segments + segment].
+  double* position_receiver;
+  double* velocity_receiver;
+  double* acceleration_receiver;
+
+  // Sender at the emission time t - L(t), [(link * 3 + xyz) * num_time_segments + segment].
+  double* position_sender;
+  double* velocity_sender;
+  double* acceleration_sender;
+
+  // [link * num_time_segments + segment].
+  double* light_travel_time;
+  double* light_travel_time_rate;
+  double* light_travel_time_acceleration;
+
+  // From the sender at emission to the receiver at reception,
+  // [(link * 3 + xyz) * num_time_segments + segment].
+  double* unit_direction;
+  double* unit_direction_rate;
+
+  CUDA_CALLABLE_MEMBER
+  double segment_midpoint(int segment_index) const {
+    return first_segment_midpoint + ((double)segment_index) * segment_time;
+  }
+};
+
 class Orbits {
  public:
   double sc_t0;
@@ -174,6 +214,15 @@ class Orbits {
   CUDA_DEVICE Vec get_pos(double t, int sc);
   CUDA_DEVICE void get_normal_unit_vec_ptr(Vec* vec, double t, int link);
   CUDA_DEVICE void get_pos_ptr(Vec* vec, double t, int sc);
+  // Five-point central differences of the linearly interpolated tables, with the step set by
+  // ORBIT_STENCIL_STEP; near a table edge, the derivative at the nearest time the stencil fits.
+  CUDA_DEVICE Vec get_velocity(double t, int sc);
+  CUDA_DEVICE Vec get_acceleration(double t, int sc);
+  CUDA_DEVICE double get_ltt_rate(double t, int link);
+  CUDA_DEVICE double get_ltt_acceleration(double t, int link);
+  // Fill a table whose arrays live on this backend's device; raises std::invalid_argument when
+  // the midpoints plus the stencil margins leave either grid.
+  void get_kinematics_table(KinematicsTable* table);
   void get_light_travel_time_arr(double* ltt, double* t, int* link, int num);
   void get_pos_arr(double* pos_x, double* pos_y, double* pos_z, double* t,
                    int* sc, int num);

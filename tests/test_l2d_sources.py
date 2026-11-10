@@ -512,18 +512,18 @@ class SourceSearchBuildTest(_Built):
 
     def test_catalogue_seeds_through_the_prior_inverse_transform(self):
         # The MBH catalogue holds physical values; the interface must bring them to the sampling basis of
-        # MBHBPrior (ln M, ln q, d_L in Gpc, cos iota, sin delta, ...), where q = m1 / m2.
+        # MBHBPrior (ln M, q, d_L in Gpc, cos iota, sin delta, ...), where q = m1 / m2.
         _, built = self.build({"mbh": mbh_with_search()})
         setup = built["mbh"].setup
         iface = setup.search_interface
         curr = types.SimpleNamespace(general_info=types.SimpleNamespace(catalogue={"MBHB": {18: MBH_CATALOGUE_ENTRY}}))
 
         seed = iface.get_catalog_values(curr)
-        e = MBH_CATALOGUE_ENTRY
+        entry = MBH_CATALOGUE_ENTRY
         expected = [
-            np.log(1e6), np.log(4.0), e["PrimarySpinCompZ"], e["SecondarySpinCompZ"], 20.0,
-            e["PhaseReferenceSourceFrame"], np.cos(e["InclinationAngle"]), e["PolarisationAngle"],
-            e["RightAscension"], np.sin(e["Declination"]), e["TimeCoalescencePhenomTPHMSSBFrame"],
+            np.log(1e6), 4.0, entry["PrimarySpinCompZ"], entry["SecondarySpinCompZ"], 20.0,
+            entry["PhaseReferenceSourceFrame"], np.cos(entry["InclinationAngle"]), entry["PolarisationAngle"],
+            entry["RightAscension"], np.sin(entry["Declination"]), entry["TimeCoalescencePhenomTPHMSSBFrame"],
         ]
         np.testing.assert_allclose(seed, [expected], rtol=1e-12)
         self.assertTrue(np.isfinite(setup.priors["mbh"].logpdf(seed)).all())
@@ -595,8 +595,8 @@ class MBHTransformTest(unittest.TestCase):
         samples = prior.rvs(size=(200,))
         out = transform.transform_base_parameters(samples)
 
-        logM, logq, s1z, s2z, d_L, phi_ref, cos_iota, psi, alpha, sin_delta, t_c = samples.T
-        M, Q = np.exp(logM), np.exp(logq)  # Q = m1/m2 >= 1
+        logM, Q, s1z, s2z, d_L, phi_ref, cos_iota, psi, alpha, sin_delta, t_c = samples.T
+        M = np.exp(logM)  # Q = m1/m2 >= 1, sampled uniformly
         m2 = M / (1 + Q)  # reference `mT_Q`
         m1 = Q * m2
         expected = np.column_stack([

@@ -103,12 +103,28 @@ class ComputeSection(_Section):
             import jax
             jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in self.gpus))
 
-            if len(self.gpus) != len(jax.devices("gpu")):
+            visible = _keeping_current_device(lambda: jax.devices("gpu"))
+            if len(self.gpus) != len(visible):
                 raise ValueError(
-                    f"gpus {self.gpus} does not match the GPUs JAX sees: {jax.devices('gpu')}. "
+                    f"gpus {self.gpus} does not match the GPUs JAX sees: {visible}. "
                     "Check CUDA_VISIBLE_DEVICES or jax_cuda_visible_devices."
                 )
         return self
+
+
+def _keeping_current_device(call):
+    """``call()``, with the CUDA device that was current before it made current again after it."""
+    try:
+        import cupy
+    except ImportError:
+        return call()
+    # ! JAX's device discovery leaves the last card current on this thread: the general setup that follows would
+    # ! build its data, orbit table and sensitivity arrays on that card instead of on gpus[0].
+    device = cupy.cuda.runtime.getDevice()
+    try:
+        return call()
+    finally:
+        cupy.cuda.runtime.setDevice(device)
 
 class BlockConfig(BaseModel):
     """One source/noise block. Type-specific fields are validated in a later step."""
@@ -189,7 +205,7 @@ class DataSection(_Section):
     # keep a time-domain residual (one shared CPU AnalysisContainer, walker 0) next to the analysis-domain
     # ones; the seeded signals are subtracted from it through the blocks' TD generators (td_waveform)
     keep_td: bool = False
-    
+
 
     @model_validator(mode="after")
     def _orbits_match_loader(self):
@@ -395,6 +411,15 @@ class RunConfig(_Section):
                     f"block {name!r}: its ladder spans every temperature; tempering.ntemps ({ntemps}) "
                     f"must equal sampler.ntemps ({self.sampler.ntemps}) or be left out."
                 )
+            if tempering is not None and tempering.Tmax is not None:
+                # * The ladder must keep decreasing, with the cold chain at beta 1.
+                rungs = ntemps or self.sampler.ntemps
+                second_hottest = tempering.ratio ** (rungs - 2) if rungs >= 2 else None
+                if second_hottest is None or tempering.Tmax <= second_hottest:
+                    raise ValueError(
+                        f"block {name!r}: tempering.Tmax ({tempering.Tmax}) needs at least two rungs and must be "
+                        f"above the second-hottest rung's temperature, ratio ** (ntemps - 2) = {second_hottest}."
+                    )
             if block.NEEDS_REFERENCE_TIME and data.reference_time is None:
                 raise ValueError(f"block {name!r} needs data.reference_time (absolute SSB time, in seconds).")
             if isinstance(block, SourceBlock):

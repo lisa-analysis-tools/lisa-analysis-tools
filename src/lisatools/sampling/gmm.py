@@ -2131,6 +2131,28 @@ class GMMFit:
     #     return new_gmm
 
 
+def unwrap_periodic_columns(samples, periodic, xp=np):
+    """A copy of ``samples`` with each periodic column moved by whole periods into one window per group.
+
+    The window is ``[c - P / 2, c + P / 2)`` with ``P`` the column's period and ``c`` the group's circular mean of
+    the column, so a mode across the ends of the period stays one mode.
+
+    Args:
+        samples: Array of shape ``(n_groups, n_samples, n_features)``; not changed.
+        periodic: Map from feature column to its period.
+        xp: Array module of ``samples``.
+
+    Returns:
+        The unwrapped copy.
+    """
+    samples = samples.copy()
+    for column, period in periodic.items():
+        angles = (2.0 * np.pi / period) * samples[:, :, column]
+        centre = (period / (2.0 * np.pi)) * xp.angle(xp.mean(xp.exp(1j * angles), axis=1))[:, None]
+        samples[:, :, column] = centre + xp.mod(samples[:, :, column] - centre + 0.5 * period, period) - 0.5 * period
+    return samples
+
+
 def vec_fit_gmm_min_bic(
     samples,
     min_comp=1,
@@ -2139,6 +2161,7 @@ def vec_fit_gmm_min_bic(
     gpu=None,
     verbose=False,
     return_components=False,
+    periodic=None,
 ):
     """Fit per-group GMMs by sweeping component count and selecting min BIC.
 
@@ -2158,6 +2181,10 @@ def vec_fit_gmm_min_bic(
         return_components: If ``True``, return the raw lists
             ``[weights, means, covs, invcovs, dets, mins, maxs]`` instead of
             a :class:`FullGaussianMixtureModel`.
+        periodic: Optional map from feature column to period. Before the fit
+            each periodic column is moved into a window of one period around
+            its circular mean, per group (:func:`unwrap_periodic_columns`),
+            and the returned model takes the same columns as periodic.
 
     Returns:
         Either the raw component lists (when ``return_components`` is
@@ -2175,6 +2202,8 @@ def vec_fit_gmm_min_bic(
 
     n_groups, n_samples, ndim = samples.shape
     samples = xp.asarray(samples)
+    if periodic:
+        samples = unwrap_periodic_columns(samples, periodic, xp)
 
     converged = xp.zeros(n_groups, dtype=bool)
     counts_above_min_bic = xp.zeros(n_groups, dtype=int)
@@ -2260,7 +2289,7 @@ def vec_fit_gmm_min_bic(
     #     pickle.dump((weights, means, covs, invcovs, dets, mins, maxs), fp, pickle.HIGHEST_PROTOCOL)
 
     full_gmm = FullGaussianMixtureModel(
-        weights, means, covs, invcovs, dets, mins, maxs, use_cupy=use_gpu
+        weights, means, covs, invcovs, dets, mins, maxs, use_cupy=use_gpu, periodic=periodic
     )
     return full_gmm
 

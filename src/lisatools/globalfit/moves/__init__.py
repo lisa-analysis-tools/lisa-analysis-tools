@@ -1,7 +1,9 @@
 """Custom ``eryn`` MCMC moves used by the LISA global fit."""
 
 from .addremovemove import ResidualAddOneRemoveOneMove
-from .gbspecialstretch import (
+from .gbspecialmove import (
+    GBFStatRJMove,
+    GBFStatSettings,
     GBSpecialRJPriorMove,
     GBSpecialRJRefitMove,
     GBSpecialRJSearchMove,

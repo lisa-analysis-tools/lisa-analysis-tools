@@ -219,7 +219,7 @@ class EmriMbhPsdTest(_Port):
         run = on_cpu(EMRI_MBH_PSD, self.root)
         mbh_yaml = run / "blocks" / "mbh.yaml"
         raw = yaml.safe_load(mbh_yaml.read_text())
-        params = ["logM", "logq", "s1z", "s2z", "d_L", "phi_ref", "t_c"]
+        params = ["logM", "q", "s1z", "s2z", "d_L", "phi_ref", "t_c"]
         raw["flow"].update(parameters=params, gaussian={"adapt_cov": True, "mode": "am"})
         mbh_yaml.write_text(yaml.safe_dump(raw, sort_keys=False))
         with warnings.catch_warnings():
@@ -227,7 +227,7 @@ class EmriMbhPsdTest(_Port):
             cfg = load_run(run)
 
         # the flow move alone (the full build needs the data backend): a basis holding the flow's names
-        basis = ["logM", "logq", "s1z", "s2z", "d_L", "t_c", "phi_ref", "cos_i", "lam", "sin_beta", "psi"]
+        basis = ["logM", "q", "s1z", "s2z", "d_L", "t_c", "phi_ref", "cos_i", "lam", "sin_beta", "psi"]
         info = {"basis": basis, "periodic": {"mbh": {"phi_ref": 2 * np.pi, "lam": 2 * np.pi}}}
         ctx = BuildContext(cfg=cfg, general=SimpleNamespace(artifacts_file_dir=str(self.root)))
         move = make_flow_move(cfg.blocks["mbh"], ctx, info, nleaves=6)

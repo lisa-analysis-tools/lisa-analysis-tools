@@ -170,18 +170,32 @@ class STFTDomain : public STFTSettings {
                   ///< walkers)
   int num_noise;  ///< Number of independent noise/PSD realisations
   int tdi_type;   ///< TDI channel configuration type (TDI_XYZ or TDI_AET)
+  int num_freqs_noise;   ///< Frequency bins per inverse-covariance row
+  bool noise_full_grid;  ///< The noise rows hold the full active grid while
+                         ///< the data rows hold windows of it
 
+  // * The two noise arguments default to noise rows laid out like the data rows.
   CUDA_CALLABLE_MEMBER
   STFTDomain(int num_times_, int num_freqs_, int num_channels_, double t0_,
              double f_min_, double f_max_, double dt_, double df_, cmplx* data_,
-             cmplx* invC_, int num_data_, int num_noise_, int tdi_type_)
+             cmplx* invC_, int num_data_, int num_noise_, int tdi_type_,
+             int num_freqs_noise_ = -1, bool noise_full_grid_ = false)
       : STFTSettings(num_times_, num_freqs_, num_channels_, t0_, f_min_, f_max_,
                      dt_, df_),
         data(data_),
         invC(invC_),
         num_data(num_data_),
         num_noise(num_noise_),
-        tdi_type(tdi_type_) {}
+        tdi_type(tdi_type_),
+        num_freqs_noise(num_freqs_noise_ < 0 ? num_freqs_ : num_freqs_noise_),
+        noise_full_grid(noise_full_grid_) {}
+
+  /** @brief Inverse-covariance bin of a pixel: its active bin @p freq_j_here
+   *  when the noise rows hold the full grid, else its window bin
+   *  @p freq_j_local. */
+  CUDA_DEVICE inline int noise_bin(int freq_j_here, int freq_j_local) const {
+    return noise_full_grid ? freq_j_here : freq_j_local;
+  }
   // ----------------------------------------------------------------
   // Data indexing
   // ----------------------------------------------------------------
@@ -200,9 +214,11 @@ class STFTDomain : public STFTSettings {
 
   /** @brief Compute the flat index into the data array.
    *  Layout: data[(data_index * num_channels + channel) * num_times * num_freqs
-   *               + t_idx * num_freqs + f_idx] */
+   *               + t_idx * num_freqs + f_idx]
+   *  64-bit, as are the noise indices below: one split's array can hold more
+   *  than 2^31 values (a 50 GiB band buffer on an 80 GB card). */
   CUDA_DEVICE
-  int get_data_index(int t_idx, int f_idx, int channel, int data_index);
+  size_t get_data_index(int t_idx, int f_idx, int channel, int data_index);
 
   /** @brief Return the complex data value at position (t_idx, f_idx) for the
    *  given channel and data instance. */
@@ -215,10 +231,11 @@ class STFTDomain : public STFTSettings {
 
   /** @brief Compute the flat index into the diagonal inverse-covariance array.
    *  Layout: invC[(noise_index * num_channels + channel) * num_times *
-   * num_freqs
-   *               + t_idx * num_freqs + f_idx] */
+   * num_freqs_noise
+   *               + t_idx * num_freqs_noise + f_idx], with @p f_idx the
+   *  noise bin of the pixel (see noise_bin). */
   CUDA_DEVICE
-  int get_noise_index(int t_idx, int f_idx, int channel, int noise_index);
+  size_t get_noise_index(int t_idx, int f_idx, int channel, int noise_index);
 
   /** @brief Return the (diagonal) inverse-covariance value C^{-1}_{ch}
    *  at position (t_idx, f_idx) for the given channel and noise instance. */
@@ -232,10 +249,11 @@ class STFTDomain : public STFTSettings {
   /** @brief Compute the flat index into the full (3x3) inverse-covariance
    * matrix array. Layout: invC[((noise_index * num_channels + ch_i) *
    * num_channels + ch_j)
-   *               * num_times * num_freqs + t_idx * num_freqs + f_idx] */
+   *               * num_times * num_freqs_noise + t_idx * num_freqs_noise
+   *               + f_idx], with @p f_idx the noise bin of the pixel. */
   CUDA_DEVICE
-  int get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
-                            int noise_index);
+  size_t get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
+                               int noise_index);
 
   /** @brief Return the off-diagonal inverse-covariance element C^{-1}_{ch_i,
    * ch_j} at position (t_idx, f_idx) for the given noise instance. */
@@ -247,6 +265,9 @@ class STFTDomain : public STFTSettings {
   // Inner products — per-channel primitives
   // The caller is responsible for looping over all (channel_i, channel_j)
   // or channel pairs and summing the contributions.
+  // Every accumulator takes the pixel's data bin (f_idx_data) and its
+  // inverse-covariance bin (f_idx_noise); they differ only when
+  // noise_full_grid is set.
   // ----------------------------------------------------------------
 
   /** @brief Accumulate one (ch_i, ch_j) cross-term of (d|h) and (h|h).
@@ -263,9 +284,9 @@ class STFTDomain : public STFTSettings {
    */
   CUDA_DEVICE
   void get_inner_product_cross(cmplx* d_h, cmplx* h_h, cmplx h_val_i,
-                               cmplx h_val_j, int t_idx, int f_idx,
-                               int channel_i, int channel_j, int data_index,
-                               int noise_index);
+                               cmplx h_val_j, int t_idx, int f_idx_data,
+                               int f_idx_noise, int channel_i, int channel_j,
+                               int data_index, int noise_index);
 
   /** @brief Accumulate one diagonal-channel contribution to (d|h) and (h|h).
    *
@@ -279,8 +300,8 @@ class STFTDomain : public STFTSettings {
    */
   CUDA_DEVICE
   void get_inner_product_diag(cmplx* d_h, cmplx* h_h, cmplx h_val, int t_idx,
-                              int f_idx, int channel, int data_index,
-                              int noise_index);
+                              int f_idx_data, int f_idx_noise, int channel,
+                              int data_index, int noise_index);
 
   // ----------------------------------------------------------------
   // <d|d> inner product — per-channel primitives
@@ -292,8 +313,9 @@ class STFTDomain : public STFTSettings {
    *    *d_d += conj(d[ch_i]) * C^{-1}_{ch_i,ch_j} * d[ch_j]
    */
   CUDA_DEVICE
-  void get_d_d_inner_product_cross(cmplx* d_d, int t_idx, int f_idx,
-                                   int channel_i, int channel_j, int data_index,
+  void get_d_d_inner_product_cross(cmplx* d_d, int t_idx, int f_idx_data,
+                                   int f_idx_noise, int channel_i,
+                                   int channel_j, int data_index,
                                    int noise_index);
 
   /** @brief Accumulate one diagonal-channel contribution to (d|d).
@@ -302,8 +324,9 @@ class STFTDomain : public STFTSettings {
    *    *d_d += conj(d[ch]) * C^{-1}_{ch} * d[ch]
    */
   CUDA_DEVICE
-  void get_d_d_inner_product_diag(cmplx* d_d, int t_idx, int f_idx, int channel,
-                                  int data_index, int noise_index);
+  void get_d_d_inner_product_diag(cmplx* d_d, int t_idx, int f_idx_data,
+                                  int f_idx_noise, int channel, int data_index,
+                                  int noise_index);
 
   // ----------------------------------------------------------------
   // Unified dispatchers — loop over channels internally
@@ -324,7 +347,8 @@ class STFTDomain : public STFTSettings {
    */
   CUDA_DEVICE
   void add_ip_contrib(cmplx* d_h_tmp, cmplx* h_h_tmp, cmplx* template_vals,
-                      int t_idx, int f_idx, int data_index, int noise_index);
+                      int t_idx, int f_idx_data, int f_idx_noise,
+                      int data_index, int noise_index);
 
   /** @brief Dispatcher: accumulate (d|d) contribution at one (t,f) pixel.
    *
@@ -334,8 +358,8 @@ class STFTDomain : public STFTSettings {
    * @param d_d_tmp   Per-thread accumulator for (d|d), length NUM_THREADS
    */
   CUDA_DEVICE
-  void add_d_d_contrib(cmplx* d_d_tmp, int t_idx, int f_idx, int data_index,
-                       int noise_index);
+  void add_d_d_contrib(cmplx* d_d_tmp, int t_idx, int f_idx_data,
+                       int f_idx_noise, int data_index, int noise_index);
 
   /** @brief Dispatcher: accumulate all five inner-product terms needed for a
    *  source-swap (birth/death) MCMC step at one (t,f) pixel.
@@ -359,8 +383,9 @@ class STFTDomain : public STFTSettings {
   void add_ip_swap_contrib(cmplx* d_h_add_tmp, cmplx* d_h_remove_tmp,
                            cmplx* add_add_tmp, cmplx* remove_remove_tmp,
                            cmplx* add_remove_tmp, cmplx* template_vals_add,
-                           cmplx* template_vals_remove, int t_idx, int f_idx,
-                           int data_index, int noise_index);
+                           cmplx* template_vals_remove, int t_idx,
+                           int f_idx_data, int f_idx_noise, int data_index,
+                           int noise_index);
 
   /** @brief Host wrapper: launch the two-pass GPU likelihood kernels (or the
    *  equivalent CPU loop) for a batch of @p num_binaries sources.
@@ -460,13 +485,12 @@ class STFTFresnel : public STFTSettings {
   void get_amp_phase(double* amp, double* phase, cmplx z);
   CUDA_DEVICE
   double get_zeta(double f, double f0, double fdot0);
+  // Fresnel integrals C(x) and S(x), and the auxiliary functions f and g at |x| > 1.6 with their
+  // derivatives in |x| (nullptr for df_out or dg_out skips both). Both members delegate to
+  // lat_fresnel.hh, which the DFFR kernels share and which documents definitions, branches,
+  // accuracy and assumptions.
   CUDA_DEVICE
-  void get_fresnel_integrals(double* C, double* S,
-                             double x);  // Fresnel integrals C(x) and S(x)
-  // Auxiliary Fresnel functions for |x| > 1.6, the form the integrals are built from:
-  //   C + iS = sign(x) [ (1+i)/2 - (g + i f)(|x|) e^{i pi x^2 / 2} ].
-  // get_phase_kernel_core consumes them directly so the large phase never forms. df_out/dg_out
-  // are their derivatives in |x|, for the demodulated first moment; nullptr skips them.
+  void get_fresnel_integrals(double* C, double* S, double x);
   CUDA_DEVICE
   void get_fresnel_aux(double* f_out, double* g_out, double abs_x,
                        double* df_out = nullptr, double* dg_out = nullptr);
@@ -519,6 +543,14 @@ class STFTFresnel : public STFTSettings {
                                          double* f0s, double* fdot0s,
                                          double* t_starts, double* t_ends,
                                          double* t_origins, int num);
+
+  // Diagnostic entry point: C, S, f, g and the derivatives of f and g at each argument, so that the
+  // shared Fresnel functions can be checked against reference values. f, g and their derivatives
+  // are taken at |x| and hold only above the seam |x| = 1.6.
+  void compute_fresnel_functions_wrap(double* cosine_out, double* sine_out,
+                                      double* aux_f_out, double* aux_g_out,
+                                      double* slope_f_out, double* slope_g_out,
+                                      double* arguments, int num);
 };
 
 /** @brief First-pass kernel: partial (d|h) and (h|h) sums per CUDA block.

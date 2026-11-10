@@ -64,7 +64,8 @@ class BaseSearchInterface(ABC):
                  search_path: typing.Optional[str] = None,
                  spread: typing.Optional[float | np.ndarray] = None,
                  is_eryn_backend: bool = False,
-                 periodic: typing.Optional[dict[str, dict[str, float]]] = None):
+                 periodic: typing.Optional[dict[str, dict[str, float]]] = None,
+                 max_resample_tries: int = 50):
         """
         Parameters
         ----------
@@ -75,7 +76,8 @@ class BaseSearchInterface(ABC):
         parameters_searched : list[str], optional
             List of parameter names in the sampling basis that are being searched. If None, all parameters in the sampling basis are searched.
         search_path : str, optional
-            Path to the file or directory containing the search results. Required for ``search_type`` in ``["distribution", "samples", "point_estimate", "catalog"]``.
+            Path to the file or directory containing the search results. Required for ``search_type`` in ``["distribution", "samples", "point_estimate"]``.
+            For ``catalog``, an optional HDF5 file whose root holds one dataset per catalogue column, read in place of the loaded catalogue.
         spread : float or np.ndarray, optional
             Spread to use for scattering walkers around the starting points. Can be a scalar, 1-D array (diagonal covariance), 2-D array (full covariance), or 3-D array (one covariance per leaf). Required for ``search_type`` in ``["point_estimate", "catalog"]``.
         is_eryn_backend : bool, optional
@@ -84,9 +86,12 @@ class BaseSearchInterface(ABC):
             Periodic parameters in the settings format ``{branch_name: {sampling-basis name: period}}``
             (e.g. ``curr.source_info["mbh"].periodic``). Starting points are wrapped into ``[0, period)``
             after the transform to the sampling basis.
+        max_resample_tries : int, optional
+            Resample passes for walkers drawn outside the prior around a point value. Default 50.
         """
 
         self.search_type = search_type
+        self.max_resample_tries = int(max_resample_tries)
         self.search_path = search_path
         self.spread = spread
         self.transform = transform
@@ -207,12 +212,15 @@ class BaseSearchInterface(ABC):
         np.ndarray
             The transformed parameters in the sampling basis.
         """
-        if self.transform is not None:            
-            # Create a filled array with the same shape as the input parameters, but with the last dimension equal to the number of physical parameters, otherwise the transform will fail.
-            filled = np.ones((*params.shape[:-1], len(self.physical_parameters)))
-            filled[..., self.parameters_searched] = params
-            filled_converted = self.transform.both_inverse_transforms(filled)
-            params = filled_converted[..., self.parameters_searched]
+        if self.transform is not None:
+            # * Rows with every waveform-basis column (e.g. the EMRI catalogue rows) are inverted as they are.
+            if params.shape[-1] != self.transform.ndim_full:
+                # * Other rows hold the searched parameters in the sampling-basis order: place them, then add the
+                # * transform's fixed columns (e.g. the GB fddot), which the inverse transform expects.
+                filled = np.ones((*params.shape[:-1], self.transform.ndim))
+                filled[..., self.parameters_searched] = params
+                params = self.transform.fill_values(filled)
+            params = self.transform.both_inverse_transforms(params)[..., self.parameters_searched]
 
         return params
 
@@ -220,11 +228,32 @@ class BaseSearchInterface(ABC):
         """
         Returns the source catalog for the specific source type.
         """
+
+        if self.search_path is not None:
+            return self.get_search_catalog()
+
         catalog = getattr(curr.general_info, "catalogue", {}).get(self.catalog_source_name, {})
         if not catalog:
             raise ValueError(f"No catalog found for source type {self.catalog_source_name}")
 
         entries = [catalog[source_id] for source_id in sorted(catalog.keys())]
+        return entries
+
+    def get_search_catalog(self) -> list[dict]:
+        """
+        Returns the catalog of the search results at ``search_path``, one entry per source: the rows of an HDF5
+        file whose root holds one dataset per catalogue column.
+        """
+        import h5py
+
+        with h5py.File(self.search_path, "r") as catalog_file:
+            columns = {name: np.atleast_1d(item[()]) for name, item in catalog_file.items()
+                       if isinstance(item, h5py.Dataset)}
+        if not columns:
+            raise ValueError(f"{self.search_path} holds no catalogue columns at its root")
+
+        num_sources = len(next(iter(columns.values())))
+        entries = [{name: values[row] for name, values in columns.items()} for row in range(num_sources)]
         return entries
 
     @abstractmethod
@@ -579,7 +608,7 @@ class BaseSearchInterface(ABC):
                 covariances=covariances,
                 num_walkers=num_walkers,
                 betas=betas,
-                **kwargs
+                **{"max_resample_tries": self.max_resample_tries, **kwargs},
             )
 
     def get_subset_inds(self, curr: CurrentInfoGlobalFit, **kwargs) -> typing.Optional[np.ndarray]:
@@ -746,15 +775,71 @@ class GBSearchInterface(BaseSearchInterface):
     """
     Search interface for GB sources.
 
+    A ``catalog`` search with a ``search_path`` seeds from the rows of that file, such as the galaxy
+    search's ``gb_candidates.hdf5``. The STFT GB computations take the parameters at the catalogue's
+    reference epoch (their ``t_ref``), so STFT runs need ``evolve_to_data_start=False``.
+
     Attributes
     ----------
     evolve_to_data_start: bool
         If True, when seeding from the catalog values evolve the source parameters to the start of the data segment using the provided evolution function. If False, use the catalog values directly without evolution.
+    reference_time: float or None
+        The epoch of the GB kernels' parameters (``t_ref``); ``None`` takes the mojito catalogue epoch.
+        The STFT GB computations do not use it.
+    seed_phase_copies: bool
+        If True, the walkers scattered around a point (``catalog``, ``point_estimate``, ``samples``) are spread over
+        the four copies of (phi0, psi) where the template is the same, (phi0, psi), (phi0, psi + pi),
+        (phi0 + pi, psi + pi/2) and (phi0 + pi, psi + 3 pi/2), each with probability 1/4; it needs phi0 and psi
+        among the periodic columns. If False, every walker starts in the copy of its point. The L2D GB block sets it.
     """
 
-    def __init__(self, evolve_to_data_start: bool = True, **kwargs):
+    # The search types whose walkers scatter around a point, which seed_phase_copies spreads over the copies
+    PHASE_COPY_SEARCH_TYPES = ("catalog", "point_estimate", "samples")
+
+    def __init__(self, evolve_to_data_start: bool = True, reference_time: typing.Optional[float] = None,
+                 seed_phase_copies: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.evolve_to_data_start = evolve_to_data_start
+        self.reference_time = reference_time
+        self.seed_phase_copies = bool(seed_phase_copies)
+        if self.seed_phase_copies:
+            # (column, period) of phi0 and of psi in the sampling basis
+            self._phase_columns = []
+            for name in ("phi0", "psi"):
+                column = list(self.sampling_basis).index(name) if name in self.sampling_basis else None
+                if column is None or self.periodic is None or column not in self.periodic:
+                    raise ValueError(
+                        f"seed_phase_copies needs {name} as a periodic column of the {self.branch_name} branch's "
+                        f"sampling basis {list(self.sampling_basis)}"
+                    )
+                self._phase_columns.append((column, float(self.periodic[column])))
+
+    def generate_initial_draws(self, curr: CurrentInfoGlobalFit, num_walkers: int,
+                               betas: typing.Union[np.ndarray, list[float]],
+                               num_leaves_max: typing.Optional[int] = None, **kwargs) -> np.ndarray:
+        """The base class's draws; with ``seed_phase_copies`` the scattered draws spread over the four copies."""
+        draws = super().generate_initial_draws(curr, num_walkers, betas, num_leaves_max=num_leaves_max, **kwargs)
+        if not self.seed_phase_copies or self.search_type not in self.PHASE_COPY_SEARCH_TYPES:
+            return draws
+        (phi0_column, phi0_period), (psi_column, psi_period) = self._phase_columns
+        # * drawn after the scatter, so the scatter is the same as without the switch and only the phases move
+        phase_copy = np.random.rand(*draws.shape[:-1]) < 0.5
+        psi_copy = np.random.rand(*draws.shape[:-1]) < 0.5
+        draws[..., phi0_column], draws[..., psi_column] = self.phase_copies(
+            draws[..., phi0_column], draws[..., psi_column], phase_copy, psi_copy, phi0_period, psi_period)
+        shares = np.bincount((2 * phase_copy + psi_copy).ravel(), minlength=4) / phase_copy.size
+        logger.info(f"Seeded the {self.branch_name} walkers at the four copies of (phi0, psi), shares "
+                    + ", ".join(f"{share:.3f}" for share in shares))
+        return draws
+
+    @staticmethod
+    def phase_copies(phi0, psi, phase_copy, psi_copy, phi0_period=2.0 * np.pi, psi_period=2.0 * np.pi):
+        """(phi0, psi) moved to the copy (phi0 + pi, psi + pi/2) where ``phase_copy`` is set and by psi + pi where
+        ``psi_copy`` is set, wrapped into [0, period); the template is the same at the four copies. With a psi
+        period of pi the psi + pi move maps a point to itself."""
+        phi0 = np.mod(phi0 + np.pi * phase_copy, phi0_period)
+        psi = np.mod(psi + 0.5 * np.pi * phase_copy + np.pi * psi_copy, psi_period)
+        return phi0, psi
 
     @property
     def branch_name(self):

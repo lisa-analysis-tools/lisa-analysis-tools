@@ -1,0 +1,34 @@
+type: gb
+priors: {class: mojitolight.GBPrior}  # the setup limits its f0 to the proposed bands
+nleaves: 8000  # the most sources at once: the start candidates and room for RJ births
+num_prop_repeats: 50
+waveform:
+  class: GBGPU
+  runtime_kwargs: {oversample: 4, tdi_channel_setup: XYZ, tdi2: true}
+# DFFR with first-order delays, as in every DFFR run of the GB memory effort
+stft: {n_side_bins: 16, response: dffr, linear_envelope: true, use_midpoint: true, first_order_delays: true}
+# the reference ladder: beta = 1 / 1.2^k, with the hottest rung at T = 1e4
+tempering: {ratio: 1.2, Tmax: 1e4}
+pe_move:
+  class: GBSpecialRJPriorMove
+  # births from the prior; stretch_probability 0: every in-model proposal is a Fisher-matrix one
+  kwargs:
+    stretch_probability: 0.0
+    num_stationary_fim_steps: 1
+    run_swaps: true
+    use_prior_removal: false
+    phase_maximize: false
+    ranks_needed: 0
+search:
+  search_type: catalog
+  # the galaxy search's candidates, layout version 0.2 (GBs and VGBs in one table)
+  search_path: /workspace/rrondeel/erebor_dev/data/gb_candidates.hdf5
+  # ln A, f0 [mHz], fdot, phi0, cos iota, psi, alpha, sin delta; hotter chains are wider
+  spread: [1e-3, 1e-9, 1e-19, 1e-3, 1e-3, 1e-3, 1e-4, 1e-4]
+  # near 0.35 mHz only about 1 in 80 hot-chain fdot draws lands inside the fdot prior
+  max_resample_tries: 2000
+  # the STFT computations take the parameters at the catalogue epoch, where the candidates are
+  kwargs: {evolve_to_data_start: false}
+links:
+  waveform_model_code_link: https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors/blob/fb65c565aea06c62a41ddbe95bb6b40a1a9c04b6/src/ereborpriors/stock/mojitolight/gb.py

@@ -58,7 +58,7 @@ flow:
 search:
   search_type: point_estimate
   search_path: /data/asantini/globalfit/erebor_org_setup/search_results/mbh/candidates_with_psd/
-  # parameters_searched: ['logM', 'logq', 's1z', 's2z', 'cos_iota', 'psi', 'alpha', 'sin_delta', 't_c']
+  # parameters_searched: ['logM', 'q', 's1z', 's2z', 'cos_iota', 'psi', 'alpha', 'sin_delta', 't_c']
   spread: [1e-4, 1e-3, 1e-3, 1e-3, 1e-3, 1e-3, 1e-1, 1e-1, 1e-2, 1e-2, 1e-1]
 pe_move: 
   class: TDMBHSpecialMove

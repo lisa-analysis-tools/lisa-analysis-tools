@@ -42,7 +42,15 @@ N_DEV = _n_devices()
 requires_2gpu = unittest.skipUnless(
     N_DEV >= 2, f"requires >= 2 CUDA devices (found {N_DEV})")
 
-BK = "cuda12x"
+def _cuda_backend() -> str:
+    """The first CUDA backend this build has; ``cuda12x`` when none loads, which the skip covers."""
+    import lisatools
+
+    names = ("cuda13x", "cuda12x", "cuda11x")
+    return next((name for name in names if lisatools.has_backend(name)), "cuda12x")
+
+
+BK = _cuda_backend()
 
 
 @requires_2gpu
