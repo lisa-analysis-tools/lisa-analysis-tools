@@ -92,13 +92,14 @@ class _GBConfig(unittest.TestCase):
         self.run_dir = Path(folder.name)
         write_candidates(self.run_dir / CANDIDATES_FILE)
 
-    def config(self, block_changes=None, **data_changes) -> RunConfig:
+    def config(self, block_changes=None, burn_in=False, **data_changes) -> RunConfig:
+        raw = gb_raw(block_changes, **data_changes)
+        if burn_in:  # the stock recipe's stages burn-in and pe
+            raw["recipe"] = {"class": "StockRecipe", "kwargs": {"burn_in_iterations": 10}}
         with warnings.catch_warnings():
             # ? A block without a search warns that its branch starts empty.
             warnings.simplefilter("ignore", UserWarning)
-            return RunConfig.model_validate(
-                gb_raw(block_changes, **data_changes), context={"run_dir": self.run_dir}
-            )
+            return RunConfig.model_validate(raw, context={"run_dir": self.run_dir})
 
     def assertConfigError(self, message: str, block_changes=None, **data_changes) -> None:
         with self.assertRaises(ValidationError) as caught:
@@ -142,19 +143,21 @@ class GBSchemaTest(_GBConfig):
         from lisatools.globalfit.moves.gbspecialmove import GBFStatSettings
 
         self.assertEqual(self.config().blocks["gb"].extra_moves, {})
-        fstat = {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.3,
+        fstat = {"class": "GBFStatRJMove", "weight": 0.1, "stage_weights": {"burn-in": 0.3},
                  "kwargs": {"fstat_settings": {"nsteps_1": 100}}}
-        block = self.config({"extra_moves": {"fstat": fstat}}).blocks["gb"]
+        block = self.config({"extra_moves": {"fstat": fstat}}, burn_in=True).blocks["gb"]
         spec = block.extra_moves["fstat"]
-        self.assertEqual((spec.class_name, spec.weight, spec.burn_in_share), ("GBFStatRJMove", 0.1, 0.3))
+        self.assertEqual((spec.class_name, spec.weight, spec.share("burn-in"), spec.share("pe")),
+                         ("GBFStatRJMove", 0.1, 0.3, 0.1))
         # the mapping becomes the move's settings dataclass, its other fields at their defaults
         self.assertEqual(gb_move_kwargs(block, spec.kwargs)["fstat_settings"], GBFStatSettings(nsteps_1=100))
-        # without burn_in_weight the burn-in share is the PE share; a share of one phase only is allowed
+        # a stage without stage_weights takes weight; a share of one stage only is allowed
         block = self.config({"extra_moves": {
             "fstat": {"class": "GBFStatRJMove", "weight": 0.2},
-            "second": {"class": "GBFStatRJMove", "weight": 0.0, "burn_in_weight": 0.5},
-        }}).blocks["gb"]
-        self.assertEqual([spec.burn_in_share for spec in block.extra_moves.values()], [0.2, 0.5])
+            "second": {"class": "GBFStatRJMove", "weight": 0.0, "stage_weights": {"burn-in": 0.5}},
+        }}, burn_in=True).blocks["gb"]
+        self.assertEqual([spec.share("burn-in") for spec in block.extra_moves.values()], [0.2, 0.5])
+        self.assertEqual([spec.share("pe") for spec in block.extra_moves.values()], [0.2, 0.0])
 
         def extra(**fields):
             return {"extra_moves": {"x": {"class": "GBFStatRJMove", "weight": 0.5, **fields}}}
@@ -163,14 +166,16 @@ class GBSchemaTest(_GBConfig):
             ({"extra_moves": {"x": {"class": "GBFStatRJMove"}}}, "Field required"),
             (extra(weight=1.0), "less than 1"),
             (extra(weight=-0.1), "greater than or equal to 0"),
-            (extra(burn_in_weight=1.0), "less than 1"),
-            # no burn_in_weight: the burn-in share is the PE share, here 0 as well
+            (extra(stage_weights={"pe": 1.0}), "less than 1"),
             (extra(weight=0.0), "would never run"),
+            (extra(weight=0.0, stage_weights={"pe": 0.0}), "would never run"),
             ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.6},
-                              "b": {"class": "GBFStatRJMove", "weight": 0.4}}}, "of the PE iterations"),
-            ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.5},
-                              "b": {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.5}}},
-             "of the burn-in iterations"),
+                              "b": {"class": "GBFStatRJMove", "weight": 0.4}}}, "of a stage without stage_weights"),
+            ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.1, "stage_weights": {"pe": 0.5}},
+                              "b": {"class": "GBFStatRJMove", "weight": 0.1, "stage_weights": {"pe": 0.5}}}},
+             "of stage 'pe'"),
+            # a stage_weights key must be a recipe stage
+            (extra(stage_weights={"burn-in": 0.2}), "extra_moves x stage_weights ['burn-in'] are not recipe"),
             ({"extra_moves": {"pe": {"class": "GBFStatRJMove", "weight": 0.5}}}, "the name pe"),
             ({"extra_moves": {"x": {"class": "GBSpecialRJPriorMove", "weight": 0.5}}}, "is not one of"),
             (extra(seed=1), "Extra inputs are not permitted"),

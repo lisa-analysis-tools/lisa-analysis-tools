@@ -432,16 +432,23 @@ class RunConfig(_Section):
 
     @model_validator(mode="after")
     def _block_stages_are_recipe_stages(self):
-        """A block's ``stages`` keys must be stages of the stock recipe (a recipe file decides its own steps)."""
+        """A block's ``stages`` keys, and the ``stage_weights`` keys of its ``extra_moves``, must be stages of the
+        stock recipe (a recipe file decides its own steps)."""
         if not isinstance(self.recipe, StockRecipeSpec):
             return self
         from .build_recipe import make_stock_recipe  # local: build_recipe is the runtime side
 
         names = make_stock_recipe(self.recipe.class_name, self.recipe.kwargs).stage_names
         for name, block in self.blocks.items():
-            unknown = sorted(set(getattr(block, "stages", None) or ()) - set(names))
-            if block.enabled and unknown:
-                raise ValueError(f"block {name!r}: stages {unknown} are not recipe stages {names}.")
+            if not block.enabled:
+                continue
+            named = {"stages": set(getattr(block, "stages", None) or ())}
+            for key, spec in (getattr(block, "extra_moves", None) or {}).items():
+                named[f"extra_moves {key} stage_weights"] = set(spec.stage_weights)
+            for where, stages in named.items():
+                unknown = sorted(stages - set(names))
+                if unknown:
+                    raise ValueError(f"block {name!r}: {where} {unknown} are not recipe stages {names}.")
         return self
 
     @model_validator(mode="after")

@@ -537,40 +537,58 @@ class StockRecipeTest(unittest.TestCase):
         self.assertEqual(pe["name"], "pe")
 
     def test_alternating_pe_moves_take_turns_in_weighted_steps(self):
-        alternatives = [Alternative("gb prior", 0.6, 0.3), Alternative("gb fstat", 0.4, 0.5),
-                        Alternative("gb jump", 0.0, 0.2)]
+        # as the settings files: gb prior and gb refit taking turns 0.95 / 0.05 in PE, with the mbh and psd moves
+        alternatives = (Alternative("gb refit", 0.05, {"burn-in": 0.5}), Alternative("gb jump", 0.0, {"burn-in": 0.2}))
         moves = {
             "gb": BranchMoves([], ["gb prior"], alternatives),
+            "mbh": BranchMoves([], ["mbh pe"]),
             "psd": BranchMoves(["psd search"], ["psd pe"]),
         }
         search, burn_in, pe = self.steps(moves, burn_in_iterations=10)
         self.assertEqual([s["name"] for s in (search, burn_in, pe)], ["psd search", "burn-in", "pe"])
         self.assertIsInstance(pe["adjust"], gf_recipe.PERecipeStep)
-        self.assertEqual(pe["adjust"].weights, [0.6, 0.4])
-        prior_combined, fstat_combined = pe["adjust"].moves
-        # each alternative with every other branch's PE moves, in the branches' order
-        self.assertEqual(prior_combined.moves, ["gb prior", "psd pe"])
-        self.assertEqual(fstat_combined.moves, ["gb fstat", "psd pe"])
-        self.assertFalse(fstat_combined.share_temperature_control)
-        # the burn-in step takes the burn-in shares, the alternative without a PE share among them, and the same
-        # combined moves as the PE step for the alternatives in both
+        np.testing.assert_allclose(pe["adjust"].weights, [0.95, 0.05])
+        prior_combined, refit_combined = pe["adjust"].moves
+        # each choice with every other branch's PE moves, in the branches' order
+        self.assertEqual(prior_combined.moves, ["gb prior", "mbh pe", "psd pe"])
+        self.assertEqual(refit_combined.moves, ["gb refit", "mbh pe", "psd pe"])
+        self.assertFalse(refit_combined.share_temperature_control)
+        # the burn-in step takes the burn-in shares, the move without a PE share among them, and the same combined
+        # moves as the PE step for the choices in both
         self.assertIsInstance(burn_in["adjust"], gf_recipe.IterationCountRecipeStep)
-        self.assertEqual(burn_in["adjust"].weights, [0.3, 0.5, 0.2])
-        self.assertEqual(burn_in["adjust"].moves[:2], pe["adjust"].moves)
-        self.assertEqual(burn_in["adjust"].moves[2].moves, ["gb jump", "psd pe"])
+        np.testing.assert_allclose(burn_in["adjust"].weights, [0.3, 0.5, 0.2])
+        self.assertIs(burn_in["adjust"].moves[0], prior_combined)
+        self.assertIs(burn_in["adjust"].moves[1], refit_combined)
+        self.assertEqual(burn_in["adjust"].moves[2].moves, ["gb jump", "mbh pe", "psd pe"])
 
-    def test_a_burn_in_only_move_needs_a_burn_in_step(self):
-        moves = {"gb": BranchMoves([], ["a"], [Alternative("a", 1.0, 0.5), Alternative("b", 0.0, 0.5)])}
-        with self.assertRaisesRegex(ValueError, "no burn-in step"):
-            self.steps(moves)
+    def test_stages_carry_the_turns_and_the_move_settings(self):
+        alternatives = (Alternative("gb fstat", 0.1, {"warm": 0.0, "hot": 0.4}),)
+        moves = {"gb": BranchMoves([], ["gb prior"], alternatives), "mbh": BranchMoves([], ["mbh pe"])}
+        settings = {"warm": {"mbh": {"num_repeats": 2}}, "hot": {"mbh": {"num_repeats": 5}}, "pe": {}}
+        recipe = gf_recipe.Recipe()
+        stages = [{"name": "warm", "iterations": 3}, {"name": "hot", "iterations": 4}, {"name": "pe"}]
+        with mock.patch.object(gf_moves, "GFCombineMove", FakeCombine):
+            StockRecipe(stages=stages).add_steps(recipe, moves, settings.get)
+        warm, hot, pe = (step["adjust"] for step in recipe.recipe)
+        self.assertEqual([step["name"] for step in recipe.recipe], ["warm", "hot", "pe"])
+        self.assertEqual([warm.num_iters, hot.num_iters], [3, 4])
+        self.assertIsInstance(pe, gf_recipe.PERecipeStep)
+        # warm: no fstat share, so one combined move; hot and pe: the stage's share and its own default
+        self.assertEqual(warm.weights, [1.0])
+        np.testing.assert_allclose(hot.weights, [0.6, 0.4])
+        np.testing.assert_allclose(pe.weights, [0.9, 0.1])
+        self.assertEqual(len({id(m) for step in (warm, hot, pe) for m in step.moves}), 2)  # built once, shared
+        self.assertEqual([warm.move_settings, hot.move_settings, pe.move_settings],
+                         [settings["warm"], settings["hot"], {}])
 
-    def test_only_one_block_may_alternate(self):
+    def test_several_blocks_take_turns_independently(self):
         moves = {
-            "gb": BranchMoves([], ["a"], [Alternative("a", 0.5, 0.5), Alternative("b", 0.5, 0.5)]),
-            "mbh": BranchMoves([], ["c"], [Alternative("c", 0.5, 0.5), Alternative("d", 0.5, 0.5)]),
+            "gb": BranchMoves([], ["a"], (Alternative("b", 0.25),)),
+            "mbh": BranchMoves([], ["c"], (Alternative("d", 0.5),)),
         }
-        with self.assertRaisesRegex(ValueError, "only one block"):
-            self.steps(moves)
+        (pe,) = self.steps(moves)
+        self.assertEqual([m.moves for m in pe["adjust"].moves], [["a", "c"], ["a", "d"], ["b", "c"], ["b", "d"]])
+        np.testing.assert_allclose(pe["adjust"].weights, [0.375, 0.375, 0.125, 0.125])
 
     def test_nothing_to_sample(self):
         with self.assertRaisesRegex(ValueError, "nothing to sample"):

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import itertools
 from copy import deepcopy
 from functools import partial
 from dataclasses import dataclass, field
@@ -36,18 +37,21 @@ SETUP_ARGS = ("recipe", "engine_info", "curr", "acs", "priors", "state")
 logger = init_logger(__name__, level="DEBUG", name="RecipeBuilder")
 
 class Alternative(NamedTuple):
-    """One of a branch's PE moves that take turns, with its shares of the PE and the burn-in iterations."""
+    """A move that takes (random) turns with its branch's ``pe`` moves, in a share of each stage's iterations."""
 
     move: Any
-    weight: float
-    burn_in_weight: float
+    weight: float  # the share of the iterations of every stage not in stage_weights
+    stage_weights: dict[str, float] = {}  # stage name -> the share of that stage's iterations
+
+    def share(self, stage: str) -> float:
+        return self.stage_weights.get(stage, self.weight)
 
 
 class BranchMoves(NamedTuple):
     search: list  # one-shot moves run before PE (the psd max-likelihood search)
     pe: list
-    # PE moves that take (random) turns as the branch's PE move, one per iteration; None: pe runs every iteration
-    alternatives: list[Alternative] | None = None
+    # each iteration the branch runs its pe moves or one of these, the pe moves taking what these leave of the stage
+    alternatives: tuple[Alternative, ...] = ()
 
 
 @dataclass
@@ -70,6 +74,42 @@ class RecipeContext:
 
 # --- the recipes --- #
 
+class JointPEMoves:
+    """The joint PE moves of each stage: one ``GFCombineMove`` per combination of the branches' turns.
+
+    A ``GFCombineMove`` runs every move it holds, so a branch with ``alternatives`` needs one combined move per
+    choice it can make: its ``pe`` moves, or one alternative. ``moves(stage)`` gives the combinations with a share
+    in that stage, each with every branch's choice in the branches' order, and their weights, the products of the
+    branches' shares. A combination is built once, so the stages that share it share the move.
+    """
+
+    def __init__(self, moves: dict[str, BranchMoves]):
+        self.branches = list(moves.values())
+        self._combined: dict[tuple[int, ...], Any] = {}
+
+    @staticmethod
+    def choices(branch: BranchMoves, stage: str) -> list[tuple[int, list, float]]:
+        """The branch's choices ``(index, moves, share)`` in the stage, ``pe`` (index 0) first, those with a share
+        only."""
+        shares = [alternative.share(stage) for alternative in branch.alternatives]
+        options = [(branch.pe, 1.0 - sum(shares))]
+        options += [([alternative.move], share) for alternative, share in zip(branch.alternatives, shares)]
+        return [(index, moves, share) for index, (moves, share) in enumerate(options) if moves and share > 0.0]
+
+    def moves(self, stage: str) -> tuple[list, list[float]]:
+        from lisatools.globalfit.moves import GFCombineMove
+
+        combined, weights = [], []
+        per_branch = [choices for choices in (self.choices(branch, stage) for branch in self.branches) if choices]
+        for picks in itertools.product(*per_branch):
+            key = tuple(index for index, _moves, _share in picks)
+            if key not in self._combined:
+                listed = [move for _index, moves, _share in picks for move in moves]
+                self._combined[key] = GFCombineMove(moves=listed, share_temperature_control=False)
+            combined.append(self._combined[key])
+            weights.append(float(np.prod([share for _index, _moves, share in picks])))
+        return combined, weights
+
 def _positive_int(value) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value >= 1
 
@@ -78,8 +118,9 @@ class StockRecipe:
     """psd max-likelihood search (when there is a psd block), then the joint PE in ``stages``.
 
     ``stages`` is a list of ``{name, iterations}``: each stage runs ``iterations`` iterations, the last one has
-    none and runs until ``run.num_iterations``. All stages share one joint PE move; what changes between them
-    are the blocks' ``stages`` settings (proposal repeats, inner-move weights). Default: one stage, ``pe``.
+    none and runs until ``run.num_iterations``. All stages run the joint PE moves (``JointPEMoves``); what changes
+    between them are the blocks' ``stages`` settings (proposal repeats, inner-move weights) and the shares of the
+    moves that take turns with a branch's PE move (the gb ``extra_moves``). Default: one stage, ``pe``.
     ``burn_in_iterations: N`` is short for ``[{name: burn-in, iterations: N}, {name: pe}]``.
     """
 
@@ -122,7 +163,6 @@ class StockRecipe:
 
     def add_steps(self, recipe, moves: dict[str, BranchMoves], move_settings=None) -> None:
         """Add the steps; ``move_settings(stage name) -> {branch: settings}`` gives each stage's move settings."""
-        from lisatools.globalfit.moves import GFCombineMove
         from lisatools.globalfit.recipe import IterationCountRecipeStep, PERecipeStep, SearchRecipeStep
 
         search = [m for branch in moves.values() for m in branch.search]
@@ -134,64 +174,23 @@ class StockRecipe:
         if search:
             logger.info("Adding psd search")
             recipe.add_recipe_component(SearchRecipeStep(moves=search), name="psd search")
-        #from here
-        alternating = [name for name, branch in moves.items() if branch.alternatives]
-        if not alternating:
-            combined = GFCombineMove(moves=pe, share_temperature_control=False)
-            if self.burn_in_iterations is not None:
-                recipe.add_recipe_component(
-                    IterationCountRecipeStep(moves=[combined], num_iters=self.burn_in_iterations), name="burn-in"
-                )
-            logger.info("Adding joint PE")
-            recipe.add_recipe_component(PERecipeStep(moves=[combined]), name="pe")
-            return
 
-        # * A GFCombineMove runs every move it holds, so a branch whose PE moves take turns gets one combined move per
-        # * alternative, each with every other branch's PE moves in the usual order. Each step picks one per iteration
-        # * with the alternatives' shares of its phase; an alternative without a share in a phase is left out of it.
-        #! Coen: "this should be updated in the future, now keeping same behaviour as previously."
-        if len(alternating) > 1:
-            raise ValueError(f"only one block may alternate its PE moves, not {alternating}.")
-        name = alternating[0]
-        alternatives = moves[name].alternatives
-        combined = []
-        for alternative in alternatives:
-            listed = [m for other, branch in moves.items() for m in ([alternative.move] if other == name else branch.pe)]
-            combined.append(GFCombineMove(moves=listed, share_temperature_control=False))
-
-        def phase(share: str) -> tuple[list, list]:
-            kept = [index for index, alternative in enumerate(alternatives) if getattr(alternative, share) > 0.0]
-            return [combined[index] for index in kept], [getattr(alternatives[index], share) for index in kept]
-
-        if self.burn_in_iterations is not None:
-            burn_in_moves, burn_in_weights = phase("burn_in_weight")
-            logger.info(f"Adding burn-in, the {name} PE moves taking turns with weights {burn_in_weights}")
-            recipe.add_recipe_component(
-                IterationCountRecipeStep(
-                    moves=burn_in_moves, weights=burn_in_weights, num_iters=self.burn_in_iterations
-                ),
-                name="burn-in",
-            )
-        elif any(alternative.weight == 0.0 for alternative in alternatives):
-            raise ValueError(
-                f"a {name} PE move has a share of the burn-in only, but the recipe has no burn-in step "
-                "(burn_in_iterations)."
-            )
-        pe_moves, pe_weights = phase("weight")
-        logger.info(f"Adding joint PE, the {name} PE moves taking turns with weights {pe_weights}")
-        recipe.add_recipe_component(PERecipeStep(moves=pe_moves, weights=pe_weights), name="pe")
-        #to here
-        combined = GFCombineMove(moves=pe, share_temperature_control=False)
+        joint = JointPEMoves(moves)
         for stage in self.stages:
             name, iterations = stage["name"], stage["iterations"]
+            combined, weights = joint.moves(name)
             settings = move_settings(name) if move_settings is not None else None
             if iterations is None:
-                step = PERecipeStep(moves=[combined], move_settings=settings)
+                step = PERecipeStep(moves=combined, weights=weights, move_settings=settings)
             else:
-                step = IterationCountRecipeStep(moves=[combined], num_iters=iterations, move_settings=settings)
-            logger.info(f"Adding joint PE stage {name!r}" + ("" if iterations is None else f" ({iterations} iterations)"))
+                step = IterationCountRecipeStep(
+                    moves=combined, weights=weights, num_iters=iterations, move_settings=settings
+                )
+            logger.info(
+                f"Adding joint PE stage {name!r}" + ("" if iterations is None else f" ({iterations} iterations)")
+                + ("" if len(combined) == 1 else f", {len(combined)} combined moves taking turns with weights {weights}")
+            )
             recipe.add_recipe_component(step, name=name)
-         # to here
 
 
 STOCK_RECIPES: dict[str, type] = {"StockRecipe": StockRecipe}
@@ -484,15 +483,13 @@ def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, sta
             **extra_kwargs,
         )
         extra.accepted = np.zeros((parts.ntemps, parts.nwalkers))
-        extras.append(Alternative(extra, spec.weight, spec.burn_in_share))
+        extras.append(Alternative(extra, spec.weight, dict(spec.stage_weights)))
         logger.info(
-            f"Built {block.type} extra move {key} ({spec.class_name}), run in a share {spec.weight} of the PE "
-            f"iterations and {spec.burn_in_share} of the burn-in"
+            f"Built {block.type} extra move {key} ({spec.class_name}), run in a share {spec.weight} of the "
+            f"iterations" + (f" (by stage: {spec.stage_weights})" if spec.stage_weights else "")
         )
-    # * pe_move takes what the extra moves leave of each phase, more than 0 by the block's check
-    pe_share = 1.0 - sum(alternative.weight for alternative in extras)
-    burn_in_share = 1.0 - sum(alternative.burn_in_weight for alternative in extras)
-    return BranchMoves([], [move], [Alternative(move, pe_share, burn_in_share), *extras])
+    # * pe_move takes what the extra moves leave of each stage, more than 0 by the block's check
+    return BranchMoves([], [move], tuple(extras))
 
 
 def psd_moves(block, cls, engine_info, curr, acs, priors, state) -> BranchMoves:
