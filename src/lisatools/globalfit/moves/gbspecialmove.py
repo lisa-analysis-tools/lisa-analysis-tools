@@ -4313,13 +4313,15 @@ class GBFStatSettings:
     nsteps_2: int = 500
     # The gate's effective-SNR target on the settled noise, where a birth under the global f0 prior breaks even
     snr_eff_threshold: float = 7.5
-    # The foreground's inflation of the noise PSD below shutoff_frequency_threshold, which lowers a source's effective
-    # SNR by its square root: the median over the population
+    # The foreground's inflation of the noise PSD below shutoff_high_frequency_threshold, which lowers a source's
+    # effective SNR by its square root: the median over the population
     galfor_inflation_factor: float = 1.3
-    # Upper edge (Hz) of the galactic foreground: below it the gate's target is lower and no band is shut off; None
-    # puts every band above it
-    shutoff_frequency_threshold: Optional[float] = 6e-3
-    # Searches in a row without a detection after which a band above that edge is shut off
+    # Two separate shutoffs (Hz): a band wholly above the high threshold or wholly below the low threshold is shut off
+    # after shutoff_band_iteration searches in a row without a detection; None turns that shutoff off. The gate also
+    # reads the high threshold as the foreground's upper edge, below which its target is lower (None: no band below)
+    shutoff_high_frequency_threshold: Optional[float] = 6e-3
+    shutoff_low_frequency_threshold: Optional[float] = 6e-4
+    # Searches in a row without a detection after which a band in a shutoff range is shut off
     shutoff_band_iteration: int = 2
     # Proposes of the move from one search to the next; between searches the latest proposal stays
     search_interval: int = 1
@@ -4421,6 +4423,12 @@ class GBFStatRJMove(GBSpecialBase):
                 "fstat_settings: save_search_records needs output_dir; the recipe builders set "
                 "<run>_artifacts/fstat_search/"
             )
+        low_edge, high_edge = settings.shutoff_low_frequency_threshold, settings.shutoff_high_frequency_threshold
+        if low_edge is not None and high_edge is not None and not float(low_edge) < float(high_edge):
+            raise ValueError(
+                f"fstat_settings: shutoff_low_frequency_threshold ({low_edge}) must lie below "
+                f"shutoff_high_frequency_threshold ({high_edge})"
+            )
         # index of the next saved record, counted on from the files in output_dir at the first save
         self._next_record = None
         # one container per card that receives the searched walker, built at the first search on several cards
@@ -4475,8 +4483,8 @@ class GBFStatRJMove(GBSpecialBase):
 
     def _search_bands(self):
         """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
-        those searched, which leaves out the bands above the foreground's edge that found nothing in the last
-        ``shutoff_band_iteration`` searches."""
+        those searched, which leaves out the bands that found nothing in the last ``shutoff_band_iteration`` searches
+        and lie wholly above ``shutoff_high_frequency_threshold`` or wholly below ``shutoff_low_frequency_threshold``."""
         settings = self.fstat_settings
         edges_mhz = asnumpy(self.band_edges) * 1e3
         ids = np.array([0]) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
@@ -4486,9 +4494,13 @@ class GBFStatRJMove(GBSpecialBase):
         iterations = int(settings.shutoff_band_iteration)
         if history is not None and len(history) >= iterations:
             silent = np.all(~history[-iterations:], axis=0)
-            if settings.shutoff_frequency_threshold is not None:
-                silent &= low * 1e-3 >= float(settings.shutoff_frequency_threshold)
-            active = ~silent
+            # * two separate shutoffs, each off when its threshold is None
+            eligible = np.zeros(len(ids), dtype=bool)
+            if settings.shutoff_high_frequency_threshold is not None:
+                eligible |= low * 1e-3 >= float(settings.shutoff_high_frequency_threshold)
+            if settings.shutoff_low_frequency_threshold is not None:
+                eligible |= high * 1e-3 <= float(settings.shutoff_low_frequency_threshold)
+            active = ~(silent & eligible)
         return {"ids": ids, "low_mhz": low, "high_mhz": high, "active": active}
 
     def _band_mask(self, low_mhz, high_mhz):
@@ -4586,7 +4598,7 @@ class GBFStatRJMove(GBSpecialBase):
         # * the minimum read the lower peaks
         detected, thresholds, targets = self.detection_gate(
             snr, bands["low_mhz"][bands["active"]] * 1e-3, float(settings.snr_eff_threshold),
-            settings.shutoff_frequency_threshold, float(settings.galfor_inflation_factor))
+            settings.shutoff_high_frequency_threshold, float(settings.galfor_inflation_factor))
         found_row = np.zeros(len(bands["ids"]), dtype=bool)
         found_row[np.flatnonzero(bands["active"])[detected]] = True
         history = getattr(self, "found_source_in_band", None)

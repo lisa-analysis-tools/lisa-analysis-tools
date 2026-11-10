@@ -18,8 +18,9 @@ band that is not shut off.
 2. **The gate.** A band passes when its largest stored cold $\sqrt{2F}$ exceeds $\sqrt{\rho_t^2 + 8 - \delta}$. With one
    source in a band the peak of $2F$ lies at $\rho_\mathrm{eff}^2 + 8$, and $\delta$ is the median drop of the best
    stored sample below it. The target $\rho_t$ is `snr_eff_threshold`, divided by the square root of
-   `galfor_inflation_factor` below `shutoff_frequency_threshold`, the upper edge of the galactic foreground. Above that
-   edge a band that passed none of its last `shutoff_band_iteration` searches is shut off.
+   `galfor_inflation_factor` below `shutoff_high_frequency_threshold`, the upper edge of the galactic foreground. A band
+   that passed none of its last `shutoff_band_iteration` searches is shut off when it lies wholly above that edge or
+   wholly below `shutoff_low_frequency_threshold`; a threshold of None turns its shutoff off.
 3. **Stage 2.** From the F-statistic maximizers at stage 1's last state, one sampler per passing band samples all eight
    columns with the full likelihood.
 4. **The proposal.** One Gaussian mixture per passing band, fitted to the stage-2 cold chain, is the RJ birth proposal
@@ -42,8 +43,9 @@ The move takes one dataclass, `fstat_settings` (a `GBFStatSettings`; None takes 
 | `betas_2`, `burn_2`, `nsteps_2` | $1.2^{-k}$ for $k = 0, \ldots, 10$ and 0.1, 400, 500 | stage 2: 12 temperatures with $T = 10$ on top, burn-in, stored steps |
 | `snr_eff_threshold` | 7.5 | the gate's effective-SNR target |
 | `galfor_inflation_factor` | 1.3 | the foreground's inflation of the noise PSD |
-| `shutoff_frequency_threshold` | 6e-3 Hz | the foreground's upper edge |
-| `shutoff_band_iteration` | 2 | searches without a detection before a band above the edge is shut off |
+| `shutoff_high_frequency_threshold` | 6e-3 Hz | the foreground's upper edge; bands wholly above it can be shut off |
+| `shutoff_low_frequency_threshold` | 6e-4 Hz | bands wholly below it can be shut off |
+| `shutoff_band_iteration` | 2 | searches without a detection before a band in a shutoff range is shut off |
 | `search_interval` | 1 | proposes of the move from one search to the next |
 | `save_search_records` | `"none"` | what each search saves: `"none"`, `"summary"` or `"full"` |
 | `output_dir` | None | folder of the search log and the records; the recipe builders set `<run>_artifacts/fstat_search/` |
