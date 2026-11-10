@@ -4347,6 +4347,9 @@ class GBFStatRJMove(GBSpecialBase):
     4. one Gaussian mixture per passing band, fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
        theta+-, lam periodic, becomes the RJ proposal (:class:`FStatPhaseProposal`).
 
+    On several cards the walker's data and noise rows are copied to every card (:meth:`_fill_search_holder`), and each
+    likelihood call's rows are shared out in equal blocks, so every card works on every stage of the search.
+
     A search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
     ``save_search_records`` asks for one. The math (the start draws, the amplitudes and their map to the extrinsic
     parameters, the gate, the theta rows) sits in static and class methods. Points are in the GB sampling basis, with
@@ -4420,6 +4423,8 @@ class GBFStatRJMove(GBSpecialBase):
             )
         # index of the next saved record, counted on from the files in output_dir at the first save
         self._next_record = None
+        # one container per card that receives the searched walker, built at the first search on several cards
+        self._search_holder = None
 
     def setup(self, model, branches):
         """Search when this propose is due, else keep the proposal of the latest search.
@@ -4451,14 +4456,15 @@ class GBFStatRJMove(GBSpecialBase):
             self.rj_proposal_distribution = self.gpu_priors if self.backend.uses_cupy else self.priors
             self._finish_search(search, time_start, "every band is shut off; the prior is the proposal")
             return
-        search["stage_1"], search["likelihood_1"] = self._run_stage_1(holder, walker, search["bands"])
+        search_holder, owners = self._search_owners(holder, walker)
+        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, search["bands"])
         search["gate"] = self._apply_gate(search["stage_1"], search["bands"])
         if not search["gate"]["detected"].any():
             self._finish_search(search, time_start, "no band passes; the latest proposal stays")
             return
         search["start"] = self._stage_2_start(search["likelihood_1"], search["stage_1"], search["gate"])
         search["stage_2"], search["likelihood_2"] = self._run_stage_2(
-            holder, walker, search["bands"], search["gate"], search["start"])
+            search_holder, owners, search["bands"], search["gate"], search["start"])
         search["mixtures"] = self._build_proposal(search["stage_2"])
         if search["mixtures"]["proposal"] is None:
             self._finish_search(
@@ -4491,7 +4497,71 @@ class GBFStatRJMove(GBSpecialBase):
         outside_f0 = 0.5 * float(self.joint_f0_fdot_prior(self.priors["gb"]).f0_min)
         return BandMaskTransform(low_mhz, high_mhz, outside_f0)
 
-    def _run_stage_1(self, holder, walker, bands):
+    def _search_owners(self, holder, walker):
+        """The holder the search reads and its rows that hold the walker's residual. On several cards: the search
+        holder, with the walker copied into its row on every card; else ``holder`` and the walker itself."""
+        gpus = getattr(holder, "gpus", None)
+        if gpus is None or len(gpus) < 2:
+            return holder, [walker]
+        return self._fill_search_holder(holder, walker), list(range(len(gpus)))
+
+    def _build_search_holder(self, holder):
+        """One container per card of ``holder`` on its full STFT grid, built as the GB band buffer builds its cells:
+        data and noise rows of zeros on the card, a sensitivity backend made from the card's split, and the split's
+        Fresnel settings. Its rows receive the searched walker at each search."""
+        xp = self.xp
+        settings = holder.settings
+        data_shape = (int(holder.nchannels),) + tuple(holder.end_shape)
+        noise_shape = tuple(holder.shape_sens) + tuple(holder.end_shape)
+        containers = []
+        for split, card in enumerate(holder.gpus):
+            with xp.cuda.Device(int(card)):
+                # ! A backend of its own: the array rebinds its containers' noise arrays, which must not be the main
+                # ! holder's. The split's backend holds the card's own orbit tables.
+                split_backend = holder.cpp_splits[split].sensitivity_backend
+                sensitivity = type(split_backend)(**dict(split_backend.kwargs))
+                sensitivity.data_shape = settings.basis_shape_active
+                noise_zeros = xp.zeros(noise_shape, dtype=xp.complex128)
+                sensitivity.sens_mat = noise_zeros
+                sensitivity.invC = noise_zeros
+                sensitivity.channel_shape = tuple(holder.shape_sens)
+                data = settings.associated_class(xp.zeros(data_shape, dtype=xp.complex128), settings)
+                containers.append(AnalysisContainer(data, sensitivity))
+        group = holder.cpp_splits[0]
+        cards = [int(card) for card in holder.gpus]
+        return AnalysisContainerArray(
+            containers, gpus=cards, complex_psd=True, gpu_assignment=cards,
+            domain_group_kwargs=dict(tdi_type=group.tdi_type, window_alpha=group.window_alpha,
+                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope))
+
+    def _fill_search_holder(self, holder, walker):
+        """The search holder, built at the first call, with ``walker``'s data and noise rows of ``holder`` copied card
+        to card into its row on every card, and its (d|d) for those rows."""
+        if self._search_holder is None:
+            self._search_holder = self._build_search_holder(holder)
+        search_holder = self._search_holder
+        xp = self.xp
+        split = int(np.asarray(asnumpy(holder.split_map))[walker])
+        row = int(np.flatnonzero(np.asarray(asnumpy(holder.gpu_splits[split])) == walker)[0])
+        data_size = int(holder.nchannels) * int(holder.data_length)
+        noise_size = int(np.prod(holder.shape_sens)) * int(holder.data_length)
+        data_row = holder.linear_data_arr[split][row * data_size:(row + 1) * data_size]
+        noise_row = holder.linear_psd_arr[split][row * noise_size:(row + 1) * noise_size]
+        # ! The walker's rows come from its card's stream; each copy runs on its target card's stream, which the
+        # ! search's kernels then follow.
+        xp.cuda.Device(int(holder.gpus[split])).synchronize()
+        for target, card in enumerate(search_holder.gpus):
+            with xp.cuda.Device(int(card)):
+                for source, destination in ((data_row, search_holder.linear_data_arr[target]),
+                                            (noise_row, search_holder.linear_psd_arr[target])):
+                    if destination.size != source.size:
+                        raise ValueError(f"search holder row of {destination.size} entries for a walker row of "
+                                         f"{source.size}")
+                    destination.data.copy_from_device_async(source.data, source.nbytes)
+        search_holder.compute_d_d_terms()
+        return search_holder
+
+    def _run_stage_1(self, holder, owners, bands):
         """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
         restricted to each band. Returns the samplers' outputs and the likelihood, whose terms the maximizers reuse."""
         settings = self.fstat_settings
@@ -4499,7 +4569,7 @@ class GBFStatRJMove(GBSpecialBase):
         low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
         mask = np.zeros(self.NDIM, dtype=bool)
         mask[list(self.SAMPLED_COLUMNS)] = True
-        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, walker, self.parameter_transforms,
+        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
                                            fstat=True)
         start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
         output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
@@ -4572,7 +4642,7 @@ class GBFStatRJMove(GBSpecialBase):
         maximized[outside] = coords[outside]
         return maximized, fstat, scored & ~outside
 
-    def _run_stage_2(self, holder, walker, bands, gate, start):
+    def _run_stage_2(self, holder, owners, bands, gate, start):
         """Stage 2 in the passing bands: the full likelihood over every column (phi0 left to the analytic maximum when
         phase_maximize), from the maximized rows at every temperature. Returns the samplers' outputs, with the cold
         chains, and the likelihood."""
@@ -4583,7 +4653,7 @@ class GBFStatRJMove(GBSpecialBase):
         mask = np.ones(self.NDIM, dtype=bool)
         if self.phase_maximize:
             mask[self.COL_PHI0] = False
-        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, walker, self.parameter_transforms,
+        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
                                            fstat=False, phase_maximize=self.phase_maximize,
                                            waveform_kwargs=self.waveform_kwargs)
         output = self.run_band_samplers(
@@ -5015,19 +5085,27 @@ class FStatSearchLikelihood:
     value per row (numpy).
 
     ``fstat=True`` gives F (stage 1), ``fstat=False`` the full ln L of the band engine's ``get_ll`` (stage 2), both
-    against ``walker``'s row of ``holder``; :meth:`terms` gives the F-statistic terms that the maximizers solve. Counts
-    the calls, the rows and the seconds.
+    against the residual that each of ``owners`` (rows of ``holder``) holds: the walker itself, or its copy on every
+    card, which then take equal blocks of each call's rows. :meth:`terms` gives the F-statistic terms that the
+    maximizers solve. Counts the calls, the rows and the seconds.
     """
 
-    def __init__(self, engine, holder, walker, transform, fstat, phase_maximize=False, waveform_kwargs=None):
-        self.engine, self.holder, self.walker = engine, holder, int(walker)
+    def __init__(self, engine, holder, owners, transform, fstat, phase_maximize=False, waveform_kwargs=None):
+        self.engine, self.holder = engine, holder
+        self.owners = np.atleast_1d(np.asarray(owners, dtype=np.int32))
         self.transform, self.fstat = transform, bool(fstat)
         self.phase_maximize = bool(phase_maximize)
         self.waveform_kwargs = {} if waveform_kwargs is None else waveform_kwargs
         self.calls, self.rows, self.seconds = 0, 0, 0.0
 
+    def row_owners(self, num_rows):
+        """The holder row that each of ``num_rows`` rows reads: equal consecutive blocks, one per owner."""
+        xp = self.engine.xp
+        blocks = (xp.arange(num_rows) * len(self.owners)) // max(num_rows, 1)
+        return xp.asarray(self.owners)[blocks]
+
     def terms(self, params_phys):
-        """F-statistic terms of waveform rows against the walker's residual row: N (n, 4), M (n, 10) and 2F (n).
+        """F-statistic terms of waveform rows against the owners' residual: N (n, 4), M (n, 10) and 2F (n).
 
         One ``get_fstat_terms_stft`` call (the templates T+ and Tx of a row in one pass) per split of the band engine's
         plan, with the split's own comp and window starts, as the engine's ``get_ll`` runs, so the search sees the
@@ -5045,12 +5123,13 @@ class FStatSearchLikelihood:
         keep = engine._central_bin_keep(params_phys)
         if bool(keep.any()):
             rows_kept = xp.where(keep)[0]
-            walker_index = xp.full(int(rows_kept.shape[0]), self.walker, dtype=xp.int32)
+            walker_index = self.row_owners(int(rows_kept.shape[0]))
             plan = engine._split_plan(holder, walker_index, walker_index)
             plan_rows = [rows_kept[sub_rows] for _split, sub_rows, _data, _noise, _device in plan]
-            # ! All rows read one walker, so they go to one split. A split on another card than the caller's runs on
-            # ! its own stream: it waits for the caller's rows and parameters, and the caller waits for its outputs
-            # ! before copying them, as the engine's get_ll does; without the waits the copies read zero-filled outputs.
+            # ! Each owner's block goes to its split, and every split launches before any is waited for. A split on
+            # ! another card than the caller's runs on its own stream: it waits for the caller's rows and parameters, and
+            # ! the caller waits for its outputs before copying them, as the engine's get_ll does; without the waits the
+            # ! copies read zero-filled outputs.
             caller_ready = engine._stream_event(plan[0][4]) if plan else None
             launched = []
             for (split, _sub_rows, intra_data, intra_noise, device), rows in zip(plan, plan_rows):
@@ -5078,7 +5157,7 @@ class FStatSearchLikelihood:
             _, _, two_f, keep = self.terms(params_phys)
             values = xp.where(keep, 0.5 * two_f, GBFStatRJMove.REJECTED_LL)
         else:
-            walker_index = xp.full(coords.shape[0], self.walker, dtype=xp.int32)
+            walker_index = self.row_owners(coords.shape[0])
             values = self.engine.get_ll(self.holder, params_phys, data_index=walker_index, noise_index=walker_index,
                                         N_vals=None, phase_maximize=self.phase_maximize,
                                         waveform_kwargs=self.waveform_kwargs)
