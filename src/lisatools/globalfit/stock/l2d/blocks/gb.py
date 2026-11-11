@@ -55,6 +55,8 @@ class ExtraMove(NamedTuple):
     # True: the band sorter draws the move's dead rows from the prior, as for pe_move; False: the move builds its own
     # proposal (the F-statistic move at its first search)
     prior_proposal: bool
+    # True: the move runs on an STFT domain only (checked against the run's domain at load, io.RunConfig)
+    stft_only: bool = False
 
 
 class ExtraMoveSpec(ClassSpec):
@@ -83,6 +85,7 @@ class GBBlock(SourceBlock):
     SEARCH_INTERFACE: ClassVar[str] = "GBSearchInterface"
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("catalog", "point_estimate")
     FULL_LADDER: ClassVar[bool] = True  # the band temperatures span every temperature
+    STAGES_HINT: ClassVar[str] = " Set the moves' shares per stage in extra_moves.<name>.stage_weights."
     # ? The STFT computations take the parameters at the mojito catalogue epoch, not at data.reference_time.
     NEEDS_REFERENCE_TIME: ClassVar[bool] = False
     PE_MOVES: ClassVar[dict[str, PEMove]] = {
@@ -90,7 +93,7 @@ class GBBlock(SourceBlock):
     }
     # * The classes extra_moves may name; the recipe fills GB_SPECIAL_MOVE_FILLED for them as for pe_move
     EXTRA_MOVES: ClassVar[dict[str, ExtraMove]] = {
-        "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False),
+        "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False, stft_only=True),
     }
 
     nleaves: PositiveInt = 8000  # the most sources at once (nleaves_max); the least is 0
@@ -174,6 +177,19 @@ class GBBlock(SourceBlock):
             if not isinstance(value, dict):
                 raise ValueError(f"pe_move kwargs {name} must be a mapping of {class_name} fields.")
             check_kwargs(value, find_class(class_name, (module,)), frozenset())
+        return self
+
+    @model_validator(mode="after")
+    def _move_settings_are_valid(self):
+        """Build the moves' settings dataclasses as the builder does (``gb_move_kwargs``), so their own value rules
+        (e.g. ``GBFStatSettings.__post_init__``) fail at load, not after the band setup. After the key checks above."""
+        merged = [("pe_move", None)]
+        merged += [(f"extra_moves {key}", {**self.pe_move.kwargs, **spec.kwargs}) for key, spec in self.extra_moves.items()]
+        for where, kwargs in merged:
+            try:
+                gb_move_kwargs(self, kwargs)
+            except (TypeError, ValueError) as err:  # pydantic reports only ValueError as a config error
+                raise ValueError(f"{where}: {err}") from err
         return self
 
     @model_validator(mode="after")

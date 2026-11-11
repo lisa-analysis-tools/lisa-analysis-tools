@@ -135,9 +135,11 @@ class TemperingSpec(_Spec):
         if clashing:
             raise ValueError(f"tempering.betas gives the ladder itself; leave out {clashing}.")
         betas = np.asarray(self.betas, dtype=float)
-        if betas.size == 0 or np.any(np.diff(betas) >= 0) or betas[0] > 1.0 or betas[-1] <= 0.0:
+        # * The cold chain samples the posterior: the ladder starts at beta 1, as the ratio and Tmax ladders do.
+        if betas.size == 0 or np.any(np.diff(betas) >= 0) or betas[0] != 1.0 or betas[-1] <= 0.0:
             raise ValueError(
-                f"tempering.betas {self.betas} must be a non-empty, strictly decreasing list in (0, 1]."
+                f"tempering.betas {self.betas} must be a strictly decreasing list from 1.0 (the cold chain), "
+                "positive to the end."
             )
         return self
 
@@ -362,6 +364,7 @@ class MoveBlock(BlockBase):
 
     PE_MOVES: ClassVar[dict[str, PEMove]]  # classes this block may name in pe_move
     FULL_LADDER: ClassVar[bool] = False  # True -> tempering.ntemps must equal sampler.ntemps
+    STAGES_HINT: ClassVar[str] = ""  # what a block whose pe_move takes no stage settings uses instead
 
     # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
     pe_move: ClassSpec
@@ -456,8 +459,13 @@ class SourceBlock(MoveBlock):
     def _stages_fit_the_moves(self):
         if not self.stages:
             return self
-        if self.PE_MOVES[self.pe_move.class_name].module != SPECIAL_MOVES:
-            raise ValueError(f"stages: need a special pe_move; {self.pe_move.class_name} takes no stage settings.")
+        # * The capability, not where the class lives: stage settings reach the move through apply_settings.
+        cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
+        if not hasattr(cls, "apply_settings"):
+            raise ValueError(
+                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings)."
+                + self.STAGES_HINT
+            )
         for name, stage in self.stages.items():
             weights = stage.inner_move_weights
             if weights is not None and self.inner_moves is None:

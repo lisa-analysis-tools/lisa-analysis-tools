@@ -272,11 +272,12 @@ class SourceSchemaTest(_Sources):
         self.assertEqual(type(tempering).model_validate(tempering.model_dump()), tempering)
         for betas, msg in (
             (list(0.5 ** np.arange(sampler_ntemps + 1)), "length of tempering.betas"),
-            ([], "non-empty, strictly decreasing"),
-            ([1.0, 1.0], "non-empty, strictly decreasing"),
-            ([0.5, 1.0], "non-empty, strictly decreasing"),
-            ([1.5, 0.5], "non-empty, strictly decreasing"),
-            ([1.0, 0.0], "non-empty, strictly decreasing"),
+            ([], "strictly decreasing list from 1.0"),
+            ([1.0, 1.0], "strictly decreasing list from 1.0"),
+            ([0.5, 1.0], "strictly decreasing list from 1.0"),
+            ([1.5, 0.5], "strictly decreasing list from 1.0"),
+            ([1.0, 0.0], "strictly decreasing list from 1.0"),
+            ([0.9, 0.5], "strictly decreasing list from 1.0"),  # the cold chain would sample at T = 1.11
         ):
             with self.subTest(betas=betas), self.assertRaises(ValidationError) as ctx:
                 self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": betas}}})
@@ -586,7 +587,8 @@ class SkyWiringTest(unittest.TestCase):
 
     def test_wrappers_round_trip_and_touch_only_the_sky_columns(self):
         ind_map = sky_ind_map(self.BASIS, MBHBlock.SKY_BASIS)
-        to_lisa, from_lisa = make_sky_wrappers(EqualArmlengthOrbits(), REFERENCE_TIME, ind_map)
+        # * the host orbits, as MBHBlock passes them (ctx.general.orbits): the coords are numpy
+        to_lisa, from_lisa = make_sky_wrappers(EqualArmlengthOrbits(force_backend="cpu"), REFERENCE_TIME, ind_map)
 
         rng = np.random.default_rng(3)
         n = 50

@@ -77,6 +77,8 @@ def gb_raw(block_changes=None, **data_changes):
     block = {"type": "gb", "priors": {"class": "mojitolight.GBPrior"}, **(block_changes or {})}
     raw = cpu_raw({"gb": block})
     raw["domain"] = dict(STFT_DOMAIN)
+    # * A small grid of 2 h segments: the auto taper (1/min_freq = 10000 s) would not fit one, so taper 1 h of each.
+    raw["window"] = {**raw.get("window", {}), "taper_duration": "1 h"}
     raw["data"] = {**raw["data"], "source_types": ["noise", "gb"], **data_changes}
     return raw
 
@@ -183,6 +185,11 @@ class GBSchemaTest(_GBConfig):
             (extra(kwargs={"fstat_search": {}}), "does not accept"),
             (extra(kwargs={"fstat_settings": {"nsteps": 10}}), "GBFStatSettings does not accept"),
             (extra(kwargs={"fstat_settings": True}), "must be a mapping"),
+            # * the settings' own value rules, at load (GBFStatSettings.__post_init__ through gb_move_kwargs)
+            (extra(kwargs={"fstat_settings": {"search_interval": 0}}), "search_interval must be a positive integer"),
+            (extra(kwargs={"fstat_settings": {"search_interval": 1.5}}), "search_interval must be a positive integer"),
+            (extra(kwargs={"fstat_settings": {"save_search_records": "fulll"}}), "save_search_records must be one of"),
+            (extra(kwargs={"fstat_settings": {"shutoff_low_frequency_threshold": 1e-2}}), "must lie below"),
             (extra(kwargs={"debug_settings": True}), "must be a mapping"),
             ({**extra(), "stft": {"response": "tdi_on_the_fly"}}, "stft response dffr only"),
         ):
@@ -229,6 +236,20 @@ class GBSchemaTest(_GBConfig):
 
     def test_the_data_holds_the_galaxy(self):
         self.assertConfigError("needs 'gb' in data.source_types", source_types=["noise"])
+
+    def test_fstat_move_needs_an_stft_domain(self):
+        raw = gb_raw({"extra_moves": {"fstat": {"class": "GBFStatRJMove", "weight": 0.1}}})
+        raw["domain"] = {"type": "fd", "min_freq": 1e-4, "max_freq": 2.9e-2}
+        with self.assertRaises(ValidationError) as caught, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            RunConfig.model_validate(raw, context={"run_dir": self.run_dir})
+        self.assertIn("runs on an stft domain only, not fd", str(caught.exception))
+
+    def test_stages_are_rejected_at_load(self):
+        # * The GB moves have no apply_settings: per-stage settings would crash at recipe setup, after the bands.
+        self.assertConfigError(
+            "extra_moves.<name>.stage_weights", {"stages": {"pe": {"num_prop_repeats": 10}}}
+        )
 
     def test_direct_betas_span_every_temperature(self):
         from lisatools.globalfit.stock.l2d.blocks.base import make_betas

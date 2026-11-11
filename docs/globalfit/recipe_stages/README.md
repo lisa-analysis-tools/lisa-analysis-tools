@@ -133,6 +133,13 @@ def setup_recipe(recipe, engine_info, curr, acs, priors, state, l2d):
     )
 ```
 
+Two checks keep a recipe file from silently dropping what the blocks set:
+
+- **at load:** when a block sets `extra_moves` or `stages`, the function must take `l2d`;
+- **after the function has added its steps, before the first iteration** (`check_recipe_uses_the_blocks`):
+  - every `stages` and `stage_weights` key must name one of its steps;
+  - every extra move must sit in some step.
+
 ## Code
 
 - `src/lisatools/globalfit/stock/l2d/build_recipe.py`: `Alternative`, `BranchMoves`, `JointPEMoves`,

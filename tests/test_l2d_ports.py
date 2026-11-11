@@ -41,9 +41,10 @@ from lisatools.globalfit.stock.l2d.io import load_run
 from lisatools.globalfit.stock.l2d.load_settings import build_curr_info
 from lisatools.utils.constants import YRSID_SI
 
+from tests.test_l2d_io import stand_in_jax_gpu_pin
 from tests.test_l2d_load_settings import FakeL1
 from tests.test_l2d_run import fake_mpi4py, load_script
-from tests.test_l2d_sources import EMRI_WAVEFORM_MODULE, make_fake_emri_waveform_module
+from tests.test_l2d_sources import EMRI_WAVEFORM_MODULE, MBH_CATALOGUE_ENTRY, make_fake_emri_waveform_module
 
 INTERFACE = Path(__file__).resolve().parents[1] / "gf_dev" / "interface"
 EMRI_MBH_PSD = INTERFACE / "emri_mbh_psd"
@@ -108,14 +109,39 @@ def on_cpu(folder: Path, root: Path) -> Path:
     return run
 
 
+# An EMRI catalogue entry in the mojito columns (physical values; only the diagnostic plots' truths read them)
+EMRI_CATALOGUE_ENTRY = dict(
+    PrimaryMassSSBFrame=1e6, SecondaryMassSSBFrame=10.0, PrimarySpinParameter=0.9, SemiLatusRectum=12.0,
+    Eccentricity=0.3, InclinationAngle=0.5, LuminosityDistance=1000.0, PolarAnglePrimarySpin=1.0,
+    AzimuthalAnglePrimarySpin=2.0, AzimuthalPhase=0.5, PolarPhase=1.5, RadialPhase=2.5, RightAscension=2.0,
+    Declination=0.3,
+)
+
+
+class FakeL1WithCatalogue(FakeL1):
+    """FakeL1 with the catalogue a real L1 folder holds for the requested source ids: the blocks' catalog searches
+    read it when the run is built (``catalog_truths``)."""
+
+    ENTRIES = {"mbhb": ("MBHB", MBH_CATALOGUE_ENTRY), "emri": ("EMRI", EMRI_CATALOGUE_ENTRY)}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        source_ids = FakeL1.received["source_ids"]
+        self.catalogue = {
+            key: {int(i): dict(entry) for i in source_ids[name]}
+            for name, (key, entry) in self.ENTRIES.items() if name in source_ids
+        }
+
+
 class _Port(unittest.TestCase):
     def setUp(self):
+        stand_in_jax_gpu_pin(self)  # the folders are written for GPUs (compute.gpus); on_cpu copies switch to cpu
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         for patcher in (
             mock.patch.dict(_sys.modules, {EMRI_WAVEFORM_MODULE: make_fake_emri_waveform_module()}),
-            mock.patch.dict(load_settings.LOADERS, {"mojito_l1": FakeL1}),
+            mock.patch.dict(load_settings.LOADERS, {"mojito_l1": FakeL1WithCatalogue}),
             mock.patch.dict(_sys.modules, fake_mpi4py(rank=0)),
         ):
             patcher.start()
