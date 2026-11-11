@@ -354,12 +354,12 @@ class PSDSearchSchemaTest(_Blocks):
         self.psd(priors=NOISE_PRIOR, search={"search_type": "prior"})
 
     def test_noise_has_no_catalogue_and_no_distribution_search_yet(self):
-        for search_type in ("catalog", "distribution"):
-            with self.subTest(search_type=search_type):
-                self.assertBlockError(
-                    "value_error", "", msg="not available for the 'psd' block",
-                    priors=NOISE_PRIOR, search={"search_type": search_type, "spread": 1e-3, "search_path": "."},
-                )
+        # * each a valid search spec (catalog reads no file, distribution needs one), refused by the block
+        for search in ({"search_type": "catalog", "spread": 1e-3},
+                       {"search_type": "distribution", "spread": 1e-3, "search_path": "."}):
+            with self.subTest(search_type=search["search_type"]):
+                self.assertBlockError("value_error", "", msg="not available for the 'psd' block",
+                                      priors=NOISE_PRIOR, search=search)
 
     def test_samples_and_point_estimates_need_a_path(self):
         for search_type in ("samples", "point_estimate"):

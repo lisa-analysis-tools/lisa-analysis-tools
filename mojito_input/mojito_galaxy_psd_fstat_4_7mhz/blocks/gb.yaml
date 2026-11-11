@@ -31,8 +31,8 @@ extra_moves:
     kwargs:
       fstat_settings: {shutoff_band_iteration: 1000000000, save_search_records: full}
 search:
-  search_type: catalog
-  # ! The galaxy search's candidates strictly inside the sampled f0 range: the catalogue search has no f0 filter, and a
+  search_type: point_estimate  # the candidates file, a catalogue table: one point per source
+  # ! The galaxy search's candidates strictly inside the sampled f0 range: the point_estimate search has no f0 filter, and a
   # ! row outside the range stops the seeding.
   search_path: /workspace/rrondeel/erebor_dev/data/gb_candidates_4_7mhz.hdf5
   # ln A, f0 [mHz], fdot, phi0, cos iota, psi, alpha, sin delta; hotter chains are wider

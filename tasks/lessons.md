@@ -70,3 +70,10 @@ sketch, expecting the user to steer them before they are planned in detail.
 Correction: after a rejected ExitPlanMode I rewrote the plan and acted on an approval the user never saw
 ("you didnt show me the plan"). Rule: every plan revision goes through a visible ExitPlanMode on the
 current plan file, and nothing (not even memory/todo bookkeeping) is written until that approval.
+
+## 2026-11-11 — read the data's shape, don't impose one
+Correction: for the catalogue-shaped .h5 search file I planned to always add a samples axis
+(`values[:, None, :]`); the user pointed out the file may already carry the right shape. Rule: when a new
+input format joins an existing reader, route it through the reader's existing dimensionality rules (here
+the .npy 1-D/2-D/3-D normalization, where 2-D means sources in a file but samples in a per-source folder)
+instead of a fixed reshape, and test each layout against the format it must match.

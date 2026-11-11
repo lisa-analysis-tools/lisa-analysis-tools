@@ -8,14 +8,15 @@ takes no ``inner_moves`` and no ``flow``. ``waveform.runtime_kwargs`` and ``stft
 from the ``GeneralSetup``. ``extra_moves`` adds GB moves that take turns with ``pe_move`` (``EXTRA_MOVES``, the
 F-statistic RJ move ``GBFStatRJMove`` among them), each in its share of each recipe stage's iterations. The
 search seeds each source's walkers at the four copies of (phi0, psi) where the template is the same
-(``seed_phase_copies`` of ``GBSearchInterface``) unless its ``kwargs`` set ``seed_phase_copies: false``.
+(``seed_phase_copies`` of ``GBSearchInterface``) unless its ``kwargs`` set ``seed_phase_copies: false``. The
+search is a ``point_estimate`` over a candidates file (a catalogue table, e.g. ``gb_candidates.hdf5``): the injection
+catalogue holds the GB population as one entry of arrays, so a ``catalog`` search cannot seed GBs.
 """
 from __future__ import annotations
 
 import dataclasses
 import importlib
 from copy import deepcopy
-from types import SimpleNamespace
 from typing import Annotated, Any, ClassVar, Literal, NamedTuple
 
 from pydantic import Field, PositiveInt, model_validator
@@ -83,7 +84,9 @@ class GBBlock(SourceBlock):
     SETTINGS_NAME: ClassVar[str] = "GBSettings"
     SETUP_NAME: ClassVar[str] = "GBSetup"
     SEARCH_INTERFACE: ClassVar[str] = "GBSearchInterface"
-    SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("catalog", "point_estimate")
+    # * The injection catalogue holds the GB population as one entry of arrays, which the interface cannot unpack per
+    # * source: GBs are seeded from a candidates file (a catalogue table) with point_estimate, never with catalog.
+    SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("point_estimate",)
     FULL_LADDER: ClassVar[bool] = True  # the band temperatures span every temperature
     STAGES_HINT: ClassVar[str] = " Set the moves' shares per stage in extra_moves.<name>.stage_weights."
     # ? The STFT computations take the parameters at the mojito catalogue epoch, not at data.reference_time.
@@ -192,15 +195,6 @@ class GBBlock(SourceBlock):
                 raise ValueError(f"{where}: {err}") from err
         return self
 
-    @model_validator(mode="after")
-    def _catalog_reads_a_file(self):
-        if self.search is not None and self.search.search_type == "catalog" and self.search.search_path is None:
-            raise ValueError(
-                "the gb catalog search needs search_path, e.g. gb_candidates.hdf5: the loaded catalogue holds "
-                "the GB population as one entry of arrays, which the interface cannot unpack per source."
-            )
-        return self
-
     def build_source(self, ctx: BuildContext) -> BlockBuild:
         """The GB setup, from the grouped ``GBSettings`` (``GBSettings.from_general_setup``)."""
         from lisatools.globalfit.stock.erebor import (
@@ -228,10 +222,6 @@ class GBBlock(SourceBlock):
             search_interface=search_interface,
         )
         setup = GBSetup(settings)
-        if search_interface is not None and search_interface.search_type == "catalog":
-            # * As SourceBlock.build_source: the plots' truths, set here so a restart (which does not seed) keeps
-            # * them. GBSettings has no injection field; the plots read the setup's attribute if present.
-            setup.injection = search_interface.catalog_truths(SimpleNamespace(general_info=general_setup))
         metadata = setup.make_source_metadata(
             waveform_model_code_link=self.links.waveform_model_code_link,
             prior_model_code_link=self.links.prior_model_code_link,

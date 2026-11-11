@@ -205,8 +205,8 @@ class SearchSpec(_Spec):
     """
 
     search_type: Literal["prior", "distribution", "samples", "point_estimate", "catalog"] = "catalog"
-    # samples / point estimates: a file or a folder (one file per source); catalog: an HDF5 file whose root holds
-    # one dataset per catalogue column, read in place of the loaded catalogue
+    # samples / point estimates: a file or a folder (one file per source), each a .npy of physical values or an
+    # .h5/.hdf5 catalogue table (one root dataset per catalogue column); catalog reads the injection catalogue, no file
     search_path: RunPath | None = None
     parameters_searched: list[str] | Literal["all"] = "all"  # names in the prior's input (sampling) basis
     # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
@@ -219,6 +219,11 @@ class SearchSpec(_Spec):
     def _same_rules_as_the_interface(self):
         if self.search_type not in ("catalog", "prior") and self.search_path is None:
             raise ValueError(f"search_type {self.search_type!r} needs search_path.")
+        if self.search_type == "catalog" and self.search_path is not None:
+            raise ValueError(
+                "search_type 'catalog' seeds from the injection catalogue and reads no search_path; give a search "
+                "file as point_estimate (one point per source) or samples."
+            )
         if self.search_type in ("catalog", "point_estimate") and self.spread is None:
             raise ValueError(f"search_type {self.search_type!r} needs spread.")
         if self.search_path is not None and not self.search_path.exists():

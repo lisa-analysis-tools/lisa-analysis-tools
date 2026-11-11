@@ -451,6 +451,13 @@ class SourceSearchSchemaTest(_Sources):
         block = {**MBH_BLOCK, "search": {"search_type": "catalog"}}
         self.assertConfigError("value_error", "blocks.mbh.mbh.search", msg="needs spread", blocks={"mbh": block})
 
+    def test_catalog_reads_no_search_path(self):
+        # * catalog is the injection catalogue: a file given with it would be ignored, so it is refused at load
+        block = {**MBH_BLOCK, "search": {"search_type": "catalog", "search_path": ".", "spread": 1e-3}}
+        self.assertConfigError(
+            "value_error", "blocks.mbh.mbh.search", msg="seeds from the injection catalogue", blocks={"mbh": block}
+        )
+
     def test_distribution_search_is_not_available_yet(self):
         block = {**MBH_BLOCK, "search": {"search_type": "distribution", "search_path": "."}}
         self.assertConfigError(

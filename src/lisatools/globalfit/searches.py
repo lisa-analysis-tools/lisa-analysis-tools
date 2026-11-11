@@ -188,6 +188,13 @@ class BaseSearchInterface(ABC):
         if self.search_type not in ["catalog", "prior"] and self.search_path is None:
             raise ValueError(f"Search path must be provided for search type {self.search_type}")
 
+        # * catalog is the injection catalogue (curr.general_info.catalogue): a file would be silently ignored
+        if self.search_type == "catalog" and self.search_path is not None:
+            raise ValueError(
+                f"search type catalog seeds from the injection catalogue and reads no search_path ({self.search_path});"
+                " give a search file as point_estimate (one point per source) or samples."
+            )
+
         if self.search_type in ["catalog", "point_estimate"] and self.spread is None:
             raise ValueError(f"Spread must be provided for search type {self.search_type}")
 
@@ -243,12 +250,11 @@ class BaseSearchInterface(ABC):
         """
         raise NotImplementedError("This method should be implemented in subclasses.")
 
-    def get_catalog_values(self, curr: CurrentInfoGlobalFit, catalog_entries: list[dict] = None) -> np.ndarray:
+    def get_catalog_values(self, curr: CurrentInfoGlobalFit) -> np.ndarray:
         """
         Returns the catalog values for the specific source type, in the sampling basis with periodic parameters wrapped.
         """
-        if catalog_entries is None:
-            catalog_entries = self.get_source_catalog(curr)
+        catalog_entries = self.get_source_catalog(curr)
         physical_params = np.array([self.unpack_catalog_entries(entry, curr) for entry in catalog_entries]) # shape: (num_leaves, num_physical_params)
         sampling_params = self.transform_to_sampling_basis(physical_params)
         return self.wrap_periodic(sampling_params) #shape: (num_leaves, num_dim)
@@ -262,15 +268,20 @@ class BaseSearchInterface(ABC):
         filename order: a 2-D array is ``(num_samples, num_dim)`` and a 1-D array is ``(num_dim,)``. These files hold
         physical-basis values and are inverse-transformed to the sampling basis.
 
-        Eryn backends are read from the cold chain as ``(num_leaves, num_samples, num_dim)`` and must already be in
-        the sampling basis of this branch (no inverse transform is applied). Only the samples where a leaf is active
-        are kept, and leaves that are never active are dropped; for reversible-jump chains, leaf ``k`` is assumed to
-        track the same source across walkers and steps.
+        A file is a ``.npy`` array of the physical parameters, or an ``.h5`` catalogue table: one root dataset per
+        catalogue column, unpacked per entry by ``unpack_catalog_entries`` into the array of the columns' shape
+        (``(num_rows,)`` columns give the 2-D array above, ``(num_sources, num_samples)`` columns the 3-D one).
+
+        Eryn backends (``is_eryn_backend``) are read from the cold chain as ``(num_leaves, num_samples, num_dim)``
+        and must already be in the sampling basis of this branch (no inverse transform is applied). Only the samples
+        where a leaf is active are kept, and leaves that are never active are dropped; for reversible-jump chains,
+        leaf ``k`` is assumed to track the same source across walkers and steps.
 
         Parameters
         ----------
         curr : CurrentInfoGlobalFit, optional
-            The current information holder for the global fit. Used to access the source catalog if needed.
+            The current information holder for the global fit, for ``unpack_catalog_entries`` (e.g. the data start
+            the GB parameters are evolved to); needed only for an ``.h5`` catalogue table.
 
         Returns
         -------
@@ -284,7 +295,8 @@ class BaseSearchInterface(ABC):
         if not os.path.exists(self.search_path):
             raise FileNotFoundError("Search path does not exist.")
 
-        supported_extensions = ["npy", "h5"]
+        hdf5_extensions = ("h5", "hdf5")  # the galaxy search writes gb_candidates.hdf5
+        supported_extensions = ["npy", *hdf5_extensions]
 
         def stack_sources(all_samples, source_label):
             # sources can have different numbers of samples: subsample each to the smallest so they can be stacked
@@ -299,34 +311,33 @@ class BaseSearchInterface(ABC):
 
         def read_from_one_file(filepath, one_source_per_file):
             extension = filepath.split(".")[-1]
-            if extension == "h5":
-                if self.is_eryn_backend:
-                    from eryn.backends.hdfbackend import HDFBackend
-                    backend = HDFBackend(filepath, read_only=True)
-                    chain = backend.get_chain(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves, num_dim)
-                    inds = backend.get_inds(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves)
-                    # discard the first 10% of the steps as burn-in and flatten the steps and walkers dimensions
-                    num_steps, _, num_leaves, num_dim = chain.shape
-                    chain = chain[int(num_steps * 0.1):].transpose(2, 0, 1, 3).reshape(num_leaves, -1, num_dim) # shape: (num_leaves, num_samples, num_dim)
-                    inds = inds[int(num_steps * 0.1):].transpose(2, 0, 1).reshape(num_leaves, -1) # shape: (num_leaves, num_samples)
+            if extension in hdf5_extensions and self.is_eryn_backend:
+                from eryn.backends.hdfbackend import HDFBackend
+                backend = HDFBackend(filepath, read_only=True)
+                chain = backend.get_chain(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves, num_dim)
+                inds = backend.get_inds(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves)
+                # discard the first 10% of the steps as burn-in and flatten the steps and walkers dimensions
+                num_steps, _, num_leaves, num_dim = chain.shape
+                chain = chain[int(num_steps * 0.1):].transpose(2, 0, 1, 3).reshape(num_leaves, -1, num_dim) # shape: (num_leaves, num_samples, num_dim)
+                inds = inds[int(num_steps * 0.1):].transpose(2, 0, 1).reshape(num_leaves, -1) # shape: (num_leaves, num_samples)
 
-                    # inactive leaves are stored as NaN: keep only the samples where each leaf is active
-                    active_leaves = [chain[leaf, inds[leaf]][np.newaxis] for leaf in range(num_leaves) if inds[leaf].any()]
-                    if not active_leaves:
-                        raise ValueError(f"No active {self.branch_name} leaves after burn-in in {filepath}")
-                    if len(active_leaves) < num_leaves:
-                        logger.warning(f"Dropping {num_leaves - len(active_leaves)}/{num_leaves} {self.branch_name} leaves never active after burn-in in {filepath}")
+                # inactive leaves are stored as NaN: keep only the samples where each leaf is active
+                active_leaves = [chain[leaf, inds[leaf]][np.newaxis] for leaf in range(num_leaves) if inds[leaf].any()]
+                if not active_leaves:
+                    raise ValueError(f"No active {self.branch_name} leaves after burn-in in {filepath}")
+                if len(active_leaves) < num_leaves:
+                    logger.warning(f"Dropping {num_leaves - len(active_leaves)}/{num_leaves} {self.branch_name} leaves never active after burn-in in {filepath}")
 
-                    # eryn chains are already in the sampling basis
-                    return stack_sources(active_leaves, filepath)
+                # eryn chains are already in the sampling basis
+                return stack_sources(active_leaves, filepath)
 
-                else:
-                    catalog_alike = self.read_file_as_catalog(filepath) 
-                    return self.get_catalog_values(curr, catalog_entries=catalog_alike)
-
+            if extension in hdf5_extensions:
+                # * A catalogue table holds physical values, as a .npy does: unpacked per entry into the file's own
+                # * shape, it takes the same shape rules and transform below.
+                entries, shape = self.read_file_as_catalog(filepath)
+                samples = np.array([self.unpack_catalog_entries(entry, curr) for entry in entries]).reshape(*shape, -1)
             elif extension == "npy":
                 samples = np.load(filepath)
-            
             else:
                 raise ValueError(f"Unsupported file extension: {extension}. Supported extensions are: {supported_extensions}")
 
@@ -363,10 +374,12 @@ class BaseSearchInterface(ABC):
         return samples
 
     @staticmethod
-    def read_file_as_catalog(filepath: str) -> list[dict]:
-        """
-        Returns the catalog of the search results at ``search_path``, one entry per source: the rows of an HDF5
-        file whose root holds one dataset per catalogue column.
+    def read_file_as_catalog(filepath: str) -> tuple[list[dict], tuple[int, ...]]:
+        """The entries of the catalogue table at ``filepath`` and their shape.
+
+        The file's root holds one dataset per catalogue column (groups, such as a search's own columns, are
+        skipped). The columns share one shape: ``(num_rows,)``, or ``(num_sources, num_samples)`` for samples of
+        each source. Returns one ``{column: value}`` dict per entry, in C order over that shape, and the shape.
         """
         import h5py
 
@@ -376,9 +389,12 @@ class BaseSearchInterface(ABC):
         if not columns:
             raise ValueError(f"{filepath} holds no catalogue columns at its root")
 
-        num_sources = len(next(iter(columns.values())))
-        entries = [{name: values[row] for name, values in columns.items()} for row in range(num_sources)]
-        return entries
+        shapes = {name: values.shape for name, values in columns.items()}
+        shape = next(iter(shapes.values()))
+        if any(column_shape != shape for column_shape in shapes.values()):
+            raise ValueError(f"the catalogue columns of {filepath} must share one shape; got {shapes}")
+        entries = [{name: values[index] for name, values in columns.items()} for index in np.ndindex(shape)]
+        return entries, shape
 
     def get_covariance_matrices_from_spread(self, num_leaves: int, num_dim: int) -> np.ndarray:
         """
@@ -592,6 +608,11 @@ class BaseSearchInterface(ABC):
         else:
             if self.search_type == "samples":
                 samples = self.read_samples_from_file(curr)
+                if samples.shape[1] < 2:  # the covariance of one point is NaN
+                    raise ValueError(
+                        f"samples needs several samples per source; {self.search_path} holds one point per source "
+                        f"(shape {samples.shape}): use search_type point_estimate."
+                    )
                 starting_points = self.wrap_periodic(np.median(samples, axis=1))
                 covariances = self.get_covariance_matrices_from_samples(samples)
 
@@ -780,9 +801,10 @@ class GBSearchInterface(BaseSearchInterface):
     """
     Search interface for GB sources.
 
-    A ``catalog`` search with a ``search_path`` seeds from the rows of that file, such as the galaxy
-    search's ``gb_candidates.hdf5``. The STFT GB computations take the parameters at the catalogue's
-    reference epoch (their ``t_ref``), so STFT runs need ``evolve_to_data_start=False``.
+    A ``point_estimate`` search seeds from the rows of a catalogue table at ``search_path``, such as the galaxy
+    search's ``gb_candidates.hdf5`` (``read_samples_from_file``). The injection catalogue holds the GB population as
+    one entry of arrays, so a ``catalog`` search cannot seed GBs. The STFT GB computations take the parameters at the
+    catalogue's reference epoch (their ``t_ref``), so STFT runs need ``evolve_to_data_start=False``.
 
     Attributes
     ----------
