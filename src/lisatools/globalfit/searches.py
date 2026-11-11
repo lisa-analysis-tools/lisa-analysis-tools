@@ -228,32 +228,11 @@ class BaseSearchInterface(ABC):
         """
         Returns the source catalog for the specific source type.
         """
-
-        if self.search_path is not None:
-            return self.get_search_catalog()
-
         catalog = getattr(curr.general_info, "catalogue", {}).get(self.catalog_source_name, {})
         if not catalog:
             raise ValueError(f"No catalog found for source type {self.catalog_source_name}")
 
         entries = [catalog[source_id] for source_id in sorted(catalog.keys())]
-        return entries
-
-    def get_search_catalog(self) -> list[dict]:
-        """
-        Returns the catalog of the search results at ``search_path``, one entry per source: the rows of an HDF5
-        file whose root holds one dataset per catalogue column.
-        """
-        import h5py
-
-        with h5py.File(self.search_path, "r") as catalog_file:
-            columns = {name: np.atleast_1d(item[()]) for name, item in catalog_file.items()
-                       if isinstance(item, h5py.Dataset)}
-        if not columns:
-            raise ValueError(f"{self.search_path} holds no catalogue columns at its root")
-
-        num_sources = len(next(iter(columns.values())))
-        entries = [{name: values[row] for name, values in columns.items()} for row in range(num_sources)]
         return entries
 
     @abstractmethod
@@ -264,16 +243,17 @@ class BaseSearchInterface(ABC):
         """
         raise NotImplementedError("This method should be implemented in subclasses.")
 
-    def get_catalog_values(self, curr: CurrentInfoGlobalFit) -> np.ndarray:
+    def get_catalog_values(self, curr: CurrentInfoGlobalFit, catalog_entries: list[dict] = None) -> np.ndarray:
         """
         Returns the catalog values for the specific source type, in the sampling basis with periodic parameters wrapped.
         """
-        catalog_entries = self.get_source_catalog(curr)
+        if catalog_entries is None:
+            catalog_entries = self.get_source_catalog(curr)
         physical_params = np.array([self.unpack_catalog_entries(entry, curr) for entry in catalog_entries]) # shape: (num_leaves, num_physical_params)
         sampling_params = self.transform_to_sampling_basis(physical_params)
         return self.wrap_periodic(sampling_params) #shape: (num_leaves, num_dim)
 
-    def read_samples_from_file(self) -> np.ndarray:
+    def read_samples_from_file(self, curr: CurrentInfoGlobalFit = None) -> np.ndarray:
         """
         Reads samples from a file or directory for the specific source type.
 
@@ -286,6 +266,11 @@ class BaseSearchInterface(ABC):
         the sampling basis of this branch (no inverse transform is applied). Only the samples where a leaf is active
         are kept, and leaves that are never active are dropped; for reversible-jump chains, leaf ``k`` is assumed to
         track the same source across walkers and steps.
+
+        Parameters
+        ----------
+        curr : CurrentInfoGlobalFit, optional
+            The current information holder for the global fit. Used to access the source catalog if needed.
 
         Returns
         -------
@@ -314,32 +299,34 @@ class BaseSearchInterface(ABC):
 
         def read_from_one_file(filepath, one_source_per_file):
             extension = filepath.split(".")[-1]
-            if extension == "h5" and self.is_eryn_backend:
-                from eryn.backends.hdfbackend import HDFBackend
-                backend = HDFBackend(filepath, read_only=True)
-                chain = backend.get_chain(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves, num_dim)
-                inds = backend.get_inds(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves)
-                # discard the first 10% of the steps as burn-in and flatten the steps and walkers dimensions
-                num_steps, _, num_leaves, num_dim = chain.shape
-                chain = chain[int(num_steps * 0.1):].transpose(2, 0, 1, 3).reshape(num_leaves, -1, num_dim) # shape: (num_leaves, num_samples, num_dim)
-                inds = inds[int(num_steps * 0.1):].transpose(2, 0, 1).reshape(num_leaves, -1) # shape: (num_leaves, num_samples)
+            if extension == "h5":
+                if self.is_eryn_backend:
+                    from eryn.backends.hdfbackend import HDFBackend
+                    backend = HDFBackend(filepath, read_only=True)
+                    chain = backend.get_chain(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves, num_dim)
+                    inds = backend.get_inds(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves)
+                    # discard the first 10% of the steps as burn-in and flatten the steps and walkers dimensions
+                    num_steps, _, num_leaves, num_dim = chain.shape
+                    chain = chain[int(num_steps * 0.1):].transpose(2, 0, 1, 3).reshape(num_leaves, -1, num_dim) # shape: (num_leaves, num_samples, num_dim)
+                    inds = inds[int(num_steps * 0.1):].transpose(2, 0, 1).reshape(num_leaves, -1) # shape: (num_leaves, num_samples)
 
-                # inactive leaves are stored as NaN: keep only the samples where each leaf is active
-                active_leaves = [chain[leaf, inds[leaf]][np.newaxis] for leaf in range(num_leaves) if inds[leaf].any()]
-                if not active_leaves:
-                    raise ValueError(f"No active {self.branch_name} leaves after burn-in in {filepath}")
-                if len(active_leaves) < num_leaves:
-                    logger.warning(f"Dropping {num_leaves - len(active_leaves)}/{num_leaves} {self.branch_name} leaves never active after burn-in in {filepath}")
+                    # inactive leaves are stored as NaN: keep only the samples where each leaf is active
+                    active_leaves = [chain[leaf, inds[leaf]][np.newaxis] for leaf in range(num_leaves) if inds[leaf].any()]
+                    if not active_leaves:
+                        raise ValueError(f"No active {self.branch_name} leaves after burn-in in {filepath}")
+                    if len(active_leaves) < num_leaves:
+                        logger.warning(f"Dropping {num_leaves - len(active_leaves)}/{num_leaves} {self.branch_name} leaves never active after burn-in in {filepath}")
 
-                # eryn chains are already in the sampling basis
-                return stack_sources(active_leaves, filepath)
+                    # eryn chains are already in the sampling basis
+                    return stack_sources(active_leaves, filepath)
 
-            if extension == "npy":
+                else:
+                    catalog_alike = self.read_file_as_catalog(filepath) 
+                    return self.get_catalog_values(curr, catalog_entries=catalog_alike)
+
+            elif extension == "npy":
                 samples = np.load(filepath)
-            elif extension == "h5":
-                import h5py
-                with h5py.File(filepath, "r") as f:
-                    samples = f["samples"][:]
+            
             else:
                 raise ValueError(f"Unsupported file extension: {extension}. Supported extensions are: {supported_extensions}")
 
@@ -374,6 +361,24 @@ class BaseSearchInterface(ABC):
         logger.info(f"Read samples from {self.search_path} with shape {samples.shape}")
 
         return samples
+
+    @staticmethod
+    def read_file_as_catalog(filepath: str) -> list[dict]:
+        """
+        Returns the catalog of the search results at ``search_path``, one entry per source: the rows of an HDF5
+        file whose root holds one dataset per catalogue column.
+        """
+        import h5py
+
+        with h5py.File(filepath, "r") as catalog_file:
+            columns = {name: np.atleast_1d(item[()]) for name, item in catalog_file.items()
+                       if isinstance(item, h5py.Dataset)}
+        if not columns:
+            raise ValueError(f"{filepath} holds no catalogue columns at its root")
+
+        num_sources = len(next(iter(columns.values())))
+        entries = [{name: values[row] for name, values in columns.items()} for row in range(num_sources)]
+        return entries
 
     def get_covariance_matrices_from_spread(self, num_leaves: int, num_dim: int) -> np.ndarray:
         """
@@ -586,12 +591,12 @@ class BaseSearchInterface(ABC):
 
         else:
             if self.search_type == "samples":
-                samples = self.read_samples_from_file()
+                samples = self.read_samples_from_file(curr)
                 starting_points = self.wrap_periodic(np.median(samples, axis=1))
                 covariances = self.get_covariance_matrices_from_samples(samples)
 
             elif self.search_type == "point_estimate":
-                starting_points = self.read_samples_from_file()
+                starting_points = self.read_samples_from_file(curr)
                 if starting_points.ndim == 3:
                     if starting_points.shape[1] != 1:
                         raise ValueError(f"point_estimate expects one point per source; got shape {starting_points.shape}")
