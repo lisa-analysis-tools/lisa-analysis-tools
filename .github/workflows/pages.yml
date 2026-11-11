@@ -1,7 +1,12 @@
 name: Publish documentation to GitHub Pages
-#
 on:
+  release:
+    types: [published]
   push:
+    branches: ['**'] # branches only, so tag pushes don't start a second run
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
 jobs:
   select:
     runs-on: ubuntu-latest
@@ -9,53 +14,63 @@ jobs:
       build: ${{ steps.select.outputs.build }}
       publish: ${{ steps.select.outputs.publish }}
       notebooks: ${{ steps.select.outputs.notebooks }}
+    permissions: {}
     steps:
       - name: initialize
         run: |
-          echo "LISATOOLSPAGE_BUILD=false" >> "$GITHUB_ENV"
-          echo "LISATOOLSPAGE_PUBLISH=false" >> "$GITHUB_ENV"
-          echo "LISATOOLSPAGE_NOTEBOOK=false" >> "$GITHUB_ENV"
+          {
+            echo "LISATOOLSPAGE_BUILD=false"
+            echo "LISATOOLSPAGE_PUBLISH=false"
+            echo "LISATOOLSPAGE_NOTEBOOK=false"
+          } >> "$GITHUB_ENV"
       - name: build on commit message
-        if: contains(github.event.head_commit.message, '[ci:build-pages]')
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[ci:build-pages]')
         run: |
           echo "LISATOOLSPAGE_BUILD=true" >> "$GITHUB_ENV"
       - name: build on commit message
-        if: contains(github.event.head_commit.message, '[ci:publish-pages]')
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[ci:publish-pages]')
         run: |
           echo "LISATOOLSPAGE_BUILD=true" >> "$GITHUB_ENV"
           echo "LISATOOLSPAGE_PUBLISH=true" >> "$GITHUB_ENV"
       - name: execute notebooks on request
-        if: contains(github.event.head_commit.message, '[doc:run-notebooks]')
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, '[doc:run-notebooks]')
         run: |
           echo "LISATOOLSPAGE_NOTEBOOK=true" >> "$GITHUB_ENV"
       - name: build and publish on tag 'v*'
-        if: startsWith(github.event.ref, 'refs/tags/v')
+        if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
         run: |
-          echo "LISATOOLSPAGE_BUILD=true" >> "$GITHUB_ENV"
-          echo "LISATOOLSPAGE_PUBLISH=true" >> "$GITHUB_ENV"
-          echo "LISATOOLSPAGE_NOTEBOOK=true" >> "$GITHUB_ENV"
+          {
+            echo "LISATOOLSPAGE_BUILD=true"
+            echo "LISATOOLSPAGE_PUBLISH=true"
+            echo "LISATOOLSPAGE_NOTEBOOK=true"
+          } >> "$GITHUB_ENV"
       - name: output results
         id: select
         run: |
-          echo "build=$LISATOOLSPAGE_BUILD" >> $GITHUB_OUTPUT
-          echo "publish=$LISATOOLSPAGE_PUBLISH" >> $GITHUB_OUTPUT
-          echo "notebooks=$LISATOOLSPAGE_NOTEBOOK" >> $GITHUB_OUTPUT
+          {
+            echo "build=$LISATOOLSPAGE_BUILD"
+            echo "publish=$LISATOOLSPAGE_PUBLISH"
+            echo "notebooks=$LISATOOLSPAGE_NOTEBOOK"
+          } >> "$GITHUB_OUTPUT"
   build_doc:
     name: Build documentation
     runs-on: "ubuntu-24.04"
+    permissions:
+      contents: read
     needs:
       - select
     if: needs.select.outputs.build == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Install pandoc
-        uses: ConorMacBride/install-package@v1
+        uses: ConorMacBride/install-package@3e7ad059e07782ee54fa35f827df52aae0626f30 # v1.1.0
         with:
           apt: pandoc
       # - name: Update version scheme
@@ -91,7 +106,7 @@ jobs:
               --define nbsphinx_execute=never
       - name: Upload static files as artifact
         id: deployment
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/build/html
   deploy:
@@ -109,4 +124,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
