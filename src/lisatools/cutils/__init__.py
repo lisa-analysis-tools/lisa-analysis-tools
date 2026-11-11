@@ -7,7 +7,17 @@ import abc
 from typing import Optional, Sequence, TypeVar, Union
 from ..utils.exceptions import *
 
-from gpubackendtools.gpubackendtools import BackendMethods, CpuBackend, Cuda11xBackend, Cuda12xBackend, Cuda13xBackend
+from gpubackendtools.gpubackendtools import Backend, BackendMethods, CpuBackend, Cuda11xBackend, Cuda12xBackend
+from gpubackendtools.gpubackendtools import BackendUnavailableException as _BackendUnavailableException
+
+try:
+    from gpubackendtools.gpubackendtools import Cuda13xBackend
+except ImportError:
+    class Cuda13xBackend(Backend):
+        def __init__(self, *args, **kwargs):
+            raise _BackendUnavailableException(
+                "CUDA 13 requires a GPUBackendTools release that provides Cuda13xBackend."
+            )
 from gpubackendtools.exceptions import *
 
 @dataclasses.dataclass
