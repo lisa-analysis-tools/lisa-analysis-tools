@@ -50,7 +50,9 @@ jobs:
             echo "LISATOOLSWHL_PUBLISH=true"
           } >> "$GITHUB_ENV"
       - name: add core-suffix on non-official repo
-        if: github.event.repository.full_name != 'mikekatz04/LISAanalysistools'
+        # Compare by numeric repo ID (lisa-analysis-tools/lisa-analysis-tools, formerly
+        # mikekatz04/LISAanalysistools) so the check survives renames and transfers.
+        if: github.repository_id != '314626846'
         run: |
           echo "LISATOOLSWHL_CORE_SUFFIX=true" >> "$GITHUB_ENV"
       - name: output results
