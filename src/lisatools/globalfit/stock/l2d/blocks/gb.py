@@ -104,7 +104,7 @@ class GBBlock(SourceBlock):
     pe_move: ClassSpec = Field(default_factory=lambda: ClassSpec.model_validate({
         "class": "GBSpecialRJPriorMove",
         "kwargs": dict(
-            stretch_probability=0.0, num_stationary_fim_steps=1, run_swaps=True, use_prior_removal=False,
+            stretch_probability=0.0, num_stationary_fim_steps=50, run_swaps=True, use_prior_removal=False,
             phase_maximize=False, ranks_needed=0,
         ),
     }))
