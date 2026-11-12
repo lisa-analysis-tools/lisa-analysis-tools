@@ -844,6 +844,10 @@ class GBHDFBackend(eryn_HDFBackend):
         discard = it + 1 - thin
 
         band_info = self.get_band_info(discard=discard, thin=thin)
+        # [0] drops the single iteration axis, as the other backends of this file do. band_edges is stored without it.
+        for name, array in band_info.items():
+            if isinstance(array, np.ndarray) and name != "band_edges":
+                band_info[name] = array[0]
         sample = GBState(None, band_info=band_info)
         sample.band_info["initialized"] = True
         return sample
