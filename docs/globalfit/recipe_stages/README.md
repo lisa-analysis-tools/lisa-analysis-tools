@@ -77,6 +77,84 @@ Checks when the config loads:
 - in every stage, the extra moves' shares must sum to less than 1, so the `pe_move` keeps a share;
 - an extra move must have a share in some stage (`weight > 0` or a positive `stage_weights` entry).
 
+## Autocorrelation at runtime: adaptive repeats and a convergence stop
+
+Two autocorrelation times (ACT) are measured while the run goes, one for each use:
+
+| | Measured on | Used for |
+|---|---|---|
+| inner ACT | the cold chain across the proposal repeats of one call of a block's move, the other blocks frozen | the block's `num_prop_repeats` |
+| outer ACT | the stored cold chain across the iterations of the last stage | stopping the run |
+
+More repeats shorten only the inner one. The outer one also carries the correlation between blocks, so it never
+sets the repeats; a block whose outer ACT stays long with a short inner one is held back by the other blocks.
+
+### Adaptive repeats (`blocks/<mbh|emri|sobbh>.yaml`)
+
+```yaml
+num_prop_repeats: 50                             # the starting value
+adaptive_repeats: {min: 10, max: 500}            # its presence switches the adapting on
+```
+
+| key | default | |
+|---|---|---|
+| `min`, `max` | 10, 500 | bounds of the repeats, while tuning and afterwards |
+| `per_act` | 2 | inner ACTs per iteration in the last stage |
+| `resolve` | 10 | inner ACTs per iteration while tuning (at least 8) |
+| `every` | 10 | iterations of the block's move between updates |
+| `max_step` | 2 | largest factor the repeats change by in one update |
+
+- **Stages before the last** tune: every `every` iterations of the move, the repeats go to `resolve` inner ACTs.
+  They are held that high because the ACT can only be measured on a call several ACTs long: it is not resolved
+  below about 5 ACTs per call (the repeats then grow by `max_step`), and unbiased from about 8.
+- **The last stage**, whose samples are kept, runs with `per_act` inner ACTs, fixed.
+- A stage whose `stages` entry sets `num_prop_repeats` runs with that number, and nothing is tuned in it.
+- The tuned values are stored in the backend (`GFHDFBackend.recipe_repeats`), so a restart resumes them.
+- If the ACT is still not resolved at `max` repeats, a warning is logged and the last stage runs with `max`.
+
+Only the single-source special moves measure an inner ACT (`ResidualAddOneRemoveOneMove.inner_act`); the gb and
+psd moves keep fixed repeats. With several sources in the block, the slowest source sets the repeats. The inner
+ACT is measured within each walker: walkers that sit in different modes without ever crossing do not show in it.
+
+Checks when the config loads: the move must measure an inner ACT; `min <= num_prop_repeats <= max`; some stage
+before the last must leave `num_prop_repeats` to the tuning.
+
+### Convergence stop (`global.yaml`, last stage)
+
+```yaml
+stages:
+  - {name: burn-in, iterations: 200}
+  - {name: tune, iterations: 300}
+  - {name: pe, target_ess: 10000, check_every: 50}
+```
+
+Every `check_every` iterations (default 50) the last stage reads its cold chain from the backend and, per block,
+takes the largest ACT over the block's series and `ESS = nwalkers * iterations / ACT`. The run stops when the
+smallest ESS reaches `target_ess` and every ACT is reliable (`iterations > 50 * ACT`, eryn's
+`AutoCorrelationStop` rule). `run.num_iterations` stays the hard limit. Without `target_ess` the last stage runs to
+it, as before.
+
+| block | gates the stop | logged only |
+|---|---|---|
+| mbh, emri, sobbh, psd, galfor | every sampled parameter of every active leaf (periodic ones as sin and cos) | |
+| gb | the cold-chain number of sources | the per-band numbers of sources |
+
+What does not hold the run: leaf slots that are not active, parameters with the same value in every walker and
+iteration, and a gb block whose number of sources never changes (logged as "not gating"). What does: a walker that
+never moves in some parameter (its ACT is not defined, and an undefined ACT is never read as converged).
+
+Each check logs, per block, the ACT, the ESS, whether it is reliable, and the block's repeats.
+
+### The estimates
+
+- Outer: eryn's `get_acf` per walker, averaged over the walkers, with Sokal's automatic window
+  (`lisatools.sampling.utility.cold_chain_act`). `eryn.utils.get_integrated_act` sums a fixed 50 lags, so it cannot
+  return more than about 100.
+- Inner: the same window on `1 - variogram / plateau`, the variogram being half the mean squared difference at
+  each lag (`variogram`, `variogram_act`). It needs no mean. `get_acf` subtracts each walker's own mean, which on a
+  call of 10 ACTs halves the ACT; a mean pooled over the walkers fails because each walker samples its own
+  conditional distribution (it carries its own state of the other blocks).
+
 ## How the steps are built
 
 `build_block_moves` returns one `BranchMoves(search, pe, alternatives)` per block:
@@ -140,6 +218,11 @@ Two checks keep a recipe file from silently dropping what the blocks set:
   - every `stages` and `stage_weights` key must name one of its steps;
   - every extra move must sit in some step.
 
+A recipe file gets the same from `recipe.RepeatController` (`repeat_controllers=` of a step, with
+`l2d.adaptive_repeats()` for the blocks' settings; `kept_repeats=` on the step that keeps its samples) and
+`recipe.ConvergenceRecipeStep` (`monitors=` from `build_recipe.stage_monitors`). A block with `adaptive_repeats`
+must have a controller in some step.
+
 ## Code
 
 - `src/lisatools/globalfit/stock/l2d/build_recipe.py`: `Alternative`, `BranchMoves`, `JointPEMoves`,
@@ -149,6 +232,9 @@ Two checks keep a recipe file from silently dropping what the blocks set:
 - `src/lisatools/globalfit/stock/l2d/io.py`: `_block_stages_are_recipe_stages` (stage names of `stages` and
   `stage_weights`).
 
+- `src/lisatools/globalfit/recipe.py`: `RepeatController`, `ConvergenceRecipeStep`, `ChainMonitor`,
+  `GBCountMonitor`; `src/lisatools/sampling/utility.py`: `cold_chain_act`, `variogram`, `variogram_act`.
+
 ## Tests
 
 - `tests/test_l2d_recipe.py::StockRecipeTest`: shares per stage, shared instances across stages, several blocks
@@ -156,3 +242,5 @@ Two checks keep a recipe file from silently dropping what the blocks set:
 - `tests/test_l2d_stages.py::RecipeStepTest::test_turns_and_settings_together`: real `GFCombineMove`s through
   `setup_run`, with the stage settings reaching the move inside both combined moves.
 - `tests/test_l2d_gb.py::GBSchemaTest::test_extra_moves`: the `stage_weights` schema and its checks.
+- `tests/test_l2d_stages.py`: `ActTest` (the estimates on AR(1) chains), `MoveInnerActTest`, `RepeatControllerTest`,
+  `AdaptiveStagesTest` (tuning, freezing, restarts), `ConvergenceStepTest`, `AdaptiveRepeatsSchemaTest`.
