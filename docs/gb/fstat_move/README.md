@@ -3,13 +3,15 @@
 `GBFStatRJMove` (`src/lisatools/globalfit/moves/gbspecialmove.py`) is a reversible-jump (RJ) move of the GB block
 whose births come from a search of the data. It runs beside the prior RJ move (`GBSpecialRJPriorMove`), which covers
 the whole prior, and proposes sources where its search found them. It runs on the STFT domain with the DFFR response
-only and replaces the FD serial search (`GBSpecialRJSerialSearchMCMC` stays as an alias). The evidence behind its
+only and replaces the FD serial search (`GBSpecialRJSerialSearchMCMC` stays as an alias). The search itself is a class
+of its own in the same file, `FStatResidualSearch`, which the move builds for itself from its settings at its first
+search; the move keeps the schedule, the choice of the bands and the proposal. The evidence behind its
 settings and the checks of the port are in [`results.md`](results.md). Author: Coen Rondeel.
 
 ## How it works
 
-A search runs in the move's `setup()`, on the residual of the walker with the highest likelihood, in every interior
-band that is not shut off.
+A search (`FStatResidualSearch.run`) runs in the move's `setup()`, on the residual of the walker with the highest
+likelihood, in every interior band that is not shut off.
 
 1. **Stage 1.** The F-statistic $F = \tfrac12 N^\top M^{-1} N$ maximizes the likelihood over the four amplitude
    parameters ($A$, $\iota$, $\psi$, $\phi_0$) analytically. $N$ and $M$ come from two templates per row
@@ -72,6 +74,41 @@ extra_moves:
     kwargs: {fstat_settings: {save_search_records: summary}}
 ```
 
+## The search memory
+
+The keyword `fstat_search_memory` (default None) hands the move an `FStatSearchMemory`, a host data holder in which the
+F-statistic moves of a run share the Gaussian mixtures of their searches. After a search that fitted, this move sets one
+fit per usable band as the memory's fits on the residual, replacing the earlier ones (the empty list after a search with
+no band to search; a fixed memory refuses the list and the move goes on as before). The split and merge
+(`GBFStatSplitMergeRJMove`, also an `extra_moves` class of the GB block) takes the same keyword in place of record files
+and builds its search part from the memory at construction and at the start of each propose in which the memory's
+version changed: per band one mixture, with two thirds of the weight on the fit on the residual and one third shared per
+fit among the other fits (a band without a fit of one side gives its weight to the other). A band whose covariance
+cannot be factored is left without a search part, with a warning. Its `apply_settings(fix_search_part=True)` brings the
+part up to the memory's version and fixes the memory, which then takes no new fit. A recipe file must make that call on
+every GB move that has the method, in its step of the kept iterations: the stock recipe does not, so the YAML builder
+refuses a block that would get a memory on it. The builders make one memory per run, in
+`<run>_artifacts/fstat_search_memory.npz`, and load it when the run resumes.
+
+While the memory is not fixed (the burn-in), the split and merge also makes the searches that fill it, in its `setup()`
+before the search part is rebuilt. It takes the walker with the highest likelihood, as this move does, and the sources
+of that walker's cold chain in the interior bands. Around each source it opens a window of plus and minus the reach
+window W of the source's band (half the own-source width at the band's centre), cut at the band's edges; windows of one
+band that overlap become one. The windows go to `FStatResidualSearch` in calls of up to 40. In each window the first
+stage starts from the best rows of a seed grid that is scored on the input of the search: f0 nodes one bin apart, five
+fdot values two drift bins apart on the line of constant mid-span frequency through each source, and 192 sky points. The
+two stages, the gate and the mixture fit then run as in this move. A window that passes the gate has the best row of its
+second stage subtracted and is searched again on a new grid, up to four passes; every pass that passes gives one fit.
+
+Two kinds of fit are made this way. The fit on the raw data is made once per run, at the split and merge's first
+propose, on the walker's residual with all its sources added back. The fit on the residual plus the window's sources is
+made around every source that lies in no range searched before, while fewer than five searches are counted within a
+reach window, on the residual with every source inside those windows added back. At the first propose that is every
+window, so both kinds run on the same input. Each kind works on the walker's residual in place and writes the saved copy
+back bit for bit at its end. A call of windows that raises is skipped with a warning and its sources are searched again
+at the next propose. A fit that the memory's check refuses (a value that is not finite, for instance) is left out with
+a warning, in both moves. From the start of the kept iterations the memory is fixed and no search starts.
+
 ## Output
 
 Each search writes one line to the run log (`[GB_FSTAT_SEARCH <move name>]`: the bands searched and passing, the outcome
@@ -84,6 +121,7 @@ values, the mixtures and the times (about 40 kB per search on 43 bands), `"full"
 | piece | place |
 | --- | --- |
 | the move and its settings | `GBFStatRJMove`, `GBFStatSettings` in `src/lisatools/globalfit/moves/gbspecialmove.py`, with the objects handed to Eryn and the band sorter (`BandMaskTransform`, `FStatSearchLikelihood`, `FStatPhaseProposal`) |
+| the search | `FStatResidualSearch` (the steps, the logs and the record) and `FStatSearchBase` (the columns, constants and static math, which the move inherits as well), in the same file |
 | periodic mixture columns | `vec_fit_gmm_min_bic` in `src/lisatools/sampling/gmm.py`, `FullGaussianMixtureModel` in `src/lisatools/sampling/prior.py` |
 | the F-statistic terms | `STFTGBComputations.get_fstat_terms_stft` (GBGPU) |
 | the recipes | `build_gb_moves` in `src/lisatools/globalfit/recipe.py`; the GB block and the stock recipe in `src/lisatools/globalfit/stock/l2d/` |
