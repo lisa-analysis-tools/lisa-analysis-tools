@@ -4635,6 +4635,77 @@ class FStatSearchBase:
         return phi0, psi
 
 
+@dataclass
+class SeedGrid:
+    """The seed grid of one window in factored form: ``n_chirp`` (f0, fdot) points and ``n_sky`` sky points.
+
+    Row ``chirp * n_sky + sky`` of the grid is the pair. ``chirp_node`` is f0 in frequency bins, an integer. The sky
+    points are right ascension and sine declination, the frame of the sampled columns 6 and 7 in this run.
+    """
+
+    chirp_f0_mhz: np.ndarray
+    chirp_fdot: np.ndarray
+    chirp_node: np.ndarray
+    sky_ra: np.ndarray
+    sky_sin_dec: np.ndarray
+    ln_amp: float
+    observation_seconds: float
+
+    @property
+    def n_chirp(self):
+        return len(self.chirp_f0_mhz)
+
+    @property
+    def n_sky(self):
+        return len(self.sky_ra)
+
+    @property
+    def bin_mhz(self):
+        return 1e3 / self.observation_seconds
+
+    @property
+    def drift_bin(self):
+        return 1.0 / self.observation_seconds**2
+
+    def rows(self, chirp_index, sky_index=None):
+        """Sampling rows (chirp points chosen x sky points chosen, 8), chirp-major.
+
+        The columns that the F-statistic maximizes over (phi0, cos iota, psi) are zero and ln A sits at the middle of
+        its prior.
+        """
+        chirp_index = np.atleast_1d(chirp_index)
+        sky_index = np.arange(self.n_sky) if sky_index is None else np.atleast_1d(sky_index)
+        rows = np.zeros((len(chirp_index) * len(sky_index), FStatSearchBase.NDIM))
+        rows[:, FStatSearchBase.COL_LN_AMP] = self.ln_amp
+        rows[:, FStatSearchBase.COL_F0] = np.repeat(self.chirp_f0_mhz[chirp_index], len(sky_index))
+        rows[:, FStatSearchBase.COL_FDOT] = np.repeat(self.chirp_fdot[chirp_index], len(sky_index))
+        rows[:, FStatSearchBase.COL_LAM] = np.tile(self.sky_ra[sky_index], len(chirp_index))
+        rows[:, FStatSearchBase.COL_SIN_BETA] = np.tile(self.sky_sin_dec[sky_index], len(chirp_index))
+        return rows
+
+
+@dataclass(frozen=True)
+class SeedStartInputs:
+    """What a seeded start needs that differs from call to call, for each searched window in the order of the call.
+
+    ``source_rows`` holds one (sources of the window, 8) array of sampling rows per window, ``reach_bins`` the reach
+    window W of each window's band in frequency bins, ``epoch_fraction`` the time from the parameters' epoch to the
+    middle of the data over the span, and ``observation_seconds`` the span.
+    """
+
+    source_rows: list
+    reach_bins: np.ndarray
+    epoch_fraction: float
+    observation_seconds: float
+
+    def subset(self, window_indices):
+        """The inputs of some of the windows, in the order of ``window_indices``."""
+        window_indices = np.asarray(window_indices, dtype=int)
+        return SeedStartInputs([self.source_rows[index] for index in window_indices],
+                               np.asarray(self.reach_bins)[window_indices], self.epoch_fraction,
+                               self.observation_seconds)
+
+
 class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
     """The F-statistic search of bands on the residual of one walker, on the STFT/DFFR response.
 
@@ -4649,8 +4720,16 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
     4. one Gaussian mixture per passing band is fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
        theta+-, lam periodic.
 
+    A band may be a window inside one, and :meth:`run` takes any number of them in one call: :meth:`source_windows`
+    makes the windows around sources. With ``seeds`` stage 1 starts from the best rows of a seed grid
+    (:meth:`seed_grid`) that is scored on the input of the search. :meth:`run_passes` searches a window again after its
+    best row is taken out. :meth:`add_sources_back` and :meth:`restored_residual` give a search the walker's residual
+    with chosen sources added back, and put the row back as it was.
+
     On several cards each :meth:`run` copies the walker's data and noise rows to every card (:meth:`_fill_search_holder`),
     and each likelihood call's rows are shared out in equal blocks, so every card works on every stage of the search.
+    Since the copies are made at the start of each :meth:`run`, every pass of :meth:`run_passes` reads the residual as
+    the passes before left it.
 
     The search chooses neither the bands nor the walker and changes nothing of the run: the caller turns the fit into a
     proposal. It keeps no sampler and no data between calls, except the containers of those copies, which it builds
@@ -4667,6 +4746,29 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         name: The label of the log lines and the prefix of the record files.
         force_backend: The backend, as for the moves; None takes the preferred one.
     """
+
+    # The seed grid of a window: 192 sky points and 5 fdot values around the line of each source, from the cost test
+    # of the window search (the peak was found in 16 of 18 cases at 62.5 s per window searched alone)
+    SEED_SKY_POINTS = 192
+    SEED_FDOT_HALF_STEPS = 2
+    # The step between fdot values, in drift bins (one over the span squared)
+    SEED_FDOT_STEP_DRIFT_BINS = 2.0
+    # Two seeds at one sky point differ by at least this many f0 bins
+    SEED_MIN_F0_BINS = 4
+    # * At most this many seeds lie within the reach window of each other: one loud leftover spreads over hundreds of
+    # * rows along its f0 and fdot line and would take every seed
+    SEED_NEIGHBOURHOOD_CAP = 4
+    # The best rows of a grid that its ranking walks down
+    SEED_RANKING_POOL = 200_000
+    # Rows per call of the grid's likelihood (35.5 us per row on a full card) and rows of a grid made at once (13 MB)
+    SEED_BATCH_ROWS = 20_000
+    SEED_GRID_PIECE_ROWS = 200_000
+    # The golden angle of the Fibonacci spiral that places the sky points
+    GOLDEN_ANGLE = np.pi * (3.0 - np.sqrt(5.0))
+    # A window that passes the gate has its best row taken out and is searched again, at most this many times in all
+    MAX_PASSES = 4
+    # * Windows of one call: the size that has run in production (40 bands in one call, 7680 rows per call in stage 1)
+    WINDOWS_PER_CALL = 40
 
     def __init__(self, fstat_settings: Optional[GBFStatSettings] = None, *, priors, parameter_transforms,
                  phase_maximize=False, waveform_kwargs=None, name="fstat search", force_backend=None):
@@ -4687,24 +4789,177 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         return ["lisatools_" + backend_name for backend_name in cls.GPU_RECOMMENDED()]
 
     # ==================================================================================================================
+    # The windows around sources and the seed grid of a window
+    # ==================================================================================================================
+
+    @classmethod
+    def source_windows(cls, source_frequencies_mhz, source_bands, band_edges_mhz, reach_mhz):
+        """The windows around sources, in the form of the ``bands`` dict that :meth:`run` takes.
+
+        A source has the window of its frequency plus and minus the reach window of its band, clipped to the band;
+        windows of one band that overlap become one. ``source_bands`` holds the band of each source, ``band_edges_mhz``
+        (bands + 1) and ``reach_mhz`` (bands) are host arrays. Returns ``ids`` (the band of each window), ``low_mhz``
+        and ``high_mhz`` (the windows in order of frequency) and ``active`` (all True). Raises ValueError for a source
+        outside its band or a reach that is not positive.
+        """
+        frequencies = np.asarray(source_frequencies_mhz, dtype=float)
+        source_bands = np.asarray(source_bands, dtype=int)
+        edges = np.asarray(band_edges_mhz, dtype=float)
+        reach = np.asarray(reach_mhz, dtype=float)
+        if np.any(reach <= 0.0):
+            raise ValueError("every band needs a positive reach window")
+        if np.any(frequencies < edges[source_bands]) or np.any(frequencies > edges[source_bands + 1]):
+            raise ValueError("a source lies outside its band")
+        ids, lows, highs = [], [], []
+        for source in np.argsort(frequencies, kind="stable"):
+            band = int(source_bands[source])
+            low = max(edges[band], frequencies[source] - reach[band])
+            high = min(edges[band + 1], frequencies[source] + reach[band])
+            if ids and ids[-1] == band and low <= highs[-1]:
+                highs[-1] = max(highs[-1], high)
+            else:
+                ids.append(band)
+                lows.append(low)
+                highs.append(high)
+        return {"ids": np.array(ids, dtype=int), "low_mhz": np.array(lows, dtype=float),
+                "high_mhz": np.array(highs, dtype=float), "active": np.ones(len(ids), dtype=bool)}
+
+    @staticmethod
+    def window_members(bands, frequencies_mhz):
+        """The index of the window that holds each frequency, -1 where none does; the ends of a window count as inside.
+
+        ``bands`` is a dict of windows in order of frequency, as :meth:`source_windows` makes it. A frequency at an edge
+        that two windows share belongs to the upper one, as a source at the edge of two bands belongs to the upper band.
+        """
+        frequencies = np.asarray(frequencies_mhz, dtype=float)
+        low = np.asarray(bands["low_mhz"], dtype=float)
+        high = np.asarray(bands["high_mhz"], dtype=float)
+        if len(low) == 0:
+            return np.full(frequencies.shape, -1, dtype=int)
+        index = np.searchsorted(low, frequencies, side="right") - 1
+        inside = (index >= 0) & (frequencies <= high[np.maximum(index, 0)])
+        return np.where(inside, index, -1)
+
+    @classmethod
+    def fibonacci_sky(cls, count):
+        """Near-uniform points on the sphere along a golden-angle spiral: right ascension and sine declination."""
+        index = np.arange(count)
+        return np.mod(index * cls.GOLDEN_ANGLE, 2.0 * np.pi), 1.0 - 2.0 * (index + 0.5) / count
+
+    @classmethod
+    def line_fdot(cls, f0_mhz, source_rows, epoch_fraction, observation_seconds):
+        """fdot at each f0 (mHz) on the line f0 + mu T fdot = constant through each source: (n_f0, n_sources).
+
+        The line is the degeneracy of a chirping source at the parameters' epoch: moving f0 by df moves the best fdot by
+        -df / (mu T), with mu T the time from the epoch to the middle of the data.
+        """
+        f0_mhz = np.atleast_1d(np.asarray(f0_mhz, dtype=float))
+        source_rows = np.atleast_2d(source_rows)
+        shift_hz = (source_rows[None, :, cls.COL_F0] - f0_mhz[:, None]) * 1e-3
+        return source_rows[None, :, cls.COL_FDOT] + shift_hz / (epoch_fraction * observation_seconds)
+
+    @classmethod
+    def seed_grid(cls, source_rows, window_low_mhz, window_high_mhz, reach_bins, epoch_fraction, observation_seconds,
+                  prior_container):
+        """The seed grid of one window.
+
+        The f0 nodes lie one bin apart over the union of the reach windows of the sources, clipped to the window. At
+        each node the fdot values lie ``SEED_FDOT_STEP_DRIFT_BINS`` apart on the line of constant mid-span frequency
+        through each source whose reach holds the node, ``SEED_SKY_POINTS`` sky points on a Fibonacci sphere go with
+        every (f0, fdot), and rows whose fdot lies outside the prior's bounds are dropped. ``source_rows`` are the
+        sampling rows of the window's sources and ``reach_bins`` the reach window of the window's band in bins. Returns
+        a :class:`SeedGrid`, with no rows when no node lies within the reach of a source.
+        """
+        bin_mhz, drift_bin = 1e3 / observation_seconds, 1.0 / observation_seconds**2
+        sources = np.atleast_2d(np.asarray(source_rows, dtype=float))
+        reach_mhz = reach_bins * bin_mhz
+        low_mhz = max(float(window_low_mhz), sources[:, cls.COL_F0].min() - reach_mhz)
+        high_mhz = min(float(window_high_mhz), sources[:, cls.COL_F0].max() + reach_mhz)
+        nodes = np.arange(int(np.ceil(low_mhz / bin_mhz)), int(np.floor(high_mhz / bin_mhz)) + 1)
+        near = np.abs(nodes[:, None] * bin_mhz - sources[None, :, cls.COL_F0]) <= reach_mhz
+        nodes, near = nodes[near.any(axis=1)], near[near.any(axis=1)]
+        sky_ra, sky_sin_dec = cls.fibonacci_sky(cls.SEED_SKY_POINTS)
+        bounds = cls.one_column_bounds(prior_container, cls.COL_LN_AMP)
+        ln_amp = 0.5 * (bounds[0] + bounds[1]) if bounds is not None else 0.0
+        if len(nodes) == 0:
+            return SeedGrid(np.zeros(0), np.zeros(0), np.zeros(0, dtype=int), sky_ra, sky_sin_dec, float(ln_amp),
+                            float(observation_seconds))
+        lines = cls.line_fdot(nodes * bin_mhz, sources, epoch_fraction, observation_seconds)
+        step = cls.SEED_FDOT_STEP_DRIFT_BINS * drift_bin
+        offsets = np.arange(-cls.SEED_FDOT_HALF_STEPS, cls.SEED_FDOT_HALF_STEPS + 1) * step
+        chirp_node, chirp_fdot = [], []
+        for position, node in enumerate(nodes):
+            values = (lines[position, near[position]][:, None] + offsets[None, :]).ravel()
+            # * rounding to the step and keeping the unique values stops near-coincident lines from multiplying rows
+            values = np.unique(np.round(values / step)) * step
+            chirp_node.append(np.full(len(values), node))
+            chirp_fdot.append(values)
+        chirp_node, chirp_fdot = np.concatenate(chirp_node), np.concatenate(chirp_fdot)
+        chirp_f0 = chirp_node * bin_mhz
+        fdot_low, fdot_high = cls.joint_f0_fdot_prior(prior_container).get_fdot_bounds(chirp_f0)
+        inside = (chirp_fdot >= asnumpy(fdot_low)) & (chirp_fdot <= asnumpy(fdot_high))
+        return SeedGrid(chirp_f0[inside], chirp_fdot[inside], chirp_node[inside], sky_ra, sky_sin_dec, float(ln_amp),
+                        float(observation_seconds))
+
+    @classmethod
+    def select_seeds(cls, grid, scores, nwalkers, reach_bins):
+        """The best rows of a grid, at most ``nwalkers`` of them.
+
+        The ranking by F walks down from the best row and keeps a row unless a kept row has the same sky point and an
+        f0 node less than ``SEED_MIN_F0_BINS`` away, or ``SEED_NEIGHBOURHOOD_CAP`` kept rows already lie within
+        ``reach_bins`` of its node. ``scores`` are the F values (n_chirp, n_sky). Returns the rows (count, 8) and a dict
+        with the chirp index, the sky index and F of each seed; fewer than ``nwalkers`` rows when the ranking runs out
+        or the cap blocks the rest.
+        """
+        flat = scores.ravel()
+        kept = np.zeros((nwalkers, 3), dtype=np.int64)
+        count = 0
+        if flat.size:
+            pool = min(cls.SEED_RANKING_POOL, flat.size)
+            top = np.argpartition(flat, -pool)[-pool:]
+            top = top[np.argsort(flat[top])[::-1]]
+            for index in top:
+                if flat[index] <= cls.REJECTED_LL or count == nwalkers:
+                    break
+                chirp, sky = divmod(int(index), grid.n_sky)
+                node = grid.chirp_node[chirp]
+                node_distance = np.abs(kept[:count, 1] - node)
+                same_sky = kept[:count, 2] == sky
+                if np.any(same_sky & (node_distance < cls.SEED_MIN_F0_BINS)):
+                    continue
+                if np.count_nonzero(node_distance <= reach_bins) >= cls.SEED_NEIGHBOURHOOD_CAP:
+                    continue
+                kept[count] = (chirp, node, sky)
+                count += 1
+        chirp_index, sky_index = kept[:count, 0], kept[:count, 2]
+        rows = (np.concatenate([grid.rows(chirp, sky) for chirp, sky in zip(chirp_index, sky_index)]) if count
+                else np.zeros((0, cls.NDIM)))
+        return rows, {"chirp_index": chirp_index, "sky_index": sky_index,
+                      "fstat": scores[chirp_index, sky_index] if count else np.zeros(0)}
+
+    # ==================================================================================================================
     # The search, in its steps
     # ==================================================================================================================
 
-    def run(self, holder, walker, bands, *, engine, periodic):
+    def run(self, holder, walker, bands, *, engine, periodic, seeds=None):
         """One search of the walker's residual in the bands, from stage 1 to the mixture fit.
 
         ``holder`` is the model's analysis container array, ``walker`` the index of the walker in it, ``bands`` a dict
         of ``ids``, ``low_mhz``, ``high_mhz`` (the f0 edges in mHz) and ``active`` (the bands to search), ``engine`` the
-        caller's band likelihood engine and ``periodic`` its Eryn periodic container. Returns a dict with ``walker``,
-        ``bands``, the output of each step that ran and ``status``: "no_range" (no band is active), "no_detection" (no
-        band passes the gate), "no_usable_fit" (no passing band has a usable stage-2 chain) or "fitted".
+        caller's band likelihood engine and ``periodic`` its Eryn periodic container. A band may be a window inside one
+        (:meth:`source_windows`), and the ids of several may repeat. ``seeds`` is None for the start from prior draws,
+        or a :class:`SeedStartInputs` with one entry for each searched band for the start from the seed grid. Returns a
+        dict with ``walker``, ``bands``, the output of each step that ran and ``status``: "no_range" (no band is
+        active), "no_detection" (no band passes the gate), "no_usable_fit" (no passing band has a usable stage-2 chain)
+        or "fitted".
         """
         search = {"walker": walker, "bands": bands}
         if not bands["active"].any():
             search["status"] = "no_range"
             return search
         search_holder, owners = self._search_owners(holder, walker)
-        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, bands, engine, periodic)
+        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, bands, engine, periodic,
+                                                                      seeds)
         search["gate"] = self._apply_gate(search["stage_1"], bands)
         if not search["gate"]["detected"].any():
             search["status"] = "no_detection"
@@ -4786,10 +5041,12 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         search_holder.compute_d_d_terms()
         return search_holder
 
-    def _run_stage_1(self, holder, owners, bands, engine, periodic):
+    def _run_stage_1(self, holder, owners, bands, engine, periodic, seeds=None):
         """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
-        restricted to each band. ``holder`` and ``owners`` are those of :meth:`_search_owners`. Returns the samplers'
-        outputs and the likelihood, whose terms the maximizers reuse."""
+        restricted to each band, or from the best rows of each band's seed grid when ``seeds`` (a
+        :class:`SeedStartInputs`) is given. ``holder`` and ``owners`` are those of :meth:`_search_owners`. Returns the
+        samplers' outputs and the likelihood, whose terms the maximizers reuse; with seeds the outputs hold
+        ``seeding``, the facts of :meth:`_seeded_start`."""
         settings = self.fstat_settings
         betas = np.asarray(settings.betas_1, dtype=float)
         low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
@@ -4798,9 +5055,13 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms,
                                            fstat=True)
         start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
+        if seeds is not None:
+            start, seeding = self._seeded_start(holder, owners, bands, engine, start, seeds)
         output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
                                         periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
                                         progress=bool(settings.progress))
+        if seeds is not None:
+            output["seeding"] = seeding
         return output, likelihood
 
     def _apply_gate(self, stage_1, bands):
@@ -4903,6 +5164,172 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         components, chunk = self.fit_band_mixtures(theta, gpu, periodic=self.GMM_PERIODIC)
         return {"usable": usable, "components": components, "chunk": chunk,
                 "seconds": time.perf_counter() - time_start}
+
+    # ==================================================================================================================
+    # The seeded start, the passes and the input of a search
+    # ==================================================================================================================
+
+    def _score_seed_grid(self, likelihood, grid):
+        """F of every row of a seed grid, (n_chirp, n_sky): in pieces of ``SEED_GRID_PIECE_ROWS`` rows, which bound the
+        host memory, and calls of ``SEED_BATCH_ROWS`` rows of the likelihood."""
+        scores = np.empty((grid.n_chirp, grid.n_sky))
+        chirp_per_piece = max(1, self.SEED_GRID_PIECE_ROWS // grid.n_sky)
+        for first_chirp in range(0, grid.n_chirp, chirp_per_piece):
+            chirp_index = np.arange(first_chirp, min(first_chirp + chirp_per_piece, grid.n_chirp))
+            rows = grid.rows(chirp_index)
+            values = np.empty(len(rows))
+            for first_row in range(0, len(rows), self.SEED_BATCH_ROWS):
+                batch = slice(first_row, first_row + self.SEED_BATCH_ROWS)
+                values[batch] = likelihood(rows[batch])
+            scores[chirp_index] = values.reshape(len(chirp_index), -1)
+        return scores
+
+    def _seeded_start(self, holder, owners, bands, engine, start, seeds):
+        """Put the best rows of each searched window's seed grid into the stage-1 start.
+
+        The grid of a window is scored on the input of this search, so it is made anew at every search. The best rows
+        become the f0, fdot and sky of the first walkers of every temperature; the walkers that the seeds do not fill
+        keep their prior draws. ``holder`` and ``owners`` are those of :meth:`_search_owners`, ``start`` is (windows,
+        ntemps, nwalkers, 8) and ``seeds`` a :class:`SeedStartInputs` with one entry for each searched window. Returns
+        the start and a dict of facts: ``grid_rows`` scored, their ``seconds``, and ``seed_counts`` and ``best_fstat``
+        of each window.
+        """
+        searched = np.flatnonzero(bands["active"])
+        if len(seeds.source_rows) != len(searched) or len(seeds.reach_bins) != len(searched):
+            raise ValueError("the seeded start needs the sources and the reach of each searched window")
+        nwalkers = int(self.fstat_settings.nwalkers)
+        # * a likelihood object of its own keeps the rows and seconds of the grids out of the record's stage-1 counts
+        likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms, fstat=True)
+        time_start = time.perf_counter()
+        grid_rows, seed_counts, best_fstat = 0, np.zeros(len(searched), dtype=int), np.full(len(searched), np.nan)
+        for window, band in enumerate(searched):
+            grid = self.seed_grid(seeds.source_rows[window], bands["low_mhz"][band], bands["high_mhz"][band],
+                                  seeds.reach_bins[window], seeds.epoch_fraction, seeds.observation_seconds,
+                                  self.priors["gb"])
+            scores = self._score_seed_grid(likelihood, grid)
+            rows, _ = self.select_seeds(grid, scores, nwalkers, seeds.reach_bins[window])
+            for column in self.SAMPLED_COLUMNS:
+                start[window, :, :len(rows), column] = rows[None, :, column]
+            grid_rows += scores.size
+            seed_counts[window] = len(rows)
+            if scores.size:
+                best_fstat[window] = scores.max()
+        seconds = time.perf_counter() - time_start
+        logger.info("[GB_FSTAT_SEARCH %s] seed grids of %d windows: %.3e rows in %.1f s (%.1f us per row), seeds per "
+                    "window %d to %d", self.name, len(searched), grid_rows, seconds, 1e6 * seconds / max(grid_rows, 1),
+                    seed_counts.min(), seed_counts.max())
+        return start, {"grid_rows": grid_rows, "seconds": seconds, "seed_counts": seed_counts, "best_fstat": best_fstat}
+
+    def run_passes(self, holder, walker, bands, *, engine, periodic, seeds=None, after_pass=None):
+        """Search windows in passes: a window that passes the gate has the best row of its stage 2 taken out of the
+        walker's residual and is searched again, until no window passes or ``MAX_PASSES`` passes have run.
+
+        The first pass searches all of ``bands``. Each later pass searches the windows that passed the gate in the pass
+        before, with the same sources (``seeds``, or None for the prior start) and a seed grid made anew on the
+        changed residual. Returns a list with one search dict of :meth:`run` for each pass; each holds ``pass_number``,
+        ``windows`` (the indices into ``bands`` of the windows it searched) and ``seconds``, and a pass that another
+        follows holds ``subtracted_rows`` (:meth:`_subtract_best_rows`). ``after_pass`` is called with the dict of each
+        pass as soon as it ends, before the best rows are taken out. The subtractions change the walker's residual, so
+        the caller keeps it with :meth:`restored_residual`.
+        """
+        passes = []
+        window_index = np.arange(len(bands["ids"]))
+        current, current_seeds = bands, seeds
+        for pass_number in range(self.MAX_PASSES):
+            time_start = time.perf_counter()
+            searched = np.flatnonzero(current["active"])
+            search = self.run(holder, walker, current, engine=engine, periodic=periodic, seeds=current_seeds)
+            search["pass_number"], search["windows"] = pass_number, window_index[searched]
+            search["seconds"] = time.perf_counter() - time_start
+            passes.append(search)
+            if after_pass is not None:
+                after_pass(search)
+            if "gate" not in search or not search["gate"]["detected"].any() or pass_number == self.MAX_PASSES - 1:
+                break
+            passing = search["gate"]["detected"]
+            search["subtracted_rows"] = self._subtract_best_rows(holder, walker, search, engine)
+            window_index = window_index[searched[passing]]
+            current = {name: np.asarray(current[name])[searched[passing]]
+                       for name in ("ids", "low_mhz", "high_mhz", "active")}
+            current_seeds = None if current_seeds is None else current_seeds.subset(np.flatnonzero(passing))
+        return passes
+
+    def _subtract_best_rows(self, holder, walker, search, engine):
+        """Take the best stage-2 row of each window that passed the gate out of the walker's residual, in one fill call.
+
+        The best row is the cold row of the largest ln L of the window's chain. A window whose best row was not scored
+        keeps its residual, and a warning names it. Returns the best rows (windows that passed, 8), NaN where nothing
+        was taken out.
+        """
+        cold_ll = search["stage_2"]["cold_ll"]
+        count = cold_ll.shape[0]
+        log_likelihood = cold_ll.reshape(count, -1)
+        best = np.argmax(log_likelihood, axis=1)
+        rows = search["stage_2"]["cold_coords"].reshape(count, -1, self.NDIM)[np.arange(count), best]
+        scored = log_likelihood[np.arange(count), best] > self.REJECTED_LL
+        bands = search["bands"]
+        passing = np.flatnonzero(bands["active"])[search["gate"]["detected"]]
+        for window in passing[~scored]:
+            logger.warning("[GB_FSTAT_SEARCH %s] the best row of the window %.6f to %.6f mHz was not scored and "
+                           "stays in the residual", self.name, bands["low_mhz"][window], bands["high_mhz"][window])
+        self._fill_rows(holder, walker, rows[scored], -1, engine)
+        return np.where(scored[:, None], rows, np.nan)
+
+    def _fill_rows(self, holder, walker, source_rows, factor, engine):
+        """Put the templates of sampling rows into the walker's row of the container (factor +1) or take them out (-1).
+
+        One fill call for all rows: the kernel adds with atomic operations, so rows of one walker that overlap are safe.
+        """
+        rows = np.asarray(source_rows, dtype=float).reshape(-1, self.NDIM)
+        if len(rows) == 0:
+            return
+        xp = engine.xp
+        params_phys = xp.asarray(self.parameter_transforms.both_transforms(rows))
+        walker_index = xp.full(len(rows), int(walker), dtype=xp.int32)
+        engine.fill_template(holder, params_phys, walker_index, None, factor=factor,
+                             waveform_kwargs=self.waveform_kwargs)
+
+    def add_sources_back(self, holder, walker, source_rows, *, engine):
+        """Add the templates of sources back into the walker's residual, in one fill call.
+
+        The input of a search that must see these sources: the data with them present. Pair it with
+        :meth:`restored_residual`, which writes the saved row back.
+        """
+        self._fill_rows(holder, walker, source_rows, +1, engine)
+
+    @staticmethod
+    def _walker_row(holder, walker):
+        """The walker's row of the container's flat data buffer: a view that the template fills write into."""
+        split, intra = int(holder.split_map[walker]), int(holder.ac_to_intra[walker])
+        size = int(holder.nchannels) * int(holder.data_length)
+        return holder.linear_data_arr[split][intra * size:(intra + 1) * size]
+
+    @contextmanager
+    def restored_residual(self, holder, walker):
+        """Keep the walker's residual through a block that changes it: copy it on entry, write it back on exit.
+
+        Yields a dict that holds ``likelihood_before``, the walker's ln L on entry, and, after the block,
+        ``likelihood_after`` and ``likelihood_difference``. The row is written back also when the block raises. Raises
+        RuntimeError when the bytes of the row differ from the copy after the write back.
+        """
+        walker = int(walker)
+        row = self._walker_row(holder, walker)
+        device = None if holder.gpus is None else int(holder.gpu_map[walker])
+        facts = {"likelihood_before": float(holder.likelihood(index=np.array([walker]))[0])}
+        with holder.device_context(device):
+            saved = row.copy()
+        try:
+            yield facts
+        finally:
+            with holder.device_context(device):
+                row[:] = saved
+                xp = get_array_module(row)
+                # * compared as 64-bit words, so that a sign of zero or a NaN that changed is seen
+                differing = bool(xp.any(row.view(xp.uint64) != saved.view(xp.uint64)))
+            facts["likelihood_after"] = float(holder.likelihood(index=np.array([walker]))[0])
+            facts["likelihood_difference"] = facts["likelihood_after"] - facts["likelihood_before"]
+            if differing:
+                raise RuntimeError("the walker's residual differs from its copy after the write back")
 
     # ==================================================================================================================
     # The search's logs and record
