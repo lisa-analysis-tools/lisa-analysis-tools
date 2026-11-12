@@ -437,9 +437,12 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
 
 def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, state) -> BranchMoves:
     """The GB PE move: ``block.pe_move``'s class on the band machinery ``prepare_gb_branches`` set up
-    (``prepare_gb_moves``, which also subtracted the start sources and set the band temperatures)."""
+    (``prepare_gb_moves``, which also subtracted the start sources and set the band temperatures). When the block
+    holds the split and merge without record files, one search memory is made for it and for the search move."""
     from lisatools.globalfit.moves.gbdebug import GBDebugSettings
-    from lisatools.globalfit.recipe import default_gb_debug_settings
+    from lisatools.globalfit.recipe import default_gb_debug_settings, make_fstat_search_memory
+
+    from .blocks.gb import reads_search_memory
 
     parts = ctx.wave_gens[block.type]
     kwargs = gb_move_kwargs(block)
@@ -447,6 +450,26 @@ def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, sta
     kwargs["debug_settings"] = default_gb_debug_settings(
         kwargs.get("debug_settings") or GBDebugSettings(), curr.general_info.artifacts_file_dir
     )
+    # * The extra moves take the pe_move's knobs (its in-model proposals among them) with their own on top. Their kwargs
+    # * are made before any move is built, since the search memory depends on them.
+    extras_kwargs = {
+        key: gb_move_kwargs(block, {**block.pe_move.kwargs, **spec.kwargs}) for key, spec in block.extra_moves.items()
+    }
+    moves_kwargs = [(block.pe_move.class_name, kwargs)] + [
+        (spec.class_name, extras_kwargs[key]) for key, spec in block.extra_moves.items()
+    ]
+    if any(reads_search_memory(class_name, move_kwargs) for class_name, move_kwargs in moves_kwargs):
+        if not hasattr(ctx.cfg.recipe, "file"):
+            raise ValueError(
+                f"the {block.type} block holds the F-statistic split and merge without record files, whose search "
+                "part must be fixed when the kept iterations start, and the stock recipe "
+                f"{ctx.cfg.recipe.class_name} does not fix it: use a recipe file whose step of the kept iterations "
+                "calls apply_settings(fix_search_part=True) on every GB move that has the method."
+            )
+        memory = make_fstat_search_memory(curr)
+        for class_name, move_kwargs in moves_kwargs:
+            if class_name == "GBFStatRJMove" or reads_search_memory(class_name, move_kwargs):
+                move_kwargs["fstat_search_memory"] = memory
     move = cls(
         *parts.args,
         **parts.kwargs,
@@ -466,8 +489,7 @@ def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, sta
     extras = []
     for key, spec in block.extra_moves.items():
         entry = block.EXTRA_MOVES[spec.class_name]
-        # * the pe_move's knobs (its in-model proposals among them) with the extra move's on top
-        extra_kwargs = gb_move_kwargs(block, {**block.pe_move.kwargs, **spec.kwargs})
+        extra_kwargs = extras_kwargs[key]
         extra_kwargs["debug_settings"] = default_gb_debug_settings(
             extra_kwargs.get("debug_settings") or GBDebugSettings(), curr.general_info.artifacts_file_dir
         )

@@ -54,6 +54,7 @@ from .moves.gbbandstructure import plot_band_layout, stft_store_window_layout
 from .moves.gbspecialmove import (
     GBFStatRJMove,
     GBFStatSettings,
+    GBFStatSplitMergeRJMove,
     GBSpecialRJPriorMove,
     GBSpecialRJRefitMove,
     GBSpecialBase
@@ -1373,6 +1374,40 @@ def default_fstat_settings(fstat_settings, artifacts_file_dir: str):
     return dataclasses.replace(settings, output_dir=os.path.join(artifacts_file_dir, "fstat_search", ""))
 
 
+# * The search memory's file in the run's artifacts folder: one name at every start, so that a restart finds it
+FSTAT_SEARCH_MEMORY_FILE = "fstat_search_memory.npz"
+
+
+def run_resumes(curr: CurrentInfoGlobalFit) -> bool:
+    """Whether the run resumes from stored iterations: its main backend file is initialised and holds more than zero
+    of them, the test ``load_info`` of the engine applies. The existence of the file says nothing, since the engine
+    creates and resets it before the builders run."""
+    from .hdfbackend import GFHDFBackend
+
+    backend_path = curr.general_info.main_file_path
+    if not os.path.exists(backend_path):
+        return False
+    backend = GFHDFBackend(backend_path)
+    return bool(backend.initialized and backend.iteration > 0)
+
+
+def make_fstat_search_memory(curr: CurrentInfoGlobalFit):
+    """The search memory that the F-statistic moves of a run share (:class:`FStatSearchMemory`): it saves itself to
+    ``FSTAT_SEARCH_MEMORY_FILE`` in the run's artifacts folder and loads that file when the run resumes (a file that is
+    missing then gives a warning and an empty memory). The split and merge binds it to its layout."""
+    from .moves.gbspecialmove import FStatSearchMemory
+
+    path = os.path.join(curr.general_info.artifacts_file_dir, FSTAT_SEARCH_MEMORY_FILE)
+    resume = run_resumes(curr)
+    logger.info(f"Search memory of the F-statistic moves: {path}, the run resumes: {resume}")
+    if resume and not os.path.exists(path):
+        logger.warning(
+            f"The run resumes, but the search memory file {path} does not exist: the memory starts empty, so the "
+            "split and merge has no search part from the searches before the restart."
+        )
+    return FStatSearchMemory(path, resume=resume)
+
+
 def prepare_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
@@ -1879,6 +1914,14 @@ def build_gb_moves(
                 f"does not exist or include_refit is False."
             )
 
+    # * The F-statistic moves share one search memory when the split and merge reads no record files
+    split_merge_settings = getattr(move_settings, "fstat_split_merge_settings", None)
+    search_memory = None
+    if "rj_fstat_split_merge" in search_move_names + pe_move_names and (
+        split_merge_settings is None or split_merge_settings.record_files is None
+    ):
+        search_memory = make_fstat_search_memory(curr)
+
     def _create_move(name: str) -> GBSpecialBase:
         # * the search moves recompute each source's Fisher matrix at every block, since a source
         # * climbing onto its signal needs one at its current position
@@ -1904,6 +1947,7 @@ def build_gb_moves(
                 is_rj_prop=True,
                 run_swaps=False,
                 name="rj_fstat_mcmc_search",
+                fstat_search_memory=search_memory,
                 phase_maximize=False,
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
@@ -1943,6 +1987,7 @@ def build_gb_moves(
                 rj_proposal_distribution=None,
                 run_swaps=True,
                 name="rj_fstat_mcmc",
+                fstat_search_memory=search_memory,
                 phase_maximize=False,
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
@@ -1962,6 +2007,21 @@ def build_gb_moves(
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
+            )
+        elif name == "rj_fstat_split_merge":
+            # * Split and merge in place of birth and death; the sorter draws its dead rows as for rj_prior
+            move = GBFStatSplitMergeRJMove(
+                *gb_move_args,
+                rj_proposal_distribution=gpu_priors,
+                name="rj_fstat_split_merge",
+                fstat_search_memory=search_memory,
+                use_prior_removal=False,
+                phase_maximize=False,
+                ranks_needed=0,
+                run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
+                fstat_split_merge_settings=getattr(move_settings, "fstat_split_merge_settings", None),
+                **gb_move_kwargs,
             )
         else:
             raise ValueError(f"Unknown GB move name '{name}'.")

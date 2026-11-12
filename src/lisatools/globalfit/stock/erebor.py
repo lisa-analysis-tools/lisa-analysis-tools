@@ -41,6 +41,7 @@ from ..searches import MBHBSearchInterface, GBSearchInterface, EMRISearchInterfa
 if typing.TYPE_CHECKING:
     from ..moves.gbspecialmove import GBLeafCapSettings, GBSigHetSettings
     from ..moves.gbspecialmove import GBFStatSettings
+    from ..moves.gbspecialmove import GBFStatSplitMergeSettings
 
 
 # * The GB code reads the sampling columns by position: the amplitude (ln A) first, then these.
@@ -152,6 +153,8 @@ class GBMoveSettings:
     search_kwargs: Optional[dict[str, Any]] = None
     # Read by the F-statistic moves (rj_fstat_mcmc, rj_fstat_mcmc_search) only; None takes their defaults.
     fstat_settings: Optional[GBFStatSettings] = None
+    # Read by the rj_fstat_split_merge move only; None takes its defaults.
+    fstat_split_merge_settings: Optional[GBFStatSplitMergeSettings] = None
 
 
 @dataclasses.dataclass

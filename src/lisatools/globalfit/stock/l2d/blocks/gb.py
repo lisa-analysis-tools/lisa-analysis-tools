@@ -6,11 +6,12 @@ engine-owned arguments (``recipe.prepare_gb_moves``). The in-model proposals bel
 takes no ``inner_moves`` and no ``flow``. ``waveform.runtime_kwargs`` and ``stft`` hold the knobs of
 ``GBWaveformSettings`` and ``GBSTFTSettings``; the builder fills their time grid, window, orbits and domain
 from the ``GeneralSetup``. ``extra_moves`` adds GB moves that take turns with ``pe_move`` (``EXTRA_MOVES``, the
-F-statistic RJ move ``GBFStatRJMove`` among them), each in its share of each recipe stage's iterations. The
-search seeds each source's walkers at the four copies of (phi0, psi) where the template is the same
-(``seed_phase_copies`` of ``GBSearchInterface``) unless its ``kwargs`` set ``seed_phase_copies: false``. The
-search is a ``point_estimate`` over a candidates file (a catalogue table, e.g. ``gb_candidates.hdf5``): the injection
-catalogue holds the GB population as one entry of arrays, so a ``catalog`` search cannot seed GBs.
+F-statistic RJ move ``GBFStatRJMove`` and the F-statistic split and merge ``GBFStatSplitMergeRJMove`` among them),
+each in its share of each recipe stage's iterations. The search seeds each source's walkers at the four copies of
+(phi0, psi) where the template is the same (``seed_phase_copies`` of ``GBSearchInterface``) unless its ``kwargs`` set
+``seed_phase_copies: false``. The search is a ``point_estimate`` over a candidates file (a catalogue table, e.g.
+``gb_candidates.hdf5``): the injection catalogue holds the GB population as one entry of arrays, so a ``catalog``
+search cannot seed GBs.
 """
 from __future__ import annotations
 
@@ -27,13 +28,14 @@ from .base import (
 )
 from .utility import check_kwargs, find_class
 
-# GBSpecialBase arguments the recipe fills (recipe.prepare_gb_moves and build_recipe.gb_moves)
+# GBSpecialBase arguments the recipe fills (recipe.prepare_gb_moves and build_recipe.gb_moves), and the search memory
+# that the builders hand to the F-statistic moves
 GB_SPECIAL_MOVE_FILLED = frozenset({
     "gb", "priors", "start_freq_ind", "data_length", "acs", "band_edges", "band_N_vals", "gpu_priors",
     "waveform_kwargs", "parameter_transforms", "provide_betas", "skip_supp_names_update", "random_seed",
     "force_backend", "nfriends", "temperature_control", "gb_wdm_comp", "gb_fd_comp", "gb_stft_comp", "orbits",
     "tdi_config", "t_ref", "ntemps", "stft_store_windows", "rj_proposal_distribution", "num_repeat_proposals",
-    "name",
+    "name", "fstat_search_memory",
 })
 # GBWaveformSettings and GBSTFTSettings fields the builder fills from the GeneralSetup
 GB_WAVEFORM_FILLED = frozenset({"dt", "T", "start_freq_ind", "window", "window_alpha", "orbits", "t0", "force_backend"})
@@ -44,9 +46,12 @@ GB_MOVE_DATACLASSES = {
     "leaf_cap_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBLeafCapSettings"),
     "sighet_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBSigHetSettings"),
     "fstat_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBFStatSettings"),
+    "fstat_split_merge_settings": ("lisatools.globalfit.moves.gbspecialmove", "GBFStatSplitMergeSettings"),
 }
 # GBSearchInterface arguments the block sets unless its search kwargs do: the walkers start at every copy of the phases
 GB_SEARCH_DEFAULTS = {"seed_phase_copies": True}
+# The extra moves that run on the STFT domain with the DFFR response only: their F-statistic and swap rows come from it
+DFFR_ONLY_MOVES = frozenset({"GBFStatRJMove", "GBFStatSplitMergeRJMove"})
 
 
 class ExtraMove(NamedTuple):
@@ -97,6 +102,7 @@ class GBBlock(SourceBlock):
     # * The classes extra_moves may name; the recipe fills GB_SPECIAL_MOVE_FILLED for them as for pe_move
     EXTRA_MOVES: ClassVar[dict[str, ExtraMove]] = {
         "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False, stft_only=True),
+        "GBFStatSplitMergeRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=True, stft_only=True),
     }
 
     nleaves: PositiveInt = 8000  # the most sources at once (nleaves_max); the least is 0
@@ -130,9 +136,9 @@ class GBBlock(SourceBlock):
                 )
             if spec.weight == 0.0 and not any(spec.stage_weights.values()):
                 raise ValueError(f"extra_moves {name} has no share in any stage, so it would never run.")
-            if spec.class_name == "GBFStatRJMove" and self.stft.get("response", "dffr") != "dffr":
+            if spec.class_name in DFFR_ONLY_MOVES and self.stft.get("response", "dffr") != "dffr":
                 raise ValueError(
-                    f"extra_moves {name}: GBFStatRJMove computes its F-statistic with the stft response dffr only."
+                    f"extra_moves {name}: {spec.class_name} computes its F-statistic with the stft response dffr only."
                 )
             cls = find_class(spec.class_name, (self.EXTRA_MOVES[spec.class_name].module,))
             check_kwargs(spec.kwargs, cls, GB_SPECIAL_MOVE_FILLED)
@@ -238,3 +244,10 @@ def gb_move_kwargs(block: GBBlock, kwargs: dict[str, Any] | None = None) -> dict
         if isinstance(kwargs.get(name), dict):
             kwargs[name] = find_class(class_name, (module,))(**kwargs[name])
     return kwargs
+
+
+def reads_search_memory(class_name: str, kwargs: dict[str, Any]) -> bool:
+    """Whether a GB move is the split and merge without record files, whose search part comes from the search memory
+    that the builders make. ``kwargs`` are those of ``gb_move_kwargs``, whose settings are a dataclass."""
+    settings = kwargs.get("fstat_split_merge_settings")
+    return class_name == "GBFStatSplitMergeRJMove" and (settings is None or settings.record_files is None)
