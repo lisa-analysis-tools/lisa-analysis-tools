@@ -377,6 +377,14 @@ class STFTEngineCallSignatureTest(unittest.TestCase):
                 sigs["get_ll_grad_stft"].bind(self, *args, **kwargs)
                 return np.zeros((args[0].shape[0], 9))
 
+            def get_fstat_terms_stft(self, *args, **kwargs):
+                _Stub.calls.append(("get_fstat_terms_stft", args, kwargs))
+                sigs["get_fstat_terms_stft"].bind(self, *args, **kwargs)
+                num_rows = args[0].shape[0]
+                # Constants rather than zeros, so that the gather into the kept rows shows.
+                return (np.full((num_rows, 4), 1.0), np.full((num_rows, 10), 2.0),
+                        np.full(num_rows, 3.0))
+
         return _Stub()
 
     def _build_aca_stub(self, num_bands=2):
@@ -547,6 +555,111 @@ class STFTEngineCallSignatureTest(unittest.TestCase):
         self.assertEqual(
             [c for c in stub.calls if c[0] == "get_swap_ll_stft"], []
         )
+
+    def test_fstat_and_pair_calls_bind_to_STFTGBComputations_signatures(self):
+        """``get_fstat_terms`` and ``get_pair_products`` on the two-band stub.
+
+        The kernel calls bind to the comp's signatures and carry only the kept rows, with their
+        intra-split indices; the outputs land back on those rows and the other rows hold zeros.
+        """
+        import inspect
+
+        import numpy as np
+
+        from gbgpu.gb_likelihood import PairProducts
+        from gbgpu.gbcomps import STFTGBComputations
+        from lisatools.domains import STFTSettings
+        from lisatools.globalfit.moves.gb_likelihood import (
+            STFTBandLikelihoodEngine,
+        )
+
+        sigs = {
+            name: inspect.signature(getattr(STFTGBComputations, name))
+            for name in ("get_swap_ll_stft", "get_fstat_terms_stft")
+        }
+        stub = self._build_stub(sigs)
+        stub.calls.clear()
+        aca = self._build_aca_stub()
+        # * Bands 0 and 1 at intra-split slots 1 and 0, so that the recorded indices show the remap.
+        aca.ac_to_intra_by_split = [np.array([1, 0], dtype=np.int32)]
+
+        basis = STFTSettings(
+            t0=0.0, dt=21600.0, df=1.0 / 21600.0, NT=8, NF=96,
+            min_freq=3.0e-3, max_freq=4.0e-3,
+        )
+        engine = STFTBandLikelihoodEngine(
+            gb_stft_comp=stub,
+            basis_settings=basis,
+            nchannels=3,
+            tdi_channel_setup="XYZ",
+        )
+
+        # Rows in both bands; the first set leaves the band at row 2, the second set at row 3.
+        band_index = np.array([0, 1, 0, 1, 0], dtype=np.int32)
+        params_first = np.zeros((5, 9))
+        params_first[:, 1] = (basis.ind_min + 2) * basis.df
+        params_first[2, 1] = (basis.ind_max + 10) * basis.df
+        params_second = np.zeros((5, 9))
+        params_second[:, 1] = (basis.ind_min + 3) * basis.df
+        params_second[3, 1] = (basis.ind_max + 10) * basis.df
+
+        projections, overlaps, two_f, kept = engine.get_fstat_terms(
+            aca, params_first, data_index=band_index, noise_index=band_index
+        )
+        self.assertIs(stub.stft_comps, aca.cpp_splits[0])
+        name, args, kwargs = stub.calls[-1]
+        self.assertEqual(name, "get_fstat_terms_stft")
+        rows_kept = [0, 1, 3, 4]
+        np.testing.assert_array_equal(args[0], params_first[rows_kept])
+        np.testing.assert_array_equal(kwargs["data_index"], [1, 0, 0, 1])
+        np.testing.assert_array_equal(kwargs["noise_index"], [1, 0, 0, 1])
+        self.assertIsNone(kwargs["start_freq_inds"])
+        np.testing.assert_array_equal(kept, [True, True, False, True, True])
+        self.assertEqual((projections.shape, overlaps.shape, two_f.shape), ((5, 4), (5, 10), (5,)))
+        np.testing.assert_array_equal(projections[rows_kept], 1.0)
+        np.testing.assert_array_equal(overlaps[rows_kept], 2.0)
+        np.testing.assert_array_equal(two_f[rows_kept], 3.0)
+        np.testing.assert_array_equal(projections[2], 0.0)
+        np.testing.assert_array_equal(overlaps[2], 0.0)
+        self.assertEqual(float(two_f[2]), 0.0)
+
+        products = engine.get_pair_products(
+            aca, params_first, params_second, data_index=band_index, noise_index=band_index
+        )
+        self.assertIsInstance(products, PairProducts)
+        name, args, kwargs = stub.calls[-1]
+        self.assertEqual(name, "get_swap_ll_stft")
+        rows_kept = [0, 1, 4]
+        # The comp's "add" template is the first row and its "remove" template the second.
+        np.testing.assert_array_equal(args[0], params_first[rows_kept])
+        np.testing.assert_array_equal(args[1], params_second[rows_kept])
+        np.testing.assert_array_equal(kwargs["data_index"], [1, 0, 1])
+        np.testing.assert_array_equal(kwargs["noise_index"], [1, 0, 1])
+        self.assertIsNone(kwargs["start_freq_inds"])
+        np.testing.assert_array_equal(products.kept, [True, True, False, False, True])
+        for values in (products.d_h_first, products.d_h_second, products.first_first,
+                       products.second_second, products.first_second):
+            self.assertEqual(values.dtype, np.complex128)
+            np.testing.assert_array_equal(values[rows_kept], 1.0 + 0.25j)
+            np.testing.assert_array_equal(values[[2, 3]], 0.0)
+
+        # A batch wholly outside the band issues no kernel call and returns zeros.
+        num_calls = len(stub.calls)
+        params_outside = params_first.copy()
+        params_outside[:, 1] = (basis.ind_max + 10) * basis.df
+        projections_outside, overlaps_outside, two_f_outside, kept_outside = (
+            engine.get_fstat_terms(
+                aca, params_outside, data_index=band_index, noise_index=band_index
+            )
+        )
+        products_outside = engine.get_pair_products(
+            aca, params_outside, params_second, data_index=band_index, noise_index=band_index
+        )
+        self.assertEqual(len(stub.calls), num_calls)
+        self.assertFalse(bool(kept_outside.any()) or bool(products_outside.kept.any()))
+        for values in (projections_outside, overlaps_outside, two_f_outside,
+                       products_outside.d_h_first, products_outside.first_second):
+            np.testing.assert_array_equal(values, 0.0)
 
 
 @unittest.skipUnless(
@@ -724,6 +837,194 @@ class STFTEngineNumericTest(unittest.TestCase):
         )
         return aca, gb
 
+    def _build_filled_dffr_setup(self):
+        """The DFFR setup with the source written into band 0 (the data is its template)."""
+        import numpy as np
+
+        aca, gb, engine, params = self._build_setup(response="dffr")
+        engine.fill_template(
+            aca, params, np.array([0], dtype=np.int32), None,
+            factor=+1, waveform_kwargs={},
+        )
+        return aca, gb, engine, params
+
+    def test_fstat_terms_dffr(self):
+        """``get_fstat_terms`` at the source's own row on [band 0, band 1], band 0 holding it.
+
+        On the filled band the best fit recovers the template, so 2F is its (h|h); on the empty
+        band N and 2F are zero and M is that of band 0. The engine equals the comp called directly.
+        """
+        import numpy as np
+
+        from gbgpu.gbcomps import STFTGBComputations
+
+        aca, gb, engine, params = self._build_filled_dffr_setup()
+        both_rows = np.vstack([params, params])
+        band_index = np.array([0, 1], dtype=np.int32)
+        engine.get_ll(
+            aca, both_rows, data_index=band_index, noise_index=band_index,
+            N_vals=None, waveform_kwargs={},
+        )
+        h_h = engine.h_h_out_cmplx.copy()
+
+        projections, overlaps, two_f, kept = engine.get_fstat_terms(
+            aca, both_rows, data_index=band_index, noise_index=band_index
+        )
+        self.assertTrue(bool(kept.all()))
+        # The kernel's closed form against the solve of the 4 x 4 system.
+        np.testing.assert_allclose(
+            two_f, STFTGBComputations.fstat_2F(projections, overlaps), rtol=1e-10, atol=0.0
+        )
+        relative = float(abs(two_f[0] - h_h[0].real) / h_h[0].real)
+        self.assertLess(relative, 1e-10, msg=f"2F against (h|h) on the filled band: {relative:.3e}")
+        self.assertLess(float(np.abs(projections[1]).max()), 1e-30)
+        self.assertLess(float(abs(two_f[1])), 1e-30)
+        # Both bands hold the same unit noise rows.
+        np.testing.assert_allclose(overlaps[1], overlaps[0], rtol=1e-12, atol=0.0)
+
+        # Refactor equivalence: the comp called directly after a manual rebind.
+        gb.stft_comps = aca.cpp_splits[0]
+        direct = gb.get_fstat_terms_stft(both_rows, data_index=band_index, noise_index=band_index)
+        for engine_values, direct_values in zip((projections, overlaps, two_f), direct):
+            np.testing.assert_allclose(engine_values, direct_values, rtol=1e-12, atol=0.0)
+
+    def test_pair_products_dffr(self):
+        """``get_pair_products`` on band 0, which holds the source A.
+
+        (A, A): the three template products agree and both (d|h) equal (h|h) of ``get_ll``.
+        (A, B), B a second source inside the band: swapping the two templates conjugates the cross
+        product and exchanges the others. The engine equals the comp called directly.
+        """
+        import numpy as np
+
+        aca, gb, engine, params = self._build_filled_dffr_setup()
+        band_zero = np.array([0], dtype=np.int32)
+        engine.get_ll(
+            aca, params, data_index=band_zero, noise_index=band_zero,
+            N_vals=None, waveform_kwargs={},
+        )
+        h_h = complex(engine.h_h_out_cmplx[0])
+
+        same = engine.get_pair_products(
+            aca, params, params, data_index=band_zero, noise_index=band_zero
+        )
+        self.assertTrue(bool(same.kept.all()))
+        first_first = complex(same.first_first[0])
+        for name in ("first_second", "second_second"):
+            value = complex(getattr(same, name)[0])
+            self.assertLess(abs(value - first_first) / abs(first_first), 1e-12, msg=name)
+        for name in ("d_h_first", "d_h_second"):
+            value = complex(getattr(same, name)[0])
+            self.assertLess(abs(value - h_h) / abs(h_h), 1e-12, msg=name)
+
+        # Source B: the carrier 2.5 bins of 1 / T higher (a third of a grid bin, inside the band),
+        # other amplitude, fdot and angles.
+        settings = engine.basis_settings
+        params_b = params.copy()
+        params_b[0, 0] = 2.0 * params[0, 0]
+        params_b[0, 1] = params[0, 1] + 2.5 / (settings.NT * settings.dt)
+        params_b[0, 2] = 2.0 * params[0, 2]
+        params_b[0, 4:] = [1.1, 0.7, 2.2, 3.5, -0.4]
+        forward = engine.get_pair_products(
+            aca, params, params_b, data_index=band_zero, noise_index=band_zero
+        )
+        backward = engine.get_pair_products(
+            aca, params_b, params, data_index=band_zero, noise_index=band_zero
+        )
+        self.assertTrue(bool(forward.kept.all()) and bool(backward.kept.all()))
+        # A cross product away from zero, so that the conjugate relation is a real check.
+        scale = float(np.sqrt(abs(forward.first_first[0] * forward.second_second[0])))
+        self.assertGreater(float(abs(forward.first_second[0])), 1e-6 * scale)
+        for forward_values, backward_values in (
+            (forward.first_second, np.conj(backward.first_second)),
+            (forward.first_first, backward.second_second),
+            (forward.second_second, backward.first_first),
+            (forward.d_h_first, backward.d_h_second),
+            (forward.d_h_second, backward.d_h_first),
+        ):
+            np.testing.assert_allclose(forward_values, backward_values, rtol=1e-12, atol=0.0)
+
+        # Refactor equivalence: the comp called directly after a manual rebind.
+        gb.stft_comps = aca.cpp_splits[0]
+        direct = gb.get_swap_ll_stft(params, params_b, data_index=band_zero, noise_index=band_zero)
+        engine_values = (forward.d_h_first, forward.d_h_second, forward.first_first,
+                         forward.second_second, forward.first_second)
+        for engine_value, direct_value in zip(engine_values, direct[2:]):
+            np.testing.assert_allclose(engine_value, direct_value, rtol=1e-12, atol=0.0)
+
+    def test_buffer_fstat_terms_and_pair_products_forward_to_engine(self):
+        """``SubBandBuffer.get_fstat_terms`` and ``get_pair_products`` on a partial buffer.
+
+        The buffer transforms the sampling rows, passes itself as the holder with the given
+        indices to its engine, and returns the engine's outputs unchanged.
+        """
+        import numpy as np
+
+        from lisatools.globalfit.moves.gbbands import SubBandBuffer
+        from lisatools.utils.parallelbase import LISAToolsParallelModule
+
+        sampling_first = np.full((2, 8), 0.25)
+        sampling_second = np.full((2, 8), 0.75)
+        physical_first = np.arange(18.0).reshape(2, 9)
+        physical_second = physical_first + 100.0
+        data_index = np.array([3, 5], dtype=np.int32)
+        noise_index = np.array([4, 6], dtype=np.int32)
+        fstat_outputs = (np.ones((2, 4)), np.ones((2, 10)), np.ones(2), np.ones(2, dtype=bool))
+        pair_outputs = object()
+
+        class _Transform:
+            """Returns the fixed physical rows of each set of sampling rows."""
+
+            calls = []
+
+            def both_transforms(self, params, xp=None):
+                _Transform.calls.append((params, xp))
+                return physical_first if params is sampling_first else physical_second
+
+        class _Engine:
+            calls = []
+
+            def get_fstat_terms(self, holder, params_phys, *, data_index, noise_index):
+                _Engine.calls.append((holder, (params_phys,), data_index, noise_index))
+                return fstat_outputs
+
+            def get_pair_products(self, holder, params_first_phys, params_second_phys, *,
+                                  data_index, noise_index):
+                _Engine.calls.append(
+                    (holder, (params_first_phys, params_second_phys), data_index, noise_index)
+                )
+                return pair_outputs
+
+        buf = SubBandBuffer.__new__(SubBandBuffer)
+        LISAToolsParallelModule.__init__(buf, force_backend="cpu")
+        buf.track_counter = None
+        buf.transform_fn = _Transform()
+        buf.waveform_kwargs = {}
+        buf._likelihood_engine = _Engine()
+
+        self.assertIs(buf.get_fstat_terms(sampling_first, data_index, noise_index), fstat_outputs)
+        self.assertIs(
+            buf.get_pair_products(sampling_first, sampling_second, data_index, noise_index),
+            pair_outputs,
+        )
+        # One transform for the F-statistic rows and one per set of pair rows, on the buffer's xp.
+        self.assertEqual(len(_Transform.calls), 3)
+        self.assertIs(_Transform.calls[0][0], sampling_first)
+        self.assertCountEqual([id(call[0]) for call in _Transform.calls[1:]],
+                              [id(sampling_first), id(sampling_second)])
+        self.assertTrue(all(call[1] is buf.xp for call in _Transform.calls))
+        expected_physical = ((physical_first,), (physical_first, physical_second))
+        self.assertEqual(len(_Engine.calls), 2)
+        for (holder, physical, data_passed, noise_passed), expected in zip(
+            _Engine.calls, expected_physical
+        ):
+            self.assertIs(holder, buf)
+            self.assertEqual(len(physical), len(expected))
+            for passed, wanted in zip(physical, expected):
+                self.assertIs(passed, wanted)
+            self.assertIs(data_passed, data_index)
+            self.assertIs(noise_passed, noise_index)
+
     def test_build_stft_band_aca_smoke(self):
         """Real ``SubBandBuffer._build_band_ac_list`` STFT run (partial init).
 
@@ -765,9 +1066,10 @@ class STFTEngineNumericTest(unittest.TestCase):
             band_aca.linear_data_arr[0].size,
             2 * 3 * settings.NT * settings.NF_active,
         )
+        # linear_envelope is copied from the parent group as well (its default is True)
         self.assertEqual(
             band_aca.domain_group_kwargs,
-            dict(tdi_type="XYZ", window_alpha=0.0, use_midpoint=False),
+            dict(tdi_type="XYZ", window_alpha=0.0, use_midpoint=False, linear_envelope=True),
         )
         group = band_aca.cpp_splits[0]
         self.assertIsInstance(group, STFTComputationGroup)

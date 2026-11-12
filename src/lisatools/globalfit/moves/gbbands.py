@@ -2523,6 +2523,38 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
             return ll, self.d_h_out, self.h_h_out, self.phase_angle
         return ll
 
+    # * _RoutedBandEngine needs no routing for the two methods below: make_routed_band_engine
+    # * returns the STFT engine unwrapped, and the FD and WDM engines raise.
+    def get_fstat_terms(self, params, data_index, noise_index):
+        """F-statistic terms of sampling rows against their cells' residuals.
+
+        Transforms the rows to physical parameters and returns the engine's ``get_fstat_terms``
+        unchanged: ``(projections, overlaps, two_f, kept)`` of shapes (n, 4), (n, 10), (n,) and
+        (n,), on the engine's xp. STFT buffers with the DFFR response only.
+        """
+        params_phys = self.transform_fn.both_transforms(params, xp=self.xp)
+        self._count_window_tracks(params_phys, data_index)
+        return self._likelihood_engine.get_fstat_terms(
+            self, params_phys, data_index=data_index, noise_index=noise_index
+        )
+
+    def get_pair_products(self, params_first, params_second, data_index, noise_index):
+        """The five complex inner products of the two templates of each pair of sampling rows.
+
+        Transforms both sets of rows to physical parameters and returns the engine's
+        ``get_pair_products`` unchanged, a :class:`gbgpu.gb_likelihood.PairProducts`. STFT buffers
+        only.
+        """
+        params_first_phys = self.transform_fn.both_transforms(params_first, xp=self.xp)
+        params_second_phys = self.transform_fn.both_transforms(params_second, xp=self.xp)
+        # Both templates of a row read the cell's store window, so both tracks are counted.
+        self._count_window_tracks(params_first_phys, data_index)
+        self._count_window_tracks(params_second_phys, data_index)
+        return self._likelihood_engine.get_pair_products(
+            self, params_first_phys, params_second_phys,
+            data_index=data_index, noise_index=noise_index,
+        )
+
     def setup_in_model_likelihood(self, params, data_index, N_vals=None) -> None:
         """Per-source in-model likelihood setup (once per repeat block).
 

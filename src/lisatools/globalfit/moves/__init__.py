@@ -6,6 +6,8 @@ from .gbspecialmove import (
     FStatSearchMemory,
     GBFStatRJMove,
     GBFStatSettings,
+    GBFStatSplitMergeRJMove,
+    GBFStatSplitMergeSettings,
     GBSpecialRJPriorMove,
     GBSpecialRJRefitMove,
     GBSpecialRJSearchMove,
