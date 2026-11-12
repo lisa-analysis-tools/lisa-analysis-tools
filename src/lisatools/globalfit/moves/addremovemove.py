@@ -257,6 +257,48 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         weights = np.where(self._has_flow, 0.0, self.move_weights)
         return weights / weights.sum()
 
+    # --- inner autocorrelation time (the recipe's RepeatController sets the repeats from it) --- #
+    record_inner_chain = False  # keep every repeat's cold-chain coordinates of the leaf being updated
+    inner_window = 20  # calls to propose whose chain is kept
+    _inner_chains = None  # leaf -> deque of its last visits' cold chains, each [num_repeats, nwalkers, ndim]
+    _inner_calls = 0  # calls to propose since reset_inner_act
+
+    def reset_inner_act(self, keep_chain: bool = False) -> None:
+        """Start counting the calls again; unless ``keep_chain``, forget the recorded chain too."""
+        self._inner_calls = 0
+        if not keep_chain:
+            self._inner_chains = {}
+
+    def _add_inner_visit(self, leaf: int, chain: np.ndarray) -> None:
+        """Add one visit of ``leaf``, its cold chain ``[num_repeats, nwalkers, ndim]``, to the leaf's chain."""
+        from collections import deque
+
+        if self._inner_chains is None:
+            self._inner_chains = {}
+        visits = self._inner_chains.get(leaf)
+        if visits is None or visits.maxlen != self.inner_window:
+            visits = self._inner_chains[leaf] = deque(visits or (), maxlen=self.inner_window)
+        visits.append(chain)
+
+    def inner_act(self) -> tuple[float, int]:
+        """``(tau, ncalls)``: the integrated ACT of the cold chain in units of proposal repeats, and the calls to
+        ``propose`` since :meth:`reset_inner_act`. The largest over the leaves and their parameters.
+
+        Each leaf's chain is its last :attr:`inner_window` visits put end to end, so the ACT does not have to fit
+        in one call; between two visits the other blocks move, as they do in the stored chain. NaN when that
+        chain is too short to resolve the ACT of some leaf (under about five ACTs).
+
+        The walker-permuting swap needs no special handling: it only randomises which walkers are paired across
+        the rungs, so what a cold slot gets from it is a proper transition.
+        """
+        from lisatools.sampling.utility import branch_periods, variogram, variogram_act
+
+        if not self._inner_chains:
+            return np.nan, self._inner_calls
+        periods = branch_periods(getattr(self, "_periodic", None), self.branch_name)
+        taus = [variogram_act(variogram(np.concatenate(list(v)), periods)) for v in self._inner_chains.values()]
+        return (np.nan if np.isnan(taus).any() else float(max(taus))), self._inner_calls
+
     def apply_settings(self, num_repeats: int | None = None, weights=None) -> None:
         """Change the proposals per leaf visit and the inner-move weights (e.g. at a recipe step).
 
@@ -855,9 +897,13 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         ring_buffer = dict() # prepare a ring buffer to store the proposed points to be submitted to an eventual flow proposal.
 
+        if self.record_inner_chain:
+            self._inner_calls += 1
+
         for leaf in leaves_random_order:
 
             leaf_buffer = []
+            inner_chain = []  # the cold chain of every repeat (record_inner_chain)
             # guard against leaves with False
             assert np.all(
                 state.branches[self.branch_name].inds[0, 0, leaf]
@@ -1027,6 +1073,9 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                     self.branch_name
                 ][:, :, 0]
 
+                if self.record_inner_chain:
+                    inner_chain.append(new_state.branches_coords[self.branch_name][0, :, leaf].copy())
+
                 # Thin the flow-trainer feed: only every flow_buffer_thin-th
                 # snapshot (and always the last) is kept, so the submitted
                 # rows are semi-independent instead of near-duplicate runs
@@ -1042,6 +1091,8 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             # ll_tmp1 = -1/2 * 4 * self.df * xp.sum(data_residuals[:2].conj() * data_residuals[:2] / psd[:2], axis=(0, 2)).get()
             # (n_snapshots, nwalkers, ndim): the walker axis lets a FlowGaussianMove estimate within-mode spreads
             ring_buffer[leaf] = np.array(leaf_buffer)
+            if inner_chain:
+                self._add_inner_visit(int(leaf), np.array(inner_chain))
             # add back cold chain sources
             _free_pool()
 

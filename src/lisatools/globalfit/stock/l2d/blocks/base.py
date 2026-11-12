@@ -118,6 +118,30 @@ class StageSpec(_Spec):
     flow_weight: NonNegativeFloat | None = None
 
 
+class AdaptiveRepeatsSpec(_Spec):
+    """A source block's proposal repeats follow its inner autocorrelation time (``recipe.RepeatController``).
+
+    In every recipe stage but the last the repeats go to ``per_act`` inner ACTs, starting from the block's
+    ``num_prop_repeats``; the last stage, which keeps its samples, runs with the value reached, fixed. A stage
+    whose ``stages`` entry sets ``num_prop_repeats`` runs with that number instead.
+    """
+
+    min: PositiveInt = 10
+    max: PositiveInt = 500
+    per_act: PositiveFloat = 2.0  # inner ACTs per iteration
+    every: PositiveInt = 10  # iterations of the block's move between updates
+    window: PositiveInt = 20  # iterations of the block's move the ACT is measured over
+    max_step: float = Field(default=2.0, gt=1.0)  # largest factor the repeats change by in one update
+
+    @model_validator(mode="after")
+    def _bounds(self):
+        if self.min > self.max:
+            raise ValueError(f"adaptive_repeats: min ({self.min}) is above max ({self.max}).")
+        if self.window < self.every:
+            raise ValueError(f"adaptive_repeats: window ({self.window}) is below every ({self.every}).")
+        return self
+
+
 class TemperingSpec(_Spec):
     ntemps: PositiveInt | None = None  # None -> sampler.ntemps
     ratio: float = Field(default=1.2, gt=1.0)  # geometric ladder: betas = ratio ** -arange(ntemps)
@@ -444,6 +468,8 @@ class SourceBlock(MoveBlock):
     time_reference: Literal["mojito", "data_start"] = "mojito"
     # recipe stage name -> the PE move's settings in that stage (special pe_moves only; see StageSpec)
     stages: dict[str, StageSpec] = Field(default_factory=dict)
+    # the proposal repeats follow the inner autocorrelation time (special pe_moves with inner_act; see the spec)
+    adaptive_repeats: AdaptiveRepeatsSpec | None = None
     # per-leaf priors for the PE move (the branch prior `priors` stays for the transform, seeding and sampler)
     proposal_priors: ProposalPriorsSpec | None = None
 
@@ -457,6 +483,24 @@ class SourceBlock(MoveBlock):
             raise ValueError(
                 "proposal_priors: a prior search draws from the branch prior, outside the per-leaf priors; "
                 "seed from a catalog or point_estimate search."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _adaptive_repeats_fit_the_move(self):
+        spec = self.adaptive_repeats
+        if spec is None:
+            return self
+        cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
+        if not hasattr(cls, "inner_act"):
+            raise ValueError(
+                f"adaptive_repeats: the pe_move {self.pe_move.class_name} measures no inner autocorrelation time "
+                "(only the single-source special moves of mbh, emri and sobbh do)."
+            )
+        if not spec.min <= self.num_prop_repeats <= spec.max:
+            raise ValueError(
+                f"adaptive_repeats: num_prop_repeats ({self.num_prop_repeats}), the starting value, must be within "
+                f"[min, max] = [{spec.min}, {spec.max}]."
             )
         return self
 

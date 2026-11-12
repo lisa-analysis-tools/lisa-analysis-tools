@@ -340,38 +340,42 @@ class ActTest(unittest.TestCase):
         self.assertAlmostEqual(tau[0], 10.0, delta=2.0)
         self.assertLess(cold_chain_act(angle)[0][0], 0.8 * tau[0])  # as it is, the jumps at the wrap read as mixing
 
-    def test_inner_act_of_short_visits(self):
+    def test_inner_act(self):
         from eryn.utils import get_acf
 
         from lisatools.sampling.utility import _windowed_act, variogram, variogram_act
 
         tau, rng = 20.0, np.random.default_rng(5)
 
-        def visits(repeats, offset=0.0):
+        def chain(steps, offset=0.0, seed=0):
             # each walker around its own mean: it carries its own state of the other blocks
-            return [ar1(repeats, 32, tau, seed=s) + offset * rng.normal(size=(1, 32, 1)) for s in range(40)]
+            return ar1(steps, 14, tau, seed=seed) + offset * rng.normal(size=(1, 14, 1))
 
-        for offset in (0.0, 1.0, 5.0):
-            for ratio, expected in [(10, tau), (8, tau), (2, np.nan), (1, np.nan)]:  # repeats per ACT
-                estimate = variogram_act(np.mean([variogram(v) for v in visits(int(ratio * tau), offset)], axis=0))
+        for offset in (0.0, 5.0):
+            for ratio, expected in [(50, tau), (20, tau), (3, np.nan), (1, np.nan)]:  # steps per ACT
+                estimates = [variogram_act(variogram(chain(int(ratio * tau), offset, seed))) for seed in range(8)]
                 with self.subTest(offset=offset, ratio=ratio):
                     if np.isnan(expected):
-                        self.assertTrue(np.isnan(estimate), msg=f"read as {estimate}")
+                        self.assertGreaterEqual(np.isnan(estimates).mean(), 0.75, msg=f"read as {estimates}")
                     else:
-                        self.assertAlmostEqual(estimate, expected, delta=0.25 * tau)
-        # each walker's own mean (eryn's get_acf) halves the ACT at 10 repeats per ACT
-        own_mean = _windowed_act(np.mean([get_acf(v).mean(axis=1) for v in visits(200)], axis=0))[0]
+                        self.assertLessEqual(np.isnan(estimates).mean(), 0.25)
+                        self.assertAlmostEqual(np.nanmean(estimates), expected, delta=0.2 * tau)
+        # each walker's own mean (eryn's get_acf) falls short on a series of 10 ACTs
+        own_mean = np.mean([_windowed_act(get_acf(chain(200, seed=s)).mean(axis=1))[0] for s in range(8)])
         self.assertLess(own_mean, 0.7 * tau)
 
     def test_inner_act_edges(self):
         from lisatools.sampling.utility import variogram, variogram_act
 
-        self.assertTrue(np.isnan(variogram_act(variogram(ar1(5, 32, 3.0)))))  # too few repeats to say anything
-        self.assertAlmostEqual(variogram_act(variogram(ar1(40, 256, 1.0))), 1.0, delta=0.3)  # independent draws
-        for slow in (10.0, 30.0, 100.0):  # ten repeats of a slow chain: never "resolved"
-            estimate = variogram_act(np.mean([variogram(ar1(10, 32, slow, seed=s)) for s in range(20)], axis=0))
-            self.assertTrue(np.isnan(estimate), msg=f"ACT {slow} in 10 repeats read as {estimate}")
-        fixed = ar1(200, 32, 5.0, ncols=2)
+        direct = ar1(300, 5, 10.0, ncols=3).cumsum(axis=0)  # the FFT form against the definition
+        expected = [0.5 * ((direct[k:] - direct[: 300 - k]) ** 2).mean(axis=(0, 1)) for k in range(300)]
+        np.testing.assert_allclose(variogram(direct), expected, rtol=1e-8, atol=1e-8)
+
+        self.assertTrue(np.isnan(variogram_act(variogram(ar1(5, 32, 3.0)))))  # too few steps to say anything
+        self.assertAlmostEqual(variogram_act(variogram(ar1(400, 256, 1.0))), 1.0, delta=0.4)  # independent draws
+        drift = ar1(2000, 14, 3.0).cumsum(axis=0)  # a chain that diffuses (burn-in): the variogram never flattens
+        self.assertTrue(np.isnan(variogram_act(variogram(drift))))
+        fixed = ar1(2000, 32, 5.0, ncols=2)
         fixed[:, :, 1] = 3.0  # a parameter held fixed does not hide the other
         self.assertAlmostEqual(variogram_act(variogram(fixed)), 5.0, delta=1.5)
         stuck = np.broadcast_to(np.arange(32.0)[None, :, None], (200, 32, 1))  # nothing accepted
@@ -395,54 +399,68 @@ class MoveInnerActTest(unittest.TestCase):
 
     def test_act_is_the_slowest_parameter_of_the_slowest_leaf(self):
         move = self.build()
-        for seed in range(10):  # ten visits of 200 repeats of each leaf: ACTs (5, 8) and (5, 20)
-            move._add_inner_visit(0, np.concatenate([ar1(200, 32, 5.0, seed), ar1(200, 32, 8.0, 50 + seed)], axis=-1))
-            move._add_inner_visit(1, np.concatenate([ar1(200, 32, 5.0, seed), ar1(200, 32, 20.0, 99 + seed)], axis=-1))
-        self.assertAlmostEqual(move.inner_act()[0], 20.0, delta=4.0)
+        slow = np.concatenate([ar1(4000, 14, 5.0, 1), ar1(4000, 14, 20.0, 2)], axis=-1)
+        fast = np.concatenate([ar1(4000, 14, 5.0, 3), ar1(4000, 14, 8.0, 4)], axis=-1)
+        for call in range(20):  # twenty calls of 200 repeats
+            move._add_inner_visit(0, fast[call * 200 : (call + 1) * 200])
+            move._add_inner_visit(1, slow[call * 200 : (call + 1) * 200])
+        self.assertAlmostEqual(move.inner_act()[0], 20.0, delta=5.0)
+        move.reset_inner_act(keep_chain=True)
+        self.assertAlmostEqual(move.inner_act()[0], 20.0, delta=5.0)
         move.reset_inner_act()
         self.assertTrue(np.isnan(move.inner_act()[0]))
 
+    def test_the_chain_runs_on_across_calls(self):
+        # an ACT of 100 repeats in calls of 50: no call holds it, twenty calls end to end do
+        move, chain = self.build(), ar1(4000, 14, 100.0, 7, ncols=2)
+        move._add_inner_visit(0, chain[:50])
+        self.assertTrue(np.isnan(move.inner_act()[0]))
+        for call in range(1, 80):
+            move._add_inner_visit(0, chain[call * 50 : (call + 1) * 50])
+        self.assertEqual(len(move._inner_chains[0]), move.inner_window)  # the last 20 calls: 1000 repeats
+        self.assertAlmostEqual(move.inner_act()[0], 100.0, delta=35.0)
+        move.inner_window = 80  # set by the controller (window)
+        for call in range(80):
+            move._add_inner_visit(0, chain[call * 50 : (call + 1) * 50])
+        self.assertAlmostEqual(move.inner_act()[0], 100.0, delta=25.0)
+
     def test_one_leaf_not_resolved(self):
         move = self.build()
-        for seed in range(10):
-            move._add_inner_visit(0, ar1(200, 32, 5.0, seed, ncols=2))
-            move._add_inner_visit(1, ar1(200, 32, 100.0, seed, ncols=2))  # two ACTs per visit
+        fast, slow = ar1(4000, 14, 5.0, 1, ncols=2), ar1(4000, 14, 3000.0, 2, ncols=2)  # about one ACT in the window
+        for call in range(20):
+            move._add_inner_visit(0, fast[call * 200 : (call + 1) * 200])
+            move._add_inner_visit(1, slow[call * 200 : (call + 1) * 200])
         self.assertTrue(np.isnan(move.inner_act()[0]))
-
-    def test_new_repeats_start_the_average_again(self):
-        move = self.build()
-        move._add_inner_visit(0, ar1(40, 32, 20.0, ncols=2))
-        for seed in range(10):
-            move._add_inner_visit(0, ar1(200, 32, 20.0, seed, ncols=2))
-        self.assertEqual(move._inner_variograms[0][1], 10)
-        self.assertAlmostEqual(move.inner_act()[0], 20.0, delta=4.0)
 
     def test_periodic_parameter(self):
         from eryn.utils import PeriodicContainer
 
         # by name, as a prior gives it: the container resolves the index
         move = self.build(PeriodicContainer({"mbh": {"phi": 2.0 * np.pi}}, key_order={"mbh": ["m", "phi"]}))
-        for seed in range(10):
-            visit = ar1(200, 32, 10.0, seed, ncols=2)
-            visit[:, :, 1] = np.mod(0.3 * visit[:, :, 1], 2.0 * np.pi)  # sits on the wrap
-            move._add_inner_visit(0, visit)
-        self.assertAlmostEqual(move.inner_act()[0], 10.0, delta=2.5)
+        chain = ar1(4000, 14, 10.0, 3, ncols=2)
+        chain[:, :, 1] = np.mod(0.3 * chain[:, :, 1], 2.0 * np.pi)  # sits on the wrap
+        for call in range(20):
+            move._add_inner_visit(0, chain[call * 200 : (call + 1) * 200])
+        self.assertAlmostEqual(move.inner_act()[0], 10.0, delta=3.0)
 
 
 class InnerActMove:
-    """What a RepeatController needs of a move; its inner ACT is ``true_tau``, resolved from five ACTs per call."""
+    """What a RepeatController needs of a move; its inner ACT is ``true_tau`` repeats, resolved when the window
+    (``inner_window`` calls at the current repeats) holds ten ACTs."""
 
     def __init__(self, true_tau, num_repeats=50):
-        self.true_tau, self.num_repeats, self.calls, self.record_inner_chain = true_tau, num_repeats, 0, False
+        self.true_tau, self.num_repeats, self.calls = true_tau, num_repeats, 0
+        self.record_inner_chain, self.inner_window = False, None
 
     def apply_settings(self, num_repeats=None, weights=None):
         self.num_repeats = num_repeats
 
-    def reset_inner_act(self):
+    def reset_inner_act(self, keep_chain=False):
         self.calls = 0
 
     def inner_act(self):
-        return (self.true_tau if self.num_repeats >= 5 * self.true_tau else np.nan), self.calls
+        resolved = self.inner_window * self.num_repeats >= 10 * self.true_tau
+        return (self.true_tau if resolved else np.nan), self.calls
 
 
 class RepeatControllerTest(unittest.TestCase):
@@ -456,21 +474,24 @@ class RepeatControllerTest(unittest.TestCase):
             history.append(move.num_repeats)
         return controller, history
 
-    def test_settles_at_resolve_acts_and_keeps_per_act(self):
+    def test_settles_at_per_act_acts(self):
         for tau, start in [(20.0, 50), (3.0, 400), (60.0, 10)]:
             with self.subTest(tau=tau):
                 move = InnerActMove(tau, start)
                 controller, history = self.tune(move)
-                self.assertEqual(history[-5:], [int(10 * tau)] * 5)  # no oscillation
+                self.assertEqual(history[-5:], [int(2 * tau)] * 5)  # no oscillation
                 self.assertEqual(controller.kept, int(2 * tau))
                 self.assertTrue(move.record_inner_chain)
+                self.assertEqual(move.inner_window, 20)
 
     def test_step_limit_and_bounds(self):
         _controller, history = self.tune(InnerActMove(60.0, 10))
-        self.assertEqual(history[:4], [20, 40, 80, 160])  # unresolved: a factor max_step at a time
-        controller, history = self.tune(InnerActMove(1000.0, 50), max=300)
+        self.assertEqual(history[:4], [20, 40, 80, 120])  # not resolved, then resolved: a factor max_step at a time
+        controller, history = self.tune(InnerActMove(5000.0, 50), max=300)
         self.assertEqual(history[-1], 300)
         self.assertEqual(controller.kept, 300)  # never resolved: the maximum
+        controller, history = self.tune(InnerActMove(400.0, 50), max=300)
+        self.assertEqual((history[-1], controller.kept, controller.tau), (300, 300, 400.0))  # resolved, above max
         controller, history = self.tune(InnerActMove(0.2, 50), min=20)
         self.assertEqual((history[-1], controller.kept), (20, 20))
 
@@ -482,7 +503,7 @@ class RepeatControllerTest(unittest.TestCase):
         self.assertIsNone(controller.update())
         self.assertEqual(move.num_repeats, 50)
         move.calls = 10
-        self.assertEqual(controller.update(), {"tuning": 100, "kept": 1000, "tau": controller.tau})
+        self.assertEqual(controller.update(), {"tuning": 40, "kept": 40, "tau": 20.0})
 
     def test_resumes_stored_values(self):
         move = InnerActMove(20.0, 50)
@@ -536,14 +557,14 @@ class AdaptiveStagesTest(unittest.TestCase):
         recipe.setup_first_recipe_step(0, None, sampler)
         self.run_recipe(recipe, sampler, move, until=30)
         self.assertEqual(recipe.current_recipe_step["name"], "tune")
-        self.assertEqual(move.num_repeats, 200)  # the stage settings (50) did not reset the tuning
+        self.assertEqual(move.num_repeats, 40)  # two inner ACTs; the stage settings (50) did not reset the tuning
         self.run_recipe(recipe, sampler, move, until=89)
-        self.assertEqual(move.num_repeats, 200)
+        self.assertEqual(move.num_repeats, 40)
         self.assertEqual(backend.repeats["mbh"]["kept"], 40)
 
         self.run_recipe(recipe, sampler, move, until=90)
         self.assertEqual(recipe.current_recipe_step["name"], "pe")
-        self.assertEqual(move.num_repeats, 40)  # two inner ACTs, fixed
+        self.assertEqual(move.num_repeats, 40)  # as tuned, fixed
         self.assertFalse(move.record_inner_chain)
         move.true_tau = 100.0
         self.run_recipe(recipe, sampler, move, until=150)
@@ -572,7 +593,7 @@ class AdaptiveStagesTest(unittest.TestCase):
         self.assertEqual(move.num_repeats, 50)
         self.assertFalse(move.record_inner_chain)
         self.run_recipe(recipe, sampler, move, until=60)
-        self.assertEqual(move.num_repeats, 200)
+        self.assertEqual(move.num_repeats, 40)
 
     def test_backend_stores_the_repeats(self):
         import os
@@ -728,7 +749,7 @@ class AdaptiveRepeatsSchemaTest(BlockStagesTest):
         block = {**MBH, "adaptive_repeats": {"min": 10, "max": 400}, "stages": {"pe": {"num_prop_repeats": 30}}}
         cfg = self.config({"mbh": block}, self.TUNED)
         kwargs, fixed = adaptive_repeats(cfg)["mbh"]
-        self.assertEqual(kwargs, {"min": 10, "max": 400, "per_act": 2.0, "resolve": 10.0, "every": 10, "max_step": 2.0})
+        self.assertEqual(kwargs, {"min": 10, "max": 400, "per_act": 2.0, "every": 10, "window": 20, "max_step": 2.0})
         self.assertEqual(fixed, {"pe"})
         gf_recipe.RepeatController("mbh", **kwargs)
         self.assertEqual(adaptive_repeats(self.config({"mbh": MBH}, self.TUNED)), {})
@@ -737,7 +758,7 @@ class AdaptiveRepeatsSchemaTest(BlockStagesTest):
         for adaptive, recipe, extra, msg in [
             ({"min": 60}, self.TUNED, {}, "within"),  # num_prop_repeats is 50
             ({"min": 20, "max": 10}, self.TUNED, {}, "above max"),
-            ({"resolve": 3.0}, self.TUNED, {}, "greater than or equal to 8"),
+            ({"window": 5}, self.TUNED, {}, "below every"),
             ({}, None, {}, "there is none"),  # one stage: nowhere to tune
             ({}, self.TUNED, {"stages": {"tune": {"num_prop_repeats": 20}}}, "there is none"),
         ]:

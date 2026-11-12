@@ -636,17 +636,33 @@ def variogram(x, periods: dict | None = None) -> np.ndarray:
     return (0.5 * (head + tail - 2.0 * cross) / pairs).mean(axis=1)
 
 
-def variogram_act(vario: np.ndarray, c: float = 5.0, min_steps: int = 8) -> float:
-    """The largest integrated ACT over the columns of a (visit-averaged) :func:`variogram`; NaN if any column is
-    not resolved within the series (it needs about five ACTs, and ``min_steps`` steps).
+def variogram_act(vario: np.ndarray, level: float = 1.0 - np.exp(-1.0), flat: float = 0.75, min_steps: int = 8) -> float:
+    """The largest integrated ACT over the columns of a :func:`variogram`; NaN if it is not resolved.
 
-    The variance is the variogram's plateau, taken between a half and three quarters of the series: reached when
-    the series is at least about eight ACTs long, which is where the estimate is unbiased.
+    The variance is the variogram's plateau, between a half and three quarters of the series. The ACT is twice
+    the lag at which the variogram reaches ``level`` of the plateau (the ACF falls to ``1 - level``, 1/e by
+    default): exact for an exponential ACF, and, unlike the sum of the ACF, not sensitive to the plateau (an
+    error of 5% in it doubles the sum, and moves this by 10%).
+
+    Not resolved (NaN) when the series is shorter than ``min_steps`` or than five ACTs, or when the variogram is
+    still rising: its mean between a quarter and a half of the series is below ``flat`` of the plateau (0.6 for
+    a chain that drifts or diffuses, as during burn-in; 1 for a stationary chain several ACTs long).
+    Calibration (AR(1), and a stretch move on a 12-dimensional Gaussian with 14 and 48 walkers): resolved from
+    about ten ACTs, within 10% for AR(1) and 10 to 30% high for the stretch move.
     """
     nsteps = vario.shape[0]
     if nsteps < min_steps:
         return float("nan")
     plateau = vario[nsteps // 2 : (3 * nsteps) // 4].mean(axis=0)
-    vario = vario[:, plateau > 0.0]  # a column that never changes (a parameter held fixed) says nothing
-    tau = _windowed_act(1.0 - vario / plateau[plateau > 0.0], c)
-    return float(np.nan if tau.size == 0 or np.isnan(tau).any() else tau.max())
+    rising = vario[nsteps // 4 : nsteps // 2].mean(axis=0)
+    moving = plateau > 0.0  # a column that never changes (a parameter held fixed) says nothing
+    if not moving.any() or (rising[moving] < flat * plateau[moving]).any():
+        return float("nan")
+    tau = 1.0
+    for column, top in zip(vario[:, moving].T, level * plateau[moving]):
+        k = int(np.argmax(column >= top))  # column[0] = 0 < top, and the plateau itself is above top
+        if k == 0:
+            return float("nan")
+        crossing = k - 1 + (top - column[k - 1]) / (column[k] - column[k - 1])
+        tau = max(tau, 2.0 * crossing)
+    return float(tau) if tau <= nsteps / 5.0 else float("nan")
