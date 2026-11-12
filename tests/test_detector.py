@@ -4,6 +4,7 @@ import numpy as np
 import time
 
 import unittest
+from copy import deepcopy
 
 try:
     import cupy as cp
@@ -81,3 +82,89 @@ class DetectorTest(unittest.TestCase):
         # out-of-range spacecraft ids raise instead of silently returning zeros
         with self.assertRaises(ValueError):
             orbits.get_vel(t_arr, xp.asarray([1, 2, 9], dtype=np.int32))
+
+
+class OrbitsDeepCopyTest(unittest.TestCase):
+    """A deep copy of a configured orbit shares its read-only arrays and reads the same values.
+
+    Settings trees and each computation's private copy are deep copied. A Mojito L1 table is 1.26 GiB
+    on the device, so a copy that duplicated it would fill the card.
+    """
+
+    SHARED_TABLES = ("x", "v", "n", "sc_t")
+    # The default 50 s grid takes several GiB per configure; sharing does not depend on the grid.
+    GRID_STEP_S = 1000.0
+
+    def check_each_orbit(self, check, configured=True):
+        """Run ``check(orbits)`` for every orbit class with packaged tables, on every backend."""
+        import lisatools
+
+        # Named backends: has_backend does not know the "cuda" and "gpu" aliases.
+        backends = [name for name in ("cpu", "cuda13x", "cuda12x", "cuda11x") if lisatools.has_backend(name)]
+        for backend in backends:
+            for orbit_class in (lisa.EqualArmlengthOrbits, lisa.ESAOrbits):
+                with self.subTest(backend=backend, orbit=orbit_class.__name__):
+                    orbits = orbit_class(force_backend=backend, linear_interp_setup=False, dt=self.GRID_STEP_S)
+                    if configured:
+                        orbits._ensure_configured()
+                    check(orbits)
+
+    def test_configured_copy_shares_its_tables(self):
+        def check(orbits):
+            duplicate = deepcopy(orbits)
+            self.assertIsNot(duplicate, orbits)
+            self.assertTrue(duplicate.configured)
+            for name in self.SHARED_TABLES:
+                self.assertIs(getattr(duplicate, name), getattr(orbits, name), msg=name)
+            # The C++ orbit reads these arrays, and the light travel times are its largest one.
+            for position, argument in enumerate(orbits.pycppdetector_args):
+                if hasattr(argument, "shape"):
+                    self.assertIs(duplicate.pycppdetector_args[position], argument, msg=str(position))
+
+        self.check_each_orbit(check)
+
+    def test_unconfigured_copy_owns_its_tables(self):
+        def check(orbits):
+            duplicate = deepcopy(orbits)
+            self.assertIsNot(duplicate, orbits)
+            self.assertFalse(duplicate.configured)
+            self.assertIsNot(duplicate.x_base, orbits.x_base)
+            duplicate._ensure_configured()
+            self.assertTrue(duplicate.configured)
+            self.assertFalse(orbits.configured)
+
+        self.check_each_orbit(check, configured=False)
+
+    def test_one_orbit_reached_twice_stays_one_copy(self):
+        def check(orbits):
+            settings_tree = deepcopy({"first": orbits, "nested": {"second": orbits}})
+            self.assertIs(settings_tree["first"], settings_tree["nested"]["second"])
+            self.assertIsNot(settings_tree["first"], orbits)
+
+        self.check_each_orbit(check)
+
+    def test_copy_reads_the_same_values(self):
+        def check(orbits):
+            duplicate = deepcopy(orbits)
+            xp = orbits.xp
+            times = xp.linspace(1e4, 1e6, 50)
+            for link in orbits.LINKS:
+                self.assertTrue(xp.array_equal(duplicate.get_light_travel_times(times, int(link)),
+                                               orbits.get_light_travel_times(times, int(link))))
+                self.assertTrue(xp.array_equal(duplicate.get_normal_unit_vec(times, int(link)),
+                                               orbits.get_normal_unit_vec(times, int(link))))
+            for spacecraft in (1, 2, 3):
+                self.assertTrue(xp.array_equal(duplicate.get_pos(times, spacecraft),
+                                               orbits.get_pos(times, spacecraft)))
+
+        self.check_each_orbit(check)
+
+    def test_new_configure_rebinds_the_copy_only(self):
+        def check(orbits):
+            duplicate = deepcopy(orbits)
+            source_table = orbits.x
+            duplicate._configure(**duplicate._configure_kwargs)
+            self.assertIs(orbits.x, source_table)
+            self.assertIsNot(duplicate.x, source_table)
+
+        self.check_each_orbit(check)

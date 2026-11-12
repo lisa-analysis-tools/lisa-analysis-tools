@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import logging
@@ -15,10 +16,11 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 import numpy as np
 import numpy
 
-from eryn.state import BranchSupplemental
+from eryn.state import BranchSupplemental, State
 from gbgpu.gbgpu import GBGPU
 from gbgpu.utils.utility import get_N, get_fdot
 from scipy import stats
+from scipy.special import gammaln
 
 from ... import sensitivity
 from ...detector import sangria
@@ -36,7 +38,6 @@ from ...utils.parallelbase import LISAToolsParallelModule
 from ...utils.utility import asnumpy
 from ..galaxyglobal import fit_each_leaf, make_gmm, run_gb_bulk_search
 from .globalfitmove import GFCombineMove, GlobalFitMove
-from ..priors.gbpriors import get_fdot_mojito
 
 try:
     import cupy as cp
@@ -47,9 +48,9 @@ except ModuleNotFoundError:
 
     gpu_available = False
 
+from eryn.ensemble import EnsembleSampler
 from eryn.moves import GroupStretchMove, Move, StretchMove
 from eryn.moves.multipletry import get_mt_computations, logsumexp
-from eryn.paraensemble import ParaEnsembleSampler
 from eryn.prior import ProbDistContainer, uniform_dist
 from eryn.utils import PeriodicContainer
 from eryn.utils.utility import groups_from_inds
@@ -73,6 +74,7 @@ from .gbdebug import (
 from .gbbands import (
     BandScheduler,
     BandSorter,
+    FriendTables,
     StoreWindowTrackCounter,
     SubBandBuffer,
     estimate_buffer_preload_limits,
@@ -97,6 +99,8 @@ __all__ = [
     "SeqPickStrategy",
     "GBSigHetSettings",
     "GBLeafCapSettings",
+    "GBFStatRJMove",
+    "GBFStatSettings",
 ]
 
 logger = logging.getLogger(__name__)
@@ -108,7 +112,7 @@ class _NoOpMempool:
         return
 
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from eryn.state import Branch
 from eryn.utils import TransformContainer
@@ -118,6 +122,9 @@ from .gbbands import (
     BandSorter,
     Buffer,
     SubBandBuffer,
+    free_device_bytes,
+    split_rows_by_budget,
+    stft_batch_budget_bytes,
     _RoutedBandEngine,
     make_routed_band_engine,
     pack_special_index,
@@ -198,6 +205,74 @@ def _tspan(tm, name: str):
     return tm.span(name) if tm is not None else nullcontext()
 
 
+# * Currently only using uniform priors for which the variance is w^2 / 12 for width w
+PRIOR_PRECISION_FACTOR = 12.0
+
+# * Step of the numerical Jacobian of the transform container: 1e-6 of |x| with a floor of 1e-3 in
+# * |x|. It is exact for the linear f0 and fdot transforms, also for fdot sampled as fdot x Tobs^2.
+JACOBIAN_STEP_RELATIVE = 1e-6
+JACOBIAN_STEP_FLOOR = 1e-3
+
+# * Side bins of the STFT Fisher matrix of the in-model proposal. At 12 the matrix is 4e-4 smaller than at 16
+# * and keeps its shape, and a pass of the DFFR Fisher kernel fits one round of its threads (529 against 750 us
+# * per source on an A100). The likelihood keeps the settings' side bins.
+FISHER_N_SIDE_BINS = 12
+
+# * Cached Fisher Information matrices in the gb branch supplemental, per leaf slot:
+# * FIM in the sampling basis, the prior widths, the blocks served, and whether the slot holds one.
+_FIM_STORE_KEYS = ("fim_matrix", "fim_widths", "fim_age", "fim_valid")
+
+
+def fisher_proposal_factor(info_sampling, prior_widths, beta, xp=np):
+    """Factor L with L L^T = (beta F + P)^-1 per source, P = diag(12 / w^2), in correlation form.
+
+    ``info_sampling`` (n_src, ndim, ndim) is the Fisher matrix F in the sampling basis,
+    ``prior_widths`` (n_src, ndim) or (ndim,) the widths w of the uniform prior box in the same
+    units and ``beta`` a scalar or (n_src,) inverse temperatures. The sum is whitened by its own
+    diagonal d: C = (beta F + P) / (d d^T) = V diag(lam) V^T and L = V diag(lam^-1/2) / d. No
+    eigenvalue floor is needed, since P holds every direction the data leave open. A source whose
+    matrix is not finite or not positive definite gets the prior factor diag(w / sqrt(12)).
+
+    Returns ``(factor, diagnostics)``. ``diagnostics`` holds per source ``fallback`` (the prior
+    factor was used), ``condition`` (largest over smallest eigenvalue of C, NaN for a fallback) and
+    ``prior_dominated`` (an eigenvector of C whose eigenvalue is more than half prior).
+    """
+    info = xp.asarray(info_sampling, dtype=xp.float64)
+    n_src, ndim = info.shape[0], info.shape[-1]
+    widths = xp.broadcast_to(xp.asarray(prior_widths, dtype=xp.float64), (n_src, ndim))
+    betas = xp.broadcast_to(xp.asarray(beta, dtype=xp.float64).reshape(-1), (n_src,))
+    precision = PRIOR_PRECISION_FACTOR / widths ** 2
+    identity = xp.eye(ndim)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        total = betas[:, None, None] * info + precision[:, :, None] * identity[None]
+        scale = xp.sqrt(xp.diagonal(total, axis1=1, axis2=2))
+        finite = xp.all(xp.isfinite(total), axis=(1, 2)) & xp.all(scale > 0.0, axis=1)
+        safe_scale = xp.where(finite[:, None], scale, 1.0)
+        # ! one non-finite matrix would make the batched eigh fail (numpy) or return NaN (cupy) for
+        # ! the whole batch, so it is replaced by the identity here and gets the prior factor below
+        corr = xp.where(
+            finite[:, None, None],
+            total / safe_scale[:, :, None] / safe_scale[:, None, :],
+            identity[None],
+        )
+        evals, evecs = xp.linalg.eigh(corr)
+        usable = finite & xp.all(evals > 0.0, axis=1)
+        safe_evals = xp.where(usable[:, None], evals, 1.0)
+        factor = evecs / xp.sqrt(safe_evals)[:, None, :] / safe_scale[:, :, None]
+        prior_factor = (widths / np.sqrt(PRIOR_PRECISION_FACTOR))[:, :, None] * identity[None]
+        factor = xp.where(usable[:, None, None], factor, prior_factor)
+        # * prior share of eigenvector v: v^T (d^-1 P d^-1) v / lam, between 0 and 1
+        prior_share = xp.einsum("nik,ni->nk", evecs ** 2, precision / safe_scale ** 2) / safe_evals
+        diagnostics = {
+            "fallback": ~usable,
+            "condition": xp.where(usable, safe_evals.max(axis=1) / safe_evals.min(axis=1), xp.nan),
+            # more than half of the eigenvalue from the prior
+            "prior_dominated": usable & xp.any(prior_share > 0.5, axis=1),
+        }
+
+    return factor, diagnostics
+
+
 
 @dataclass
 class GBSigHetSettings:
@@ -236,6 +311,65 @@ class GBLeafCapSettings:
     @property
     def enabled(self) -> bool:
         return self.start is not None
+
+
+def sweep_tempering_rows(values, betas, log_uniforms, bands, walkers, source_counts,
+                         walker_totals, nleaves_max, log_factorial):
+    """Swap decisions of the tempering loop, made on the host from each grid row's value table.
+
+    Row ``r`` holds one cell of band ``bands[r]`` per temperature: column ``t`` is walker
+    ``walkers[r, t]``, whose cell holds ``source_counts[r, t]`` sources. ``values[r, t, j]`` is the
+    ln L of column ``t`` holding the template of column ``j``, up to a term of column ``t`` alone.
+    The decisions go band after band (ascending), pair after pair from the top, the rows of a band
+    together: the order of the swap loop, whose chunks never mix bands. The rows of one band touch
+    distinct walker totals, so their decisions do not interact.
+
+    The rule is the swap loop's. For the pair ``(t, t - 1)``, ``betas[r, t]`` and ``betas[r, t - 1]``
+    weight the ln L changes of the two columns; the change of ln k! of both walkers is added, with
+    ``walker_totals[t, w]`` the sources of walker ``w`` at temperature ``t`` over all bands (updated
+    in place on acceptance); a swap that gives a walker more than ``nleaves_max`` sources is refused;
+    ``log_uniforms[r, t - 1]`` is the log of the uniform draw. A template keeps moving down the
+    ladder when the next pair accepts it again.
+
+    Returns:
+        ``template_column[r, t]``, the column whose template ends at column ``t``, and
+        ``accepted[r, t - 1]``, whether the swap of the pair ``(t, t - 1)`` was accepted.
+    """
+    num_rows, num_temps = betas.shape
+    template_column = np.tile(np.arange(num_temps), (num_rows, 1))
+    accepted = np.zeros((num_rows, num_temps - 1), dtype=bool)
+    for band in np.unique(bands):
+        rows = np.flatnonzero(bands == band)
+        for hot in range(num_temps - 1, 0, -1):
+            cold = hot - 1
+            from_hot = template_column[rows, hot]
+            from_cold = template_column[rows, cold]
+            paccept = (
+                betas[rows, hot] * (values[rows, hot, from_cold] - values[rows, hot, from_hot])
+                + betas[rows, cold] * (values[rows, cold, from_hot] - values[rows, cold, from_cold])
+            )
+            hot_walkers = walkers[rows, hot]
+            cold_walkers = walkers[rows, cold]
+            sources_hot = source_counts[rows, from_hot]
+            sources_cold = source_counts[rows, from_cold]
+            k_hot = walker_totals[hot, hot_walkers]
+            k_cold = walker_totals[cold, cold_walkers]
+            k_hot_new = k_hot - sources_hot + sources_cold
+            k_cold_new = k_cold - sources_cold + sources_hot
+            fits = (k_hot_new <= nleaves_max) & (k_cold_new <= nleaves_max)
+            log_weight_change = (
+                log_factorial[np.minimum(k_hot_new, nleaves_max)]
+                + log_factorial[np.minimum(k_cold_new, nleaves_max)]
+                - log_factorial[k_hot]
+                - log_factorial[k_cold]
+            )
+            take = fits & (paccept + log_weight_change > log_uniforms[rows, cold])
+            walker_totals[hot, hot_walkers[take]] = k_hot_new[take]
+            walker_totals[cold, cold_walkers[take]] = k_cold_new[take]
+            template_column[rows[take], hot] = from_cold[take]
+            template_column[rows[take], cold] = from_hot[take]
+            accepted[rows, cold] = take
+    return template_column, accepted
 
 
 # MHMove needs to be to the left here to overwrite GBBruteRejectionRJ RJ proposal method
@@ -292,7 +426,30 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         gb_stft_comp: Optional :class:`gbgpu.gbcomps.STFTGBComputations`
             instance. Required when ``mgh.settings`` is an
             :class:`~lisatools.domains.STFTSettings`; ignored otherwise.
+        num_stationary_fim_steps: Blocks of in-model repeats a source's Fisher
+            matrix serves before it is recomputed at the source's position. 1
+            recomputes it at every block.
     """
+
+    # * STFT tempering decides its swaps from the cross terms of each grid row; False runs the swap
+    # * loop.
+    TEMPERING_CROSS_TERMS = True
+    # Sum the DFFR cross terms over each band's store window (True) or over the whole cell. TDI on
+    # the fly always takes the whole cell: its carrier can spike out of the window near antenna nulls.
+    TEMPERING_BAND_WINDOW = True
+    # * DFFR proposal cells take the width of their band's class (a power of two) instead of the
+    # * widest window, and the classes of a band unit run one after another.
+    STFT_WIDTH_CLASSES = True
+    # * The same for the tempering cells of DFFR rows. A switch of its own, so that the classes of
+    # * the two phases can be measured apart.
+    TEMPERING_WIDTH_CLASSES = True
+    # * Empty the pool just before a proposal phase. Its band sorter subsets live for the whole propose: in a
+    # * free block they pin it, 1.6 GiB of a 2.6 GiB block from the second propose on.
+    EMPTY_POOL_BEFORE_PROPOSAL = True
+    # * True keeps the parent closed during a pass: a cell adds back only its own band's cold sources, and the
+    # * other bands of its class stay subtracted at their values from the start of the pass. The cells of a
+    # * class still run in parallel. False first adds the class back to the parent, as before.
+    PARALLEL_GIBBS = True
 
     @property
     def xp(self) -> Union[ModuleType, numpy , cupy]:
@@ -334,7 +491,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         search_kwargs=None,
         stretch_probability=0.5,
         band_units=2,
-        gamma_base=0.84, # = 2.38 / sqrt(D) where D=4
+        gamma_base=0.84, # = 2.38 / sqrt(D) where D=8
+        num_stationary_fim_steps: int = 1,
         debug_settings: Optional[GBDebugSettings] = None,
         sighet_settings: Optional[GBSigHetSettings] = None,
         leaf_cap_settings: Optional[GBLeafCapSettings] = None,
@@ -347,6 +505,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         self.a = float(kwargs.get("a", 2.0))
         self.nfriends = int(kwargs.get("nfriends", 32))
+        self.lift_scale = float(kwargs.get("lift_scale", 2.0))
+        self.lift_kmax = int(kwargs.get("lift_kmax", 2))
+        self._lift = None
+        self._inds_run = {}
+        self._last_log_norm = None
+        self._turns = self.xp.arange(-self.lift_kmax, self.lift_kmax + 1)
+        self._periodic_cache = {}
         self.return_gpu = True
         self.use_gpu = self.backend.uses_cupy
 
@@ -365,6 +530,18 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             xp=self.xp,
             gpus=kwargs.get("gpus", None),
         )
+
+        # * With store windows, a setting left at None is sized from the memory free at each build,
+        # * where the cell width is known. A given setting runs as it is; the estimate serves the rest.
+        self._size_proposal_batches = num_band_preload is None and stft_store_windows is not None
+        self._size_tempering_batches = num_bands_preload_temp is None and stft_store_windows is not None
+        if stft_store_windows is not None:
+            self._stft_bytes_per_bin = int(getattr(acs, "nchannels", 3)) * int(acs.settings.NT) * 16
+            if not SubBandBuffer.READ_PARENT_NOISE_ROWS:
+                # A cell then owns its noise window, and a new twin holds one until it is built.
+                self._stft_bytes_per_bin += (
+                    int(np.prod(acs.shape_sens)) * int(acs.settings.NT) * np.dtype(acs.noise_dtype).itemsize
+                )
 
         # Both arrive from GBSettings through recipe.py; the estimate is the fallback.
         if num_band_preload is None:
@@ -442,7 +619,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         self.band_units = max(1, int(band_units))
         self.jump_scales = float(gamma_base) * self.xp.array([0.2, 1.0, 2.5])
         self.jump_scales_probs = self.xp.array([0.2, 0.6, 0.2])
-        self._fdot_scale = 1e-16
+        self._jump_scale_cdf = self.jump_scales_probs.cumsum()
+        self._jump_scale_cdf /= self._jump_scale_cdf[-1]
+        fim_interval = num_stationary_fim_steps
+        if int(fim_interval) != fim_interval or fim_interval < 1:
+            raise ValueError(
+                f"num_stationary_fim_steps must be a positive integer, got {fim_interval}"
+            )
+        self.num_stationary_fim_steps = int(num_stationary_fim_steps)
+        self._held_fim_rows = None
 
         # Parent binding: config-only FD comp + move-level engine. A user-
         # supplied gb_fd_comp is honored as-is; otherwise one is built from
@@ -640,6 +825,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def remove_cold_chain_sources_from_residual(self, *args, **kwargs) -> None:
         kwargs["temp"] = 0
         kwargs["apply_inds"] = True
+        if self.PARALLEL_GIBBS and ("remainder" in kwargs or "extra_bool" in kwargs):
+            # Nothing goes into the parent. The cells and the close read the class as it is now.
+            band_sorter = args[1]
+            band_sorter.cold_class_at_open = band_sorter.get_subset(**kwargs)
+            return
         self.remove_sources_from_residual(*args, **kwargs)
 
     def remove_sources_from_residual(self, *args, **kwargs) -> None:
@@ -648,6 +838,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
     def add_cold_chain_sources_to_residual(self, *args, **kwargs) -> None:
         kwargs["temp"] = 0
         kwargs["apply_inds"] = True
+        if self.PARALLEL_GIBBS and ("remainder" in kwargs or "extra_bool" in kwargs):
+            # The parent still holds the class as it was at the open: those sources go back, the new ones come off below.
+            model, band_sorter = args
+            cold_class = band_sorter.cold_class_at_open
+            band_sorter.cold_class_at_open = None
+            if cold_class is not None:
+                self._likelihood_engine.fill_template(
+                    model.analysis_container_arr,
+                    cold_class.coords_in,
+                    cold_class.walker_inds.astype(self.xp.int32),
+                    cold_class.N_vals,
+                    factor=+1,
+                    waveform_kwargs=self.waveform_kwargs,
+                )
         self.add_sources_to_residual(*args, **kwargs)
 
     def add_sources_to_residual(self, *args, **kwargs) -> None:
@@ -926,8 +1130,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                                     -> compute delta_ll = - < r| h > - 0.5 < h | h > 
                                 else (outside freq limits):
                                     -> curr_logp = -inf (fast rejection)
-                            -> compute acceptance ratio:
-                               accept = beta * delta_ll + delta_logp + factors >= log(rand)
+                            -> compute acceptance ratio (the picks of one walker in turn):
+                               accept = beta * delta_ll + delta_logp + factors + k_term >= log(rand)
                             if accept:
                                 kill/birth source and update residual
                             else (rejected):
@@ -964,6 +1168,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         prop_counts = self.xp.zeros((2, self.ntemps, self.nwalkers, self.num_bands), dtype=int)
         acc_counts = self.xp.zeros_like(prop_counts)
 
+        self._jump_scale_counts = self.xp.zeros((2, len(self.jump_scales), self.ntemps), dtype=int)
+
+        # * Alive sources per (temp, walker) for the k prior term; _run_rj_step keeps it current
+        # * (it is the only step that flips ``inds`` in this pass).
+        if self.is_rj_prop:
+            walker_cell_all = band_sorter.temp_inds * self.nwalkers + band_sorter.walker_inds
+            alive_cells = walker_cell_all[band_sorter.inds]
+            # ! CuPy's bincount raises on an empty array (zero-leaf start)
+            self._k_walker = (
+                self.xp.bincount(alive_cells, minlength=self.ntemps * self.nwalkers)
+                if alive_cells.shape[0] > 0
+                else self.xp.zeros(self.ntemps * self.nwalkers, dtype=self.xp.int64)
+            )
+
         # Reset per-step debug state
         self.debugger.start_proposal_step()
 
@@ -995,10 +1213,22 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 apply_inds=apply_inds,
                 extra_bool=extra_bool,
             )
-            if subset is not None:
+            # Read with getattr: run_proposal also runs on stand-in moves without these attributes.
+            class_widths = getattr(self, "_stft_band_class_widths", lambda switched_on: None)(
+                getattr(self, "STFT_WIDTH_CLASSES", False)
+            )
+            if subset is not None and class_widths is not None:
+                self._run_width_classes(
+                    model, band_sorter, subset, band_temps, ll_change_log, prop_counts, acc_counts,
+                    class_widths, dict(units=units, remainder=remainder, apply_inds=apply_inds,
+                                       extra_bool=extra_bool),
+                )
+            elif subset is not None:
                 self._run_band_unit(
                     model, band_sorter, subset, band_temps,
                     ll_change_log, prop_counts, acc_counts,
+                    **({"num_slots": self._proposal_num_slots()}
+                       if getattr(self, "_size_proposal_batches", False) else {}),
                 )
 
             # Close: re-subtract with (possibly updated) cold-chain coords.
@@ -1018,12 +1248,119 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         return ll_change_log, prop_counts, acc_counts
 
+    def _stft_band_class_widths(self, switched_on: bool):
+        """Cell width of each band's class when the caller's phase uses classes, else None (one width).
+
+        DFFR only: a TDI-on-the-fly carrier can spike out of the store window, and a class cell
+        leaves it a smaller margin than the widest window does.
+        """
+        store_windows = getattr(self, "stft_store_windows", None)
+        if (not switched_on or store_windows is None
+                or getattr(getattr(self, "gb_stft_comp", None), "response", None) != "dffr"):
+            return None
+        return store_windows.class_width
+
+    def _class_num_slots(self, setting: int, cell_width: int) -> int:
+        """Cells of a class buffer for a batch setting, which counts cells of the widest window.
+
+        The buffer then takes the bytes the setting means with one width.
+        """
+        return max(1, int(setting) * int(self.stft_store_windows.buffer_width) // int(cell_width))
+
+    def _batch_budget_bytes(self) -> tuple:
+        """Bytes one device may give to buffers now, and the number of devices."""
+        gpus = getattr(self.gb, "gpus", None) if self.backend.uses_cupy else None
+        return stft_batch_budget_bytes(free_device_bytes(self.xp, gpus)), len(gpus) if gpus else 1
+
+    def _proposal_num_slots(self, cell_width=None) -> int:
+        """Cells of a proposal buffer: from the free memory, or from the setting when it is given.
+
+        ``None`` is the one width. A buffer shares its cells evenly between the devices.
+        """
+        if not self._size_proposal_batches:
+            if cell_width is None:
+                return self.num_band_preload
+            return self._class_num_slots(self.num_band_preload, cell_width)
+        width = int(self.stft_store_windows.buffer_width) if cell_width is None else int(cell_width)
+        budget_bytes, num_devices = self._batch_budget_bytes()
+        num_slots = max(1, num_devices * budget_bytes // (self._stft_bytes_per_bin * width))
+        logger.info(
+            f"{self.name}: {num_slots} proposal cells of {width} bins, from a budget of "
+            f"{budget_bytes / 1024**3:.2f} GiB per device."
+        )
+        return num_slots
+
+    def _sized_tempering_rows(self, class_widths, num_splits: int) -> dict:
+        """Rows per chunk over all splits for each tempering buffer, from the free memory.
+
+        Keyed by cell width, or by ``None`` alone for one width, which also serves when one row of
+        every class does not fit: a class buffer stays for the whole propose.
+        """
+        budget_bytes, _ = self._batch_budget_bytes()
+        # A row is one cell and its twin per temperature.
+        budget_bins = budget_bytes // (2 * int(self.ntemps) * self._stft_bytes_per_bin)
+        if class_widths is not None:
+            bands = np.arange(1) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+            widths, band_counts = np.unique(class_widths[bands], return_counts=True)
+            if int(widths.sum()) <= budget_bins:
+                rows = split_rows_by_budget(
+                    band_counts * int(self.nwalkers) // num_splits, widths, budget_bins
+                )
+                logger.info(
+                    f"{self.name}: tempering rows per chunk {dict(zip(widths.tolist(), rows.tolist()))} "
+                    f"by class width, from a budget of {budget_bytes / 1024**3:.2f} GiB per device."
+                )
+                return {width: row * num_splits for width, row in zip(widths.tolist(), rows.tolist())}
+            logger.warning(
+                f"{self.name}: one tempering row of every class needs {int(widths.sum())} bins, the "
+                f"budget holds {budget_bins}; tempering runs at one width."
+            )
+        rows = max(1, budget_bins // int(self.stft_store_windows.buffer_width))
+        logger.info(
+            f"{self.name}: {rows} tempering rows per chunk at one width, from a budget of "
+            f"{budget_bytes / 1024**3:.2f} GiB per device."
+        )
+        return {None: rows * num_splits}
+
+    def _run_width_classes(self, model, band_sorter, subset, band_temps, ll_change_log, prop_counts,
+                           acc_counts, class_widths, unit_selection):
+        """Drive one parity unit's cells class by class, each with its own scheduler and buffer."""
+        xp = self.xp
+        # ! Cut from the main sorter: a subset of a subset deep-copies the main sorter it points at.
+        source_widths = xp.asarray(class_widths)[xp.clip(band_sorter.band_inds, 0, self.num_bands - 1)]
+        unit_widths = np.unique(class_widths[np.unique(asnumpy(subset.band_inds))])
+        extra_bool = unit_selection.pop("extra_bool")
+        for cell_width in unit_widths.tolist():
+            class_bool = source_widths == cell_width
+            class_subset = band_sorter.get_subset(
+                **unit_selection,
+                extra_bool=class_bool if extra_bool is None else class_bool & extra_bool,
+            )
+            if class_subset is not None:
+                self._run_band_unit(
+                    model, band_sorter, class_subset, band_temps, ll_change_log, prop_counts,
+                    acc_counts, cell_width=int(cell_width),
+                    num_slots=self._proposal_num_slots(cell_width),
+                )
+                # The next build's first small allocation would split this class's freed block, and
+                # its own block would then take new device memory.
+                with _tspan(getattr(self, "_prop_timer", None), "mempool_free"):
+                    if self.backend.uses_cupy:
+                        self.xp.cuda.runtime.deviceSynchronize()
+                    self.mempool.free_all_blocks()
+
     def _run_band_unit(self, model, band_sorter, subset, band_temps,
-                       ll_change_log, prop_counts, acc_counts):
-        """Drive one parity unit's cells through the sub-band buffer."""
+                       ll_change_log, prop_counts, acc_counts, cell_width=None, num_slots=None):
+        """Drive one parity unit's cells through the sub-band buffer.
+
+        ``cell_width`` and ``num_slots`` size the buffer of one width class; by default it takes the
+        widest window and ``num_band_preload`` cells.
+        """
         tm = getattr(self, "_prop_timer", None)
         scheduler = BandScheduler(
-            subset.special_band_inds, self.num_band_preload, xp=self.xp
+            subset.special_band_inds,
+            self.num_band_preload if num_slots is None else num_slots,
+            xp=self.xp,
         )
         probe = getattr(self, "_mem_probe", None)
         if probe is not None:
@@ -1032,6 +1369,7 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             buffer_obj = subset.get_buffer(
                 model.analysis_container_arr, scheduler.slot_specials.copy(),
                 track_counter=self._track_counter,
+                **({} if cell_width is None else {"stft_cell_width": cell_width}),
             )
         if tm is not None:
             tm.count("cells", int(scheduler.n_cells))
@@ -1173,12 +1511,23 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         the pre-computed ±logpdf of the RJ proposal distribution. On accept,
         ``inds`` flips and the cell residual is updated through
         ``fill_template`` with the appropriate sign.
+
+        The prior on the number of sources k of a walker is uniform on
+        [0, N], N = nleaves_max. The slot flip alone (one birth proposal per
+        dead slot, one death per source) would weigh k by C(N, k), so a birth
+        adds ln((k + 1) / (N - k)) and a death ln((N - k + 1) / k), with k the
+        walker's count just before the flip. A round holds picks in several
+        bands of one walker, so those are decided in turn (random order) with
+        k updated after each accepted flip; the likelihood terms stay
+        vectorized, since a band's delta does not depend on flips in the other
+        bands of the unit.
         """
         xp = self.xp
         ids = picked["ids"]
         slots = picked["slot_index"]
         N_vals = picked["N_vals"]
         alive = band_sorter.inds[ids].copy()   # True -> death proposal
+        temp_idx, walker_idx, band_idx = picked["temp_inds"], picked["walker_inds"], picked["band_inds"]
 
         params = band_sorter.coords[ids].copy()
         params[:] = self.periodic.wrap({"gb": params[:, None, :]}, xp=xp)["gb"][:, 0]
@@ -1283,11 +1632,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         beta = band_temps[picked["band_inds"], picked["temp_inds"]]
         factors = band_sorter.factors[ids]
         lnpdiff = beta * delta_ll + (curr_logp - prev_logp) + factors
-        accept = lnpdiff >= self.xp.log(self.xp.random.rand(*lnpdiff.shape))
+        log_u = xp.log(xp.random.rand(*lnpdiff.shape))
 
         # Coordinates outside the prior can only be accepted at beta == 0;
         # everything else is a bug -> warn and reject.
         bad_mask = (delta_ll <= -1e299) | (curr_logp <= -1e229)
+
+        # * Uniform prior on k: each flip carries C(N, k) / C(N, k +- 1) at the walker's current k, so the
+        # * picks of one walker are decided in turn (rank = position within the walker, random order).
+        n_slots = band_sorter.nleaves_max
+        walker_cell = temp_idx * self.nwalkers + walker_idx
+        order = xp.lexsort(xp.stack([xp.random.rand(len(ids)), walker_cell]))
+        _, first, group = xp.unique(walker_cell[order], return_index=True, return_inverse=True)
+        rank = xp.empty(len(ids), dtype=xp.int64)
+        rank[order] = xp.arange(len(ids)) - first[group]
+        accept = xp.zeros(len(ids), dtype=bool)
+        for position in range(int(rank.max()) + 1):
+            rows = xp.flatnonzero(rank == position)
+            k_now = self._k_walker[walker_cell[rows]].astype(xp.float64)
+            # a birth has N - k >= 1 and a death k >= 1; the clamps only touch the unused branch
+            lnpdiff[rows] += xp.where(
+                alive[rows],
+                xp.log((n_slots - k_now + 1) / xp.maximum(k_now, 1)),
+                xp.log((k_now + 1) / xp.maximum(n_slots - k_now, 1)),
+            )
+            accept[rows] = lnpdiff[rows] >= log_u[rows]
+            flips = rows[accept[rows] & ~bad_mask[rows]]
+            self._k_walker[walker_cell[flips]] += xp.where(alive[flips], -1, 1)
+
         bad_accepts = accept & bad_mask
         if bool(xp.any(bad_accepts)):
             if bool(xp.any(beta[bad_accepts] != 0.0)) and not (
@@ -1338,6 +1710,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         if bool(accept.any()):
             acc_ids = ids[accept]
             band_sorter.inds[acc_ids] = ~band_sorter.inds[acc_ids]
+
+            # a born source has no Fisher matrix yet and a dead one loses its own
+            rows = getattr(self, "_held_fim_rows", None)
+            if rows is not None:
+                row_ids = asnumpy(acc_ids)
+                rows["fim_valid"][row_ids] = False
+                rows["fim_age"][row_ids] = 0
+
             # Phase-maximised births carry the rotated phi0 forward.
             band_sorter.coords[acc_ids] = self.periodic.wrap(
                 {"gb": params[accept][:, None, :]}, xp=xp
@@ -1361,101 +1741,271 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     N_vals[death_acc] if N_vals is not None else None,
                 )
 
-    def _compute_proposal_cholesky(self, model, band_sorter, ids):
-        """Batched Cholesky of the inverse Fisher matrix for ``ids``.
+    def _prior_box(self, coords, cell_f0_lims):
+        """Uniform prior box (lower, upper) of every source, sampling basis, each (n_src, ndim).
 
-        Domain-symmetric through the fast computation objects:
-        FD -> :meth:`GBFDComputations.information_matrix`,
-        WDM -> :meth:`GBWDMComputations.information_matrix`,
-        STFT -> :meth:`STFTGBComputations.information_matrix` (all against
-        the parent inverse-covariance rows keyed by walker; the legacy
-        SharedMemory ``gb.information_matrix`` path is retired).
+        A one-column prior gives its ``minimum`` and ``maximum``. A joint (f0, fdot) prior gives f0
+        its ``f0_min`` and ``f0_max`` and fdot its bounds at each source's f0 (``get_fdot_bounds``,
+        as in LAT's ``MojitoF0mHzFdotPrior`` and erebor-priors' ``F0FdotPrior``). f0 is narrowed to
+        the cell's frequency range, which the in-model gate enforces: ``cell_f0_lims`` holds the
+        physical limits per source, mapped into the sampling basis through the transform container.
+        Periodic columns span their period, [0, period), the range the periodic container wraps
+        into.
+        """
+        xp = self.xp
+        coords = xp.asarray(coords)
+        n_src, ndim = coords.shape
+        lower = xp.full((n_src, ndim), xp.nan)
+        upper = xp.full((n_src, ndim), xp.nan)
+        prior_entries = getattr(self.gpu_priors["gb"], "priors", None)
+        if not isinstance(prior_entries, list):
+            raise TypeError(
+                "the prior box needs a ProbDistContainer, whose priors are "
+                "[columns, distribution] pairs"
+            )
+        for columns, dist in prior_entries:
+            columns = [int(column) for column in np.asarray(columns).reshape(-1)]
+            if len(columns) == 1 and hasattr(dist, "minimum") and hasattr(dist, "maximum"):
+                minimum, maximum = float(dist.minimum), float(dist.maximum)
+                if not (np.isfinite(minimum) and np.isfinite(maximum) and maximum > minimum):
+                    raise ValueError(
+                        f"the prior of column {columns[0]} ({type(dist).__name__}) has the range "
+                        f"[{minimum}, {maximum}]; the prior box needs finite bounds")
+                lower[:, columns[0]], upper[:, columns[0]] = minimum, maximum
+            elif len(columns) == 2 and hasattr(dist, "get_fdot_bounds"):
+                # * joint (f0, fdot) prior: f0 uniform, fdot uniform between f0-dependent bounds
+                f0_column, fdot_column = columns
+                lower[:, f0_column], upper[:, f0_column] = float(dist.f0_min), float(dist.f0_max)
+                fdot_low, fdot_high = dist.get_fdot_bounds(coords[:, f0_column])
+                lower[:, fdot_column] = xp.asarray(fdot_low)
+                upper[:, fdot_column] = xp.asarray(fdot_high)
+            else:
+                raise TypeError(
+                    f"the prior box cannot read {type(dist).__name__} over columns {columns}: "
+                    "it needs a one-column prior with minimum and maximum, or a joint (f0, fdot) "
+                    "prior with f0_min, f0_max and get_fdot_bounds(f0)")
 
-        The Fisher comes back in PHYSICAL parameter space; it is mapped to
-        the sampling basis with the (numerical, per-source diagonal)
-        Jacobian of the transform container, conditioned by the fdot
-        rescale, inverted, and factorized.
+        # * f0: the cell's physical limits mapped through the local slope of the transform
+        input_basis = list(getattr(self.transform_fn, "input_basis", []))
+        if "f0" not in input_basis:
+            raise ValueError("the prior box needs a sampling column named 'f0' for the cell limits")
+        f0_column = input_basis.index("f0")
+        f0_output = int(np.asarray(self.parameter_transforms.fill_dict["test_inds"])[f0_column])
+        step = JACOBIAN_STEP_RELATIVE * xp.maximum(
+            xp.abs(coords[:, f0_column]), JACOBIAN_STEP_FLOOR
+        )
+        shifted_up, shifted_down = coords.copy(), coords.copy()
+        shifted_up[:, f0_column] += step
+        shifted_down[:, f0_column] -= step
+        f0_here = self.transform_fn.both_transforms(coords, xp=xp)[:, f0_output]
+        f0_up = self.transform_fn.both_transforms(shifted_up, xp=xp)[:, f0_output]
+        f0_down = self.transform_fn.both_transforms(shifted_down, xp=xp)[:, f0_output]
+        slope = (f0_up - f0_down) / (2.0 * step)
+        cell_low = coords[:, f0_column] + (xp.asarray(cell_f0_lims[0]) - f0_here) / slope
+        cell_high = coords[:, f0_column] + (xp.asarray(cell_f0_lims[1]) - f0_here) / slope
+        lower[:, f0_column] = xp.maximum(lower[:, f0_column], xp.minimum(cell_low, cell_high))
+        upper[:, f0_column] = xp.minimum(upper[:, f0_column], xp.maximum(cell_low, cell_high))
 
-        TODO(known GBs): the fdot conditioning column (sampling index 2) and
-        the 8->9 test_inds layout are still GB-specific; revisit with the
-        known-GB branch.
+        periodic = getattr(self, "periodic", None)
+        if periodic is not None and "gb" in periodic.inds_periodic:
+            for column, period in zip(periodic.inds_periodic["gb"], periodic.periods["gb"]):
+                lower[:, int(column)] = 0.0
+                upper[:, int(column)] = float(period)
+        return lower, upper
+
+    def _sampling_jacobian(self, coords, lower, upper):
+        """Diagonal Jacobian d phys_i / d x_i of the transform container, and where it is taken.
+
+        Central differences with steps h = 1e-6 max(|x|, 1e-3). Within 2h of a prior edge the step
+        could leave the domain of arccos or arcsin (cos iota and sin delta reach +-1 in doubles),
+        so each column is clipped into [lower + 2h, upper - 2h] where the box is wider than 4h;
+        periodic columns are not clipped. The Fisher matrix is evaluated at the same point: a
+        Fisher matrix at the edge and a Jacobian 2h inside it would not belong together, since
+        dh/diota vanishes at iota = 0 while diota/dcos(iota) diverges there.
+
+        Returns ``(jacobian, point, clipped)``, clipped (n_src,) bool.
+        """
+        xp = self.xp
+        coords = xp.asarray(coords)
+        n_src, ndim = coords.shape
+        test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
+        steps = JACOBIAN_STEP_RELATIVE * xp.maximum(xp.abs(coords), JACOBIAN_STEP_FLOOR)
+        inner_low, inner_high = lower + 2.0 * steps, upper - 2.0 * steps
+        clip_columns = inner_low < inner_high
+        periodic = getattr(self, "periodic", None)
+        if periodic is not None and "gb" in periodic.inds_periodic:
+            clip_columns[:, xp.asarray(periodic.inds_periodic["gb"])] = False
+        point = xp.where(clip_columns, xp.clip(coords, inner_low, inner_high), coords)
+        clipped = xp.any(point != coords, axis=1)
+
+        steps = JACOBIAN_STEP_RELATIVE * xp.maximum(xp.abs(point), JACOBIAN_STEP_FLOOR)
+        jacobian = xp.zeros((n_src, ndim))
+        for column in range(ndim):
+            shifted_up, shifted_down = point.copy(), point.copy()
+            shifted_up[:, column] += steps[:, column]
+            shifted_down[:, column] -= steps[:, column]
+            output = int(test_inds[column])
+            phys_up = self.transform_fn.both_transforms(shifted_up, xp=xp)[:, output]
+            phys_down = self.transform_fn.both_transforms(shifted_down, xp=xp)[:, output]
+            jacobian[:, column] = (phys_up - phys_down) / (2.0 * steps[:, column])
+        return jacobian, point, clipped
+
+    def _information_matrix_phys(self, model, params_phys, walker_inds):
+        """Fisher matrix (n_src, ndim, ndim) in the physical basis from the domain's computation.
+
+        FD -> GBFDComputations, WDM -> GBWDMComputations, STFT -> STFTGBComputations, against the
+        parent inverse-covariance rows keyed by walker. The parent container is sharded across GPUs
+        on a multi-GPU run while every information_matrix is single-shard, so
+        route_information_matrix partitions the sources by the shard of their walker.
+        """
+        xp = self.xp
+        side_bins = {}  # * only the STFT comp takes side bins
+        if isinstance(self._basis_settings, STFTSettings):
+            info_comp = self.gb_stft_comp
+            # ! Never more side bins than the likelihood's.
+            side_bins = {"n_side_bins": min(FISHER_N_SIDE_BINS, int(info_comp.n_side_bins))}
+        elif isinstance(self._basis_settings, FDSettings):
+            info_comp = self.gb_fd_comp
+        else:
+            info_comp = self.gb_wdm_comp
+        test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
+        return _RoutedBandEngine.route_information_matrix(
+            info_comp, model.analysis_container_arr, params_phys,
+            inds=test_inds, noise_index=xp.asarray(walker_inds).astype(xp.int32), **side_bins,
+        )
+
+    def _compute_fisher_sampling(self, model, band_sorter, ids, cell_f0_lims):
+        """Fisher matrix in the sampling basis and the prior widths for the sources ``ids``.
+
+        F is the Fisher matrix of the domain's computation object at the point of
+        _sampling_jacobian, mapped to the sampling basis with that Jacobian. The widths are those of
+        each source's prior box (_prior_box, with the cell limits ``cell_f0_lims``). Both are
+        independent of the cell's temperature, so a held pair can be turned into a factor at any
+        beta with fisher_proposal_factor.
+
+        Returns ``(info_sampling, prior_widths, clipped)``: (n_src, ndim, ndim), (n_src, ndim) and
+        (n_src,) bool for sources evaluated at a clipped point.
         """
         xp = self.xp
         coords = band_sorter.coords[ids]
-        n_src, ndim = coords.shape
-        params_phys = self.transform_fn.both_transforms(coords, xp=self.xp)
-        _test_inds = np.asarray(self.parameter_transforms.fill_dict["test_inds"])
-        walker_inds = band_sorter.walker_inds[ids].astype(xp.int32)
+        n_src = coords.shape[0]
+        timer = getattr(self, "_prop_timer", None)
+        if timer is not None:
+            timer.count("fisher_sources", int(n_src))
 
-        # Routed per shard: this runs against the PARENT residual ACA, which
-        # is sharded across GPUs on a multi-GPU run (``run.py`` builds it with
-        # ``gpus=``), while every ``information_matrix`` implementation is
-        # single-shard by contract -- the FD binding and
-        # ``STFTGBComputations._resolve_info_group`` both raise on a
-        # multi-split holder, and the WDM one would read shard 0's rows with
-        # global indices. ``route_information_matrix`` partitions the sources
-        # by the owning shard of their walker (each source's Fisher depends
-        # only on its walker's PSD), runs each group inside its owning device
-        # context against a device-local comp replica, and reassembles the
-        # ``(num_bin, nd, nd)`` stack. Single-shard holders pass straight
-        # through, byte-identical.
-        if isinstance(self._basis_settings, STFTSettings):
-            _info_comp = self.gb_stft_comp
-        elif isinstance(self._basis_settings, FDSettings):
-            _info_comp = self.gb_fd_comp
-        else:
-            _info_comp = self.gb_wdm_comp
-
-        _timer = getattr(self, "_prop_timer", None)
-        if _timer is not None:
-            _timer.count("fisher_sources", int(n_src))
-
-        with _tspan(_timer, "fisher_matrix"):
-            info_phys = _RoutedBandEngine.route_information_matrix(
-                _info_comp, model.analysis_container_arr, params_phys,
-                inds=_test_inds, noise_index=walker_inds,
+        with _tspan(timer, "fisher_jacobian"):
+            lower, upper = self._prior_box(coords, cell_f0_lims)
+            jacobian, point, clipped = self._sampling_jacobian(coords, lower, upper)
+        with _tspan(timer, "fisher_matrix"):
+            info_phys = self._information_matrix_phys(
+                model,
+                self.transform_fn.both_transforms(point, xp=xp),
+                band_sorter.walker_inds[ids],
             )
-
-        # Conditioning scales for the sampling basis (fdot spans ~1e-13 in
-        # sampled units; without the rescale the Fisher inversion is
-        # ill-conditioned). The proposal draws in the rescaled coordinates
-        # y = x / s and maps back with * s (see in_model_proposal).
-        s = xp.ones(ndim)
-        s[2] = self._fdot_scale
-        self._proposal_param_scales = s
-
-        # Numerical diagonal Jacobian d(phys[test_inds[i]]) / d(y_i) through
-        # the transform container -- generic in the container's transforms.
-        with _tspan(_timer, "fisher_jacobian"):
-            J = xp.zeros((n_src, ndim))
-            for i in range(ndim):
-                h = 1e-6 * xp.maximum(xp.abs(coords[:, i]), 1e-3)
-                up = coords.copy()
-                dn = coords.copy()
-                up[:, i] += h
-                dn[:, i] -= h
-                dphys = (
-                    self.transform_fn.both_transforms(up, xp=self.xp)[:, _test_inds[i]]
-                    - self.transform_fn.both_transforms(dn, xp=self.xp)[:, _test_inds[i]]
-                )
-                J[:, i] = dphys / (2.0 * h) * s[i]
-
-            info_y = info_phys * J[:, :, None] * J[:, None, :]
-
-        with _tspan(_timer, "fisher_mempool"):
+        with _tspan(timer, "fisher_mempool"):
             self.mempool.free_all_blocks()
-        # Robust inverse-Fisher factor: near-zero-SNR (prior-drawn) sources
-        # give (numerically) singular Fishers. Eigendecompose and clamp the
-        # spectrum to a relative floor; B = V diag(lambda^-1/2) satisfies
-        # B B^T = inv(info) and is all the Gaussian proposal needs (the
-        # proposal shape only -- M-H corrects).
-        with _tspan(_timer, "fisher_eigh"):
-            evals, evecs = xp.linalg.eigh(info_y)
-            floor = 1e-10 * xp.maximum(
-                xp.abs(evals).max(axis=-1, keepdims=True), 1e-300
+        info_sampling = info_phys * jacobian[:, :, None] * jacobian[:, None, :]
+        return info_sampling, upper - lower, clipped
+
+    def _ensure_fim_store(self, branch):
+        """The held Fisher matrices of the gb ``branch``, created empty when missing.
+
+        Four host arrays over the leaf slots (ntemps, nwalkers, nleaves_max) in the branch
+        supplemental: the matrix in the sampling basis (..., ndim, ndim), the prior widths
+        (..., ndim), the blocks served and a flag for a held matrix. The HDF5 backends do not save
+        branch supplementals, so after a restart the store starts empty and every source gets a
+        matrix at its next block. A supplemental with other keys gets the four keys added.
+        """
+        ntemps, nwalkers, nleaves_max, ndim = branch.shape
+        base_shape = (ntemps, nwalkers, nleaves_max)
+        supplemental = branch.branch_supplemental
+        if supplemental is not None and all(key in supplemental for key in _FIM_STORE_KEYS):
+            return supplemental
+        empty = {
+            "fim_matrix": np.zeros(base_shape + (ndim, ndim)),
+            "fim_widths": np.zeros(base_shape + (ndim,)),
+            "fim_age": np.zeros(base_shape, dtype=np.int64),
+            "fim_valid": np.zeros(base_shape, dtype=bool),
+        }
+        if supplemental is None:
+            branch.branch_supplemental = BranchSupplemental(empty, base_shape=base_shape)
+        else:
+            supplemental.add_objects(
+                {key: value for key, value in empty.items() if key not in supplemental}
             )
-            evals = xp.maximum(xp.abs(evals), floor)
-            chol = evecs / xp.sqrt(evals)[:, None, :]
+        return branch.branch_supplemental
+
+    def _load_fim_rows(self, branch, band_sorter):
+        """Held Fisher matrices of the sorter rows, copied from the rows' slots at the start.
+
+        Accepted tempering swaps exchange the (temperature, walker) labels of the rows, so the
+        per-row copy follows them; _write_back_state puts the rows back at their new slots.
+        """
+        store = self._ensure_fim_store(branch)
+        start_slots = (
+            band_sorter.orig_temp_inds, band_sorter.orig_walker_inds, band_sorter.orig_leaf_inds
+        )
+        slots = tuple(asnumpy(index) for index in start_slots)
+        rows = {key: store.holder[key][slots] for key in _FIM_STORE_KEYS}
+        # a dead slot holds no matrix, so a birth always starts without one
+        rows["fim_valid"] &= asnumpy(band_sorter.inds)
+        return rows
+
+    def _compute_proposal_cholesky(self, model, band_sorter, ids, beta, cell_f0_lims):
+        """Factor of the proposal covariance (beta F + P)^-1 for the sources ``ids`` (sorter rows).
+
+        Each source holds its Fisher matrix in the sampling basis and its prior widths for
+        ``num_stationary_fim_steps`` blocks: a source without a held pair, or whose pair has served
+        that many blocks, gets a new pair from _compute_fisher_sampling at its current position.
+        The factor is rebuilt every block from the held pair with the cell's current ``beta``, so a
+        source that changed temperature keeps its matrix and takes the new beta. Between refreshes
+        the factor does not depend on the current position, so the proposal is symmetric.
+        """
+        xp = self.xp
+        rows = self._held_fim_rows
+        if rows is None:
+            raise RuntimeError("the held Fisher matrices are loaded by propose (_load_fim_rows)")
+        row_ids = asnumpy(ids)
+        due = ~rows["fim_valid"][row_ids] | (
+            rows["fim_age"][row_ids] >= self.num_stationary_fim_steps
+        )
+        clipped_count = 0
+        if due.any():
+            due_device = xp.asarray(due)
+            info_sampling, prior_widths, clipped = self._compute_fisher_sampling(
+                model, band_sorter, ids[due_device],
+                (cell_f0_lims[0][due_device], cell_f0_lims[1][due_device]),
+            )
+            due_rows = row_ids[due]
+            rows["fim_matrix"][due_rows] = asnumpy(info_sampling)
+            rows["fim_widths"][due_rows] = asnumpy(prior_widths)
+            rows["fim_age"][due_rows] = 0
+            rows["fim_valid"][due_rows] = True
+            clipped_count = int(clipped.sum())
+        timer = getattr(self, "_prop_timer", None)
+        with _tspan(timer, "fisher_eigh"):
+            chol, diagnostics = fisher_proposal_factor(
+                xp.asarray(rows["fim_matrix"][row_ids]), xp.asarray(rows["fim_widths"][row_ids]),
+                beta, xp=xp,
+            )
+        rows["fim_age"][row_ids] += 1
+
+        debugging = getattr(getattr(self, "debug_settings", None), "enabled", False)
+        if debugging and logger.isEnabledFor(logging.DEBUG):
+            n_src = len(row_ids)
+            condition = diagnostics["condition"]
+            largest = (
+                float(xp.max(xp.where(xp.isfinite(condition), condition, 0.0)))
+                if n_src else float("nan")
+            )
+            logger.debug(
+                "%s: Fisher factor of %d sources (%d new matrices, %d at a clipped point): %d with "
+                "a prior-dominated direction, largest condition number of C %.3e, %d given the "
+                "prior factor.",
+                self.name, n_src, int(due.sum()), clipped_count,
+                int(diagnostics["prior_dominated"].sum()), largest,
+                int(diagnostics["fallback"].sum()),
+            )
         return chol
 
     def in_model_proposal(self, coords, chol, band_sorter, source_ids, model):
@@ -1469,16 +2019,45 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         one full pass (``self.time >= 1``) and the cold-chain friend table
         exists; it is then drawn with probability ``stretch_probability``
         per repeat round (the info-matrix Cholesky jump otherwise).
+
+        Inside a walker-parity half of :meth:`_run_in_model_halves` the friend
+        comes from the other parity's tables (``self._friend_tables``) at the
+        source's current f0, and the factor is -inf where the friend lies
+        outside the window placed at the proposed f0 (the reverse check), so
+        the forward and the reverse move draw it with the same probability.
         """
         xp = self.xp
+        friend_tables = getattr(self, "_friend_tables", None)
+        friend_index, friend_ready = None, False
+        if friend_tables is not None:
+            friend_block = self._friend_block
+            if friend_block is None:
+                # The tables and the block's temperatures are fixed within a block, so its table indices are found once.
+                index = friend_tables.table_index(band_sorter.temp_inds[source_ids])
+                friend_block = self._friend_block = (index, bool((index >= 0).all()))
+            friend_index, friend_ready = friend_block
         use_stretch = (
             self.stretch_probability > 0.0
             and self.time >= 1
-            and getattr(band_sorter, "friend_start_inds", None) is not None
+            and (
+                friend_ready if friend_tables is not None
+                else getattr(band_sorter, "friend_start_inds", None) is not None
+            )
             and bool(np.random.rand() < self.stretch_probability)
         )
 
-        if use_stretch:
+        if use_stretch and friend_tables is not None:
+            deviation = xp.random.randint(0, friend_tables.window, size=len(source_ids))
+            ranks, self._friends_for_stretch = friend_tables.draw(friend_index, coords[:, 1], deviation)
+            q, factors = self.get_proposal(
+                {"gb": coords[None, :, None, :]},
+                model.random,
+                s_inds_all={"gb": xp.ones((1, coords.shape[0], 1), dtype=bool)},
+            )
+            new_coords = q["gb"][0, :, 0, :]
+            outside = ~friend_tables.in_window(friend_index, ranks, new_coords[:, 1])
+            factors = xp.where(outside, -xp.inf, factors.reshape(-1))
+        elif use_stretch:
             # Friends drawn per source; Eryn's GroupStretchMove supplies the
             # stretch math + (ndim-1)*log(zz) factors through find_friends.
             self._friends_for_stretch = band_sorter.draw_friends(source_ids)
@@ -1489,15 +2068,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             )
             new_coords = q["gb"][0, :, 0, :]
             factors = factors.reshape(-1)
-        else:                      
-            # Draw jump_factor per batch/walker at proposal time:
-            jump_factor = xp.random.choice(self.jump_scales, p=self.jump_scales_probs, size=1)
-            
-            # Gaussian jump through the Fisher Cholesky (drawn in the
-            # conditioned coordinates y = x / s; mapped back with * s).
+        else:
+            scale_inds = self._jump_scale_cdf.searchsorted(
+                xp.random.random_sample(coords.shape[0]), side="right"
+            )
+            self._last_jump_scale_inds = scale_inds
             _rand = xp.random.randn(*coords.shape)
-            dy = xp.einsum("...ij,...j->...i", chol, _rand)
-            new_coords = coords + jump_factor * dy * self._proposal_param_scales[None, :]
+            dx = xp.einsum("...ij,...j->...i", chol, _rand)
+            new_coords = coords + self.jump_scales[scale_inds][:, None] * dx
             factors = xp.zeros(coords.shape[0])   # symmetric draw
 
         return new_coords, factors
@@ -1558,6 +2136,40 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         pr = self.transform_fn.both_transforms(ref_track, xp=xp)
         return xp.abs(pr[:, 0]), pr[:, 1].copy(), pr[:, 2].copy()
 
+    def _run_in_model_halves(self, model, band_sorter, buffer_obj, band_temps,
+                             picked, ll_change_log, prop_counts, acc_counts):
+        """In-model repeats of the exact group stretch: the even walkers' sources first, then the odd walkers'.
+
+        Before each half the friend tables are built from the live rows of the other parity as they are then, so no
+        friend moves while a half runs. The window holds ``nfriends // 2`` ranks, the copies of a source in one parity
+        when ``nfriends`` is the walker count, as the recipe sets it.
+        """
+        periodic = getattr(self, "periodic", None)
+        # ! The reverse check reads the proposed f0 before the repeat loop wraps the periodic columns.
+        if periodic is not None and 1 in [int(column) for column in periodic.inds_periodic.get("gb", [])]:
+            raise ValueError("the exact stretch needs a non-periodic f0 in sampling column 1")
+        n_picked = len(picked["ids"])
+        parity = picked["walker_inds"] % 2
+        try:
+            for half in (0, 1):
+                members = parity == half
+                if not bool(members.any()):
+                    continue
+                subset = {
+                    key: value[members] if getattr(value, "ndim", 0) >= 1 and value.shape[0] == n_picked else value
+                    for key, value in picked.items()
+                }
+                with _tspan(getattr(self, "_prop_timer", None), "friend_tables"):
+                    self._friend_tables = FriendTables(
+                        band_sorter.coords, band_sorter.inds, band_sorter.temp_inds, band_sorter.walker_inds,
+                        1 - half, self.ntemps, self.nfriends // 2, self.xp,
+                    )
+                self._friend_block = None
+                self._run_in_model_repeats(model, band_sorter, buffer_obj, band_temps, subset,
+                                           ll_change_log, prop_counts, acc_counts)
+        finally:
+            self._friend_tables = None
+
     def _run_in_model_repeats(self, model, band_sorter, buffer_obj, band_temps,
                               picked, ll_change_log, prop_counts, acc_counts):
         """``num_repeat_proposals`` in-model rounds on the picked live sources.
@@ -1568,7 +2180,14 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         only the tracked coordinates and counters move). After the repeats,
         the final coordinates are written back into the residual and into
         the BandSorter.
+
+        At ``stretch_probability > 0`` the block runs once per walker parity
+        (:meth:`_run_in_model_halves`), each half through this method.
         """
+        if self.stretch_probability > 0.0 and getattr(self, "_friend_tables", None) is None:
+            self._run_in_model_halves(model, band_sorter, buffer_obj, band_temps, picked,
+                                      ll_change_log, prop_counts, acc_counts)
+            return
         xp = self.xp
         # Read ``inds`` from the MAIN sorter AFTER the RJ step: _run_rj_step
         # flips band_sorter.inds on accepted births/deaths, so this mask
@@ -1628,7 +2247,11 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 buffer_obj, seq["slot"])
 
         with _tspan(getattr(self, "_prop_timer", None), "inmodel_fisher"):
-            chol = self._compute_proposal_cholesky(model, band_sorter, ids)
+            # * the cell's beta and f0 range enter the proposal factor
+            chol = self._compute_proposal_cholesky(
+                model, band_sorter, ids, beta,
+                (buffer_obj.frequency_lims[0][slots], buffer_obj.frequency_lims[1][slots]),
+            )
         # Per-source likelihood setup for the repeat block (same stage as
         # the proposal cholesky / friend table). Chunked-het / FD engines
         # no-op; a sig-het computation builds its heterodyne reference
@@ -1688,7 +2311,12 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             lo_bin = (buffer_obj.frequency_lims[0][slots] / self.df).astype(int)
             hi_bin = (buffer_obj.frequency_lims[1][slots] / self.df).astype(int)
 
+        map_cpu = (asnumpy(t_i), asnumpy(w_i), asnumpy(b_i))
+        out_of_prior_accepts = self.xp.zeros((), dtype=self.xp.int64)
+
         for move_i in range(self.num_repeat_proposals):
+            # * a Fisher jump records its scale indices here; a stretch jump leaves None
+            self._last_jump_scale_inds = None
             new, factors = self.in_model_proposal(curr, chol, band_sorter, ids, model)
             new[:] = self.periodic.wrap({"gb": new[:, None, :]}, xp=xp)["gb"][:, 0]
 
@@ -1697,17 +2325,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 # In-model steps stay within +- N/4 bins of the current source
                 # and inside the band window (widened by N/4).
                 new_bin = self.xp.abs(new[:, 1] / 1e3 / self.df).astype(int)
-                new_logp[
-                    (self.xp.abs(new[:, 1] / 1e3 - curr[:, 1] / 1e3) / self.df).astype(int) > n4
-                ] = -np.inf
-                new_logp[new_bin < lo_bin - n4] = -np.inf
-                new_logp[new_bin > hi_bin + n4] = -np.inf
+                outside_window = (
+                    ((self.xp.abs(new[:, 1] / 1e3 - curr[:, 1] / 1e3) / self.df).astype(int) > n4)
+                    | (new_bin < lo_bin - n4)
+                    | (new_bin > hi_bin + n4)
+                )
+                new_logp = self.xp.where(outside_window, -np.inf, new_logp)
             else:
                 # Non-FD domains (STFT / WDM) do not use N_vals windowing:
                 # bound candidates directly by the cell frequency limits.
                 new_f_hz = new[:, 1] / 1e3
-                new_logp[new_f_hz < buffer_obj.frequency_lims[0][slots]] = -np.inf
-                new_logp[new_f_hz > buffer_obj.frequency_lims[1][slots]] = -np.inf
+                outside_cell = (
+                    (new_f_hz < buffer_obj.frequency_lims[0][slots])
+                    | (new_f_hz > buffer_obj.frequency_lims[1][slots])
+                )
+                new_logp = self.xp.where(outside_cell, -np.inf, new_logp)
 
             # Sig-het TRUST REGION: reject candidates outside the
             # expansion's validity region around the block anchor
@@ -1729,19 +2361,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     | (_drift_n > self.sighet_settings.trust_dphase)
                 ] = -np.inf
 
-            keep = ~self.xp.isinf(new_logp)
+            keep = ~self.xp.isinf(new_logp) & self.xp.isfinite(factors)
+            keep_rows = self.xp.flatnonzero(keep)
             new_ll = self.xp.full(len(ids), -1e300)
-            if bool(keep.any()):
+            if keep_rows.size:
                 with _tspan(getattr(self, "_prop_timer", None), "inmodel_add_ll"):
-                    new_ll[keep] = buffer_obj.get_add_ll(
-                        new[keep], slots[keep], slots[keep],
-                        N_vals[keep] if N_vals is not None else None,
+                    new_ll[keep_rows] = buffer_obj.get_add_ll(
+                        new[keep_rows], slots[keep_rows], slots[keep_rows],
+                        N_vals[keep_rows] if N_vals is not None else None,
                         phase_maximize=self.phase_maximize,
                     )
                 if self.phase_maximize and buffer_obj.phase_angle is not None:
-                    new[keep, 3] = new[keep, 3] - buffer_obj.phase_angle
-                    new[keep] = self.periodic.wrap(
-                        {"gb": new[keep][:, None, :]}, xp=xp
+                    new[keep_rows, 3] = new[keep_rows, 3] - buffer_obj.phase_angle
+                    new[keep_rows] = self.periodic.wrap(
+                        {"gb": new[keep_rows][:, None, :]}, xp=xp
                     )["gb"][:, 0]
 
             delta_ll = new_ll - ll_ref
@@ -1749,26 +2382,25 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             accept = lnpdiff >= self.xp.log(self.xp.random.rand(*lnpdiff.shape))
 
             bad_mask = (new_ll <= -1e299) | (new_logp <= -1e229)
-            bad_accepts = accept & bad_mask
-            if bool(xp.any(bad_accepts)):
-                if bool(xp.any(beta[bad_accepts] != 0.0)):
-                    logger.warning(
-                        f"{self.name}: accepted an out-of-prior in-model "
-                        "coordinate at beta > 0."
-                    )
-                accept[bad_accepts] = False
+            out_of_prior_accepts += self.xp.count_nonzero(accept & bad_mask & (beta != 0.0))
+            accept &= ~bad_mask
 
             prop_counts[1][t_i, w_i, b_i] += 1
-            if bool(accept.any()):
-                curr[accept] = new[accept]
-                ll_ref[accept] = new_ll[accept]
-                curr_prior[accept] = new_logp[accept]
-                ll_change_log[t_i[accept], w_i[accept], b_i[accept]] += delta_ll[accept]
-                acc_counts[1][t_i[accept], w_i[accept], b_i[accept]] += 1
+            curr[:] = self.xp.where(accept[:, None], new, curr)
+            ll_ref[:] = self.xp.where(accept, new_ll, ll_ref)
+            curr_prior[:] = self.xp.where(accept, new_logp, curr_prior)
+            ll_change_log[t_i, w_i, b_i] += self.xp.where(accept, delta_ll, 0.0)
+            acc_counts[1][t_i, w_i, b_i] += accept
+
+            # * To log Fisher jumps proposed and accepted per (scale, temperature)
+            scale_inds = getattr(self, "_last_jump_scale_inds", None)
+            scale_counts = getattr(self, "_jump_scale_counts", None)
+            if scale_inds is not None and scale_counts is not None:
+                xp.add.at(scale_counts[0], (scale_inds, t_i), 1)
+                xp.add.at(scale_counts[1], (scale_inds, t_i), accept.astype(scale_counts.dtype))
 
             self._debug_verify_in_model(
-                buffer_obj, curr, new, slots, N_vals, delta_ll, keep,
-                (asnumpy(t_i), asnumpy(w_i), asnumpy(b_i)), move_i,
+                buffer_obj, curr, new, slots, N_vals, delta_ll, keep, map_cpu, move_i,
             )
 
             # Sig-het drift refresh: every ``sighet_refresh_every``
@@ -1813,6 +2445,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                         f"{int(far.sum())}/{len(ids)} sources at repeat "
                         f"{move_i + 1}."
                     )
+
+        num_out_of_prior = int(out_of_prior_accepts)
+        if num_out_of_prior:
+            logger.warning(
+                f"{self.name}: accepted {num_out_of_prior} out-of-prior in-model "
+                "coordinates at beta > 0 in this block (rejected)."
+            )
 
         # End-of-block sig-het DRIFT audit (debug knob): report exactly
         # how far each source walked from its heterodyne expansion point
@@ -1936,6 +2575,32 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         )
         return band_index, temp_index, walkers_permuted, special_index, num_bands_unit
 
+    def _tempering_cross_term_grid(self, start, walker_groups):
+        """Grid rows of one tempering parity pass and their uniforms, drawn with NumPy.
+
+        The bands are those of :meth:`_tempering_swap_grid`. For every band, temperature and walker
+        group, the group's walkers are permuted by sorting uniform numbers, and row ``k`` of a band
+        and group holds the ``k``-th walker of each temperature's permutation; swaps therefore pair
+        walkers of one group. Then one uniform per row and temperature pair. The draws depend on
+        the global seed and the groups only, not on the chunks or the devices.
+
+        Returns:
+            ``(bands, walkers, log_uniforms)`` of shapes ``(rows,)``, ``(rows, ntemps)`` and
+            ``(rows, ntemps - 1)``, rows ordered by band, then group, then ``k``. Column ``p`` of
+            ``log_uniforms`` serves the pair ``(p + 1, p)``.
+        """
+        band_ids = np.arange(1) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+        band_ids = band_ids[start::2]
+        rows_per_group = []
+        for group in walker_groups:
+            keys = np.random.random((band_ids.size, self.ntemps, group.size))
+            permuted = group[np.argsort(keys, axis=-1, kind="stable")]
+            rows_per_group.append(permuted.transpose(0, 2, 1))
+        walkers = np.concatenate(rows_per_group, axis=1).reshape(-1, self.ntemps)
+        bands = np.repeat(band_ids, walkers.shape[0] // max(band_ids.size, 1))
+        log_uniforms = np.log(np.random.random((walkers.shape[0], self.ntemps - 1)))
+        return bands, walkers, log_uniforms
+
     def _adapt_band_temps(self, band_temps, band_swaps_accepted, band_swaps_proposed):
         """Per-band temperature-ladder adaptation, in place on ``band_temps``.
 
@@ -1977,10 +2642,48 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         band_temps += self.xp.asarray(dbetas.T)
 
     def run_tempering(self, model, state, band_sorter, band_temps):
+        """Band-wise swaps between adjacent temperatures.
+
+        A swap exchanges the sources of one band between a walker at
+        temperature t and one at t - 1, so the number of sources k of both
+        walkers changes. Under the uniform prior on k a walker with k sources
+        carries the weight k! against its set of sources (the write-back
+        repacks the leaves, so the slot labels carry no information), so a
+        swap adds the change of ln k! of both walkers, and a swap that would
+        give a walker more than nleaves_max sources is rejected. The bands of
+        a chunk are decided in turn, so that the totals stay current.
+        """
+        # Read with getattr: harnesses borrow this method onto stand-ins without the new attributes.
+        if getattr(self, "TEMPERING_CROSS_TERMS", False) and isinstance(
+            getattr(self, "_basis_settings", None), STFTSettings
+        ):
+            return self._run_tempering_cross_terms(model, state, band_sorter, band_temps)
         ll_change_log_temp = self.xp.zeros((self.ntemps, self.nwalkers, self.num_bands))
 
         band_swaps_accepted = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
         band_swaps_proposed = self.xp.zeros((len(self.band_edges) - 1, self.ntemps - 1), dtype=int)
+
+        # * Alive sources per (temp, walker, band) cell and per walker, kept current through the swaps.
+        # * Sources outside the band range count for their walker but sit in no cell.
+        n_slots = band_sorter.nleaves_max
+        num_walker_cells = self.ntemps * self.nwalkers
+        walker_cell_all = band_sorter.temp_inds * self.nwalkers + band_sorter.walker_inds
+        in_band = (
+            band_sorter.inds & (band_sorter.band_inds >= 0) & (band_sorter.band_inds < self.num_bands)
+        )
+        band_cell_all = walker_cell_all * self.num_bands + band_sorter.band_inds
+        # ! CuPy's bincount raises on an empty array
+        cell_alive = (
+            self.xp.bincount(band_cell_all[in_band], minlength=num_walker_cells * self.num_bands)
+            if bool(in_band.any())
+            else self.xp.zeros(num_walker_cells * self.num_bands, dtype=self.xp.int64)
+        ).reshape(self.ntemps, self.nwalkers, self.num_bands)
+        walker_alive = (
+            self.xp.bincount(walker_cell_all[band_sorter.inds], minlength=num_walker_cells)
+            if bool(band_sorter.inds.any())
+            else self.xp.zeros(num_walker_cells, dtype=self.xp.int64)
+        ).reshape(self.ntemps, self.nwalkers)
+        log_factorial = self.xp.asarray(gammaln(np.arange(n_slots + 1) + 1.0))   # ln k!
 
         units = 2
         tmp_start = np.random.randint(units)
@@ -2056,7 +2759,34 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                     # paccept = bi * (band_here_i1->swapped_like - band_here_i->current_like) + bi1 * (band_here_i->swapped_like - band_here_i1->current_like);
 
                     raccept = self.xp.log(self.xp.random.uniform(size=paccept.shape))
-                    sel = paccept > raccept
+
+                    # * Uniform prior on k: add the change of ln k! of both walkers, reject swaps past
+                    # * nleaves_max. Rows of one band pair distinct walkers; bands go in turn.
+                    hot_walkers, cold_walkers = walker_inds_now[:, i1], walker_inds_now[:, i2]
+                    row_bands = band_inds_now[:, i1]
+                    n_hot = cell_alive[i1, hot_walkers, row_bands]
+                    n_cold = cell_alive[i2, cold_walkers, row_bands]
+                    sel = self.xp.zeros(paccept.shape, dtype=bool)
+                    for band in self.xp.unique(row_bands).tolist():
+                        rows = self.xp.flatnonzero(row_bands == band)
+                        k_hot = walker_alive[i1, hot_walkers[rows]]
+                        k_cold = walker_alive[i2, cold_walkers[rows]]
+                        k_hot_new = k_hot - n_hot[rows] + n_cold[rows]
+                        k_cold_new = k_cold - n_cold[rows] + n_hot[rows]
+                        fits = (k_hot_new <= n_slots) & (k_cold_new <= n_slots)
+                        log_weight_change = (
+                            log_factorial[self.xp.minimum(k_hot_new, n_slots)]
+                            + log_factorial[self.xp.minimum(k_cold_new, n_slots)]
+                            - log_factorial[k_hot]
+                            - log_factorial[k_cold]
+                        )
+                        sel[rows] = fits & (paccept[rows] + log_weight_change > raccept[rows])
+                        taken = rows[sel[rows]]
+                        walker_alive[i1, hot_walkers[taken]] = k_hot_new[sel[rows]]
+                        walker_alive[i2, cold_walkers[taken]] = k_cold_new[sel[rows]]
+                    # * the accepted cells now hold each other's sources
+                    cell_alive[i1, hot_walkers[sel], row_bands[sel]] = n_cold[sel]
+                    cell_alive[i2, cold_walkers[sel], row_bands[sel]] = n_hot[sel]
 
                     current_lls[sel, i2 : i1 + 1] = new_lls[sel]
 
@@ -2129,6 +2859,273 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         return ll_change_sum_temp, band_swaps_accepted, band_swaps_proposed
 
+    def _run_tempering_cross_terms(self, model, state, band_sorter, band_temps):
+        """The swaps of :meth:`run_tempering`, decided from the cross terms of each grid row (STFT).
+
+        Per parity pass, every grid row (the cells of one band, one per temperature) gets the table
+        ``values[t, j] = (r_t|t_j) - (t_j|t_j) / 2`` from :meth:`SubBandBuffer.cross_terms`: column
+        ``t`` taking the template of column ``j`` changes its ln L by ``values[t, j] - values[t, t]``.
+        No ln L depends on a decision (each cell sits in one row and the residuals stay fixed), so
+        every row of the pass is scored first and :func:`sweep_tempering_rows` then makes the swap
+        loop's decisions on the host; the sources move once per pass. One buffer with its template
+        twin serves the whole propose and is refilled per chunk of rows. The draws come from NumPy at
+        the start of each pass and swaps pair walkers of one parent split, so the results repeat with
+        the seed for any chunk size. DFFR rows sum over their band's store window and TDI-on-the-fly
+        rows over the whole cell (``TEMPERING_BAND_WINDOW``).
+        """
+        acs = model.analysis_container_arr
+        xp = self.xp
+        ntemps, nwalkers, num_bands = self.ntemps, self.nwalkers, self.num_bands
+        timer = getattr(self, "_prop_timer", None)
+        probe = getattr(self, "_mem_probe", None)
+        temps_range = np.arange(ntemps)
+
+        ll_change_log_temp = np.zeros((ntemps, nwalkers, num_bands))
+        band_swaps_accepted = np.zeros((len(self.band_edges) - 1, ntemps - 1), dtype=int)
+        band_swaps_proposed = np.zeros((len(self.band_edges) - 1, ntemps - 1), dtype=int)
+
+        # * Alive sources per (temp, walker, band) cell and per walker, as in the swap loop. A pass
+        # * moves sources between cells of its own bands only, so the other pass's counts stay valid.
+        nleaves_max = int(band_sorter.nleaves_max)
+        temp_all = asnumpy(band_sorter.temp_inds).astype(np.int64)
+        walker_all = asnumpy(band_sorter.walker_inds).astype(np.int64)
+        band_all = asnumpy(band_sorter.band_inds).astype(np.int64)
+        alive_all = asnumpy(band_sorter.inds).astype(bool)
+        walker_cell_all = temp_all * nwalkers + walker_all
+        in_band = alive_all & (band_all >= 0) & (band_all < num_bands)
+        cell_alive = np.bincount(
+            (walker_cell_all * num_bands + band_all)[in_band],
+            minlength=ntemps * nwalkers * num_bands,
+        ).reshape(ntemps, nwalkers, num_bands)
+        walker_alive = np.bincount(
+            walker_cell_all[alive_all], minlength=ntemps * nwalkers
+        ).reshape(ntemps, nwalkers)
+        log_factorial = gammaln(np.arange(nleaves_max + 1) + 1.0)
+        betas_all = asnumpy(band_temps)
+
+        # Swaps pair walkers of one parent split (one group on one device). A buffer with one split
+        # takes every group's rows; one with a split per group takes each group's rows on its device.
+        walker_groups = [np.asarray(asnumpy(walkers), dtype=np.int64) for walkers in acs.gpu_splits]
+        group_of_walker = np.empty(nwalkers, dtype=np.int64)
+        for group, walkers in enumerate(walker_groups):
+            group_of_walker[walkers] = group
+        buffer_gpus = getattr(self.gb, "gpus", None) if self.backend.uses_cupy else None
+        num_buffer_splits = len(buffer_gpus) if buffer_gpus else 1
+        if num_buffer_splits > 1 and (
+            num_buffer_splits != len(walker_groups) or list(buffer_gpus) != list(acs.gpus)
+        ):
+            raise ValueError(
+                f"tempering buffer devices {list(buffer_gpus)} must equal the parent's walker "
+                f"splits on {acs.gpus}."
+            )
+        # Verify runs measure what a band-window sum would drop.
+        window_totals = None
+        if (getattr(getattr(self, "debug_settings", None), "verify_buffer", False)
+                and getattr(self, "stft_store_windows", None) is not None):
+            window_totals = dict(rows=0, rows_outside=0, max_energy=0.0, max_swap_change=0.0)
+        store_windows = getattr(self, "stft_store_windows", None)
+        # Only DFFR places its pixels around the kinematic carrier, which the store windows bound.
+        band_window = (
+            getattr(self, "TEMPERING_BAND_WINDOW", False) and store_windows is not None
+            and getattr(getattr(self, "gb_stft_comp", None), "response", None) == "dffr"
+        )
+
+        # One buffer and chunk size per width class, kept for the whole propose; None is the one width.
+        # Read with getattr: run_tempering also runs on stand-in moves without this method.
+        class_widths = getattr(self, "_stft_band_class_widths", lambda switched_on: None)(
+            getattr(self, "TEMPERING_WIDTH_CLASSES", False)
+        )
+        # Sized once per propose, because the class buffers stay for all of it.
+        sized_rows = None
+        if getattr(self, "_size_tempering_batches", False):
+            sized_rows = self._sized_tempering_rows(class_widths, num_buffer_splits)
+            if None in sized_rows:
+                class_widths = None
+        class_buffers = {}
+        class_rows_per_split = {}
+        buffer_obj = None
+        units = 2
+        tmp_start = np.random.randint(units)
+        for tmp in range(units):
+            start = (tmp_start + tmp) % units
+            # start == 0 pairs with bool_remainder 1 because tempering begins at band 1.
+            bool_remainder = 1 if start == 0 else 0
+            in_pass_bands = band_sorter.band_inds % 2 == bool_remainder
+
+            with _tspan(timer, "temper_open_close"):
+                self.remove_cold_chain_sources_from_residual(
+                    model, band_sorter, extra_bool=in_pass_bands
+                )
+
+            row_bands, row_walkers, log_uniforms = self._tempering_cross_term_grid(
+                start, walker_groups
+            )
+            num_rows = row_bands.size
+            row_specials = band_sorter.get_special_band_index(
+                temps_range[None, :], row_walkers, row_bands[:, None]
+            )
+            if num_buffer_splits == 1:
+                queues = [np.arange(num_rows)]
+            else:
+                row_group = group_of_walker[row_walkers[:, 0]]
+                queues = [np.flatnonzero(row_group == split) for split in range(num_buffer_splits)]
+            values = np.empty((num_rows, ntemps, ntemps))
+            # * The rows of a pass are all scored before the sweep, so their order does not matter.
+            cell_widths = [None] if class_widths is None else np.unique(class_widths[row_bands]).tolist()
+            for cell_width in cell_widths:
+                class_queues = queues if cell_width is None else [
+                    queue[class_widths[row_bands[queue]] == cell_width] for queue in queues
+                ]
+                if cell_width not in class_rows_per_split and num_rows > 0:
+                    # * The first chunk must fill every split, so the contiguous blocks hold whole rows.
+                    rows_setting = (
+                        sized_rows[cell_width] if sized_rows is not None
+                        else self.num_bands_preload_temp if cell_width is None
+                        else self._class_num_slots(self.num_bands_preload_temp, cell_width)
+                    )
+                    class_rows_per_split[cell_width] = max(1, min(
+                        rows_setting // num_buffer_splits,
+                        min(queue.size for queue in class_queues),
+                    ))
+                rows_per_split = class_rows_per_split.get(cell_width)
+                buffer_obj = class_buffers.get(cell_width)
+
+                positions = [0] * len(class_queues)
+                while any(position < queue.size for position, queue in zip(positions, class_queues)):
+                    chunk_rows, chunk_row_slots = [], []
+                    for split, queue in enumerate(class_queues):
+                        taken = queue[positions[split]:positions[split] + rows_per_split]
+                        positions[split] += taken.size
+                        chunk_rows.append(taken)
+                        chunk_row_slots.append(split * rows_per_split + np.arange(taken.size))
+                    chunk_rows = np.concatenate(chunk_rows)
+                    # Row k of split s owns the ntemps slots from (s * rows_per_split + k) * ntemps.
+                    chunk_slots = (
+                        np.concatenate(chunk_row_slots)[:, None] * ntemps + temps_range[None, :]
+                    )
+                    chunk_specials = xp.asarray(row_specials[chunk_rows].reshape(-1))
+
+                    with _tspan(timer, "temper_buffer"):
+                        if buffer_obj is None:
+                            if probe is not None:
+                                probe.check_released("temper_buffer")
+                            if cell_width is not None:
+                                # ! A new buffer reads its parent group from the comp, which still
+                                # ! points at the group of the class scored last.
+                                self._release_stft_comp_groups()
+                            # The first chunk fills every slot, in slot order.
+                            buffer_obj = band_sorter.get_buffer(
+                                acs, chunk_specials, use_template_arr=True,
+                                track_counter=self._track_counter, contiguous_splits=True,
+                                **({} if cell_width is None else {"stft_cell_width": cell_width}),
+                            )
+                            class_buffers[cell_width] = buffer_obj
+                        else:
+                            band_sorter.get_buffer(
+                                acs, chunk_specials, inds_fill=xp.asarray(chunk_slots.reshape(-1)),
+                                buffer_obj=buffer_obj,
+                            )
+
+                    starts = buffer_obj._stft_start_inds_host[chunk_slots[:, 0]].astype(np.int64)
+                    if band_window:
+                        window_lo = store_windows.j_lo[row_bands[chunk_rows]]
+                        window_hi = store_windows.j_hi[row_bands[chunk_rows]] + 1
+                    else:
+                        window_lo = starts
+                        window_hi = starts + int(buffer_obj._stft_cell_width)
+                    with _tspan(timer, "temper_swap_score"):
+                        cross, template, _ = buffer_obj.cross_terms(chunk_slots, window_lo, window_hi)
+                    values[chunk_rows] = cross - 0.5 * template
+                    if window_totals is not None:
+                        with _tspan(timer, "temper_verify_window"):
+                            self._check_tempering_band_window(
+                                buffer_obj, chunk_slots, starts, row_bands[chunk_rows], store_windows,
+                                window_totals,
+                            )
+
+            with _tspan(timer, "temper_sweep"):
+                source_counts = cell_alive[temps_range[None, :], row_walkers, row_bands[:, None]]
+                template_column, accepted = sweep_tempering_rows(
+                    values, betas_all[row_bands], log_uniforms, row_bands, row_walkers,
+                    source_counts, walker_alive, nleaves_max, log_factorial,
+                )
+                # Every row proposes each temperature pair once.
+                np.add.at(band_swaps_proposed, row_bands, 1)
+                np.add.at(band_swaps_accepted, row_bands, accepted.astype(int))
+                row_ids = np.arange(num_rows)[:, None]
+                ll_change_log_temp[temps_range[None, :], row_walkers, row_bands[:, None]] = (
+                    values[row_ids, temps_range[None, :], template_column]
+                    - values[row_ids, temps_range[None, :], temps_range[None, :]]
+                )
+
+            with _tspan(timer, "temper_relabel"):
+                # * The sources of the cell whose template ends at column t take column t's label.
+                moved_rows, moved_columns = np.nonzero(template_column != temps_range[None, :])
+                if moved_rows.size:
+                    band_sorter.move_cell_labels(
+                        row_specials[moved_rows, template_column[moved_rows, moved_columns]],
+                        moved_columns,
+                        row_walkers[moved_rows, moved_columns],
+                        row_specials[moved_rows, moved_columns],
+                    )
+
+            with _tspan(timer, "temper_open_close"):
+                self.add_cold_chain_sources_to_residual(
+                    model, band_sorter, extra_bool=in_pass_bands
+                )
+
+        if class_buffers:
+            if probe is not None:
+                # The tag holds one buffer; with width classes that is the class built last.
+                probe.watch("temper_buffer", buffer_obj, span_name="temper_buffer")
+            del buffer_obj
+            class_buffers.clear()
+            self._release_stft_comp_groups()
+            if probe is not None:
+                probe.check_released("temper_buffer")
+
+        if window_totals is not None:
+            logger.info(
+                "[VERIFY_TEMPER_WINDOW] scores summed over %s. %d rows: %d with template signal "
+                "outside the band window (largest (t|t) outside %.3e); largest change of a swap "
+                "value between the whole cell and the band window %.3e",
+                "the band windows" if band_window else "the whole cells",
+                window_totals["rows"], window_totals["rows_outside"], window_totals["max_energy"],
+                window_totals["max_swap_change"],
+            )
+
+        band_swaps_accepted = xp.asarray(band_swaps_accepted)
+        band_swaps_proposed = xp.asarray(band_swaps_proposed)
+        self._adapt_band_temps(band_temps, band_swaps_accepted, band_swaps_proposed)
+        ll_change_sum_temp = xp.asarray(ll_change_log_temp.sum(axis=-1))
+        return ll_change_sum_temp, band_swaps_accepted, band_swaps_proposed
+
+    def _check_tempering_band_window(self, buffer_obj, chunk_slots, starts, bands, store_windows,
+                                     totals):
+        """What a band-window sum drops from the whole cell, for one chunk of rows (verify runs).
+
+        Two cross-term calls over the cell bins left and right of each band's store window give
+        exactly the template signal outside the window, as ``(t_j|t_j)`` under the noise of the
+        template's own column, and the part of every swap value that the band window leaves out.
+        ``totals`` accumulates over the propose.
+        """
+        band_lo = store_windows.j_lo[bands]
+        band_hi = store_windows.j_hi[bands] + 1
+        cell_hi = starts + int(buffer_obj._stft_cell_width)
+        outside_values = 0.0
+        outside_energy = 0.0
+        for window_lo, window_hi in ((starts, band_lo), (band_hi, cell_hi)):
+            cross, template, _ = buffer_obj.cross_terms(chunk_slots, window_lo, window_hi)
+            outside_values = outside_values + cross - 0.5 * template
+            outside_energy = outside_energy + np.einsum("rjj->rj", template)
+        swap_change = outside_values - np.einsum("rii->ri", outside_values)[:, :, None]
+        totals["rows"] += int(chunk_slots.shape[0])
+        totals["rows_outside"] += int((outside_energy > 0.0).any(axis=1).sum())
+        totals["max_energy"] = max(totals["max_energy"], float(outside_energy.max(initial=0.0)))
+        totals["max_swap_change"] = max(
+            totals["max_swap_change"], float(np.abs(swap_change).max(initial=0.0))
+        )
+
     def _write_back_state(self, new_state, band_sorter) -> None:
         """Repack the sorter's live sources into ``new_state.branches['gb']``.
 
@@ -2139,8 +3136,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         (all ``False``, then ``True`` at the repacked leaves), so RJ
         births/deaths and tempering walker reassignments all land here.
 
-        TODO: NEED TO PROPERLY MOVE SUPPLEMENTAL INFO BASED ON OLD LEAVES
-        (``inds_old`` below is the source-side index for that move).
+        The held Fisher matrices of the live rows (``_held_fim_rows``) move to
+        the same new slots of the gb branch supplemental; every other slot ends
+        without one.
         """
         alive = band_sorter.inds
         special_indices_finish = (
@@ -2178,7 +3176,15 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         new_state.branches["gb"].inds[:] = False
         # turn on all the ones that are there
         new_state.branches["gb"].inds[inds_new] = True
-        # new_state.branches["gb"].branch_supplemental[inds_new] = state.branches["gb"].branch_supplemental[inds_old]
+        # * held Fisher matrices: an empty store, then the live rows at their new slots
+        rows = getattr(self, "_held_fim_rows", None)
+        if rows is not None:
+            store = self._ensure_fim_store(new_state.branches["gb"]).holder
+            alive_rows = asnumpy(alive)
+            for key in _FIM_STORE_KEYS:
+                store[key][...] = 0
+                store[key][inds_new] = rows[key][alive_rows]
+            self._held_fim_rows = None
 
     def _band_residual_lls(self, acs):
         """Per-band cold-walker residual ll ``-1/2 <r|r>`` from the parent ACA.
@@ -2364,8 +3370,10 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.name,
             context=dict(
                 num_proposals=int(self.num_proposals),
-                num_band_preload=int(self.num_band_preload),
-                num_bands_preload_temp=int(self.num_bands_preload_temp),
+                num_band_preload="sized" if self._size_proposal_batches else int(self.num_band_preload),
+                num_bands_preload_temp=(
+                    "sized" if self._size_tempering_batches else int(self.num_bands_preload_temp)
+                ),
             ),
             settings=self.debug_settings,
         )
@@ -2462,6 +3470,8 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 stft_store_windows=self.stft_store_windows,
                 verify_buffer=self.debug_settings.verify_buffer,
             )
+        # * held Fisher matrices of the sorter rows, read at each row's start-of-propose slot
+        self._held_fim_rows = self._load_fim_rows(new_state.branches["gb"], band_sorter)
 
         # Cold-chain friend table for the group-stretch half of the in-model
         # mix (rebuilt every proposal; cheap sort of the cold-chain f0s).
@@ -2503,6 +3513,17 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # assert np.all(start_diffs < 2.0)
         num_active_leaves = new_state.branches["gb"].inds[0].sum(axis=-1) # cold chain only
         logger.info(f"Number of active leaves before proposal: {num_active_leaves}")
+
+        # ! Every budget of this propose must see the copies of the parent noise rows that the
+        # ! buffers read on several devices, so they are made before the first budget reading.
+        with tm.span("parent_noise_copies"):
+            band_sorter.make_parent_noise_copies(model.analysis_container_arr)
+
+        if self.EMPTY_POOL_BEFORE_PROPOSAL:
+            with tm.span("mempool_free"):
+                if self.backend.uses_cupy:
+                    self.xp.cuda.runtime.deviceSynchronize()
+                self.mempool.free_all_blocks()
 
         st_prop = time.perf_counter()
         with tm.span("run_proposal"):
@@ -2601,6 +3622,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         logger.info(f"Number of active leaves in cold chain after proposal: {num_active_leaves}")
 
         new_inds = self.xp.asarray(new_state.branches_inds["gb"])
+        # ! The copies of the parent noise rows leave the devices with this propose, even if
+        # ! something still holds the sorter.
+        band_sorter.parent_noise_copies.clear()
         del band_sorter
         with tm.span("mempool_free"):
             self.mempool.free_all_blocks()
@@ -2715,6 +3739,21 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 "[GB_ACCEPT %s] rj cold %.4f (n=%.0f) all %.4f (n=%.0f) | "
                 "in-model cold %.4f (n=%.0f) all %.4f (n=%.0f)",
                 self.name, rj_c, rj_cn, rj_a, rj_an, im_c, im_cn, im_a, im_an,
+            )
+            # * acceptance of the Fisher jumps per jump scale, cold chain and all temperatures
+            scale_counts = asnumpy(self._jump_scale_counts)
+            scale_parts = []
+            for scale_index, scale in enumerate(asnumpy(self.jump_scales)):
+                proposed = scale_counts[0, scale_index]
+                accepted_jumps = scale_counts[1, scale_index]
+                cold = accepted_jumps[0] / proposed[0] if proposed[0] else float("nan")
+                total = accepted_jumps.sum() / proposed.sum() if proposed.sum() else float("nan")
+                scale_parts.append(
+                    f"{scale:.3f}: cold {cold:.4f} (n={proposed[0]}) "
+                    f"all {total:.4f} (n={proposed.sum()})"
+                )
+            logger.info(
+                "[GB_ACCEPT_SCALES %s] Fisher jump scale %s", self.name, "; ".join(scale_parts)
             )
         except Exception as exc:  # never break a propose for a log line
             logger.debug("[GB_ACCEPT %s] skipped: %r", self.name, exc)
@@ -3077,201 +4116,6 @@ def gb_refit_func(comm, curr, main_rank, class_extra_gpus, class_ranks_list):
         fit_each_leaf(rank, curr, gather_rank, comm)
         pass
 
-def para_log_like(
-    x,
-    gb,
-    acs,
-    walker_max,
-    transform_fn,
-    phase_maximize,
-    waveform_kwargs,
-    fstat=True,
-    return_snr=False,
-):
-    """Vectorized GB log-likelihood used by serial-search and refit moves.
-
-    Args:
-        x: GB parameter rows (untransformed).
-        gb: :class:`gbgpu.GBGPU` instance.
-        acs: :class:`AnalysisContainerArray`.
-        walker_max: Index of the walker whose data the proposals are scored
-            against.
-        transform_fn: :class:`TransformContainer` for GB parameters.
-        phase_maximize: If ``True``, marginalize over phase.
-        waveform_kwargs: Forwarded to ``gb.get_fstat_ll`` / ``gb.get_ll``.
-        fstat: If ``True``, use the F-statistic likelihood (``get_fstat_ll``)
-            and overwrite the amplitude / phase / iota / polarization
-            entries of ``x`` with their maximized values.
-        return_snr: If ``True`` and ``fstat`` is ``False``, also return the
-            optimal SNR per row.
-
-    Returns:
-        Per-row log-likelihood (or ``(ll, snr)`` tuple).
-    """
-    xp = gb.backend.xp
-
-    x_tmp = transform_fn.both_transforms(x, xp=xp)
-    # need to get just f, fdot, fddot, alpha, delta
-    data_index = xp.full(x.shape[0], walker_max, dtype=xp.int32)
-    if fstat:
-        x_in = x_tmp[:, xp.array([1, 2, 3, 7, 8])]
-        # breakpoint()
-        # TODO: fix for N>256?
-        ll = gb.get_fstat_ll(
-            x_in,
-            acs.linear_data_arr,
-            acs.linear_psd_arr,
-            data_index=data_index,
-            noise_index=data_index,
-            data_length=acs.end_shape[0],
-            data_splits=np.array([gb.gpus[0]]),
-            phase_maximize=phase_maximize,
-            return_cupy=True,
-            N=512,  
-            **waveform_kwargs,
-        )
-
-        x[:, 0] = np.log(gb.A_max)
-        x[:, 3] = gb.phi0_max % (2 * np.pi)
-        x[:, 4] = np.cos(gb.iota_max % (np.pi))
-        x[:, 5] = gb.psi_max % (np.pi)
-
-    else:
-        # breakpoint()
-        x_in = x_tmp[:]
-        ll = gb.get_ll(
-            x_in,
-            acs.linear_data_arr,
-            acs.linear_psd_arr,
-            data_index=data_index,
-            noise_index=data_index,
-            data_length=acs.end_shape[0],
-            data_splits=np.array([gb.gpus[0]]),
-            phase_maximize=phase_maximize,
-            return_cupy=True,
-            # N=512,
-            **waveform_kwargs,
-        )
-        # breakpoint()
-
-        # params_remove_in = x_in.copy()
-        # params_add_in = x_in.copy()
-
-        # params_remove_in[:, 0] *= 1e-50
-        # breakpoint()
-        # ll_diff_2 = gb.swap_likelihood_difference(
-        #     params_remove_in,
-        #     params_add_in,
-        #     acs.linear_data_arr,
-        #     acs.linear_psd_arr,
-        #     # start_freq_ind=self.xp.asarray(self.acs.start_freq_ind).astype(np.int32),
-        #     data_index=data_index,
-        #     noise_index=data_index,
-        #     # N=N_vals,
-        #     data_length=acs.data_length,
-        #     data_splits=np.array([gb.gpus[0]]),
-        #     phase_maximize=phase_maximize,
-        #     return_cupy=True,
-        #     N=256,
-        #     **waveform_kwargs,
-        # )
-        # breakpoint()
-
-        if phase_maximize:
-            x[:, 3] = (x[:, 3] - xp.angle(xp.asarray(gb.non_marg_d_h))) % (2 * np.pi)
-
-        if return_snr:
-            opt_snr = gb.h_h.real ** (1 / 2)
-            return (ll, opt_snr)
-
-    return ll
-
-
-class PriorTransformFn:
-    """Transform between unit-cube prior coordinates and GB :math:`(f, \\dot f)`.
-
-    Used by the serial-search move to draw uniform-in-band proposals while
-    keeping the rest of the GB prior unchanged.
-
-    Args:
-        f_min: Minimum frequency (Hz).
-        f_max: Maximum frequency (Hz).
-        fdot_min: Minimum frequency derivative.
-        fdot_max: Maximum frequency derivative.
-    """
-
-    def __init__(self, f_min: float, f_max: float, fdot_min: float, fdot_max: float):
-        self.f_min, self.f_max, self.fdot_min, self.fdot_max = (
-            f_min,
-            f_max,
-            fdot_min,
-            fdot_max,
-        )
-
-    def adjust_logp(self, logp, groups_running):
-        """Add the (uniform) ``f`` and ``fdot`` log-density to ``logp``."""
-        xp = get_array_module(self.f_min)
-
-        if groups_running is None:
-            groups_running = xp.arange(len(self.f_min))
-
-        f_min_here = self.f_min[groups_running]
-        f_max_here = self.f_max[groups_running]
-        f_logpdf = np.log(1.0 / (f_max_here - f_min_here))
-
-        fdot_min_here = self.fdot_min[groups_running]
-        fdot_max_here = self.fdot_max[groups_running]
-        fdot_logpdf = np.log(1.0 / (fdot_max_here - fdot_min_here))
-
-        logp[:] += f_logpdf[:, None, None]
-        logp[:] += fdot_logpdf[:, None, None]
-
-        return logp
-
-    def transform_to_prior_basis(self, coords, groups_running):
-        """Map ``f`` / ``fdot`` columns of ``coords`` to the unit-cube basis."""
-        xp = get_array_module(self.f_min)
-
-        if groups_running is None:
-            groups_running = xp.arange(len(self.f_min))
-
-        f_min_here = self.f_min[groups_running]
-        f_max_here = self.f_max[groups_running]
-        try:
-            coords[:, :, :, 1] = (coords[:, :, :, 1] - f_min_here[:, None, None]) / (
-                f_max_here[:, None, None] - f_min_here[:, None, None]
-            )
-        except:
-            breakpoint()
-
-        fdot_min_here = self.fdot_min[groups_running]
-        fdot_max_here = self.fdot_max[groups_running]
-        coords[:, :, :, 2] = (coords[:, :, :, 2] - fdot_min_here[:, None, None]) / (
-            fdot_max_here[:, None, None] - fdot_min_here[:, None, None]
-        )
-
-        return
-
-    def transform_from_prior_basis(self, coords, groups_running):
-        """Map ``f`` / ``fdot`` columns of ``coords`` from unit cube back to physical."""
-        if groups_running is None:
-            groups_running = xp.arange(len(self.f_min))
-
-        assert groups_running.shape[0] == coords.shape[0]
-        f_min_here = self.f_min[groups_running]
-        f_max_here = self.f_max[groups_running]
-        coords[:, :, :, 1] = (
-            coords[:, :, :, 1] * (f_max_here[:, None, None] - f_min_here[:, None, None])
-        ) + f_min_here[:, None, None]
-
-        fdot_min_here = self.fdot_min[groups_running]
-        fdot_max_here = self.fdot_max[groups_running]
-        coords[:, :, :, 2] = (
-            coords[:, :, :, 2] * (fdot_max_here[:, None, None] - fdot_min_here[:, None, None])
-        ) + fdot_min_here[:, None, None]
-
-        return
-
 
 class BayesGMMFit:
     """Variational Bayesian GMM fit to per-leaf GB samples (sklearn ``BayesianGaussianMixture``).
@@ -3442,340 +4286,946 @@ def gather_gmms(gmms):
 
 from lisatools.sampling.gmm import vec_fit_gmm_min_bic
 
-class GBSpecialRJSerialSearchMCMC(GBSpecialBase):
-    """Reversible-jump GB move that runs a serial F-statistic MCMC search per band.
+# ======================================================================================================================
+# The F-statistic RJ move: births from an F-statistic search of the bands on the STFT/DFFR response
+# ======================================================================================================================
 
-    Each band proposes one new GB at a time using a parallel ensemble
-    sampler driven by :func:`para_log_like`, with proposals drawn from a
-    band-restricted prior via :class:`PriorTransformFn`.
+
+# The levels of GBFStatSettings.save_search_records
+FSTAT_RECORD_LEVELS = ("none", "summary", "full")
+
+
+@dataclass
+class GBFStatSettings:
+    """Settings of :class:`GBFStatRJMove`: its search of the bands, the search's schedule and what a search writes.
+
+    The defaults are the reviewed values, from the study on a benchmark group of 11 bands near 2.83 mHz
+    (``docs/gb/fstat_move/results.md``).
     """
-    comm_info = None
 
-    def get_rank_function(self):
-        return gb_search_func
+    # Walkers of each band's sampler, in both stages
+    nwalkers: int = 32
+    # Stage 1, the F-statistic over f0, fdot and the sky: the start ladder (coldest first; Eryn adapts it per band with
+    # its ends kept), the burn-in and the stored steps
+    betas_1: tuple[float, ...] = (1.0, 0.5, 0.25, 0.12, 0.05, 0.0)
+    burn_1: int = 500
+    nsteps_1: int = 300
+    # Stage 2, the full likelihood over every column, as stage 1: production's spacing 1.2^-k cut to 12 temperatures
+    # with T = 10 on top, a fixed ladder rather than the run's own
+    betas_2: tuple[float, ...] = tuple(float(1.2**-power) for power in range(11)) + (0.1,)
+    burn_2: int = 400
+    nsteps_2: int = 500
+    # The gate's effective-SNR target on the settled noise, where a birth under the global f0 prior breaks even
+    snr_eff_threshold: float = 7.5
+    # The foreground's inflation of the noise PSD below shutoff_high_frequency_threshold, which lowers a source's
+    # effective SNR by its square root: the median over the population
+    galfor_inflation_factor: float = 1.3
+    # Two separate shutoffs (Hz): a band wholly above the high threshold or wholly below the low threshold is shut off
+    # after shutoff_band_iteration searches in a row without a detection; None turns that shutoff off. The gate also
+    # reads the high threshold as the foreground's upper edge, below which its target is lower (None: no band below)
+    shutoff_high_frequency_threshold: Optional[float] = 6e-3
+    shutoff_low_frequency_threshold: Optional[float] = 6e-4
+    # Searches in a row without a detection after which a band in a shutoff range is shut off
+    shutoff_band_iteration: int = 2
+    # Proposes of the move from one search to the next; between searches the latest proposal stays
+    search_interval: int = 1
+    # Eryn's progress bar for each stage's band samplers: one bar of its burn-in and stored steps over all bands
+    progress: bool = True
+    # What each search saves to output_dir: "none", "summary" (per-band values, the mixtures, the times) or "full"
+    # (also the chains, megabytes per search on tens of bands)
+    save_search_records: str = "none"
+    # Folder of the search log (fstat_search.log) and of the saved records; the recipe builders fill
+    # <run>_artifacts/fstat_search/, and None writes neither
+    output_dir: Optional[str] = None
+
+    def __post_init__(self):
+        # * The value rules live here, so a config layer that builds the settings checks them at load.
+        interval = self.search_interval
+        if isinstance(interval, bool) or int(interval) != interval or interval < 1:
+            raise ValueError(f"fstat_settings: search_interval must be a positive integer, not {interval}")
+        if self.save_search_records not in FSTAT_RECORD_LEVELS:
+            raise ValueError(
+                f"fstat_settings: save_search_records must be one of {list(FSTAT_RECORD_LEVELS)}, not "
+                f"{self.save_search_records!r}"
+            )
+        low_edge, high_edge = self.shutoff_low_frequency_threshold, self.shutoff_high_frequency_threshold
+        if low_edge is not None and high_edge is not None and not float(low_edge) < float(high_edge):
+            raise ValueError(
+                f"fstat_settings: shutoff_low_frequency_threshold ({low_edge}) must lie below "
+                f"shutoff_high_frequency_threshold ({high_edge})"
+            )
+
+
+class GBFStatRJMove(GBSpecialBase):
+    """Reversible-jump GB move whose births come from an F-statistic search of the bands, on the STFT/DFFR response.
+
+    It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back). :meth:`setup`
+    searches when the schedule of ``search_interval`` says so, and the search's mixture becomes the RJ proposal. A
+    search runs on the residual of the max-likelihood walker, in every interior band that is not shut off:
+
+    1. stage 1 samples f0, fdot and the sky of each band with the F-statistic, which maximizes the four amplitude
+       parameters analytically; one Eryn sampler per band (``nsamplers``) runs on the run's own prior restricted to
+       the band (:class:`BandMaskTransform`);
+    2. a band passes when the largest stored cold sqrt(2F) exceeds the gate's threshold (:meth:`detection_gate`);
+    3. stage 2 samples every column of the passing bands with the full likelihood, from the F-statistic maximizers at
+       stage 1's last state;
+    4. one Gaussian mixture per passing band, fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
+       theta+-, lam periodic, becomes the RJ proposal (:class:`FStatPhaseProposal`).
+
+    On several cards the walker's data and noise rows are copied to every card (:meth:`_fill_search_holder`), and each
+    likelihood call's rows are shared out in equal blocks, so every card works on every stage of the search.
+
+    A search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
+    ``save_search_records`` asks for one. The math (the start draws, the amplitudes and their map to the extrinsic
+    parameters, the gate, the theta rows) sits in static and class methods. Points are in the GB sampling basis, with
+    the columns ``COL_*``.
+
+    Args:
+        *args: :class:`GBSpecialBase`'s arguments.
+        fstat_settings: The search's settings; None takes the defaults of :class:`GBFStatSettings`.
+        **kwargs: :class:`GBSpecialBase`'s keyword arguments.
+    """
+
+    # Sampling columns of the GB branch: ln A, f0 (mHz), fdot, phi0, cos iota, psi, lam, sin beta
+    COL_LN_AMP, COL_F0, COL_FDOT, COL_PHI0, COL_COS_IOTA, COL_PSI, COL_LAM, COL_SIN_BETA = range(8)
+    NDIM = 8
+    # Columns of the waveform rows (amp, f0 in Hz, fdot, fddot, phi0, iota, psi, lam, beta) that the maximizers set
+    PHYS_AMP, PHYS_PHI0, PHYS_IOTA, PHYS_PSI = 0, 4, 5, 6
+    # Stage 1 samples the columns the F-statistic depends on; it maximizes the other four analytically
+    SAMPLED_COLUMNS = (COL_F0, COL_FDOT, COL_LAM, COL_SIN_BETA)
+    # The mixture's periodic columns, theta+ in phi0's column, theta- in psi's and lam, with their periods
+    GMM_PERIODIC = {COL_PHI0: 2.0 * np.pi, COL_PSI: 2.0 * np.pi, COL_LAM: 2.0 * np.pi}
+    # The component counts that vec_fit_gmm_min_bic tries and the draws its BIC is scored on
+    GMM_MIN_COMPONENTS, GMM_MAX_COMPONENTS, GMM_BIC_DRAWS = 1, 30, 5000
+    # * The mixture fit runs in chunks of bands that fit the free device memory minus 1 GiB or 5 % of the device (the
+    # * larger), from an estimate of 12 working arrays of (samples x components) doubles per band
+    GMM_HEADROOM_BYTES = 2**30
+    GMM_HEADROOM_FRACTION = 0.05
+    GMM_WORK_ARRAYS = 12
+    # The likelihood value of a row that is not scored, as the band engine writes it
+    REJECTED_LL = -1e300
+    # * With one source in a band, maximizing the four amplitudes and the four sampled columns puts the stage-1 peak of
+    # * 2F at rho_eff^2 + 8; the stored cold samples lie a chi2(4) drop below the peak
+    GATE_PEAK_OFFSET = 8.0
+    GATE_DROP_DOF = 4
+    # Upper-triangle order of the F-statistic overlaps (numpy.triu_indices(4))
+    TRIU = np.triu_indices(4)
+    # The record's arrays with a steps or walkers axis, which only save_search_records "full" keeps
+    CHAIN_KEYS = (
+        "stage1_cold_fstat", "stage1_last_cold", "stage2_start", "stage2_start_fstat", "stage2_start_replaced",
+        "stage2_cold_coords", "stage2_cold_ll",
+    )
+    SEARCH_LOG_NAME = "fstat_search.log"
+
+    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None, **kwargs):
+        # * always an RJ move: its proposal only arrives with the first search, after construction
+        super().__init__(*args, **{**kwargs, "is_rj_prop": True})
+        self.fstat_settings = deepcopy(fstat_settings) if fstat_settings is not None else GBFStatSettings()
+        settings = self.fstat_settings
+        if not isinstance(self._basis_settings, STFTSettings):
+            raise NotImplementedError(
+                f"{type(self).__name__} searches on the STFT response only, not on "
+                f"{type(self._basis_settings).__name__}."
+            )
+        response = getattr(self.gb_stft_comp, "response", None)
+        if response != "dffr":
+            raise NotImplementedError(
+                f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
+            )
+        # * The value rules are GBFStatSettings' own (__post_init__); output_dir is filled by the builders, so here.
+        if settings.save_search_records != "none" and settings.output_dir is None:
+            raise ValueError(
+                "fstat_settings: save_search_records needs output_dir; the recipe builders set "
+                "<run>_artifacts/fstat_search/"
+            )
+        # index of the next saved record, counted on from the files in output_dir at the first save
+        self._next_record = None
+        # one container per card that receives the searched walker, built at the first search on several cards
+        self._search_holder = None
 
     def setup(self, model, branches):
-        assert isinstance(self.search_kwargs, dict)
-        nwalkers: int = self.search_kwargs["nwalkers"]
-        ntemps: int = self.search_kwargs["ntemps"]
-        shutoff_band_iteration: int = self.search_kwargs["shutoff_band_iteration"]
-        shutoff_frequency_threshold: float = self.search_kwargs["shutoff_frequency_threshold"]
-        burn_1: int = self.search_kwargs["burn_1"]
-        nsteps_1: int = self.search_kwargs["nsteps_1"]
-        snr_threshold: float = self.search_kwargs["snr_threshold"]
-        burn_2: int = self.search_kwargs["burn_2"]
-        nsteps_2: int = self.search_kwargs["nsteps_2"]
+        """Search when this propose is due, else keep the proposal of the latest search.
 
-        # FOR FAST TESTING/DEBUGGING
-        # import pickle
-        # with open("gmm_tmp.pickle", "rb") as fp:
-        #     full_gmm = pickle.load(fp)
+        The search runs at the move's proposes 0, M, 2M and so on, with M the setting ``search_interval`` (1: at every
+        propose). ``num_proposals`` counts the move's earlier proposes (``propose()`` raises it after ``setup()``). A
+        move without a proposal searches whatever the schedule, since ``propose()`` skips the whole propose of an RJ
+        move that has none: after a restart, which keeps no proposal, or after searches that found nothing.
+        """
+        interval = int(self.fstat_settings.search_interval)
+        if self.num_proposals % interval != 0 and self.rj_proposal_distribution is not None:
+            logger.info("[GB_FSTAT_SEARCH %s] propose %d: no search (interval %d); the latest proposal stays",
+                        self.name, self.num_proposals, interval)
+            return
+        self._search(model, branches)
 
-        # rj_dist = ProbDistContainer(
-        #     {
-        #         ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
-        #         "phi0": uniform_dist(0.0, 2 * np.pi),
-        #         "psi": uniform_dist(0.0, np.pi),
-        #     },
-        #     use_cupy=True,
-        # )
-        # rj_dist.reset_key_order(["A", "f0", "fdot", "phi0", "cos_iota", "psi", "alpha", "sin_delta"])
-        # return
+    # ==================================================================================================================
+    # The search, in its steps
+    # ==================================================================================================================
 
-        # run paraensemble MCMC.
-        max_logl_walker = np.argmax(model.analysis_container_arr.likelihood()).item()
-        self.gb.d_d = model.analysis_container_arr.inner_product()[max_logl_walker] # 0.0
-        ndim = branches["gb"].ndim
-        priors_global = self.priors if not self.backend.uses_cuda else self.gpu_priors            
+    def _search(self, model, branches):
+        """One search, in the steps of the class docstring. The steps' outputs go into one dict, from which
+        :meth:`_finish_search` writes the logs and the record."""
+        time_start = time.perf_counter()
+        holder = model.analysis_container_arr
+        walker = int(np.argmax(asnumpy(holder.likelihood())))
+        search = {"walker": walker, "num_proposals": int(self.num_proposals), "bands": self._search_bands()}
+        if not search["bands"]["active"].any():
+            self.rj_proposal_distribution = self.gpu_priors if self.backend.uses_cupy else self.priors
+            self._finish_search(search, time_start, "every band is shut off; the prior is the proposal")
+            return
+        search_holder, owners = self._search_owners(holder, walker)
+        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, search["bands"])
+        search["gate"] = self._apply_gate(search["stage_1"], search["bands"])
+        if not search["gate"]["detected"].any():
+            self._finish_search(search, time_start, "no band passes; the latest proposal stays")
+            return
+        search["start"] = self._stage_2_start(search["likelihood_1"], search["stage_1"], search["gate"])
+        search["stage_2"], search["likelihood_2"] = self._run_stage_2(
+            search_holder, owners, search["bands"], search["gate"], search["start"])
+        search["mixtures"] = self._build_proposal(search["stage_2"])
+        if search["mixtures"]["proposal"] is None:
+            self._finish_search(
+                search, time_start, "no passing band has a usable stage-2 chain; the latest proposal stays", warn=True)
+            return
+        self.rj_proposal_distribution = {"gb": search["mixtures"]["proposal"]}
+        self._finish_search(search, time_start, f"{int(search['mixtures']['usable'].sum())} bands in the proposal")
 
-        if self.num_bands == 1:
-            f0_max = self.band_edges[1:]
-            f0_min = self.band_edges[:-1]
-        else:
-            f0_max = self.band_edges[2:-1]
-            f0_min = self.band_edges[1:-2]
+    def _search_bands(self):
+        """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
+        those searched, which leaves out the bands that found nothing in the last ``shutoff_band_iteration`` searches
+        and lie wholly above ``shutoff_high_frequency_threshold`` or wholly below ``shutoff_low_frequency_threshold``."""
+        settings = self.fstat_settings
+        edges_mhz = asnumpy(self.band_edges) * 1e3
+        ids = np.array([0]) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+        low, high = edges_mhz[ids], edges_mhz[ids + 1]
+        active = np.ones(len(ids), dtype=bool)
+        history = getattr(self, "found_source_in_band", None)
+        iterations = int(settings.shutoff_band_iteration)
+        if history is not None and len(history) >= iterations:
+            silent = np.all(~history[-iterations:], axis=0)
+            # * two separate shutoffs, each off when its threshold is None
+            eligible = np.zeros(len(ids), dtype=bool)
+            if settings.shutoff_high_frequency_threshold is not None:
+                eligible |= low * 1e-3 >= float(settings.shutoff_high_frequency_threshold)
+            if settings.shutoff_low_frequency_threshold is not None:
+                eligible |= high * 1e-3 <= float(settings.shutoff_low_frequency_threshold)
+            active = ~(silent & eligible)
+        return {"ids": ids, "low_mhz": low, "high_mhz": high, "active": active}
 
-        # logic to shutoff bands #? Think about how this should change when we change SNR_thresh and with changing noise
-        if self.num_proposals >= shutoff_band_iteration:
-            bands_to_shutoff = np.all(~self.found_source_in_band[-shutoff_band_iteration:, :], axis=0)
+    def _band_mask(self, low_mhz, high_mhz):
+        """The band restriction of the run prior for Eryn's samplers, one band per sampler."""
+        # below the run prior's f0 range, where the joint prior is -inf with finite fdot bounds
+        outside_f0 = 0.5 * float(self.joint_f0_fdot_prior(self.priors["gb"]).f0_min)
+        return BandMaskTransform(low_mhz, high_mhz, outside_f0)
 
-            if shutoff_frequency_threshold is not None:
-                min_freqs = getattr(f0_min, "get")() if hasattr(f0_min, "get") else f0_min
-                freq_mask = min_freqs >= shutoff_frequency_threshold
-                bands_to_shutoff = bands_to_shutoff & freq_mask
+    def _search_owners(self, holder, walker):
+        """The holder the search reads and its rows that hold the walker's residual. On several cards: the search
+        holder, with the walker copied into its row on every card; else ``holder`` and the walker itself."""
+        gpus = getattr(holder, "gpus", None)
+        if gpus is None or len(gpus) < 2:
+            return holder, [walker]
+        return self._fill_search_holder(holder, walker), list(range(len(gpus)))
 
-            if np.all(bands_to_shutoff):
-                logger.info(f"No sources found across all bands for {shutoff_band_iteration} iterations, reverting to priors")
-                self.rj_proposal_distribution = priors_global
-                return
+    def _build_search_holder(self, holder):
+        """One container per card of ``holder`` on its full STFT grid, built as the GB band buffer builds its cells:
+        data and noise rows of zeros on the card, a sensitivity backend made from the card's split, and the split's
+        Fresnel settings. Its rows receive the searched walker at each search."""
+        xp = self.xp
+        settings = holder.settings
+        data_shape = (int(holder.nchannels),) + tuple(holder.end_shape)
+        noise_shape = tuple(holder.shape_sens) + tuple(holder.end_shape)
+        containers = []
+        for split, card in enumerate(holder.gpus):
+            with xp.cuda.Device(int(card)):
+                # ! A backend of its own: the array rebinds its containers' noise arrays, which must not be the main
+                # ! holder's. The split's backend holds the card's own orbit tables.
+                split_backend = holder.cpp_splits[split].sensitivity_backend
+                sensitivity = type(split_backend)(**dict(split_backend.kwargs))
+                sensitivity.data_shape = settings.basis_shape_active
+                noise_zeros = xp.zeros(noise_shape, dtype=xp.complex128)
+                sensitivity.sens_mat = noise_zeros
+                sensitivity.invC = noise_zeros
+                sensitivity.channel_shape = tuple(holder.shape_sens)
+                data = settings.associated_class(xp.zeros(data_shape, dtype=xp.complex128), settings)
+                containers.append(AnalysisContainer(data, sensitivity))
+        group = holder.cpp_splits[0]
+        cards = [int(card) for card in holder.gpus]
+        return AnalysisContainerArray(
+            containers, gpus=cards, complex_psd=True, gpu_assignment=cards,
+            domain_group_kwargs=dict(tdi_type=group.tdi_type, window_alpha=group.window_alpha,
+                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope))
 
-            else:
-                shutoff_mask = ~bands_to_shutoff
-                f0_max = f0_max[shutoff_mask]
-                f0_min = f0_min[shutoff_mask]
-                ngroups = np.sum(shutoff_mask)
+    def _fill_search_holder(self, holder, walker):
+        """The search holder, built at the first call, with ``walker``'s data and noise rows of ``holder`` copied card
+        to card into its row on every card, and its (d|d) for those rows."""
+        if self._search_holder is None:
+            self._search_holder = self._build_search_holder(holder)
+        search_holder = self._search_holder
+        xp = self.xp
+        split = int(np.asarray(asnumpy(holder.split_map))[walker])
+        row = int(np.flatnonzero(np.asarray(asnumpy(holder.gpu_splits[split])) == walker)[0])
+        data_size = int(holder.nchannels) * int(holder.data_length)
+        noise_size = int(np.prod(holder.shape_sens)) * int(holder.data_length)
+        data_row = holder.linear_data_arr[split][row * data_size:(row + 1) * data_size]
+        noise_row = holder.linear_psd_arr[split][row * noise_size:(row + 1) * noise_size]
+        # ! The walker's rows come from its card's stream; each copy runs on its target card's stream, which the
+        # ! search's kernels then follow.
+        xp.cuda.Device(int(holder.gpus[split])).synchronize()
+        for target, card in enumerate(search_holder.gpus):
+            with xp.cuda.Device(int(card)):
+                for source, destination in ((data_row, search_holder.linear_data_arr[target]),
+                                            (noise_row, search_holder.linear_psd_arr[target])):
+                    if destination.size != source.size:
+                        raise ValueError(f"search holder row of {destination.size} entries for a walker row of "
+                                         f"{source.size}")
+                    destination.data.copy_from_device_async(source.data, source.nbytes)
+        search_holder.compute_d_d_terms()
+        return search_holder
 
-        else:
-            ngroups = max(1, self.num_bands - 2)
-            assert f0_max.shape[0] == ngroups
-            assert f0_min.shape[0] == ngroups
-            bands_to_shutoff = None
+    def _run_stage_1(self, holder, owners, bands):
+        """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
+        restricted to each band. Returns the samplers' outputs and the likelihood, whose terms the maximizers reuse."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_1, dtype=float)
+        low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
+        mask = np.zeros(self.NDIM, dtype=bool)
+        mask[list(self.SAMPLED_COLUMNS)] = True
+        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
+                                           fstat=True)
+        start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
+        output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
+                                        self.periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
+                                        progress=bool(settings.progress))
+        return output, likelihood
 
-        logger.info(f"The current number of active bands is {ngroups}")
+    def _apply_gate(self, stage_1, bands):
+        """The gate on each searched band's stage-1 maximum, and the shutoff history's row of this search. Returns the
+        decisions, the thresholds, the targets and sqrt(2F) of the stored cold samples."""
+        settings = self.fstat_settings
+        # sqrt(2F) is the optimal SNR of the template at the F-statistic maximum
+        snr = np.sqrt(np.maximum(2.0 * stage_1["cold_ll"], 0.0))
+        # * the gate reads the maximum: the stage-1 cold walkers sit on several peaks without mixing, so the median and
+        # * the minimum read the lower peaks
+        detected, thresholds, targets = self.detection_gate(
+            snr, bands["low_mhz"][bands["active"]] * 1e-3, float(settings.snr_eff_threshold),
+            settings.shutoff_high_frequency_threshold, float(settings.galfor_inflation_factor))
+        found_row = np.zeros(len(bands["ids"]), dtype=bool)
+        found_row[np.flatnonzero(bands["active"])[detected]] = True
+        history = getattr(self, "found_source_in_band", None)
+        self.found_source_in_band = found_row[None] if history is None else np.vstack([history, found_row])
+        return {"detected": detected, "thresholds": thresholds, "targets": targets, "snr": snr}
 
-        fdot_max = get_fdot_mojito(f0_max, sign="+")
-        fdot_min = get_fdot_mojito(f0_max, sign="-")
-
-        priors_in = deepcopy(priors_global)["gb"].priors_in
-        priors_in["f0"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
-        priors_in["fdot"] = uniform_dist(0.0, 1.0, use_cupy=self.backend.uses_cupy)
-        priors = {
-            "gb": ProbDistContainer(priors_in, return_gpu=True, use_cupy=self.backend.uses_cupy)
+    def _stage_2_start(self, likelihood, stage_1, gate):
+        """Stage 2's start in the passing bands: the last stage-1 cold rows with the four analytic columns at their
+        maximizers. Returns the rows (bands, walkers, 8), F there, the rows replaced and the seconds."""
+        time_start = time.perf_counter()
+        nwalkers = int(self.fstat_settings.nwalkers)
+        n_detected = int(gate["detected"].sum())
+        last = stage_1["last_cold"][gate["detected"]].reshape(-1, self.NDIM)
+        rows, fstat, replaced = self._maximized_rows(likelihood, last)
+        return {
+            "rows": rows.reshape(n_detected, nwalkers, self.NDIM), "fstat": fstat.reshape(n_detected, nwalkers),
+            "replaced": replaced.reshape(n_detected, nwalkers), "seconds": time.perf_counter() - time_start,
         }
-        start_params = priors["gb"].rvs(size=(ngroups, ntemps, nwalkers))
-        prior_transform_fn = PriorTransformFn(f0_min * 1e3, f0_max * 1e3, fdot_min, fdot_max)
-        prior_transform_fn.transform_from_prior_basis(start_params, self.xp.arange(ngroups))
 
-        #? print("phase maximizing here right now (?)")
-        ll_args = (
-            self.gb,
-            model.analysis_container_arr,
-            max_logl_walker,
-            self.parameter_transforms,
-            True,  # self.phase_maximize,
-            self.waveform_kwargs,
+    def _maximized_rows(self, likelihood, coords):
+        """Rows with ln A, phi0, cos iota and psi at the F-statistic maximum, F there, and the rows replaced.
+
+        A row keeps its old values where it cannot be scored, where the maximum has no amplitude, or where the maximized
+        point falls outside the run prior; an amplitude beyond the prior's range is clipped into it first.
+        """
+        xp = likelihood.engine.xp
+        transform = self.parameter_transforms
+        coords = np.asarray(coords, dtype=float)
+        params_phys = transform.both_transforms(coords)
+        projections, overlaps, two_f, keep = likelihood.terms(xp.asarray(params_phys))
+        amplitudes = self.fstat_amplitudes(projections, overlaps, keep)
+        amplitude, cos_iota, psi, phi0 = (np.asarray(asnumpy(value), dtype=float)
+                                          for value in self.extrinsics_from_amplitudes(amplitudes))
+        fstat = np.asarray(asnumpy(xp.where(keep, 0.5 * two_f, self.REJECTED_LL)), dtype=float)
+        fstat[~np.isfinite(fstat)] = self.REJECTED_LL
+        maximized_phys = params_phys.copy()
+        maximized_phys[:, self.PHYS_AMP] = amplitude
+        maximized_phys[:, self.PHYS_PHI0] = phi0
+        maximized_phys[:, self.PHYS_IOTA] = np.arccos(cos_iota)
+        maximized_phys[:, self.PHYS_PSI] = psi
+        scored = (fstat > self.REJECTED_LL) & (amplitude > 0.0) & np.isfinite(amplitude)
+        maximized = coords.copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            maximized[scored] = transform.both_inverse_transforms(maximized_phys[scored])
+        prior_container = self.priors["gb"]
+        bounds = self.one_column_bounds(prior_container, self.COL_LN_AMP)
+        if bounds is not None:
+            # a hair inside the box, so the clipped point is not on the edge the prior may exclude
+            margin = 1e-9 * (bounds[1] - bounds[0])
+            maximized[scored, self.COL_LN_AMP] = np.clip(maximized[scored, self.COL_LN_AMP], bounds[0] + margin,
+                                                         bounds[1] - margin)
+        outside = ~np.isfinite(asnumpy(prior_container.logpdf(maximized)))
+        maximized[outside] = coords[outside]
+        return maximized, fstat, scored & ~outside
+
+    def _run_stage_2(self, holder, owners, bands, gate, start):
+        """Stage 2 in the passing bands: the full likelihood over every column (phi0 left to the analytic maximum when
+        phase_maximize), from the maximized rows at every temperature. Returns the samplers' outputs, with the cold
+        chains, and the likelihood."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_2, dtype=float)
+        passing = np.flatnonzero(bands["active"])[gate["detected"]]
+        low, high = bands["low_mhz"][passing], bands["high_mhz"][passing]
+        mask = np.ones(self.NDIM, dtype=bool)
+        if self.phase_maximize:
+            mask[self.COL_PHI0] = False
+        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
+                                           fstat=False, phase_maximize=self.phase_maximize,
+                                           waveform_kwargs=self.waveform_kwargs)
+        output = self.run_band_samplers(
+            likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
+            self._band_mask(low, high), mask, self.periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
+            record_cold_coords=True, progress=bool(settings.progress))
+        return output, likelihood
+
+    def _build_proposal(self, stage_2):
+        """The RJ proposal from the passing bands' stage-2 cold chains: one mixture per band over :meth:`theta_rows`
+        with theta+, theta- and lam periodic (:class:`FStatPhaseProposal`). Returns the usable bands, the proposal
+        (None when no band is usable), the mixture's seven component lists, the bands per fit chunk and the seconds."""
+        time_start = time.perf_counter()
+        cold_coords = stage_2["cold_coords"]
+        samples = cold_coords.reshape(cold_coords.shape[0], -1, self.NDIM)
+        # * a band whose chain never moved in a column (zero range, which the mixture's box map divides by) or holds a
+        # * value that is not finite is left out, not the search
+        usable = np.all(np.isfinite(samples), axis=(1, 2)) & np.all(np.ptp(samples, axis=1) > 0.0, axis=1)
+        if not usable.any():
+            return {"usable": usable, "proposal": None, "components": None, "chunk": None,
+                    "seconds": time.perf_counter() - time_start}
+        gpu = int(self.xp.cuda.runtime.getDevice()) if self.backend.uses_cupy else None
+        theta = self.theta_rows(cold_coords[usable].reshape(int(usable.sum()), -1, self.NDIM))
+        components, chunk = self.fit_band_mixtures(theta, gpu, periodic=self.GMM_PERIODIC)
+        mixture = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy, periodic=self.GMM_PERIODIC)
+        return {"usable": usable, "proposal": FStatPhaseProposal(mixture), "components": components, "chunk": chunk,
+                "seconds": time.perf_counter() - time_start}
+
+    # ==================================================================================================================
+    # Eryn's samplers of the search and the mixture fit
+    # ==================================================================================================================
+
+    @staticmethod
+    def run_band_samplers(log_like_fn, start, prior_container, transform, gibbs_mask, periodic, burn, nsteps, betas,
+                          record_cold_coords=False, progress=True):
+        """One Eryn EnsembleSampler with one independent sampler per band; keeps the cold chain only.
+
+        ``start`` is (n_bands, ntemps, nwalkers, 8) and ``betas`` the start ladder (coldest first, the same for every
+        band), which Eryn adapts per sampler with its ends kept. The sampler stores nothing, since every temperature of
+        a full-band search would be large and only the cold rows serve. ``progress`` shows Eryn's progress bar over the
+        burn + nsteps steps. Returns ``cold_ll`` (n_bands, nsteps,
+        nwalkers), ``last_cold`` (n_bands, nwalkers, 8), ``cold_coords`` (n_bands, nsteps, nwalkers, 8) when asked, the
+        cold acceptance and the swap acceptance per band, the adapted ladders and the wall time.
+        """
+        n_bands, ntemps, nwalkers, ndim = start.shape
+        gibbs_mask = np.asarray(gibbs_mask, dtype=bool).reshape(1, ndim)
+        betas = np.asarray(betas, dtype=float)
+        if betas.shape != (ntemps,):
+            raise ValueError(f"the ladder has {betas.shape} betas, the start {ntemps} temperatures")
+        sampler = EnsembleSampler(
+            nwalkers, ndim, log_like_fn, {"gb": prior_container},
+            tempering_kwargs=dict(betas=betas) if ntemps > 1 else {},
+            branch_names=["gb"], nleaves_max=1,
+            moves=StretchMove(gibbs_sampling_setup=("gb", gibbs_mask)),
+            vectorize=True, periodic=periodic, nsamplers=n_bands,
+            prior_transform_fn={"gb": transform}, track_moves=False,
         )
+        state = State({"gb": start[:, :, :, None, :].copy()}, nsamplers=n_bands)
+        # row s * ntemps of Eryn's folded leading axis is the cold chain of sampler s
+        cold_rows = np.arange(n_bands) * ntemps
+        cold_ll = np.zeros((n_bands, nsteps, nwalkers))
+        cold_coords = np.zeros((n_bands, nsteps, nwalkers, ndim)) if record_cold_coords else None
+        swaps_accepted = np.zeros((n_bands, max(ntemps - 1, 0)))
+        time_start = time.perf_counter()
+        for step, state in enumerate(sampler.sample(state, iterations=burn + nsteps, store=False, progress=progress)):
+            if ntemps > 1:
+                swaps_accepted += np.reshape(sampler.temperature_control.swaps_accepted, (n_bands, ntemps - 1))
+            if step >= burn:
+                cold_ll[:, step - burn] = state.log_like[cold_rows]
+                if record_cold_coords:
+                    cold_coords[:, step - burn] = state.branches["gb"].coords[cold_rows, :, 0]
+        move = sampler.moves[0]
+        steps = burn + nsteps
+        return {
+            "cold_ll": cold_ll,
+            "cold_coords": cold_coords,
+            "last_cold": state.branches["gb"].coords[cold_rows, :, 0].copy(),
+            "acceptance_cold": np.asarray(move.accepted)[cold_rows].mean(axis=-1) / max(move.num_proposals, 1),
+            "swap_acceptance": swaps_accepted / max(steps * nwalkers, 1),
+            "betas": (np.asarray(sampler.temperature_control.betas).reshape(n_bands, ntemps) if ntemps > 1
+                      else np.ones((n_bands, 1))),
+            "seconds": time.perf_counter() - time_start,
+            "steps": steps,
+        }
 
-        ll_args_2 = (
-            self.gb,
-            model.analysis_container_arr,
-            max_logl_walker,
-            self.parameter_transforms,
-            self.phase_maximize, # False, #
-            self.waveform_kwargs,
-        )
+    @classmethod
+    def fit_band_mixtures(cls, samples, gpu, periodic=None):
+        """``vec_fit_gmm_min_bic`` per chunk of bands: its seven component lists, one entry per band, and the chunk size.
 
-        # test_ll = para_log_like(
-        #     test_params,
-        #     *ll_args
-        # )
-
-        gibbs_sampling_setup = np.ones(8, dtype=bool)
-        gibbs_sampling_setup[np.array([0, 3, 4, 5])] = False
-        para_sampler = ParaEnsembleSampler(
-            ndim,
-            nwalkers,
-            ngroups,
-            para_log_like,
-            priors,
-            tempering_kwargs=dict(ntemps=ntemps, Tmax=np.inf),
-            args=ll_args,
-            # kwargs: dict = {},
-            gpu=self.gb.gpus[0],
-            periodic=self.periodic,
-            # backend: ParaBackend = None,  # add ParaHDFBackend
-            # update_fn: Callable = None,
-            # update_iterations=-1,
-            # stopping_fn: Callable = None,
-            # stopping_iterations: int=-1,
-            prior_transform_fn=prior_transform_fn,
-            name="gb",
-            gibbs_sampling_setup=gibbs_sampling_setup,
-            # provide_supplemental=False,
-        )
-
-        from eryn.state import ParaState
-
-        state = ParaState({"gb": start_params}, groups_running=self.xp.ones(ngroups, dtype=bool))
-        state.log_prior = para_sampler.compute_log_prior(state.branches_coords)
-        state.log_like = para_sampler.compute_log_like(state.branches_coords, logp=state.log_prior)
-
-        para_sampler.run_mcmc(state, nsteps_1, burn=burn_1, progress=True)
-
-        samples = self.xp.asarray(para_sampler.get_chain()[:, :, 0])
-        # Diagnostics disabled (stft_tof): computed-but-unused and each costs
-        # a full likelihood sweep over all samples.
-        # check_ll = para_sampler.get_log_like()[:, :, 0]
-        # sample_ll = asnumpy(
-        #     para_log_like(samples.reshape(-1, 8), *ll_args).reshape(samples.shape[:-1])
-        # )
-
-        # check_real_ll_phase_maximized = asnumpy(
-        #     para_log_like(samples.reshape(-1, 8), *ll_args, fstat=False)
-        #     .reshape(samples.shape[:-1])
-        # )
-        check_real_ll, opt_snr = para_log_like(
-            samples.reshape(-1, 8), *ll_args_2, fstat=False, return_snr=True
-        )
-        check_real_ll = asnumpy(check_real_ll.reshape(samples.shape[:-1]))
-        opt_snr = asnumpy(opt_snr.reshape(samples.shape[:-1]))
-
-        # np.save("opt_snr_from_ldc_parasampler_check.npy", opt_snr)
-        # np.save("samples_from_ldc_parasampler_check.npy", samples)
-
-        # TODO: make cut adjustable
-        groups_running_now = opt_snr.min(axis=(0, 2)) > snr_threshold
-
-        if self.num_proposals == 0:
-            self.found_source_in_band = groups_running_now
+        ``samples`` is (n_bands, n_samples, n_columns) and ``periodic`` the fit's periodic columns. On a GPU a chunk
+        holds as many bands as the free device memory minus the headroom allows, from the estimate GMM_WORK_ARRAYS x
+        (n_samples + BIC draws) x components x 8 bytes per band, since all bands of a large search at once may not fit.
+        """
+        n_bands, n_samples, _ = samples.shape
+        if gpu is None:
+            chunk = n_bands
+            xp = np
         else:
-            if bands_to_shutoff is None:
-                self.found_source_in_band = np.vstack([self.found_source_in_band, groups_running_now])
-            else:
-                shutoff_temp = np.zeros(self.found_source_in_band.shape[1], dtype=bool)
-                shutoff_temp[~bands_to_shutoff] = groups_running_now
-                self.found_source_in_band = np.vstack([self.found_source_in_band, shutoff_temp])
+            xp = cp
+            total = int(cp.cuda.runtime.memGetInfo()[1])
+            budget = free_device_bytes(cp) - max(cls.GMM_HEADROOM_BYTES, cls.GMM_HEADROOM_FRACTION * total)
+            per_band = 8 * (n_samples + cls.GMM_BIC_DRAWS) * cls.GMM_MAX_COMPONENTS * cls.GMM_WORK_ARRAYS
+            chunk = int(max(1, min(n_bands, budget // per_band)))
+        components = [[] for _ in range(7)]
+        for first in range(0, n_bands, chunk):
+            parts = vec_fit_gmm_min_bic(
+                xp.asarray(samples[first : first + chunk]), min_comp=cls.GMM_MIN_COMPONENTS,
+                max_comp=cls.GMM_MAX_COMPONENTS, n_samp_bic_test=cls.GMM_BIC_DRAWS, gpu=gpu, verbose=False,
+                return_components=True, periodic=periodic)
+            for target, part in zip(components, parts):
+                target.extend(part)
+        return components, chunk
 
-        logger.info(f"Found a source in {groups_running_now.sum()} out of {groups_running_now.shape[0]} active bands")
-        if not np.any(groups_running_now):
-            logger.info("Did not find any new sources.")
+    # ==================================================================================================================
+    # The search's logs and record
+    # ==================================================================================================================
+
+    def _finish_search(self, search, time_start, outcome, warn=False):
+        """The search's line in the run log, its block in the search log and, when asked, its saved record."""
+        search["total_seconds"] = time.perf_counter() - time_start
+        search["outcome"] = outcome
+        (logger.warning if warn else logger.info)("[GB_FSTAT_SEARCH %s] %s", self.name, self._search_summary(search))
+        settings = self.fstat_settings
+        if settings.output_dir is None:
             return
+        os.makedirs(settings.output_dir, exist_ok=True)
+        with open(os.path.join(settings.output_dir, self.SEARCH_LOG_NAME), "a") as handle:
+            handle.write(self._search_log_block(search))
+        if settings.save_search_records != "none":
+            self._save_record(self._search_record(search))
 
-        start_params_2 = np.tile(samples[-1][groups_running_now, None], (1, ntemps, 1, 1))
-        # Maybe not start from maximized values?
-        gibbs_sampling_setup_2 = np.ones(8, dtype=bool)
-        if ll_args_2[4]: # phase_maximization
-            gibbs_sampling_setup_2[np.array([3])] = False
+    def _search_summary(self, search):
+        """One line: the propose, the walker, the bands searched and passing, the outcome and the times."""
+        active = search["bands"]["active"]
+        parts = [f"propose {search['num_proposals']}, walker {search['walker']}, {int(active.sum())} of "
+                 f"{len(active)} bands searched"]
+        if "gate" in search:
+            gate = search["gate"]
+            thresholds = ", ".join(f"{value:.2f}" for value in np.unique(gate["thresholds"]))
+            parts.append(f"{int(gate['detected'].sum())} pass (thresholds {thresholds})")
+        parts.append(search["outcome"])
+        times = [f"{name} {search[key]['seconds']:.1f} s" for name, key in
+                 (("stage 1", "stage_1"), ("stage 2", "stage_2"), ("mixtures", "mixtures")) if key in search]
+        times.append(f"total {search['total_seconds']:.1f} s")
+        return "; ".join(parts) + "; " + ", ".join(times)
 
-        prior_transform_fn_2 = PriorTransformFn(
-            f0_min[groups_running_now] * 1e3,
-            f0_max[groups_running_now] * 1e3,
-            fdot_min[groups_running_now],
-            fdot_max[groups_running_now],
-        )
-        ngroups_2 = groups_running_now.sum().item()
-        # prior_transform_fn_2.transform_from_prior_basis(start_params_2, self.xp.arange(ngroups_2))
+    def _search_log_block(self, search):
+        """The search's block in fstat_search.log: its line, the stages and one line per passing band."""
+        lines = [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.name}: {self._search_summary(search)}"]
+        if "stage_1" in search:
+            stage_1, likelihood = search["stage_1"], search["likelihood_1"]
+            lines.append(
+                f"  stage 1: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s in the "
+                f"F-statistic; cold acceptance {stage_1['acceptance_cold'].min():.3f} to "
+                f"{stage_1['acceptance_cold'].max():.3f}")
+        if "start" in search:
+            replaced = search["start"]["replaced"]
+            lines.append(f"  maximizers: {int(replaced.sum())} of {replaced.size} start rows moved to the maximum, "
+                         f"{search['start']['seconds']:.1f} s")
+        if "stage_2" in search:
+            likelihood = search["likelihood_2"]
+            lines.append(f"  stage 2: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s "
+                         "in the likelihood")
+        if "gate" in search and search["gate"]["detected"].any():
+            bands, gate = search["bands"], search["gate"]
+            searched = np.flatnonzero(bands["active"])
+            largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
+            mixtures = search.get("mixtures")
+            counts = iter([] if mixtures is None or mixtures["components"] is None
+                          else [len(asnumpy(weights)) for weights in mixtures["components"][0]])
+            for order, position in enumerate(np.flatnonzero(gate["detected"])):
+                band = searched[position]
+                line = (f"    band {bands['ids'][band]}: {bands['low_mhz'][band]:.6f} to {bands['high_mhz'][band]:.6f} "
+                        f"mHz, largest sqrt(2F) {largest[position]:.2f} against {gate['thresholds'][position]:.2f}")
+                if "stage_2" in search:
+                    line += f", stage-2 cold acceptance {search['stage_2']['acceptance_cold'][order]:.3f}"
+                if mixtures is not None:
+                    line += (f", {next(counts)} mixture components" if mixtures["usable"][order]
+                             else ", chain not usable")
+                lines.append(line)
+        return "\n".join(lines) + "\n"
 
-        para_sampler_2 = ParaEnsembleSampler(
-            ndim,
-            nwalkers,
-            ngroups_2,
-            para_log_like,
-            priors,
-            tempering_kwargs=dict(ntemps=ntemps, Tmax=np.inf),
-            args=ll_args_2,
-            kwargs=dict(fstat=False),
-            gpu=self.gb.gpus[0],
-            periodic=self.periodic,
-            # backend: ParaBackend = None,  # add ParaHDFBackend
-            # update_fn: Callable = None,
-            # update_iterations=-1,
-            # stopping_fn: Callable = None,
-            # stopping_iterations: int=-1,
-            prior_transform_fn=prior_transform_fn_2,
-            name="gb",
-            gibbs_sampling_setup=gibbs_sampling_setup_2,
-            # provide_supplemental=False,
-        )
+    def _search_record(self, search):
+        """The search's arrays, under the keys of the port's earlier record; at "summary" without CHAIN_KEYS."""
+        settings = self.fstat_settings
+        bands = search["bands"]
+        record = {
+            "walker": search["walker"], "num_proposals": search["num_proposals"], "band_ids": bands["ids"],
+            "band_low_mhz": bands["low_mhz"], "band_high_mhz": bands["high_mhz"], "active": bands["active"],
+            "settings": json.dumps(asdict(settings)), "outcome": search["outcome"],
+            "total_seconds": search["total_seconds"],
+        }
+        if "stage_1" in search:
+            stage_1, likelihood, gate = search["stage_1"], search["likelihood_1"], search["gate"]
+            snr = gate["snr"]
+            record.update({
+                "stage1_cold_fstat": stage_1["cold_ll"].astype(np.float32),
+                "stage1_snr_quantiles": np.quantile(snr.reshape(len(snr), -1), [0.0, 0.05, 0.5, 0.95, 1.0], axis=1).T,
+                "stage1_last_cold": stage_1["last_cold"], "stage1_acceptance_cold": stage_1["acceptance_cold"],
+                "stage1_swap_acceptance": stage_1["swap_acceptance"], "stage1_seconds": stage_1["seconds"],
+                "stage1_betas_start": np.asarray(settings.betas_1, dtype=float), "stage1_betas_end": stage_1["betas"],
+                "stage1_rows": likelihood.rows, "stage1_calls": likelihood.calls,
+                "stage1_likelihood_seconds": likelihood.seconds,
+                "detected": gate["detected"], "detection_rule": "maximum", "detection_thresholds": gate["thresholds"],
+                "detection_targets": gate["targets"],
+            })
+        if "start" in search:
+            start = search["start"]
+            record.update({"stage2_start": start["rows"], "stage2_start_fstat": start["fstat"],
+                           "stage2_start_replaced": start["replaced"], "maximize_seconds": start["seconds"]})
+        if "stage_2" in search:
+            stage_2, likelihood = search["stage_2"], search["likelihood_2"]
+            record.update({
+                "stage2_cold_coords": stage_2["cold_coords"], "stage2_cold_ll": stage_2["cold_ll"],
+                "stage2_acceptance_cold": stage_2["acceptance_cold"],
+                "stage2_swap_acceptance": stage_2["swap_acceptance"],
+                "stage2_betas_start": np.asarray(settings.betas_2, dtype=float), "stage2_betas_end": stage_2["betas"],
+                "stage2_seconds": stage_2["seconds"], "stage2_rows": likelihood.rows, "stage2_calls": likelihood.calls,
+                "stage2_likelihood_seconds": likelihood.seconds,
+            })
+        if "mixtures" in search:
+            mixtures = search["mixtures"]
+            record.update({"gmm_usable": mixtures["usable"], "gmm_seconds": mixtures["seconds"]})
+            if mixtures["components"] is not None:
+                record.update(self.padded_components(mixtures["components"]), gmm_layout="theta_lam",
+                              gmm_chunk_bands=mixtures["chunk"])
+        if settings.save_search_records != "full":
+            for key in self.CHAIN_KEYS:
+                record.pop(key, None)
+        return record
 
-        new_state = ParaState(
-            {"gb": start_params_2}, groups_running=self.xp.ones(ngroups_2, dtype=bool)
-        )
-        new_state.log_prior = para_sampler_2.compute_log_prior(new_state.branches_coords)
-        new_state.log_like = para_sampler_2.compute_log_like(
-            new_state.branches_coords, logp=new_state.log_prior
-        )
+    @staticmethod
+    def padded_components(components):
+        """The seven component lists as padded numpy arrays for the record (NaN beyond a band's count)."""
+        weights, means, covs, _, _, mins, maxs = components
+        counts = np.array([len(asnumpy(weight)) for weight in weights], dtype=int)
+        n_bands, most, ncols = len(weights), int(counts.max()), int(asnumpy(means[0]).shape[-1])
+        padded = {
+            "gmm_counts": counts,
+            "gmm_weights": np.full((n_bands, most), np.nan),
+            "gmm_means": np.full((n_bands, most, ncols), np.nan),
+            "gmm_covs": np.full((n_bands, most, ncols, ncols), np.nan),
+            "gmm_mins": np.array([asnumpy(value) for value in mins]),
+            "gmm_maxs": np.array([asnumpy(value) for value in maxs]),
+        }
+        for band, count in enumerate(counts):
+            padded["gmm_weights"][band, :count] = asnumpy(weights[band])
+            padded["gmm_means"][band, :count] = asnumpy(means[band])
+            padded["gmm_covs"][band, :count] = asnumpy(covs[band])
+        return padded
 
-        if np.any(np.isinf(new_state.log_prior)):
-            breakpoint()
+    def _save_record(self, record):
+        """The record as <move name>_search_<n>.npz in output_dir, n counting on from the files there, so that a
+        continued run adds to them."""
+        folder = self.fstat_settings.output_dir
+        prefix = f"{self.name.replace(' ', '_')}_search_"
+        if self._next_record is None:
+            taken = [int(name[len(prefix):-4]) for name in os.listdir(folder)
+                     if name.startswith(prefix) and name.endswith(".npz") and name[len(prefix):-4].isdigit()]
+            self._next_record = max(taken, default=-1) + 1
+        np.savez_compressed(os.path.join(folder, f"{prefix}{self._next_record:05d}.npz"), **record)
+        self._next_record += 1
 
-        para_sampler_2.run_mcmc(new_state, nsteps_2, burn=burn_2, progress=True)
+    # ==================================================================================================================
+    # Math of the search: the band-restricted start draws, the F-statistic algebra, the gate and the theta rows
+    # ==================================================================================================================
 
-        samples_2 = self.xp.asarray(para_sampler_2.get_chain()[:, :, 0])
-        # check_ll_2 = para_sampler_2.get_log_like()[:, :, 0]
+    @classmethod
+    def joint_f0_fdot_prior(cls, prior_container):
+        """The joint (f0, fdot) entry of a prior container: its one distribution with a ``get_fdot_bounds`` method."""
+        found = [(columns, dist) for columns, dist in prior_container.priors if hasattr(dist, "get_fdot_bounds")]
+        if len(found) != 1:
+            raise ValueError(f"the prior container holds {len(found)} joint (f0, fdot) entries; the search needs one")
+        columns, dist = found[0]
+        if np.asarray(columns).reshape(-1).tolist() != [cls.COL_F0, cls.COL_FDOT]:
+            raise ValueError(
+                f"the joint (f0, fdot) prior sits on columns {columns}, not [{cls.COL_F0}, {cls.COL_FDOT}]")
+        return dist
 
-        # Diagnostics disabled (stft_tof): computed-but-unused likelihood sweeps.
-        # check_real_ll_phase_maximized_2 = asnumpy(
-        #     para_log_like(samples_2.reshape(-1, 8), *ll_args, fstat=False)
-        #     .reshape(samples_2.shape[:-1])
-        # )
-        # check_real_ll_2 = asnumpy(
-        #     para_log_like(samples_2.reshape(-1, 8), *ll_args_2, fstat=False)
-        #     .reshape(samples_2.shape[:-1])
-        # )
+    @staticmethod
+    def one_column_bounds(prior_container, column):
+        """(minimum, maximum) of the one-column prior of ``column``, or None when the column has none."""
+        for columns, dist in prior_container.priors:
+            if np.asarray(columns).reshape(-1).tolist() == [column] and hasattr(dist, "minimum"):
+                return float(dist.minimum), float(dist.maximum)
+        return None
 
-        samples_2 = samples_2.transpose(1, 0, 2, 3)
-        # np.save("/workspace/rrondeel/erebor/testing/highf_gb/search2_samples_check.npy", samples_2)
+    @classmethod
+    def band_start(cls, prior_container, f0_low_mhz, f0_high_mhz, ntemps, nwalkers):
+        """Draws of the run prior restricted to each band, shape (n_bands, ntemps, nwalkers, 8), numpy.
 
-        st = time.perf_counter()
-        samples_2_tmp = samples_2.reshape(samples_2.shape[0], -1, samples_2.shape[-1])[
-            :, :, np.array([0, 1, 2, 4, 6, 7])
-        ]
+        Every column comes from the run prior; then f0 is uniform in the band and fdot uniform between the joint
+        prior's bounds at that f0, which is the run prior restricted to the band.
+        """
+        f0_low = np.asarray(f0_low_mhz, dtype=float)
+        f0_high = np.asarray(f0_high_mhz, dtype=float)
+        shape = (len(f0_low), ntemps, nwalkers)
+        start = np.asarray(asnumpy(prior_container.rvs(size=shape)), dtype=float).copy()
+        f0_draws = np.random.uniform(f0_low[:, None, None], f0_high[:, None, None], size=shape)
+        fdot_low, fdot_high = cls.joint_f0_fdot_prior(prior_container).get_fdot_bounds(f0_draws)
+        start[..., cls.COL_F0] = f0_draws
+        start[..., cls.COL_FDOT] = np.random.uniform(asnumpy(fdot_low), asnumpy(fdot_high))
+        return start
 
-        if self.xp.isnan(samples_2_tmp).any() or self.xp.isinf(samples_2_tmp).any():
-            logger.warning(
-                f"samples_2_tmp contains NaN or Inf before GMM fitting. \
-                NaN count: {self.xp.isnan(samples_2_tmp).sum()}. \
-                Inf count: {self.xp.isinf(samples_2_tmp).sum()}. \
-                Skipping search..."
-            )
-            return
-            # breakpoint()
-            # raise ValueError(
-            #     f"samples_2_tmp contains NaN or Inf before GMM fitting. "
-            #     f"NaN count: {self.xp.isnan(samples_2_tmp).sum()}, "
-            #     f"Inf count: {self.xp.isinf(samples_2_tmp).sum()}"
-            # )
+    @classmethod
+    def fstat_amplitudes(cls, projections, overlaps, keep):
+        """Maximum-likelihood filter amplitudes per row, the solution a of M a = N; rows not kept get zeros."""
+        xp = get_array_module(projections)
+        num_rows = projections.shape[0]
+        overlap_matrix = xp.zeros((num_rows, 4, 4))
+        overlap_matrix[:, xp.asarray(cls.TRIU[0]), xp.asarray(cls.TRIU[1])] = overlaps
+        overlap_matrix = overlap_matrix + xp.swapaxes(overlap_matrix, 1, 2)
+        diagonal = xp.arange(4)
+        # the symmetrisation counted the diagonal twice
+        overlap_matrix[:, diagonal, diagonal] *= 0.5
+        # rows not run hold zeros; the identity keeps the batched solve defined
+        overlap_matrix[~keep] = xp.eye(4)
+        return xp.linalg.solve(overlap_matrix, projections[..., None])[..., 0]
 
-        ranges = samples_2_tmp.max(axis=1) - samples_2_tmp.min(axis=1)  # (n_groups, n_features)
-        degenerate = (ranges == 0)
-        if degenerate.any():
-            bad_groups, bad_feats = self.xp.where(degenerate)
-            logger.warning(
-                f"Degenerate features (zero range) in groups {bad_groups} \
-                for features {bad_feats}. transform_to_gmm_basis will produce NaN. \
-                Skipping search..."
-            )
-            return
-            # breakpoint()
-            # raise ValueError(
-            #     f"Degenerate features (zero range) in groups {bad_groups} "
-            #     f"for features {bad_feats}. transform_to_gmm_basis will produce NaN."
-            # )
+    @staticmethod
+    def extrinsics_from_amplitudes(amplitudes):
+        """(A, cos iota, psi, phi0) of the template sum_i amplitudes_i A_i, by the map of ``GBGPU.get_fstat_ll``.
 
-        full_gmm = vec_fit_gmm_min_bic(
-            samples_2_tmp,
-            min_comp=1,
-            max_comp=30,
-            n_samp_bic_test=5000,
-            gpu=self.xp.cuda.runtime.getDevice(),
-            verbose=False,
-        )
-        # import pickle
-        # with open("gmm_tmp.pickle", "wb") as fp:
-        #     pickle.dump(full_gmm, fp, pickle.HIGHEST_PROTOCOL)
+        The four filters A_i are the templates at A = 2, iota = pi/2 with (psi, phase) = (0, 0), (pi/4, pi),
+        (0, 3 pi/2) and (pi/4, pi/2), as in the FD kernel. The DFFR waveform takes phi0 with the LDC sign, as GBGPU's
+        map does, but its inclination enters with the opposite sign, so cos iota is the negative of the FD map's.
+        """
+        xp = get_array_module(amplitudes)
+        first, second, third, fourth = (amplitudes[:, index] for index in range(4))
+        # harmonic projections
+        cos_minus = first + fourth
+        sin_minus = third - second
+        cos_plus = first - fourth
+        sin_plus = -(second + third)
+        # for the DFFR template norm_minus = A (1 + cos iota)^2 / 2 and norm_plus = A (1 - cos iota)^2 / 2
+        norm_minus = xp.hypot(cos_minus, sin_minus)
+        norm_plus = xp.hypot(cos_plus, sin_plus)
+        amp_plus = norm_minus + norm_plus
+        amp_cross = norm_minus - norm_plus
+        two_amp = amp_plus + 2.0 * xp.sqrt(norm_minus * norm_plus)
+        amplitude = 0.5 * two_amp
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # ! the FD map has -amp_cross here; the DFFR waveform needs the opposite sign
+            cos_iota = xp.clip(amp_cross / two_amp, -1.0, 1.0)
+        # theta_minus = 2 psi - phi0 and theta_plus = 2 psi + phi0
+        theta_minus = xp.arctan2(sin_minus, cos_minus)
+        theta_plus = xp.arctan2(sin_plus, cos_plus)
+        psi = (0.25 * (theta_plus + theta_minus)) % np.pi
+        phi0 = (0.5 * (theta_plus - theta_minus)) % (2.0 * np.pi)
+        return amplitude, cos_iota, psi, phi0
 
-        et = time.perf_counter()
-        logger.info(f"Runtime of GPU GMM FIT: {round(et - st,3)} seconds")
+    @classmethod
+    def detection_gate(cls, snr, band_low_hz, snr_eff_threshold, frequency_hz, inflation_factor):
+        """Bands whose largest stored cold sqrt(2F) passes the threshold of their effective-SNR target.
 
-        rj_dist = ProbDistContainer(
-            {
-                ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
-                "phi0": uniform_dist(0.0, 2 * np.pi),
-                "psi": uniform_dist(0.0, np.pi),
-            },
-            use_cupy=True,
-        )
-        rj_dist.reset_key_order(["A", "f0", "fdot", "phi0", "cos_iota", "psi", "alpha", "sin_delta"])
-        # if self.ranks_needed == 0:
-        #     gmms = [GMMFit(samples_2[i].get().reshape(-1, 8)) for i in range(samples_2.shape[0])[:10]]
-        #     gmm_info = gather_gmms(gmms)
+        ``snr`` is (bands, steps, walkers). A band at or above ``frequency_hz`` (None puts every band there) has the
+        target ``snr_eff_threshold``. Below it the galactic foreground inflates the noise PSD by ``inflation_factor``,
+        which lowers a source's effective SNR by its square root, so the target is snr_eff_threshold /
+        sqrt(inflation_factor): both regimes pass the same SNR on the settled noise. The threshold on the maximum is
+        sqrt(target^2 + 8 - drop), with drop the median of the smallest chi2(4) drop among the stored samples. A
+        negative target passes every band. Returns the decisions, the thresholds and the targets.
+        """
+        snr = np.asarray(snr, dtype=float)
+        n_bands = snr.shape[0]
+        n_samples = int(np.prod(snr.shape[1:]))
+        drop = float(stats.chi2.ppf(1.0 - 0.5 ** (1.0 / n_samples), cls.GATE_DROP_DOF))
+        band_low_hz = np.asarray(band_low_hz, dtype=float)
+        foreground = np.zeros(n_bands, dtype=bool) if frequency_hz is None else band_low_hz < float(frequency_hz)
+        target = np.where(foreground, snr_eff_threshold / np.sqrt(inflation_factor), snr_eff_threshold)
+        threshold = np.where(target < 0.0, -np.inf,
+                             np.sqrt(np.maximum(target**2 + cls.GATE_PEAK_OFFSET - drop, 0.0)))
+        detected = snr.reshape(n_bands, -1).max(axis=1) > threshold
+        return detected, threshold, target
 
-        # else:
-        #     if self.comm_info is None:
-        #         # this only happens the first time through
-        #         self.comm_info = self.comm.recv(tag=232342)
+    @classmethod
+    def theta_rows(cls, rows, xp=np):
+        """A copy of sampling rows with theta+ = 2 psi + phi0 in phi0's column and theta- = 2 psi - phi0 in psi's; the
+        other columns stay, f0 in column 1, where the mixture's culling reads it."""
+        out = xp.asarray(rows, dtype=xp.float64).copy()
+        phi0, psi = out[..., cls.COL_PHI0].copy(), out[..., cls.COL_PSI].copy()
+        out[..., cls.COL_PHI0] = 2.0 * psi + phi0
+        out[..., cls.COL_PSI] = 2.0 * psi - phi0
+        return out
 
-        #     gmm_info = fit_gmm(samples_2.get(), self.comm, self.comm_info)
+    @staticmethod
+    def phases_from_theta(theta_plus, theta_minus, phase_copy, psi_copy, xp=np):
+        """(phi0, psi) in [0, 2 pi) of theta+- = 2 psi +- phi0, at the copy (phi0 + pi, psi + pi/2) where ``phase_copy``
+        is set and at psi + pi where ``psi_copy`` is set: the four points where the template is the same."""
+        phi0 = xp.mod(0.5 * (theta_plus - theta_minus) + np.pi * phase_copy, 2.0 * np.pi)
+        psi = xp.mod(0.25 * (theta_plus + theta_minus) + 0.5 * np.pi * phase_copy + np.pi * psi_copy, 2.0 * np.pi)
+        return phi0, psi
 
-        # full_gmm = FullGaussianMixtureModel(*gmm_info, use_cupy=self.use_gpu)
-        # breakpoint()
 
-        # gen_samp = self.xp.asarray(rj_dist.rvs(1000))
-        # gen_ll, gen_opt_snr = para_log_like(gen_samp, *ll_args, fstat=False, return_snr=True)
-        # print(gen_ll, self.gb.d_h / gen_opt_snr, gen_opt_snr)
-        # breakpoint()
-        self.rj_proposal_distribution = {"gb": rj_dist}
+# ======================================================================================================================
+# The objects the F-statistic search hands to Eryn and the band sorter
+# ======================================================================================================================
+
+
+class BandMaskTransform:
+    """Band restriction of the run prior through Eryn's per-sampler prior transform.
+
+    Eryn's ``EnsembleSampler(nsamplers=...)`` calls ``transform_to_prior_basis(coords, samplers_running_idx)`` on a copy
+    of the (n_running, ntemps, nwalkers, ndim) coordinates before it evaluates the prior, then ``adjust_logp(logp,
+    samplers_running_idx)``. Sampler s covers [f0_low[s], f0_high[s]] in mHz: an f0 outside it is moved to
+    ``outside_f0_mhz``, below the run prior's f0 range, where the prior is -inf. Inside the band the density is the run
+    prior's own, its f0-dependent fdot bounds included. The band's normalisation is one constant per sampler, which
+    neither the stretch nor the swaps inside a sampler see, so ``adjust_logp`` adds nothing.
+    """
+
+    def __init__(self, f0_low_mhz, f0_high_mhz, outside_f0_mhz):
+        self.f0_low = np.asarray(f0_low_mhz, dtype=float)
+        self.f0_high = np.asarray(f0_high_mhz, dtype=float)
+        if self.f0_low.shape != self.f0_high.shape or np.any(self.f0_high <= self.f0_low):
+            raise ValueError("every band needs f0_low < f0_high")
+        self.outside_f0 = float(outside_f0_mhz)
+
+    def transform_to_prior_basis(self, coords, samplers_running_idx):
+        low = self.f0_low[samplers_running_idx][:, None, None]
+        high = self.f0_high[samplers_running_idx][:, None, None]
+        # a view of the f0 column, so the assignment changes Eryn's buffer in place
+        f0_column = coords[..., GBFStatRJMove.COL_F0]
+        f0_column[(f0_column < low) | (f0_column > high)] = self.outside_f0
+
+    def adjust_logp(self, logp, samplers_running_idx):
+        return logp
+
+
+class FStatSearchLikelihood:
+    """Vectorized likelihood of a search sampler against one walker's residual: sampling-basis rows (numpy) to one
+    value per row (numpy).
+
+    ``fstat=True`` gives F (stage 1), ``fstat=False`` the full ln L of the band engine's ``get_ll`` (stage 2), both
+    against the residual that each of ``owners`` (rows of ``holder``) holds: the walker itself, or its copy on every
+    card, which then take equal blocks of each call's rows. :meth:`terms` gives the F-statistic terms that the
+    maximizers solve. Counts the calls, the rows and the seconds.
+    """
+
+    def __init__(self, engine, holder, owners, transform, fstat, phase_maximize=False, waveform_kwargs=None):
+        self.engine, self.holder = engine, holder
+        self.owners = np.atleast_1d(np.asarray(owners, dtype=np.int32))
+        self.transform, self.fstat = transform, bool(fstat)
+        self.phase_maximize = bool(phase_maximize)
+        self.waveform_kwargs = {} if waveform_kwargs is None else waveform_kwargs
+        self.calls, self.rows, self.seconds = 0, 0, 0.0
+
+    def row_owners(self, num_rows):
+        """The holder row that each of ``num_rows`` rows reads: equal consecutive blocks, one per owner."""
+        xp = self.engine.xp
+        blocks = (xp.arange(num_rows) * len(self.owners)) // max(num_rows, 1)
+        return xp.asarray(self.owners)[blocks]
+
+    def terms(self, params_phys):
+        """F-statistic terms of waveform rows against the owners' residual: N (n, 4), M (n, 10) and 2F (n).
+
+        One ``get_fstat_terms_stft`` call (the templates T+ and Tx of a row in one pass) per split of the band engine's
+        plan, with the split's own comp and window starts, as the engine's ``get_ll`` runs, so the search sees the
+        sampling's response, grid and noise. Rows whose f0 bin falls outside the grid are not run (the engine's
+        central-bin keep), and their terms stay zero. Returns N, the upper triangle of M (``numpy.triu_indices(4)``
+        order), 2F and the keep mask, in xp.
+        """
+        engine, holder = self.engine, self.holder
+        xp = engine.xp
+        params_phys = xp.atleast_2d(xp.asarray(params_phys, dtype=xp.float64))
+        num_rows = int(params_phys.shape[0])
+        projections = xp.zeros((num_rows, 4))
+        overlaps = xp.zeros((num_rows, 10))
+        two_f = xp.zeros(num_rows)
+        keep = engine._central_bin_keep(params_phys)
+        if bool(keep.any()):
+            rows_kept = xp.where(keep)[0]
+            walker_index = self.row_owners(int(rows_kept.shape[0]))
+            plan = engine._split_plan(holder, walker_index, walker_index)
+            plan_rows = [rows_kept[sub_rows] for _split, sub_rows, _data, _noise, _device in plan]
+            # ! Each owner's block goes to its split, and every split launches before any is waited for. A split on
+            # ! another card than the caller's runs on its own stream: it waits for the caller's rows and parameters, and
+            # ! the caller waits for its outputs before copying them, as the engine's get_ll does; without the waits the
+            # ! copies read zero-filled outputs.
+            caller_ready = engine._stream_event(plan[0][4]) if plan else None
+            launched = []
+            for (split, _sub_rows, intra_data, intra_noise, device), rows in zip(plan, plan_rows):
+                with holder.device_context(device):
+                    engine._wait_events(caller_ready)
+                    comp = engine._comp_for_split(holder, split, device)
+                    outputs = comp.get_fstat_terms_stft(
+                        params_phys[rows], data_index=intra_data, noise_index=intra_noise,
+                        start_freq_inds=engine._split_start_inds(holder, split))
+                    launched.append((rows, outputs, engine._stream_event(device)))
+            for rows, (projections_split, overlaps_split, two_f_split), ready in launched:
+                engine._wait_events(ready)
+                projections[rows] = projections_split
+                overlaps[rows] = overlaps_split
+                two_f[rows] = two_f_split
+        return projections, overlaps, two_f, keep
+
+    def __call__(self, coords):
+        time_start = time.perf_counter()
+        xp = self.engine.xp
+        coords = np.atleast_2d(np.asarray(coords, dtype=float))
+        # the transform runs on the host: Eryn's arrays are numpy, and it is a few array operations per row
+        params_phys = xp.asarray(self.transform.both_transforms(coords))
+        if self.fstat:
+            _, _, two_f, keep = self.terms(params_phys)
+            values = xp.where(keep, 0.5 * two_f, GBFStatRJMove.REJECTED_LL)
+        else:
+            walker_index = self.row_owners(coords.shape[0])
+            values = self.engine.get_ll(self.holder, params_phys, data_index=walker_index, noise_index=walker_index,
+                                        N_vals=None, phase_maximize=self.phase_maximize,
+                                        waveform_kwargs=self.waveform_kwargs)
+        out = np.asarray(asnumpy(values), dtype=float)
+        # Eryn refuses NaN; a value that is not finite means the row could not be scored
+        out[~np.isfinite(out)] = GBFStatRJMove.REJECTED_LL
+        self.calls += 1
+        self.rows += coords.shape[0]
+        self.seconds += time.perf_counter() - time_start
+        return out
+
+
+class FStatPhaseProposal:
+    """RJ birth proposal of the F-statistic move on sampling rows, from a mixture over the theta rows
+    (:meth:`GBFStatRJMove.theta_rows`).
+
+    ``mixture`` is a :class:`FullGaussianMixtureModel` with theta+, theta- and lam periodic. The template is the same at
+    the four points (phi0, psi), (phi0, psi + pi), (phi0 + pi, psi + pi/2) and (phi0 + pi, psi + 3 pi/2) of
+    [0, 2 pi)^2, where theta+- agree, and a draw takes one of them with probability 1/4. The map from (phi0, psi) to
+    (theta+, theta-) has Jacobian 4, so the density of a row is the mixture's at its theta+-.
+    """
+
+    def __init__(self, mixture):
+        self.mixture = mixture
+        self.xp = cp if mixture.use_cupy else np
+
+    def rvs(self, size=1):
+        xp = self.xp
+        move = GBFStatRJMove
+        shape = (size,) if isinstance(size, (int, np.integer)) else tuple(size)
+        rows = self.mixture.rvs(size=(int(np.prod(shape)),))
+        theta_plus, theta_minus = rows[:, move.COL_PHI0].copy(), rows[:, move.COL_PSI].copy()
+        # * one of the four points of the template's symmetry, each with probability 1/4
+        phase_copy = xp.random.rand(theta_plus.shape[0]) < 0.5
+        psi_copy = xp.random.rand(theta_plus.shape[0]) < 0.5
+        rows[:, move.COL_PHI0], rows[:, move.COL_PSI] = move.phases_from_theta(
+            theta_plus, theta_minus, phase_copy, psi_copy, xp=xp)
+        return rows.reshape(shape + (move.NDIM,))
+
+    def logpdf(self, x):
+        return self.mixture.logpdf(GBFStatRJMove.theta_rows(x, self.xp))
+
+
+# * The name of the FD serial search, which settings files still import.
+GBSpecialRJSerialSearchMCMC = GBFStatRJMove
 
 
 class GBSpecialRJSearchMove(GBSpecialBase): #? only needed for mutli GPU usage
@@ -4016,7 +5466,8 @@ class GBSpecialRJRefitMove(GBSpecialBase):
             {
                 ("A", "f0", "fdot", "cos_iota", "alpha", "sin_delta"): full_gmm,
                 "phi0": uniform_dist(0.0, 2 * np.pi),
-                "psi": uniform_dist(0.0, np.pi),
+                # * the prior's psi range: on [0, pi) the move can neither propose nor remove a source in [pi, 2 pi)
+                "psi": uniform_dist(0.0, 2 * np.pi),
             },
             use_cupy=True,
         )

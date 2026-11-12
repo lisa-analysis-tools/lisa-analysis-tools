@@ -38,7 +38,6 @@ def _domain_factory(domain):
 def _processor_init_kwargs(cfg: RunConfig) -> dict:
     orbits = cfg.data.orbits
     orbits_kwargs = orbits.model_dump(exclude={"type"}, exclude_none=True)
-    # orbits_kwargs["force_backend"] = "cpu"
     return dict(
         L1_folder=str(cfg.data.path),
         source_types=list(cfg.data.source_types),
@@ -77,7 +76,6 @@ def make_general_settings(cfg: RunConfig) -> GeneralSettings:
     _pre_config(cfg)  
 
     run, window, meta = cfg.run, cfg.window, cfg.metadata
-    taper = 1.0 / cfg.domain.min_freq if window.taper_duration == "auto" else window.taper_duration
 
     return GeneralSettings(
         # run
@@ -101,7 +99,7 @@ def make_general_settings(cfg: RunConfig) -> GeneralSettings:
         preprocess_kwargs=_preprocess_kwargs(cfg),
         domain_settings=_domain_factory(cfg.domain),
         window_type=window.type,
-        window_taper_duration=taper,
+        window_taper_duration=cfg.taper_duration,
         normalize_window=window.normalize,
         # sensitivity
         sensitivity_backend_class=_sensitivity_class(cfg.sensitivity.class_name),

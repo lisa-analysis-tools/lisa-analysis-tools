@@ -58,6 +58,8 @@ SPECIAL_PSD_MOVE_FILLED = frozenset({
     "sensitivity_backend", "temperature_control", "periodic", "use_gpu",
 })
 GENERIC_PSD_MOVE_FILLED = frozenset({"branch_name", "num_repeats", "Tmax", "betas"})
+# search interface arguments the builder fills from the prior (make_search_interface)
+SEARCH_INTERFACE_FILLED = frozenset({"transform", "periodic"})
 
 
 class PEMove(NamedTuple):
@@ -119,6 +121,32 @@ class StageSpec(_Spec):
 class TemperingSpec(_Spec):
     ntemps: PositiveInt | None = None  # None -> sampler.ntemps
     ratio: float = Field(default=1.2, gt=1.0)  # geometric ladder: betas = ratio ** -arange(ntemps)
+    # the hottest rung's temperature: its beta becomes 1 / Tmax, the other rungs stay ratio ** -k
+    Tmax: float | None = Field(default=None, gt=1.0)
+    # the ladder itself, coldest first (strictly decreasing, in (0, 1]); replaces ntemps, ratio and Tmax
+    betas: list[float] | None = None
+
+    @model_validator(mode="after")
+    def _ladder_is_consistent(self):
+        if self.betas is None:
+            return self
+        # * by value, not by fields set: a snapshot writes every field out (ratio at its default, the others None)
+        clashing = [key for key in ("ntemps", "ratio", "Tmax") if getattr(self, key) != type(self).model_fields[key].default]
+        if clashing:
+            raise ValueError(f"tempering.betas gives the ladder itself; leave out {clashing}.")
+        betas = np.asarray(self.betas, dtype=float)
+        # * The cold chain samples the posterior: the ladder starts at beta 1, as the ratio and Tmax ladders do.
+        if betas.size == 0 or np.any(np.diff(betas) >= 0) or betas[0] != 1.0 or betas[-1] <= 0.0:
+            raise ValueError(
+                f"tempering.betas {self.betas} must be a strictly decreasing list from 1.0 (the cold chain), "
+                "positive to the end."
+            )
+        return self
+
+    @property
+    def rungs(self) -> int | None:
+        """The ladder's number of rungs when the spec fixes it (betas or ntemps); None -> sampler.ntemps."""
+        return len(self.betas) if self.betas is not None else self.ntemps
 
 class FlowSpec(_Spec):
     """A normalizing-flow proposal (``ConditionalFlowMove``) trained online by a ``ProcessExecutor``.
@@ -171,20 +199,31 @@ class SearchSpec(_Spec):
     The interface (``lisatools.globalfit.searches``) gets the prior's transform and periodicity from
     the builder and seeds through the inverse transform (``GlobalFit.load_info``, fresh starts). A block
     without ``search`` gets its ``DEFAULT_SEARCH``: none for source branches (they start empty), ``prior`` for
-    psd/galfor. The psd max-likelihood search runs whatever the seeding.
+    psd/galfor. The psd max-likelihood search runs whatever the seeding. ``kwargs`` are the interface
+    class's own arguments (e.g. ``evolve_to_data_start`` of the GB interface), checked against that class
+    at load.
     """
 
     search_type: Literal["prior", "distribution", "samples", "point_estimate", "catalog"] = "catalog"
-    search_path: RunPath | None = None  # samples / point estimates: a file or a folder (one file per source)
+    # samples / point estimates: a file or a folder (one file per source), each a .npy of physical values or an
+    # .h5/.hdf5 catalogue table (one root dataset per catalogue column); catalog reads the injection catalogue, no file
+    search_path: RunPath | None = None
     parameters_searched: list[str] | Literal["all"] = "all"  # names in the prior's input (sampling) basis
     # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
     spread: float | list[float] | list[list[float]] | list[list[list[float]]] | None = None
     is_eryn_backend: bool = False  # search results are an eryn backend, already in the sampling basis
+    max_resample_tries: PositiveInt = 50  # redraws of walkers that land outside the prior around a point value
+    kwargs: dict[str, Any] = Field(default_factory=dict)  # the interface class's own arguments
 
     @model_validator(mode="after")
     def _same_rules_as_the_interface(self):
         if self.search_type not in ("catalog", "prior") and self.search_path is None:
             raise ValueError(f"search_type {self.search_type!r} needs search_path.")
+        if self.search_type == "catalog" and self.search_path is not None:
+            raise ValueError(
+                "search_type 'catalog' seeds from the injection catalogue and reads no search_path; give a search "
+                "file as point_estimate (one point per source) or samples."
+            )
         if self.search_type in ("catalog", "point_estimate") and self.spread is None:
             raise ValueError(f"search_type {self.search_type!r} needs spread.")
         if self.search_path is not None and not self.search_path.exists():
@@ -277,6 +316,17 @@ class BlockBase(_Spec):
             )
         return self
 
+    @model_validator(mode="after")
+    def _search_kwargs_fit_the_interface(self):
+        if self.search is None or not self.search.kwargs:
+            return self
+        fields = sorted(set(self.search.kwargs) & set(SearchSpec.model_fields))
+        if fields:
+            raise ValueError(f"{fields} are search fields; give them next to search_type, not in search.kwargs.")
+        interface = getattr(importlib.import_module("lisatools.globalfit.searches"), self.SEARCH_INTERFACE)
+        check_kwargs(self.search.kwargs, interface, SEARCH_INTERFACE_FILLED)
+        return self
+
     def parse_prior_information(self, g: GeneralSetup) -> dict[str, Any]:
         """Return the prior, transform container, periodicity and basis for this block's priors."""
         priors_obj = make_priors(self, g)
@@ -319,6 +369,7 @@ class MoveBlock(BlockBase):
 
     PE_MOVES: ClassVar[dict[str, PEMove]]  # classes this block may name in pe_move
     FULL_LADDER: ClassVar[bool] = False  # True -> tempering.ntemps must equal sampler.ntemps
+    STAGES_HINT: ClassVar[str] = ""  # what a block whose pe_move takes no stage settings uses instead
 
     # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
     pe_move: ClassSpec
@@ -413,8 +464,13 @@ class SourceBlock(MoveBlock):
     def _stages_fit_the_moves(self):
         if not self.stages:
             return self
-        if self.PE_MOVES[self.pe_move.class_name].module != SPECIAL_MOVES:
-            raise ValueError(f"stages: need a special pe_move; {self.pe_move.class_name} takes no stage settings.")
+        # * The capability, not where the class lives: stage settings reach the move through apply_settings.
+        cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
+        if not hasattr(cls, "apply_settings"):
+            raise ValueError(
+                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings)."
+                + self.STAGES_HINT
+            )
         for name, stage in self.stages.items():
             weights = stage.inner_move_weights
             if weights is not None and self.inner_moves is None:
@@ -608,14 +664,20 @@ def make_betas(tempering: TemperingSpec | None, default_ntemps: int):
 
     if tempering is None:
         return None
+    if tempering.betas is not None:
+        return np.asarray(tempering.betas, dtype=float)
     ntemps = tempering.ntemps or default_ntemps
-    return 1.0 / tempering.ratio ** np.arange(ntemps)
+    betas = 1.0 / tempering.ratio ** np.arange(ntemps)
+    if tempering.Tmax is not None:
+        betas[-1] = 1.0 / tempering.Tmax
+    return betas
 
-def make_search_interface(block: BlockBase, info: dict[str, Any]):
+def make_search_interface(block: BlockBase, info: dict[str, Any], defaults: dict[str, Any] | None = None):
     """The block's search interface, or ``None`` without ``search``.
 
     The prior supplies what the interface needs to seed through the inverse transform: its transform and
-    its (branch-keyed) periodicity.
+    its (branch-keyed) periodicity. ``defaults`` are interface arguments the block sets unless its search
+    kwargs do.
     """
     spec = block.search if block.search is not None else block.DEFAULT_SEARCH
     if spec is None:
@@ -635,7 +697,8 @@ def make_search_interface(block: BlockBase, info: dict[str, Any]):
         spread=None if spec.spread is None else np.asarray(spec.spread, dtype=float),
         is_eryn_backend=spec.is_eryn_backend,
         periodic=info["periodic"],
-        **(block.search_interface_kwargs() if isinstance(block, SourceBlock) else {}),
+        max_resample_tries=spec.max_resample_tries,
+        **{**(defaults or {}), **deepcopy(spec.kwargs)},
     )
 
 def engine_waveform_kwargs(ctx: BuildContext, block: SourceBlock) -> dict[str, Any]:

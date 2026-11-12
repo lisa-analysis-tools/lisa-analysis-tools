@@ -2275,6 +2275,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             zero in the exact window convolution (checked per call against a rigorous
             bound; falls back to the full band with a warning). ``None`` (default):
             whole band.
+        device_galactic_grids: Map from device to its galactic grid, handed on by
+            :attr:`kwargs` so that a backend and its copies hold one grid per device.
+            Leave it out for a new backend.
     """
 
     def __init__(
@@ -2300,6 +2303,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         psd_batch_size: Optional[int] = None,
         window_convolution_mode: str = "exact",
         galaxy_fmax: Optional[float] = None,
+        device_galactic_grids: Optional[dict] = None,
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         if noise_symmetry not in NOISE_SYMMETRIES:
@@ -2355,10 +2359,12 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         self._averaging_active = False   # set True by get_averaged_ltts() in FD averaged mode
 
         self._setup()
-        
+
         self.galactic_grid_kwargs = galactic_grid_kwargs # for propagation to copies
+        # * A grid takes device memory outside the pool, 87 MiB on the full band
+        self.device_galactic_grids = {} if device_galactic_grids is None else device_galactic_grids
         include_galaxy = (isinstance(galactic_grid_kwargs, dict) and len(galactic_grid_kwargs) > 0)
-        
+
         if include_galaxy:
             self._sanitize_galactic_grid_kwargs(galactic_grid_kwargs)
             self._setup_galactic_grid(**galactic_grid_kwargs)
@@ -2387,6 +2393,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "psd_batch_size": self.psd_batch_size,
             "window_convolution_mode": self.window_convolution_mode,
             "galaxy_fmax": self.galaxy_fmax,
+            "device_galactic_grids": self.device_galactic_grids,
         }
 
     @property
@@ -2440,7 +2447,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
     def time_indices(self):
         """Integer indices into the time axis used by the C++ backend."""
         return self._time_indices
-    
+
 
     @time_indices.setter
     def time_indices(self, x):
@@ -2550,7 +2557,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         # check if we need multiple time points
         if hasattr(self.basis_settings, "t_arr"):
             t_arr = self.xp.asarray(self.basis_settings.t_arr)
-        
+
             tiled_times = self.xp.tile(
                 t_arr[:, self.xp.newaxis], (1, 6)
             ).flatten()  # compute ltts at these times with orbits
@@ -2709,7 +2716,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
         # Manually copy attributes
         for key, value in self.__dict__.items():
-            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays", "_avg_mosa_tf_arrays", "noise_normalization", "_alias_freqs_flat", "_spline_zeros") or key.startswith("_wconv_"):
+            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "device_galactic_grids", "_avg_tf_arrays", "_avg_mosa_tf_arrays", "noise_normalization", "_alias_freqs_flat", "_spline_zeros") or key.startswith("_wconv_"):
                 # Don't deepcopy backend objects - just reference.
                 # _avg_tf_arrays is referenced by raw pointers inside the (shared)
                 # pycpp_sensitivity_matrix, so copies MUST share these arrays.
@@ -2726,7 +2733,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             else:
                 # Deepcopy everything else
                 setattr(new_obj, key, deepcopy(value, memo))
-        
+
         return new_obj
 
     def _get_window_kernel(self):
@@ -2777,7 +2784,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         if self.n_alias == 0:
             return f_arr
         return self.xp.concatenate([f_arr, self.xp.abs(self._alias_freqs_flat)])
-                
+
     def _init_basis_settings(self):
         """Initialize basis settings from domain settings."""
         self.f_arr = self.xp.asarray(self.basis_settings.f_arr)
@@ -2835,7 +2842,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
     def _sanitize_galactic_grid_kwargs(self, kwargs: dict) -> None:
         """
         Check that the galactic grid kwargs are valid and contain the necessary parameters.
-        
+
         Args:
             kwargs: Dictionary of galactic grid parameters to check. Expected keys include:
                 - R_d: Disk radial scale length [kpc]
@@ -2906,7 +2913,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             t0: Reference time at which to compute the initial LISA orbital phase and rotation angle.
             N_lambda: Number of ecliptic longitude points for quadrature (default 90)
             N_beta: Number of ecliptic latitude points for quadrature (default 60)
-            galactic_grid: Optional pre-computed galactic grid object (e.g., from another instance) to reuse
+            galactic_grid: Optional pre-computed galactic grid object (e.g., from another instance) to reuse.
+                By default this device's grid in ``device_galactic_grids``, or a new one if it has none.
             f_b: Fraction of sources in a spherical Gaussian bulge ``exp(-r^2/r_b^2)``; the rest is in
                 the exponential disk (mass-normalized mixture). ``0`` (default) is the disk-only model.
             r_b: Bulge scale radius [kpc] (default 0.5)
@@ -2923,12 +2931,15 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         """
         if los_center_half_width is None:
             los_center_half_width = 5.0 * r_b if f_b > 0.0 else 0.0
+        device = self.xp.cuda.runtime.getDevice() if self.backend.uses_cupy else None
+        if galactic_grid is None:
+            galactic_grid = self.device_galactic_grids.get(device)
 
         if galactic_grid is not None:
             self._galactic_grid = galactic_grid
 
             # logger.info("Using provided galactic grid object, skipping re-initialization.")
-            
+
         else:
             if response == "analytic":
                 # cartwheel phases in the convention of the closed forms, fitted to the orbit arms
@@ -2950,7 +2961,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
                 los_center_half_width=float(los_center_half_width),
                 los_center_sub=int(los_center_sub),
             )
-            
+
             # logger.debug(f"Galactic sky grid: N_sky={setup.N_sky}, N_quad={setup.N_quad}")
 
             if hasattr(self.basis_settings, "t_arr"):
@@ -2981,6 +2992,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
                 r_b=float(r_b),
                 arms=self._orbit_arms(_t_arr) if response == "orbits" else None,
             )
+            self.device_galactic_grids[device] = self._galactic_grid
 
             # logger.info("Galactic grid initialized.")
 

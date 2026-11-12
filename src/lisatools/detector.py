@@ -191,6 +191,23 @@ class Orbits(LISAToolsParallelModule, ABC):
         )
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
 
+    def __deepcopy__(self, memo):
+        """A distinct object that shares the arrays of a configured orbit.
+
+        :func:`copy_orbits` says why that is correct. Deep copies of a settings tree and each
+        computation's private copy would otherwise put one more table on the device, 1.26 GiB for
+        a Mojito L1 orbit. An unconfigured orbit holds no device arrays and is copied in full.
+        """
+        if self.configured:
+            duplicate = shallow_copy(self)
+            memo[id(self)] = duplicate
+            return duplicate
+        duplicate = self.__class__.__new__(self.__class__)
+        memo[id(self)] = duplicate
+        for name, value in self.__dict__.items():
+            duplicate.__dict__[name] = deepcopy(value, memo)
+        return duplicate
+
     @property
     def frame(self) -> str:
         """Reference frame of the orbit data (``"ecliptic"`` or ``"icrs"``)."""

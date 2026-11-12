@@ -3703,7 +3703,7 @@ def para_log_like(
         x[:, 0] = np.log(gb.A_max)
         x[:, 3] = gb.phi0_max % (2 * np.pi)
         x[:, 4] = np.cos(gb.iota_max % (np.pi))
-        x[:, 5] = gb.psi_max % (np.pi)
+        x[:, 5] = gb.psi_max % (2 * np.pi)
 
     else:
         # breakpoint()

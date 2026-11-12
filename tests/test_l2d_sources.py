@@ -264,6 +264,29 @@ class SourceSchemaTest(_Sources):
             blocks={"mbh": {**MBH_BLOCK, "tempering": {"ntemps": too_many}}},
         )
 
+    def test_direct_betas_schema(self):
+        sampler_ntemps = self.config({}).sampler.ntemps
+        tempering = self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": [1.0, 0.5]}}}).blocks["mbh"].tempering
+        self.assertEqual((tempering.betas, tempering.rungs), ([1.0, 0.5], 2))
+        # a snapshot writes every field out (ratio at its default, ntemps and Tmax None) and reloads
+        self.assertEqual(type(tempering).model_validate(tempering.model_dump()), tempering)
+        for betas, msg in (
+            (list(0.5 ** np.arange(sampler_ntemps + 1)), "length of tempering.betas"),
+            ([], "strictly decreasing list from 1.0"),
+            ([1.0, 1.0], "strictly decreasing list from 1.0"),
+            ([0.5, 1.0], "strictly decreasing list from 1.0"),
+            ([1.5, 0.5], "strictly decreasing list from 1.0"),
+            ([1.0, 0.0], "strictly decreasing list from 1.0"),
+            ([0.9, 0.5], "strictly decreasing list from 1.0"),  # the cold chain would sample at T = 1.11
+        ):
+            with self.subTest(betas=betas), self.assertRaises(ValidationError) as ctx:
+                self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": betas}}})
+            self.assertIn(msg, str(ctx.exception))
+        for extra in ({"ntemps": 2}, {"ratio": 1.5}, {"Tmax": 10.0}):
+            with self.subTest(extra=extra), self.assertRaises(ValidationError) as ctx:
+                self.config({"mbh": {**MBH_BLOCK, "tempering": {"betas": [1.0, 0.5], **extra}}})
+            self.assertIn("gives the ladder itself", str(ctx.exception))
+
     def test_disabled_blocks_skip_the_run_checks(self):
         cfg = self.config(mbh_block(enabled=False), reference_time=None, source_ids={}, source_types=["noise"])
         self.assertFalse(cfg.blocks["mbh"].enabled)
@@ -333,6 +356,11 @@ class MBHBuildTest(_Built):
     def test_subset_ladder(self):
         _, built = self.build({"mbh": {**MBH_BLOCK, "tempering": {"ntemps": 3, "ratio": 2.0}}})
         np.testing.assert_allclose(built["mbh"].setup.betas, [1.0, 0.5, 0.25])
+
+    def test_direct_betas(self):
+        # the ladder as given, also a subset of the sampler's temperatures (padded in the state by pad_ladder)
+        _, built = self.build({"mbh": {**MBH_BLOCK, "tempering": {"betas": [1.0, 0.3, 0.01]}}})
+        np.testing.assert_array_equal(built["mbh"].setup.betas, [1.0, 0.3, 0.01])
 
     def test_waveform_init_kwargs_get_the_engine_values(self):
         _, built = self.build({"mbh": MBH_BLOCK})
@@ -423,6 +451,13 @@ class SourceSearchSchemaTest(_Sources):
         block = {**MBH_BLOCK, "search": {"search_type": "catalog"}}
         self.assertConfigError("value_error", "blocks.mbh.mbh.search", msg="needs spread", blocks={"mbh": block})
 
+    def test_catalog_reads_no_search_path(self):
+        # * catalog is the injection catalogue: a file given with it would be ignored, so it is refused at load
+        block = {**MBH_BLOCK, "search": {"search_type": "catalog", "search_path": ".", "spread": 1e-3}}
+        self.assertConfigError(
+            "value_error", "blocks.mbh.mbh.search", msg="seeds from the injection catalogue", blocks={"mbh": block}
+        )
+
     def test_distribution_search_is_not_available_yet(self):
         block = {**MBH_BLOCK, "search": {"search_type": "distribution", "search_path": "."}}
         self.assertConfigError(
@@ -512,18 +547,18 @@ class SourceSearchBuildTest(_Built):
 
     def test_catalogue_seeds_through_the_prior_inverse_transform(self):
         # The MBH catalogue holds physical values; the interface must bring them to the sampling basis of
-        # MBHBPrior (ln M, ln q, d_L in Gpc, cos iota, sin delta, ...), where q = m1 / m2.
+        # MBHBPrior (ln M, q, d_L in Gpc, cos iota, sin delta, ...), where q = m1 / m2.
         _, built = self.build({"mbh": mbh_with_search()})
         setup = built["mbh"].setup
         iface = setup.search_interface
         curr = types.SimpleNamespace(general_info=types.SimpleNamespace(catalogue={"MBHB": {18: MBH_CATALOGUE_ENTRY}}))
 
         seed = iface.get_catalog_values(curr)
-        e = MBH_CATALOGUE_ENTRY
+        entry = MBH_CATALOGUE_ENTRY
         expected = [
-            np.log(1e6), np.log(4.0), e["PrimarySpinCompZ"], e["SecondarySpinCompZ"], 20.0,
-            e["PhaseReferenceSourceFrame"], np.cos(e["InclinationAngle"]), e["PolarisationAngle"],
-            e["RightAscension"], np.sin(e["Declination"]), e["TimeCoalescencePhenomTPHMSSBFrame"],
+            np.log(1e6), 4.0, entry["PrimarySpinCompZ"], entry["SecondarySpinCompZ"], 20.0,
+            entry["PhaseReferenceSourceFrame"], np.cos(entry["InclinationAngle"]), entry["PolarisationAngle"],
+            entry["RightAscension"], np.sin(entry["Declination"]), entry["TimeCoalescencePhenomTPHMSSBFrame"],
         ]
         np.testing.assert_allclose(seed, [expected], rtol=1e-12)
         self.assertTrue(np.isfinite(setup.priors["mbh"].logpdf(seed)).all())
@@ -559,7 +594,8 @@ class SkyWiringTest(unittest.TestCase):
 
     def test_wrappers_round_trip_and_touch_only_the_sky_columns(self):
         ind_map = sky_ind_map(self.BASIS, MBHBlock.SKY_BASIS)
-        to_lisa, from_lisa = make_sky_wrappers(EqualArmlengthOrbits(), REFERENCE_TIME, ind_map)
+        # * the host orbits, as MBHBlock passes them (ctx.general.orbits): the coords are numpy
+        to_lisa, from_lisa = make_sky_wrappers(EqualArmlengthOrbits(force_backend="cpu"), REFERENCE_TIME, ind_map)
 
         rng = np.random.default_rng(3)
         n = 50
@@ -595,8 +631,8 @@ class MBHTransformTest(unittest.TestCase):
         samples = prior.rvs(size=(200,))
         out = transform.transform_base_parameters(samples)
 
-        logM, logq, s1z, s2z, d_L, phi_ref, cos_iota, psi, alpha, sin_delta, t_c = samples.T
-        M, Q = np.exp(logM), np.exp(logq)  # Q = m1/m2 >= 1
+        logM, Q, s1z, s2z, d_L, phi_ref, cos_iota, psi, alpha, sin_delta, t_c = samples.T
+        M = np.exp(logM)  # Q = m1/m2 >= 1, sampled uniformly
         m2 = M / (1 + Q)  # reference `mT_Q`
         m1 = Q * m2
         expected = np.column_stack([

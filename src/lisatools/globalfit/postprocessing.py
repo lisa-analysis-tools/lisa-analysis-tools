@@ -378,8 +378,8 @@ def _seconds_to_duration_str(t: float) -> str:
 
 def _infer_tdi_channels(curr: CurrentInfoGlobalFit) -> List[str]:
     """Infer TDI channel list from GB setup or sensitivity backend class name."""
-    if "gb" in curr.source_info and hasattr(curr.source_info["gb"], "tdi_setup"):
-        setup_str = curr.source_info["gb"].tdi_setup or "XYZ"
+    if "gb" in curr.source_info and hasattr(curr.source_info["gb"], "waveform"):
+        setup_str = curr.source_info["gb"].waveform.tdi_channel_setup or "XYZ"
         return list(setup_str)
     backend_name = type(curr.general_info.sensitivity_backend).__name__
     if "AET" in backend_name:
@@ -1442,7 +1442,7 @@ class SubmissionWriter(BackendConsumer):
         from lisatools.globalfit.state import GBState
 
         gb_info = self.curr.source_info["gb"]
-        gb_wave_gen = GBGPU(**gb_info.initialize_kwargs)
+        gb_wave_gen = GBGPU(**gb_info.waveform.initialize_kwargs)
         gb_wave_gen.gpus = self.curr.general_info.gpus[:1] # use only one GPU for the clustering
 
         cluster_kwargs = dict(
@@ -1474,7 +1474,7 @@ class SubmissionWriter(BackendConsumer):
             acs.f_arr,
             gb_info.transform,
             gb_wave_gen,
-            gb_info.waveform_kwargs.copy(),
+            gb_info.waveform.waveform_kwargs,
             cp.asarray(gb_info.band_edges),
             gb_info.band_N_vals,
             reader,

@@ -77,10 +77,16 @@ class DomainKernelStrategy(LISAToolsParallelModule):
         self.split_index = split_index
         self.data_arr = acs.linear_data_arr[split_index]
         self.invC_arr = acs.linear_psd_arr[split_index]
+        self.settings = acs.settings
         self.num_channels = acs.nchannels
         self.num_data = len(acs.gpu_splits[split_index])
         self.num_noise = len(acs.gpu_splits[split_index])
-        self.settings = acs.settings
+        # Shape of one row of an external noise array; None while every AC holds its own row.
+        self.noise_row_shape = None
+        if getattr(acs, "external_noise_rows", False):
+            # The ACs read the rows of an external noise array, so the row count is its own.
+            self.num_noise = acs.num_noise_rows(split_index)
+            self.noise_row_shape = tuple(acs.noise_row_shape)
 
         all_acs = acs.acs.flatten()
         split_container_ids = acs.gpu_splits[split_index]
@@ -363,6 +369,23 @@ class DomainKernelStrategy(LISAToolsParallelModule):
 BaseDomainComputationGroup = DomainKernelStrategy
 
 
+#: Fields of the kinematics table and the leading shape of each. A field is stored flat with the
+#: segment index fastest, e.g. ``position_receiver[(spacecraft * 3 + xyz) * NT + segment]``.
+KINEMATICS_TABLE_FIELDS = (
+    ("position_receiver", (3, 3)),
+    ("velocity_receiver", (3, 3)),
+    ("acceleration_receiver", (3, 3)),
+    ("position_sender", (6, 3)),
+    ("velocity_sender", (6, 3)),
+    ("acceleration_sender", (6, 3)),
+    ("light_travel_time", (6,)),
+    ("light_travel_time_rate", (6,)),
+    ("light_travel_time_acceleration", (6,)),
+    ("unit_direction", (6, 3)),
+    ("unit_direction_rate", (6, 3)),
+)
+
+
 class STFTComputationGroup(DomainKernelStrategy):
     """Wraps C++ STFTDomainWrap for batched likelihood computation."""
 
@@ -374,7 +397,7 @@ class STFTComputationGroup(DomainKernelStrategy):
         force_backend: str = "cpu",
         window_alpha: float = 0.0,
         use_midpoint: bool = False,
-        linear_envelope: bool = False,
+        linear_envelope: bool = True,
     ):
         """
         Args:
@@ -391,7 +414,9 @@ class STFTComputationGroup(DomainKernelStrategy):
                 amplitude slope is derived for free from the estimator's
                 ``t +- D`` stencil samples, so this models the within-segment
                 TDI amplitude drift the const-envelope kernel otherwise freezes.
-                Defaults ``False`` (byte-identical to the const-envelope path).
+                Defaults ``True``; ``False`` gives the const-envelope path, byte for
+                byte the kernel of before. ``STFTGBComputations`` defaults to ``True``
+                as well and checks that the two agree.
         """
         from .domains import STFTSettings
 
@@ -430,7 +455,15 @@ class STFTComputationGroup(DomainKernelStrategy):
             self.num_data,
             self.num_noise,
             self.backend.TDITypeDict[self.tdi_type],
+            *self._noise_layout_args(),
         ]
+
+    def _noise_layout_args(self) -> list:
+        """Trailing wrapper arguments for external noise rows; none while every AC holds its own row."""
+        if getattr(self, "noise_row_shape", None) is None:
+            return []
+        # The rows hold the full active grid, so the kernels read them at a pixel's active bin.
+        return [int(self.noise_row_shape[-1]), True]
 
     def _create_cpp_domain(self):
         self._cpp_domain = self.backend.STFTDomainWrap(*self.domain_args)
@@ -486,6 +519,59 @@ class STFTComputationGroup(DomainKernelStrategy):
         finally:
             self._cpp_fresnel = saved
 
+    def cpp_kinematics(self, cpp_orbits):
+        """Kinematics table at this group's segment midpoints, built from ``cpp_orbits``.
+
+        The table holds the spacecraft states, light travel times and link vectors that the
+        DFFR response reads; it does not depend on the source. It is built on the group's
+        device on the first call and kept; a call with another orbits object rebuilds it.
+
+        Args:
+            cpp_orbits: ``OrbitsWrap`` of the response, with its arrays on this group's device.
+
+        Returns:
+            The backend's ``KinematicsTableWrap``.
+
+        Raises:
+            ValueError: If the segment midpoints, widened by the derivative stencils, leave
+                the position or light-travel-time grid of the orbits.
+        """
+        cached = getattr(self, "_kinematics", None)
+        if cached is not None and cached[0] is cpp_orbits:
+            return cached[2]
+
+        num_times = int(self.settings.NT)
+        with self.group_device_context():
+            arrays = {
+                name: self.xp.zeros(int(np.prod(shape)) * num_times, dtype=self.xp.float64)
+                for name, shape in KINEMATICS_TABLE_FIELDS
+            }
+            # * Midpoints of the windows whose starts the STFT kernels place at t0 + i dt.
+            table = self.backend.KinematicsTableWrap(
+                float(self.settings.t0) + 0.5 * float(self.settings.dt),
+                float(self.settings.dt),
+                num_times,
+                *arrays.values(),
+            )
+            table.build(cpp_orbits)
+        # ! The orbits object stays referenced, so the identity check above cannot match a new
+        # ! object that reuses its id.
+        self._kinematics = (cpp_orbits, arrays, table)
+        return table
+
+    def kinematics_fields(self, cpp_orbits) -> dict:
+        """The kinematics table of :meth:`cpp_kinematics` as arrays of shape ``(..., NT)``.
+
+        The arrays stay on the group's device; see ``KINEMATICS_TABLE_FIELDS`` for the
+        leading shape of each field.
+        """
+        self.cpp_kinematics(cpp_orbits)
+        num_times = int(self.settings.NT)
+        return {
+            name: self._kinematics[1][name].reshape(shape + (num_times,))
+            for name, shape in KINEMATICS_TABLE_FIELDS
+        }
+
     def compute_signal_likelihood_terms(
         self,
         data_index: NDArrayLike,
@@ -535,6 +621,104 @@ class STFTComputationGroup(DomainKernelStrategy):
         )
 
         return d_h_out, h_h_out
+
+    def compute_cross_terms(
+        self,
+        residual_index: NDArrayLike,
+        noise_index: NDArrayLike,
+        residual_starts: NDArrayLike,
+        templates: NDArrayLike,
+        template_index: NDArrayLike,
+        template_starts: NDArrayLike,
+        window_lo: NDArrayLike,
+        window_hi: NDArrayLike,
+        run_async: bool = False,
+    ) -> tuple[NDArrayLike, NDArrayLike, NDArrayLike]:
+        """Inner products of this group's data rows with template rows, per table.
+
+        Table ``b`` holds residuals ``i`` and templates ``j``. Residual ``i`` is data row
+        ``residual_index[b, i]``, read with noise row ``noise_index[b, i]``, and its window starts at
+        active bin ``residual_starts[b, i]``. Template ``j`` is row ``template_index[b, j]`` of
+        ``templates``, and its window starts at ``template_starts[b, j]``. The sums run over every
+        segment and the active bins ``[window_lo[b], window_hi[b])``: a pixel outside a residual's
+        window adds nothing to that residual's terms, and a template is zero outside its window.
+        With ``(a|c) = 4 df Re sum a^H C^-1 c`` under the noise row of residual ``i``::
+
+            cross[b, i, j] = (r_i|t_j),  template[b, i, j] = (t_j|t_j),  residual[b, i] = (r_i|r_i).
+
+        Each value is summed in one fixed order that does not depend on the other tables of the
+        call or on the device, so tables split over calls or devices give identical results.
+
+        Args:
+            residual_index, noise_index, residual_starts: ints of shape
+                ``(num_tables, num_residuals)``.
+            templates: complex128 rows of shape ``(num_rows, num_channels, NT, width)``,
+                C-contiguous.
+            template_index, template_starts: ints of shape ``(num_tables, num_templates)``.
+            window_lo, window_hi: ints of shape ``(num_tables,)``. Host arrays size the launch
+                without waiting for the device.
+            run_async: free the kernel's partial sums asynchronously and return without waiting.
+
+        Returns:
+            ``(cross, template, residual)``, float64 arrays of shapes
+            ``(num_tables, num_residuals, num_templates)``, the same, and
+            ``(num_tables, num_residuals)``.
+        """
+        xp = self.xp
+        num_tables, num_residuals = np.shape(residual_index)
+        num_templates = np.shape(template_index)[1]
+        if np.shape(noise_index) != (num_tables, num_residuals) or np.shape(residual_starts) != (
+            num_tables, num_residuals
+        ):
+            raise ValueError("noise_index and residual_starts must have the shape of residual_index.")
+        if np.shape(template_index) != (num_tables, num_templates) or np.shape(
+            template_starts
+        ) != (num_tables, num_templates):
+            raise ValueError("template_index and template_starts must have the same shape.")
+        if np.shape(window_lo) != (num_tables,) or np.shape(window_hi) != (num_tables,):
+            raise ValueError("window_lo and window_hi need one entry per table.")
+        if templates.ndim != 4 or tuple(templates.shape[1:3]) != (
+            self.num_channels, int(self.settings.NT)
+        ):
+            raise ValueError(
+                f"templates must have shape (rows, {self.num_channels}, {int(self.settings.NT)}, "
+                f"width); got {templates.shape}."
+            )
+        # ! The binding reads raw pointers, so a strided or converted array would be read wrongly.
+        if templates.dtype != xp.complex128 or not templates.flags.c_contiguous:
+            raise ValueError("templates must be a C-contiguous complex128 array.")
+        max_window_width = int((window_hi - window_lo).max()) if num_tables else 0
+
+        with self.group_device_context():
+            cross = xp.empty((num_tables, num_residuals, num_templates), dtype=xp.float64)
+            template = xp.empty((num_tables, num_residuals, num_templates), dtype=xp.float64)
+            residual = xp.empty((num_tables, num_residuals), dtype=xp.float64)
+            if num_tables == 0:
+                return cross, template, residual
+
+            def flat_ints(values):
+                return xp.ascontiguousarray(xp.asarray(values), dtype=xp.int32).reshape(-1)
+
+            self.cpp_domain.compute_cross_terms(
+                cross.reshape(-1),
+                template.reshape(-1),
+                residual.reshape(-1),
+                templates.reshape(-1),
+                int(templates.shape[-1]),
+                flat_ints(residual_index),
+                flat_ints(noise_index),
+                flat_ints(residual_starts),
+                flat_ints(template_index),
+                flat_ints(template_starts),
+                flat_ints(window_lo),
+                flat_ints(window_hi),
+                num_tables,
+                num_residuals,
+                num_templates,
+                max_window_width,
+                run_async,
+            )
+        return cross, template, residual
 
 
 class FDComputationGroup(DomainKernelStrategy):
