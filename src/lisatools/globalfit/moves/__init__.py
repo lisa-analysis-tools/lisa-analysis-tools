@@ -3,6 +3,7 @@
 from .addremovemove import ResidualAddOneRemoveOneMove
 from .gbspecialmove import (
     FStatResidualSearch,
+    FStatSearchMemory,
     GBFStatRJMove,
     GBFStatSettings,
     GBSpecialRJPriorMove,
@@ -10,6 +11,7 @@ from .gbspecialmove import (
     GBSpecialRJSearchMove,
     GBSpecialRJSerialSearchMCMC,
     GBSpecialStretchMove,
+    SearchFit,
 )
 from .emrispecialmove import EMRISpecialMove
 from .globalfitmove import GFCombineMove, GlobalFitMove

@@ -4287,6 +4287,624 @@ def gather_gmms(gmms):
 from lisatools.sampling.gmm import vec_fit_gmm_min_bic
 
 # ======================================================================================================================
+# The search memory: GMM fits of the F-statistic searches, the counts of the searches and the rule that limits them
+# ======================================================================================================================
+# It runs no search and uses numpy and the standard library only, so the search move, the split and merge move and the
+# recipe can share one object that lives on the host. Its fits are of three kinds, by the input of the search that made
+# them: the residual of the best walker (set as a whole after every search that gives a proposal), the data in the reach
+# windows around the sources (raw data) and that residual with the window's own sources added back (residual plus
+# sources); the last two are added. It saves itself to one file after every change, so a restarted run has its fits and
+# its counts.
+
+# Columns of a fit: the sampling columns of the GB branch, as the search's record holds them
+FIT_COLUMNS = 8
+# What a fit description (a dict handed to set_fits or add_fits) must hold, and what it may hold with its default
+_REQUIRED_FIT_ENTRIES = ("weights", "means", "covs", "mins", "maxs", "low_mhz", "high_mhz")
+_OPTIONAL_FIT_ENTRIES = {"search_number": 0, "pass_number": 0, "walker": 0, "largest_snr": float("nan"),
+                         "threshold": float("nan")}
+
+
+def _read_only(array):
+    """The array with its write flag off, so that a fit handed out cannot be changed by its reader."""
+    array.flags.writeable = False
+    return array
+
+
+@dataclass(frozen=True, eq=False)
+class SearchFit:
+    """One Gaussian mixture of one search of one frequency range.
+
+    ``means`` (components, 8) and ``covs`` (components, 8, 8) are in the unit box of the searched range, y = 2 (x - min)
+    / (max - min) - 1 per column, with the box corners ``mins`` and ``maxs`` (8,) in sampling units; ``weights``
+    (components,) sum to one. ``largest_snr`` is the largest sqrt(2F) of the search's first stage and ``threshold`` the
+    gate's threshold on it. The arrays are read-only. Fits compare by field, not by ``==``.
+    """
+
+    kind: str
+    band: int
+    low_mhz: float
+    high_mhz: float
+    search_number: int
+    pass_number: int
+    walker: int
+    largest_snr: float
+    threshold: float
+    weights: np.ndarray
+    means: np.ndarray
+    covs: np.ndarray
+    mins: np.ndarray
+    maxs: np.ndarray
+
+
+class FStatSearchMemory:
+    """The fits of the F-statistic searches, the counts of the searches of one kind, and the rule that limits them.
+
+    The memory is bound to the layout of the run once: the edges of the GB bands, the width of one frequency bin (one
+    over the span) and the reach window W of each band, all in mHz. A second bind with another layout is an error.
+
+    A restart from an older sampler checkpoint finds the memory as the last run left it, so its fits and counts may be
+    newer than the sampler state; that is harmless in the burn-in and has no effect in the kept steps. The search of
+    the kind "raw data" is made once in a run, so the memory also keeps a flag for it (``raw_data_searched``).
+
+    Args:
+        path: The file the memory saves itself to and loads at the bind; None keeps the memory in memory only.
+        resume: True for a run that resumes: the bind then loads the file when it exists. False for a run that starts
+            fresh: the bind then raises ValueError when the file exists, so that a file left by an earlier run in the
+            same folder cannot seed a new run.
+    """
+
+    # The kinds of fit, by the input of the search that made them
+    KIND_RESIDUAL = "residual"
+    KIND_RAW_DATA = "raw_data"
+    KIND_RESIDUAL_PLUS_SOURCES = "residual_plus_sources"
+    KINDS = (KIND_RESIDUAL, KIND_RAW_DATA, KIND_RESIDUAL_PLUS_SOURCES)
+    # * A search of the kind "residual plus sources" starts only while fewer than this
+    # * many searches of that kind are counted within the reach window around the middle of its window
+    MAX_SEARCHES_WITHIN_REACH = 5
+    # The layout of a restarted run is computed again, so two layouts agree when their numbers agree to this
+    LAYOUT_RELATIVE_TOLERANCE = 1e-12
+    # The format of the file, stored in it
+    FILE_FORMAT = 1
+
+    def __init__(self, path=None, resume=False):
+        self.path = None if path is None else os.fspath(path)
+        self.resume = bool(resume)
+        self._layout = None
+        self._counts = None
+        self._fits = []
+        self._searched = []
+        self._version = 0
+        self._fixed = False
+        self._raw_data_searched = False
+
+    # ==================================================================================================================
+    # The layout and the state that can be read
+    # ==================================================================================================================
+
+    def bind(self, band_edges_mhz, bin_mhz, window_mhz):
+        """Bind the memory to the layout of the run, and load the file at ``path`` when the run resumes.
+
+        Args:
+            band_edges_mhz: The edges of the GB bands (number of bands + 1,), increasing.
+            bin_mhz: The width of one frequency bin, one over the span.
+            window_mhz: The reach window W of each band (number of bands,).
+
+        A second bind with the same layout does nothing. When ``resume`` is True and the file exists, it is loaded; when
+        ``resume`` is False and the file exists, the bind raises ValueError naming the file. Raises ValueError also for a
+        layout that is not valid, for a second bind with another layout, for a file that was made for another layout, and
+        for a file that cannot be read. An error at the first bind leaves the memory not bound; an error at a later bind
+        leaves it as it was.
+        """
+        layout = self._checked_layout(band_edges_mhz, bin_mhz, window_mhz)
+        if self._layout is not None:
+            self._require_same_layout(layout, "this bind")
+            return
+        file_exists = self.path is not None and os.path.exists(self.path)
+        if file_exists and not self.resume:
+            raise ValueError(f"the search memory file {self.path} exists, but this run does not resume: remove the file, "
+                             "use another folder, or bind a memory made with resume=True")
+        self._layout = layout
+        self._counts = np.zeros(self._number_of_bins(), dtype=np.int32)
+        if file_exists:
+            try:
+                self._load()
+            except Exception:
+                self._layout, self._counts = None, None
+                raise
+
+    @property
+    def is_bound(self):
+        return self._layout is not None
+
+    @property
+    def version(self):
+        """A number that grows by one with every call of ``set_fits``, ``add_fits`` or ``finish_raw_data_search`` that
+        changes the fits; counts, searched ranges and the raw data flag do not change it."""
+        return self._version
+
+    @property
+    def fixed(self):
+        """True from the start of the kept steps: the split and merge's search part is fixed, so the memory takes no new
+        fit and starts no new search."""
+        return self._fixed
+
+    @property
+    def raw_data_searched(self):
+        """True once the search of the kind "raw data", which is made once in a run, has ended and its fits are stored.
+
+        The flag is saved with the fits, so a run that resumes knows that the search was made also when it gave no fit.
+        """
+        return self._raw_data_searched
+
+    @property
+    def search_counts(self):
+        """A copy of the counts: one integer per frequency bin of the run, the searches of the kind "residual plus
+        sources" counted at the bin in the middle of their window."""
+        self._require_bound()
+        return self._counts.copy()
+
+    @property
+    def searched_ranges(self):
+        """The searched windows of the kind "residual plus sources", (n, 2) (low, high) in mHz in the order they
+        started, whether or not they gave a fit."""
+        return np.array(self._searched, dtype=np.float64).reshape(-1, 2)
+
+    def band_of(self, frequency_mhz):
+        """The band of each frequency (scalar or array), by the sorter's rule: the band holds its lower edge and not its
+        upper edge, and the last edge belongs to the last band. Raises ValueError outside the layout."""
+        self._require_bound()
+        edges = self._layout["band_edges_mhz"]
+        frequency = self._checked_frequency(frequency_mhz)
+        return np.minimum(np.searchsorted(edges, frequency, side="right") - 1, edges.size - 2)
+
+    def bin_of(self, frequency_mhz):
+        """The frequency bin of each frequency (scalar or array), counted from the first band edge. Raises ValueError
+        outside the layout."""
+        self._require_bound()
+        frequency = self._checked_frequency(frequency_mhz)
+        index = np.floor((frequency - self._layout["band_edges_mhz"][0]) / self._layout["bin_mhz"]).astype(np.int64)
+        return np.minimum(index, self._counts.size - 1)
+
+    # ==================================================================================================================
+    # The fits
+    # ==================================================================================================================
+
+    def fix(self):
+        """Fix the memory from the start of the kept steps: it takes no new fit and starts no new search from now on, which
+        keeps what the split and merge reads the same after a restart. The flag is saved."""
+        self._require_bound()
+        if not self._fixed:
+            self._fixed = True
+            self._save()
+
+    def set_fits(self, kind, fits):
+        """Set all fits of one kind in one change: remove every stored fit of the kind and store the given list.
+
+        The search move sets the kind "residual" this way after every search that gives it a new proposal, one fit per
+        usable band and an empty list when every band is shut off, so that the memory mirrors the latest search: a band
+        that passed in an earlier search and not in this one drops out.
+
+        Args:
+            kind: One of ``KINDS``.
+            fits: A list of fit descriptions, possibly empty. A description is a dict with ``weights`` (components,),
+                ``means`` (components, 8) and ``covs`` (components, 8, 8) in the unit box; ``mins`` and ``maxs`` (8,),
+                the corners of that box in sampling units, with maxs above mins; ``low_mhz`` and ``high_mhz``, the
+                searched range, whose middle gives the band of the fit; and optionally ``search_number``,
+                ``pass_number``, ``walker``, ``largest_snr`` and ``threshold``, what the search reports about itself.
+
+        The version grows by one and the file is written once when anything changed; nothing changes when the kind had
+        no fit and the list is empty. Returns True when the memory took the list and False when it is fixed. Every
+        description is checked before anything changes and its arrays are copied. Raises ValueError for an unknown
+        kind, a description with an entry missing or unknown, an array of the wrong shape or with a value that is not
+        finite, a box without width, or a range outside the layout.
+        """
+        self._require_bound()
+        new_fits = self._checked_fits(kind, fits)
+        if self._fixed:
+            return False
+        kept = [fit for fit in self._fits if fit.kind != kind]
+        if len(kept) == len(self._fits) and not new_fits:
+            return True
+        self._fits = kept + new_fits
+        self._version += 1
+        self._save()
+        return True
+
+    def add_fits(self, kind, fits):
+        """Add several fits of one kind in one change: the fits of all windows and passes of one search call.
+
+        The arguments and checks are those of ``set_fits``, which describes a fit; the fits already stored stay. The
+        version grows by one and the file is written once; an empty list changes nothing. Returns True when the memory
+        took the list and False when it is fixed.
+        """
+        self._require_bound()
+        new_fits = self._checked_fits(kind, fits)
+        if self._fixed:
+            return False
+        if new_fits:
+            self._fits += new_fits
+            self._version += 1
+            self._save()
+        return True
+
+    def finish_raw_data_search(self, fits):
+        """Add the fits of the kind "raw data" and record that this search was made, in one change and one file write.
+
+        The search of this kind is made once in a run. The fits and the flag ``raw_data_searched`` are saved together,
+        so a kill leaves both or neither, and a run that resumes knows that the search was made also when it gave no
+        fit (``fits`` may be empty). The arguments and checks are those of ``add_fits``. The version grows by one when
+        ``fits`` is not empty. Returns True when the memory took the list and False when it is fixed. Raises
+        RuntimeError when the search was already recorded.
+        """
+        self._require_bound()
+        new_fits = self._checked_fits(self.KIND_RAW_DATA, fits)
+        if self._fixed:
+            return False
+        if self._raw_data_searched:
+            raise RuntimeError("the search of the kind raw data was already recorded")
+        self._fits += new_fits
+        self._raw_data_searched = True
+        if new_fits:
+            self._version += 1
+        self._save()
+        return True
+
+    def screen_fits(self, kind, fits):
+        """Apply the memory's own check to each fit description alone, and change nothing.
+
+        ``set_fits``, ``add_fits`` and ``finish_raw_data_search`` check a whole list and raise ValueError for the
+        first description that fails. A caller that wants to store the good ones and leave the others out asks here
+        first; the rule stays in one place, ``_checked_fit``, which this method calls for each description.
+
+        Args:
+            kind: One of ``KINDS``.
+            fits: A list of fit descriptions, as ``set_fits`` takes them.
+
+        Returns ``(accepted, refused)``: ``accepted`` holds the descriptions that pass, the very objects, in the order
+        given; ``refused`` holds a ``(position, reason)`` for each description that fails, with its position in
+        ``fits`` and the message of the ValueError that ``add_fits`` raises for it. The call changes no state and writes
+        no file, also when the memory is fixed. Raises ValueError for an unknown kind and RuntimeError when the memory
+        is not bound.
+        """
+        self._require_bound()
+        # an unknown kind is a mistake of the caller, refused as in the other calls, and not a flawed description
+        self._checked_fits(kind, [])
+        accepted, refused = [], []
+        for position, description in enumerate(fits):
+            try:
+                self._checked_fit(kind, description)
+            except ValueError as error:
+                refused.append((position, str(error)))
+            else:
+                accepted.append(description)
+        return accepted, refused
+
+    def fits(self, band=None, kind=None):
+        """The stored fits, in the order they were added, as a list of ``SearchFit``; only those of ``band`` and
+        of ``kind`` when given."""
+        return [fit for fit in self._fits
+                if (band is None or fit.band == band) and (kind is None or fit.kind == kind)]
+
+    def count_fits(self, band, kind):
+        """The number of fits of ``kind`` in ``band``."""
+        return len(self.fits(band=band, kind=kind))
+
+    def combined(self, band, weights_by_kind):
+        """One mixture of a band from the fits of chosen kinds, in one unit box that spans them.
+
+        Args:
+            band: The band.
+            weights_by_kind: A dict from kind to the weight of that kind, in the order the components are to follow. The
+                weight of a kind is shared equally among the fits of that kind in the band, and a kind without a fit
+                gives its weight to the others: the shares are divided by their total.
+
+        Returns a dict with ``weights`` (components,), ``means`` (components, 8), ``covs`` (components, 8, 8), ``mins``
+        and ``maxs`` (8,), the components of the kinds in the order of the dict and, within a kind, in the order the fits
+        were added; or None when no chosen kind has a fit in the band. Raises ValueError for an unknown kind or a weight
+        that is negative or not finite.
+        """
+        chosen, shares = [], []
+        for kind, weight in weights_by_kind.items():
+            if kind not in self.KINDS:
+                raise ValueError(f"unknown kind {kind!r}; the kinds are {list(self.KINDS)}")
+            if not np.isfinite(weight) or weight < 0.0:
+                raise ValueError(f"the weight of kind {kind!r} must be finite and not negative, not {weight}")
+            of_kind = self.fits(band=band, kind=kind)
+            if weight == 0.0 or not of_kind:
+                continue
+            chosen += of_kind
+            shares += [weight / len(of_kind)] * len(of_kind)
+        if not chosen:
+            return None
+        total = sum(shares)
+        return self.combine_fits(chosen, [share / total for share in shares])
+
+    @staticmethod
+    def combine_fits(fits, shares):
+        """The mixture of several fits of one band in the box that spans them, the shares of the fits as the weight
+        of each fit's components.
+
+        Each fit's means are taken to sampling units and back into the spanning box, a mean by the map between the two
+        boxes and a covariance by the ratio of the half widths on both sides. Nothing else changes, so the combined
+        mixture is the weighted union of the fits' mixtures. Args: ``fits``, a list of ``SearchFit``, and ``shares``, one
+        per fit, summing to one. Returns the dict of ``combined``. Raises ValueError for a spanning box without width.
+        """
+        mins = np.min([fit.mins for fit in fits], axis=0)
+        maxs = np.max([fit.maxs for fit in fits], axis=0)
+        half = 0.5 * (maxs - mins)
+        if np.any(half <= 0.0):
+            raise ValueError(f"the spanning box has no width in the columns {np.flatnonzero(half <= 0.0).tolist()}")
+        weights, means, covariances = [], [], []
+        for fit, share in zip(fits, shares):
+            source_half = 0.5 * (fit.maxs - fit.mins)
+            # A component in sampling units, then in the spanning box: an affine map per column, so a covariance
+            # scales by the ratio of the half widths on both sides
+            sampling_means = fit.mins + (fit.means + 1.0) * source_half
+            means.append((sampling_means - mins) / half - 1.0)
+            ratio = source_half / half
+            covariances.append(fit.covs * ratio[None, :, None] * ratio[None, None, :])
+            weights.append(share * fit.weights / fit.weights.sum())
+        return {"weights": np.concatenate(weights), "means": np.concatenate(means), "covs": np.concatenate(covariances),
+                "mins": mins, "maxs": maxs}
+
+    # ==================================================================================================================
+    # The counts and the searched ranges of the kind "residual plus sources"
+    # ==================================================================================================================
+
+    def search_count_within_reach(self, frequency_mhz):
+        """The searches counted within the reach window around a frequency: the counts of the bins from f - W to f + W,
+        with W the reach window of the band of that frequency. Returns an int."""
+        self._require_bound()
+        edges = self._layout["band_edges_mhz"]
+        frequency = float(frequency_mhz)
+        reach = float(self._layout["window_mhz"][self.band_of(frequency)])
+        first = self.bin_of(max(frequency - reach, edges[0]))
+        last = self.bin_of(min(frequency + reach, edges[-1]))
+        return int(self._counts[first:last + 1].sum())
+
+    def start_window_searches(self, windows):
+        """Ask to start searches of the kind "residual plus sources" in several windows, and count those that may start.
+
+        The windows are taken in order, each by the limit: a search may start only while fewer than
+        ``MAX_SEARCHES_WITHIN_REACH`` searches are counted within the reach window around the middle of its window, the
+        searches started earlier in this call included. A search that starts adds one to the count of the bin at the
+        middle and keeps the window in the searched ranges, whether or not it gives a fit. The file is written once for
+        the call, when a search started.
+
+        Args:
+            windows: The low and high end of each window in mHz, (n, 2), a list of pairs or an array.
+
+        Returns a boolean array of length n, True where the search may start. A fixed memory starts none and changes
+        nothing. Every window is checked before anything changes; raises ValueError for a window that is not a pair,
+        is empty, or lies outside the layout.
+        """
+        self._require_bound()
+        edges = self._layout["band_edges_mhz"]
+        try:
+            checked = [(float(low), float(high)) for low, high in windows]
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"windows must be pairs of a low and a high end in mHz: {error}") from error
+        for low, high in checked:
+            if not (edges[0] <= low < high <= edges[-1]):
+                raise ValueError(f"the window {low} to {high} mHz is empty or outside the layout "
+                                 f"{edges[0]} to {edges[-1]} mHz")
+        started = np.zeros(len(checked), dtype=bool)
+        if self._fixed:
+            return started
+        for position, (low, high) in enumerate(checked):
+            middle = 0.5 * (low + high)
+            if self.search_count_within_reach(middle) < self.MAX_SEARCHES_WITHIN_REACH:
+                self._counts[self.bin_of(middle)] += 1
+                self._searched.append((low, high))
+                started[position] = True
+        if started.any():
+            self._save()
+        return started
+
+    def would_start_window_searches(self, windows):
+        """The answer of ``start_window_searches`` without a change: which windows the limit would let start.
+
+        The call takes the windows in order and counts those that would start, as ``start_window_searches`` does, and
+        changes no count, no range, no file and no version. A caller can then search first and register afterwards,
+        so that a search that is cut short leaves nothing registered. The arguments, the checks and the result are
+        those of ``start_window_searches``.
+        """
+        self._require_bound()
+        # The same code on a copy that shares the fits, which it does not change, and has no file to write
+        probe = type(self).__new__(type(self))
+        probe.__dict__.update(self.__dict__, path=None, _counts=self._counts.copy(), _searched=list(self._searched))
+        return probe.start_window_searches(windows)
+
+    def outside_searched_ranges(self, frequencies_mhz):
+        """Which frequencies lie in no searched range of the kind "residual plus sources" (the ends of a range count as
+        inside). Returns a boolean array of the shape of the input."""
+        frequencies = np.asarray(frequencies_mhz, dtype=np.float64)
+        inside = np.zeros(frequencies.shape, dtype=bool)
+        for low, high in self._searched:
+            inside |= (frequencies >= low) & (frequencies <= high)
+        return ~inside
+
+    # ==================================================================================================================
+    # The checks of what comes in
+    # ==================================================================================================================
+
+    def _require_bound(self):
+        if self._layout is None:
+            raise RuntimeError("the memory is not bound to a layout: call bind first")
+
+    def _number_of_bins(self):
+        span = self._layout["band_edges_mhz"][-1] - self._layout["band_edges_mhz"][0]
+        return int(np.ceil(span / self._layout["bin_mhz"]))
+
+    def _checked_frequency(self, frequency_mhz):
+        frequency = np.asarray(frequency_mhz, dtype=np.float64)
+        edges = self._layout["band_edges_mhz"]
+        if np.any(frequency < edges[0]) or np.any(frequency > edges[-1]) or not np.all(np.isfinite(frequency)):
+            raise ValueError(f"a frequency lies outside the layout, {edges[0]} to {edges[-1]} mHz")
+        return frequency
+
+    @staticmethod
+    def _checked_layout(band_edges_mhz, bin_mhz, window_mhz):
+        edges = np.array(band_edges_mhz, dtype=np.float64)
+        windows = np.array(window_mhz, dtype=np.float64)
+        bin_width = float(bin_mhz)
+        if edges.ndim != 1 or edges.size < 2 or not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0.0):
+            raise ValueError("band_edges_mhz must be one-dimensional, finite, increasing and hold at least two edges")
+        if windows.shape != (edges.size - 1,) or not np.all(np.isfinite(windows)) or np.any(windows <= 0.0):
+            raise ValueError(f"window_mhz must hold one positive window for each of the {edges.size - 1} bands")
+        if not np.isfinite(bin_width) or bin_width <= 0.0:
+            raise ValueError(f"bin_mhz must be positive, not {bin_mhz}")
+        return {"band_edges_mhz": edges, "bin_mhz": bin_width, "window_mhz": windows}
+
+    def _require_same_layout(self, layout, what):
+        """Raises ValueError unless ``layout`` agrees with the bound layout, naming what differs."""
+        tolerance = self.LAYOUT_RELATIVE_TOLERANCE
+        differing = []
+        for name in ("band_edges_mhz", "window_mhz"):
+            first, second = self._layout[name], layout[name]
+            if first.shape != second.shape or not np.allclose(first, second, rtol=tolerance, atol=0.0):
+                differing.append(f"{name} ({first.size} against {second.size} values)")
+        if not np.isclose(self._layout["bin_mhz"], layout["bin_mhz"], rtol=tolerance, atol=0.0):
+            differing.append(f"bin_mhz ({self._layout['bin_mhz']} against {layout['bin_mhz']})")
+        if differing:
+            raise ValueError(f"the layout of {what} differs from the bound layout in: {', '.join(differing)}")
+
+    def _checked_fits(self, kind, fits):
+        """The fits of a list of descriptions as ``SearchFit``, all checked, or ValueError."""
+        if kind not in self.KINDS:
+            raise ValueError(f"unknown kind {kind!r}; the kinds are {list(self.KINDS)}")
+        return [self._checked_fit(kind, description) for description in fits]
+
+    def _checked_fit(self, kind, description):
+        if not hasattr(description, "keys"):
+            raise ValueError(f"a fit description must be a dict, not {type(description).__name__}")
+        missing = [name for name in _REQUIRED_FIT_ENTRIES if name not in description]
+        unknown = [name for name in description if name not in _REQUIRED_FIT_ENTRIES and name not in _OPTIONAL_FIT_ENTRIES]
+        if missing or unknown:
+            raise ValueError(f"a fit description lacks the entries {missing} and has the unknown entries {unknown}")
+        entries = {**_OPTIONAL_FIT_ENTRIES, **description}
+        low_mhz, high_mhz = entries["low_mhz"], entries["high_mhz"]
+        arrays = [np.array(entries[name], dtype=np.float64) for name in ("weights", "means", "covs", "mins", "maxs")]
+        weights, means, covs, mins, maxs = arrays
+        count = weights.shape[0] if weights.ndim == 1 else 0
+        if (count < 1 or means.shape != (count, FIT_COLUMNS) or covs.shape != (count, FIT_COLUMNS, FIT_COLUMNS)
+                or mins.shape != (FIT_COLUMNS,) or maxs.shape != (FIT_COLUMNS,)):
+            raise ValueError(f"a fit needs weights (c,), means (c, {FIT_COLUMNS}), covs (c, {FIT_COLUMNS}, "
+                             f"{FIT_COLUMNS}), mins and maxs ({FIT_COLUMNS},); got {weights.shape}, {means.shape}, "
+                             f"{covs.shape}, {mins.shape}, {maxs.shape}")
+        if not all(np.all(np.isfinite(array)) for array in arrays):
+            raise ValueError("a fit must hold finite values only")
+        if np.any(weights < 0.0) or weights.sum() <= 0.0:
+            raise ValueError("the weights of a fit must not be negative and must have a positive sum")
+        if np.any(maxs <= mins):
+            raise ValueError("the box of a fit needs maxs above mins in every column")
+        if not (self._layout["band_edges_mhz"][0] <= low_mhz < high_mhz <= self._layout["band_edges_mhz"][-1]):
+            raise ValueError(f"the searched range {low_mhz} to {high_mhz} mHz is empty or outside the layout")
+        band = int(self.band_of(0.5 * (low_mhz + high_mhz)))
+        return SearchFit(kind=kind, band=band, low_mhz=float(low_mhz), high_mhz=float(high_mhz),
+                         search_number=int(entries["search_number"]), pass_number=int(entries["pass_number"]),
+                         walker=int(entries["walker"]), largest_snr=float(entries["largest_snr"]),
+                         threshold=float(entries["threshold"]),
+                         **{name: _read_only(array) for name, array in
+                            zip(("weights", "means", "covs", "mins", "maxs"), arrays)})
+
+    # ==================================================================================================================
+    # The file
+    # ==================================================================================================================
+
+    def _state_arrays(self):
+        """The whole state as arrays (no pickles): the layout, the counts, the searched ranges, and the fits padded to the
+        largest number of components with NaN, as the search's record pads its bands."""
+        fits = self._fits
+        most = max((fit.weights.size for fit in fits), default=0)
+        padded = {"fit_weights": np.full((len(fits), most), np.nan),
+                  "fit_means": np.full((len(fits), most, FIT_COLUMNS), np.nan),
+                  "fit_covs": np.full((len(fits), most, FIT_COLUMNS, FIT_COLUMNS), np.nan)}
+        for index, fit in enumerate(fits):
+            count = fit.weights.size
+            padded["fit_weights"][index, :count] = fit.weights
+            padded["fit_means"][index, :count] = fit.means
+            padded["fit_covs"][index, :count] = fit.covs
+        return {
+            "file_format": np.array(self.FILE_FORMAT), "version": np.array(self._version), "fixed": np.array(self._fixed),
+            "raw_data_searched": np.array(self._raw_data_searched),
+            "band_edges_mhz": self._layout["band_edges_mhz"], "bin_mhz": np.array(self._layout["bin_mhz"]),
+            "window_mhz": self._layout["window_mhz"], "counts": self._counts, "searched_ranges": self.searched_ranges,
+            "fit_kinds": np.array([fit.kind for fit in fits], dtype="U32"),
+            "fit_bands": np.array([fit.band for fit in fits], dtype=np.int64),
+            "fit_low_mhz": np.array([fit.low_mhz for fit in fits], dtype=np.float64),
+            "fit_high_mhz": np.array([fit.high_mhz for fit in fits], dtype=np.float64),
+            "fit_search_numbers": np.array([fit.search_number for fit in fits], dtype=np.int64),
+            "fit_pass_numbers": np.array([fit.pass_number for fit in fits], dtype=np.int64),
+            "fit_walkers": np.array([fit.walker for fit in fits], dtype=np.int64),
+            "fit_largest_snr": np.array([fit.largest_snr for fit in fits], dtype=np.float64),
+            "fit_thresholds": np.array([fit.threshold for fit in fits], dtype=np.float64),
+            "fit_component_counts": np.array([fit.weights.size for fit in fits], dtype=np.int64),
+            "fit_mins": np.array([fit.mins for fit in fits], dtype=np.float64).reshape(len(fits), FIT_COLUMNS),
+            "fit_maxs": np.array([fit.maxs for fit in fits], dtype=np.float64).reshape(len(fits), FIT_COLUMNS),
+            **padded,
+        }
+
+    @staticmethod
+    def _state_keys():
+        """The names of the arrays a file must hold."""
+        return ("version", "fixed", "band_edges_mhz", "bin_mhz", "window_mhz", "counts", "searched_ranges", "fit_kinds",
+                "fit_bands", "fit_low_mhz", "fit_high_mhz", "fit_search_numbers", "fit_pass_numbers", "fit_walkers",
+                "fit_largest_snr", "fit_thresholds", "fit_component_counts", "fit_mins", "fit_maxs", "fit_weights",
+                "fit_means", "fit_covs")
+
+    def _save(self):
+        """Write the state to ``path`` under a temporary name and rename it over the file, so that a reader or a crash
+        never sees half a file. Does nothing without a path."""
+        if self.path is None:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        temporary = self.path + ".tmp"
+        with open(temporary, "wb") as handle:
+            np.savez_compressed(handle, **self._state_arrays())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.path)
+
+    def _load(self):
+        """Read the file into the state. Raises ValueError for a file that cannot be read, of another format or made for
+        another layout; the state is changed only when the whole file is valid."""
+        try:
+            with np.load(self.path, allow_pickle=False) as stored:
+                arrays = {key: stored[key] for key in stored.files}
+        except Exception as error:
+            raise ValueError(f"cannot read the search memory file {self.path}: {error}") from error
+        if int(arrays.get("file_format", -1)) != self.FILE_FORMAT:
+            raise ValueError(f"{self.path} has file format {arrays.get('file_format')}, expected {self.FILE_FORMAT}")
+        missing = [key for key in self._state_keys() if key not in arrays]
+        if missing:
+            raise ValueError(f"{self.path} lacks the entries {missing}")
+        layout = self._checked_layout(arrays["band_edges_mhz"], arrays["bin_mhz"], arrays["window_mhz"])
+        self._require_same_layout(layout, f"the file {self.path}")
+        counts = arrays["counts"].astype(np.int32)
+        if counts.shape != self._counts.shape:
+            raise ValueError(f"{self.path} holds {counts.size} counts, the layout has {self._counts.size} bins")
+        fits = []
+        for index in range(arrays["fit_kinds"].size):
+            count = int(arrays["fit_component_counts"][index])
+            fits.append(SearchFit(
+                kind=str(arrays["fit_kinds"][index]), band=int(arrays["fit_bands"][index]),
+                low_mhz=float(arrays["fit_low_mhz"][index]), high_mhz=float(arrays["fit_high_mhz"][index]),
+                search_number=int(arrays["fit_search_numbers"][index]), pass_number=int(arrays["fit_pass_numbers"][index]),
+                walker=int(arrays["fit_walkers"][index]), largest_snr=float(arrays["fit_largest_snr"][index]),
+                threshold=float(arrays["fit_thresholds"][index]),
+                weights=_read_only(arrays["fit_weights"][index, :count].copy()),
+                means=_read_only(arrays["fit_means"][index, :count].copy()),
+                covs=_read_only(arrays["fit_covs"][index, :count].copy()),
+                mins=_read_only(arrays["fit_mins"][index].copy()), maxs=_read_only(arrays["fit_maxs"][index].copy())))
+        self._counts, self._fits = counts, fits
+        self._searched = [(float(low), float(high)) for low, high in arrays["searched_ranges"]]
+        self._version, self._fixed = int(arrays["version"]), bool(arrays["fixed"])
+        # a file written before the flag existed has no key, and no raw data search was recorded then
+        self._raw_data_searched = bool(arrays["raw_data_searched"]) if "raw_data_searched" in arrays else False
+
+
+# ======================================================================================================================
 # The F-statistic RJ move: births from an F-statistic search of the bands on the STFT/DFFR response
 # ======================================================================================================================
 
@@ -5331,6 +5949,30 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
             if differing:
                 raise RuntimeError("the walker's residual differs from its copy after the write back")
 
+    @staticmethod
+    def fit_descriptions(search, pass_number=0):
+        """One fit description for each usable band of a search that fitted, in the order of the mixture's components,
+        as :meth:`FStatSearchMemory.set_fits` and ``add_fits`` take it: the band's edges in mHz as the searched range,
+        the mixture's weights, means, covariances and box as host arrays, the propose of the move, the walker the search
+        ran on and the pass, and the largest sqrt(2F) of the band's first stage with the gate's threshold on it."""
+        bands, gate, mixtures = search["bands"], search["gate"], search["mixtures"]
+        searched = np.flatnonzero(bands["active"])
+        usable = np.flatnonzero(gate["detected"])[mixtures["usable"]]
+        largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
+        weights, means, covariances, _, _, mins, maxs = mixtures["components"]
+        descriptions = []
+        for order, position in enumerate(usable):
+            band = searched[position]
+            descriptions.append({
+                "weights": asnumpy(weights[order]), "means": asnumpy(means[order]), "covs": asnumpy(covariances[order]),
+                "mins": asnumpy(mins[order]), "maxs": asnumpy(maxs[order]),
+                "low_mhz": float(bands["low_mhz"][band]), "high_mhz": float(bands["high_mhz"][band]),
+                "search_number": int(search["num_proposals"]), "pass_number": int(pass_number),
+                "walker": int(search["walker"]),
+                "largest_snr": float(largest[position]), "threshold": float(gate["thresholds"][position]),
+            })
+        return descriptions
+
     # ==================================================================================================================
     # The search's logs and record
     # ==================================================================================================================
@@ -5477,13 +6119,24 @@ class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
     ``save_search_records`` asks for one. The columns, the constants and the math of the search are class attributes
     of the move as well (:class:`FStatSearchBase`).
 
+    Given a search memory, the move also writes the fit of each search into it, for the split and merge move to read:
+    one fit of the kind "residual" for each usable band after a search that fitted, the empty list after a search with
+    no band to search, and nothing after a search that found nothing. The move's own proposal stays the fit of its
+    latest search alone, and a fixed memory refuses the list without a change to the move.
+
     Args:
         *args: :class:`GBSpecialBase`'s arguments.
         fstat_settings: The search's settings; None takes the defaults of :class:`GBFStatSettings`.
+        fstat_search_memory: The search memory that takes the fit of each search (:class:`FStatSearchMemory`), which the
+            split and merge move binds; None writes nothing. The recipe builders hand it over.
         **kwargs: :class:`GBSpecialBase`'s keyword arguments.
     """
 
-    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None, **kwargs):
+    # The search memory that takes the fit of each search, or None (set by the constructor)
+    fstat_search_memory = None
+
+    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None,
+                 fstat_search_memory: Optional[FStatSearchMemory] = None, **kwargs):
         # * always an RJ move: its proposal only arrives with the first search, after construction
         super().__init__(*args, **{**kwargs, "is_rj_prop": True})
         self.fstat_settings = deepcopy(fstat_settings) if fstat_settings is not None else GBFStatSettings()
@@ -5504,6 +6157,12 @@ class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
                 "fstat_settings: save_search_records needs output_dir; the recipe builders set "
                 "<run>_artifacts/fstat_search/"
             )
+        if fstat_search_memory is not None and not isinstance(fstat_search_memory, FStatSearchMemory):
+            raise TypeError(
+                f"{type(self).__name__}: fstat_search_memory must be an FStatSearchMemory or None, not "
+                f"{type(fstat_search_memory).__name__}"
+            )
+        self.fstat_search_memory = fstat_search_memory
         # the search of this move, built at the first search (see residual_search)
         self._residual_search = None
 
@@ -5539,7 +6198,8 @@ class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
 
     def _search(self, model, branches):
         """One search of the max-likelihood walker's residual (:meth:`FStatResidualSearch.run`), then the history row
-        and the proposal of this move, then the logs and the record (:meth:`FStatResidualSearch.finish`)."""
+        and the proposal of this move, then the logs and the record (:meth:`FStatResidualSearch.finish`) and, with a
+        memory, the fit in it (:meth:`_write_fit_to_memory`)."""
         time_start = time.perf_counter()
         holder = model.analysis_container_arr
         walker = int(np.argmax(asnumpy(holder.likelihood())))
@@ -5560,6 +6220,8 @@ class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
             self.rj_proposal_distribution = {"gb": self._proposal_from_fit(search["mixtures"]["components"])}
             outcome = f"{int(search['mixtures']['usable'].sum())} bands in the proposal"
         self.residual_search.finish(search, time_start, outcome, warn=status == "no_usable_fit")
+        if self.fstat_search_memory is not None:
+            self._write_fit_to_memory(search)
 
     def _search_bands(self):
         """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
@@ -5595,6 +6257,50 @@ class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
         :class:`FStatPhaseProposal`."""
         mixture = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy, periodic=self.GMM_PERIODIC)
         return FStatPhaseProposal(mixture)
+
+    # ==================================================================================================================
+    # The search memory: the fit of each search, for the split and merge
+    # ==================================================================================================================
+
+    def _write_fit_to_memory(self, search):
+        """Mirror this search in the memory's fits of the kind "residual" (:meth:`FStatSearchMemory.set_fits`).
+
+        After a search that fitted the memory gets one fit for each usable band (:meth:`_fit_descriptions`); after one
+        with no band to search it gets the empty list, so that it drops what the move no longer has; after one that
+        found nothing it gets no call, as the move's own proposal stays too. A fixed memory refuses the list and the
+        move goes on as before. A description that the memory's check refuses (:meth:`FStatSearchMemory.screen_fits`)
+        is left out with one warning and does not stop the run: the other fits are set, and the band of the refused
+        one drops out of the memory as a band that no longer passes. Called by :meth:`_search` after the search's log
+        and record are written.
+        """
+        status = search["status"]
+        memory = self.fstat_search_memory
+        if status == "fitted":
+            descriptions = self._fit_descriptions(search)
+            fits, refused = memory.screen_fits(memory.KIND_RESIDUAL, descriptions)
+            for position, reason in refused:
+                logger.warning(
+                    "[GB_SEARCH_MEMORY %s] propose %d: the fit of the band %.6f to %.6f mHz is refused by the memory "
+                    "and left out: %s", self.name, search["num_proposals"], descriptions[position]["low_mhz"],
+                    descriptions[position]["high_mhz"], reason)
+        elif status == "no_range":
+            fits = []
+        else:
+            return
+        stored = memory.set_fits(memory.KIND_RESIDUAL, fits)
+        logger.info(
+            "[GB_SEARCH_MEMORY %s] propose %d: %s", self.name, search["num_proposals"],
+            f"fits of the residual: {len(fits)} set, version {memory.version}" if stored
+            else f"the memory is fixed, fits of the residual: {len(fits)} not stored")
+
+    def _fit_descriptions(self, search):
+        """One fit description for each usable band of a search that fitted, in the order of the mixture's components,
+        as :meth:`FStatSearchMemory.set_fits` takes it: the band's edges in mHz as the searched range, the mixture's
+        weights, means, covariances and box as host arrays, the propose of the move and the walker the search ran on,
+        and the largest sqrt(2F) of the band's first stage with the gate's threshold on it. The rule is that of
+        :meth:`FStatResidualSearch.fit_descriptions`."""
+        return FStatResidualSearch.fit_descriptions(search)
+
 
 # ======================================================================================================================
 # The objects the F-statistic search hands to Eryn and the band sorter
