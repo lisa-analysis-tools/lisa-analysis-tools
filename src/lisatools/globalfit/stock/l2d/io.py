@@ -10,10 +10,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, PrivateAttr, field_validator, model_validator, Discriminator, Tag
 
 from typing import Annotated
-from pydantic import BeforeValidator, AfterValidator, ValidationInfo, Discriminator, Tag
 
 from lisatools.utils.constants import YRSID_SI
 
@@ -207,7 +206,7 @@ class DataSection(_Section):
     dt: Duration                      # seconds: `dt: 5.0` or `dt: 5 s`
     highpass: FilterSpec | None = None
     lowpass: FilterSpec | None = None
-    aafilter: AafilterSpec | None = None # attenuation, freq1, freq2, fs; used only for the downsampling done by L01
+    aafilter: AafilterSpec | Literal["mojito"] | None = "mojito" # attenuation, freq1, freq2, fs; used only for the downsampling done by L01
     downsample: DownsampleSpec | None = None
     trim: TrimSpec | None = None
     alias_correction: bool = True  # whether to apply the alias correction to the data (default: True)
@@ -231,6 +230,16 @@ class DataSection(_Section):
             raise ValueError(
                 "filtering without data.trim makes process() trim 100 h from each end; set data.trim."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_aafilter(self):
+        if self.aafilter is None:
+            return self
+        if isinstance(self.aafilter, str):
+            if self.aafilter != "mojito":
+                raise ValueError(f"data.aafilter: unknown string {self.aafilter!r}; use a dict or 'mojito'.")
+            self.aafilter = AafilterSpec()  # mojito's default values
         return self
 
 # --- Domain section --- #
@@ -507,13 +516,13 @@ class RunConfig(_Section):
         if not isinstance(self.recipe, StockRecipeSpec):
             uses = sorted(
                 f"{name}.{key}" for name, block in self.blocks.items() if block.enabled
-                for key in ("stages", "extra_moves") if getattr(block, key, None)
+                for key in ("stages", "extra_moves", "adaptive_repeats") if getattr(block, key, None)
             )
             if uses and not self.recipe._takes_l2d:
                 raise ValueError(
                     f"{uses} are set, but the recipe function {self.recipe.function} takes no l2d argument, so it "
                     "never gets them: add l2d to its parameters and build the steps from l2d.block_moves "
-                    "(build_recipe.JointPEMoves) and l2d.move_settings."
+                    "(build_recipe.JointPEMoves), l2d.move_settings and l2d.adaptive_repeats."
                 )
             return self
         from .build_recipe import make_stock_recipe  # local: build_recipe is the runtime side
@@ -529,6 +538,17 @@ class RunConfig(_Section):
                 unknown = sorted(stages - set(names))
                 if unknown:
                     raise ValueError(f"block {name!r}: {where} {unknown} are not recipe stages {names}.")
+            if getattr(block, "adaptive_repeats", None) is not None:
+                # tuned in the stages before the last that leave num_prop_repeats to it
+                tuning = [
+                    stage for stage in names[:-1]
+                    if stage not in block.stages or block.stages[stage].num_prop_repeats is None
+                ]
+                if not tuning:
+                    raise ValueError(
+                        f"block {name!r}: adaptive_repeats tunes the repeats in the stages before the last "
+                        f"({names[-1]!r}) that set no num_prop_repeats of their own; there is none in {names}."
+                    )
         return self
 
     @model_validator(mode="after")
