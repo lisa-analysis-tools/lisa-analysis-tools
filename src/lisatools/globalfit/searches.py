@@ -965,21 +965,27 @@ class VGBSearchInterface(GBSearchInterface):
         """
         return "VGB"
 
-def sobhb_catalogue_to_gwtf_basis(catalogue_entry: dict, delta_t: float = 0.0) -> np.ndarray:
+def sobhb_catalogue_to_gwtf_basis(
+    catalogue_entry: dict, delta_t: float = 0.0, phase_at_coalescence: bool = False
+) -> np.ndarray:
     """One Mojito SOBHB catalogue entry in the ``GWTF_generator`` waveform basis.
 
-    ``[m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec]``, the output basis of
-    erebor-priors ``SOBHBPrior``. Masses are reordered so that ``m1 >= m2`` (spins follow);
-    the catalogue ``GW22FrequencySSBFrame`` is evolved by ``delta_t`` seconds (reference epoch ->
-    data start) with :func:`~lisatools.sources.utils.evolve_sobhb`; ``phi_coal`` is the coalescence phase of the
-    catalogue ``TrueAnomaly`` (:func:`~lisatools.sources.utils.sobhb_coalescence_phase`, mojito / TD convention;
-    ``GWTF_generator`` applies its own strain-sign offset).
+    ``[m1, m2, s1, s2, dist [Gpc], iota, f0, phase, psi, ra, dec]``, the output basis of erebor-priors
+    ``SOBHBPrior``. Masses are reordered so that ``m1 >= m2`` (spins follow); the catalogue
+    ``GW22FrequencySSBFrame`` is evolved by ``delta_t`` seconds (reference epoch -> data start) with
+    :func:`~lisatools.sources.utils.evolve_sobhb`. The catalogue ``TrueAnomaly`` (orbital phase where
+    ``f == GW22FrequencySSBFrame``) is mapped to the coalescence phase
+    (:func:`~lisatools.sources.utils.sobhb_coalescence_phase`) and, unless ``phase_at_coalescence``, on to
+    ``phi_0``, the orbital phase at the evolved ``f0`` (:func:`~lisatools.sources.utils.sobhb_reference_phase`).
+    Mojito / TD convention throughout.
 
     Args:
         catalogue_entry: catalogue parameters of one SOBHB source.
         delta_t: time (s) from the catalogue reference epoch to the data start (gwtf t=0).
+        phase_at_coalescence: the phase column is ``phi_coal`` (True) or ``phi_0`` (False, default); must
+            match the waveforms' ``phase_at_coalescence``.
     """
-    from ..sources.utils import evolve_sobhb, sobhb_coalescence_phase
+    from ..sources.utils import evolve_sobhb, sobhb_coalescence_phase, sobhb_reference_phase
 
     m1 = float(catalogue_entry["PrimaryMassSSBFrame"])
     m2 = float(catalogue_entry["SecondaryMassSSBFrame"])
@@ -993,13 +999,15 @@ def sobhb_catalogue_to_gwtf_basis(catalogue_entry: dict, delta_t: float = 0.0) -
     f_ref = float(catalogue_entry["GW22FrequencySSBFrame"])
     f0 = evolve_sobhb(0.0, delta_t, m1, m2, s1, s2, f_ref) if delta_t != 0.0 else f_ref
 
-    phi_coal = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, float(catalogue_entry["TrueAnomaly"]))
+    phase = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, float(catalogue_entry["TrueAnomaly"]))
+    if not phase_at_coalescence:
+        phase = sobhb_reference_phase(m1, m2, s1, s2, f0, phase)  # phi_coal -> phi_0 at the data start
 
     psi = float(catalogue_entry["PolarisationAngle"]) % (2 * np.pi)
     ra = float(catalogue_entry["RightAscension"]) % (2 * np.pi)
     dec = float(catalogue_entry["Declination"])
 
-    return np.array([m1, m2, s1, s2, dist, iota, f0, phi_coal, psi, ra, dec])
+    return np.array([m1, m2, s1, s2, dist, iota, f0, phase, psi, ra, dec])
 
 
 class SOBHBSearchInterface(BaseSearchInterface):
@@ -1010,11 +1018,15 @@ class SOBHBSearchInterface(BaseSearchInterface):
     ----
     evolve_to_data_start: bool
         If True, when seeding from the catalog values evolve the source parameters to the start of the data segment using the provided evolution function. If False, use the catalog values directly without evolution.
+    phase_at_coalescence: bool
+        The phase the seeds carry: the coalescence phase (True) or ``phi_0``, the orbital phase at the data start
+        (False, default). Must match the waveforms' ``phase_at_coalescence`` (the SOBBH block sets all of them).
     """
 
-    def __init__(self, evolve_to_data_start: bool = True, **kwargs):
+    def __init__(self, evolve_to_data_start: bool = True, phase_at_coalescence: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.evolve_to_data_start = evolve_to_data_start
+        self.phase_at_coalescence = phase_at_coalescence
 
     @property
     def branch_name(self):
@@ -1049,15 +1061,16 @@ class SOBHBSearchInterface(BaseSearchInterface):
     def unpack_catalog_entries(self, catalog_entry: dict, curr: CurrentInfoGlobalFit) -> np.ndarray:
         """
         Unpacks the catalog entries into the GWTF_generator basis
-        ``m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec``.
+        ``m1, m2, s1, s2, dist [Gpc], iota, f0, phase, psi, ra, dec``.
 
-        ``phi_coal`` is the gwtf coalescence phase mapped from the catalogue ``TrueAnomaly`` (orbital
-        phase where ``f == GW22FrequencySSBFrame``), in the mojito / TD convention.
+        ``phase`` is mapped from the catalogue ``TrueAnomaly`` (orbital phase where ``f == GW22FrequencySSBFrame``)
+        to ``phi_0`` at the data start, or to the coalescence phase with ``phase_at_coalescence`` (mojito / TD
+        convention).
         """
         delta_t = 0.0
         if self.evolve_to_data_start:
             delta_t = curr.general_info.data_t0 - float(catalog_entry["TimeReferenceSSBFrame"])
-        return sobhb_catalogue_to_gwtf_basis(catalog_entry, delta_t)
+        return sobhb_catalogue_to_gwtf_basis(catalog_entry, delta_t, self.phase_at_coalescence)
 
 class NoiseSearchInterface(BaseSearchInterface):
     """

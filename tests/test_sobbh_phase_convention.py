@@ -158,15 +158,17 @@ class WaveformKwargsTest(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_PYGWTF, "pygwtf not installed")
 class GWTFMatchesTDTest(unittest.TestCase):
-    """``GWTF_generator`` and ``SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True)`` give the same signal for the
-    same parameters (CPU, 3 days; the GPU version with more sources is scripts/sobbh/sobbh_gwtf_td_convention_check.py).
+    """``GWTF_generator`` and ``SOBBHTaylorT3TDIWaveform`` give the same signal for the same parameters, in both phase
+    conventions (``phase_at_coalescence`` True: phi_coal; False: phi_0, the orbital phase at the data start).
+    CPU, 3 days; the GPU version with more sources is scripts/sobbh/sobbh_gwtf_td_convention_check.py.
 
     The only expected phase difference is gwtf's unrefined coalescence time: arg <gwtf|TD> = 2 pi f0 (tc_gwtf - tc_TD).
-    A strain-sign mismatch (e.g. SOBHB_GWTF_PHASE_OFFSET dropped or doubled, or pygwtf fixing its sign) gives arg ~ pi.
+    A strain-sign mismatch (e.g. pygwtf's POL_CONVENTION not at the mojito value -1) gives arg ~ pi; a phase-convention
+    mismatch between the two generators gives an arbitrary arg (P(x0) mod 2 pi).
     """
 
     DT, BIG_DT, T0, DAYS = 5.0, 86400.0, 1.0e5, 3
-    # m1, m2, s1, s2, dist [Gpc], inc, f0 [Hz, data start], phi_coal, psi, ra, dec
+    # m1, m2, s1, s2, dist [Gpc], inc, f0 [Hz, data start], phase, psi, ra, dec
     SOURCE = np.array([25.0, 18.0, -0.5, 0.4, 0.05, 2.1, 0.018, 0.3, 1.3, 4.5, -0.8])
 
     @classmethod
@@ -180,20 +182,25 @@ class GWTFMatchesTDTest(unittest.TestCase):
         cls.settings = get_stft_settings(times, big_dt=cls.BIG_DT, min_freq=4e-3, max_freq=4e-2, force_backend="cpu")
         n = int(round(cls.settings.NT * cls.settings.dt / cls.DT))
         cls.grid = TDSettings(N=n, dt=cls.DT, t0=cls.settings.t0, force_backend="cpu")
-        cls.gwtf = GWTF_generator(
-            settings=cls.settings, orbits=EqualArmlengthOrbits(force_backend="cpu"), T_obs=n * cls.DT,
-            fresnel_kernel_width=16, use_GPU=False,
-        )
         common = dict(
             data_td_settings=cls.grid, tdi_generation="2nd generation", tdi_channels="XYZ",
             sampling_frequency=1.0 / cls.DT, orbits=EqualArmlengthOrbits(force_backend="cpu"), order=25,
             buffer_time=1.0e4, force_backend="cpu", waveform_t0=cls.settings.t0,
         )
-        cls.td = SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True, **common)
-        cls.td_reference = SOBBHTaylorT3TDIWaveform(**common)
+        # convention -> (gwtf, TD) pair taking the same phase parameter
+        cls.pairs = {
+            flag: (
+                GWTF_generator(
+                    settings=cls.settings, orbits=EqualArmlengthOrbits(force_backend="cpu"), T_obs=n * cls.DT,
+                    fresnel_kernel_width=16, use_GPU=False, phase_at_coalescence=flag,
+                ),
+                SOBBHTaylorT3TDIWaveform(phase_at_coalescence=flag, **common),
+            )
+            for flag in (False, True)
+        }
 
-    def overlap(self, gwtf_params, td, td_params):
-        g = np.asarray(self.gwtf.get_signals_for_residuals(*gwtf_params).arr)
+    def overlap(self, gwtf, gwtf_params, td, td_params):
+        g = np.asarray(gwtf.get_signals_for_residuals(*gwtf_params).arr)
         t = np.asarray(td.get_td_signals(*td_params, td_settings=self.grid).transform(self.settings).arr)
         self.assertEqual(g.shape, t.shape)
         return np.sum(np.conj(g) * t) / np.sqrt(np.sum(np.abs(g) ** 2) * np.sum(np.abs(t) ** 2))
@@ -209,12 +216,20 @@ class GWTFMatchesTDTest(unittest.TestCase):
         self.assertGreater(abs(ov), 0.95)  # gwtf's time-frequency approximation: ~1-2 % mismatch
         self.assertAlmostEqual(np.angle(ov), self.expected_arg(m1, m2, s1, s2, f0), delta=0.02)
 
+    def test_flag_is_kept_for_replicas(self):
+        """MultiGPUResidualAddRemoveMove rebuilds GWTF_generator(**kwargs): the convention must survive."""
+        for flag, (gwtf, _) in self.pairs.items():
+            self.assertIs(gwtf.kwargs["phase_at_coalescence"], flag)
+
     def test_same_parameters_same_signal(self):
         m1, m2, s1, s2, _, _, f0 = self.SOURCE[:7]
-        self.assertSameSignal(self.overlap(self.SOURCE, self.td, self.SOURCE), m1, m2, s1, s2, f0)
+        for flag, (gwtf, td) in self.pairs.items():
+            with self.subTest(phase_at_coalescence=flag):
+                self.assertSameSignal(self.overlap(gwtf, self.SOURCE, td, self.SOURCE), m1, m2, s1, s2, f0)
 
     def test_catalogue_phase_mapping(self):
-        """TD in the mojito convention (phi0 = TrueAnomaly) vs gwtf seeded through sobhb_catalogue_to_gwtf_basis."""
+        """TD in the reference-epoch convention (phi0 = TrueAnomaly at the catalogue epoch = data start here) vs gwtf
+        seeded through sobhb_catalogue_to_gwtf_basis, in both conventions."""
         from lisatools.globalfit.searches import sobhb_catalogue_to_gwtf_basis
 
         m1, m2, s1, s2, dist, inc, f0, _, psi, ra, dec = self.SOURCE
@@ -225,8 +240,27 @@ class GWTFMatchesTDTest(unittest.TestCase):
             PolarisationAngle=psi, RightAscension=ra, Declination=dec,
         )
         td_params = [m1, m2, s1, s2, dist, inc, f0, true_anomaly, psi, ra, dec]
-        ov = self.overlap(sobhb_catalogue_to_gwtf_basis(entry), self.td_reference, td_params)
-        self.assertSameSignal(ov, m1, m2, s1, s2, f0)
+        td_reference = self.pairs[False][1]
+        for flag, (gwtf, _) in self.pairs.items():
+            with self.subTest(phase_at_coalescence=flag):
+                seed = sobhb_catalogue_to_gwtf_basis(entry, phase_at_coalescence=flag)
+                self.assertSameSignal(self.overlap(gwtf, seed, td_reference, td_params), m1, m2, s1, s2, f0)
+
+    def test_phi_0_sampling_basis(self):
+        """SOBHBPrior samples phi_0 and passes it through: the default gwtf matches the TD waveform anchored at the
+        data start (waveform_t0 = settings.t0) with phi0 = phi_0."""
+        from ereborpriors.stock.mojitolight import SOBHBPrior
+
+        m1, m2, s1, s2, dist, inc, f0, _, psi, ra, dec = self.SOURCE
+        transform = SOBHBPrior.prior_factory().get_transforms()
+        gwtf, td_reference = self.pairs[False]
+        for phi_0 in (0.4, 2.0, 5.1):
+            gwtf_params = transform.both_transforms(np.array([[
+                (m1 * m2) ** 0.6 / (m1 + m2) ** 0.2, m1 * m2 / (m1 + m2) ** 2, s1, s2, dist, np.cos(inc), f0,
+                phi_0, psi, ra, np.sin(dec),
+            ]]))[0]
+            td_params = [m1, m2, s1, s2, dist, inc, f0, phi_0, psi, ra, dec]
+            self.assertSameSignal(self.overlap(gwtf, gwtf_params, td_reference, td_params), m1, m2, s1, s2, f0)
 
 
 if __name__ == "__main__":

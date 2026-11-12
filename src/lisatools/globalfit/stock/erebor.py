@@ -1405,9 +1405,10 @@ class SOBBHTFSettings(Settings):
 
     The prior, transform, periodicity and ``ndim`` come from erebor-priors
     ``mojitolight.SOBHBPrior``: sampling basis ``Mc, eta, s1, s2, d_L [Gpc], cos_iota,
-    f0 [Hz, at data start], phi_coal, psi, alpha, sin_delta``, transformed to the
+    f0 [Hz, at data start], phi_0 [orbital phase at data start], psi, alpha, sin_delta``, transformed to the
     ``GWTF_generator`` / ``SOBBHTaylorT3TDIWaveform`` basis ``m1, m2, s1, s2, dist [Gpc],
-    inc, f0, phi_coal, psi, ra, dec`` (sky/polarisation in the frame of the orbits).
+    inc, f0, phi_0, psi, ra, dec`` (sky/polarisation in the frame of the orbits; ``phi_0`` passes
+    through, the waveforms take it with ``phase_at_coalescence=False``).
 
     Injected ``priors`` (e.g. from an l2d YAML block) take precedence and then need
     ``transform``. Otherwise ``SOBHBPrior.prior_factory`` is built from ``f0_lims`` and

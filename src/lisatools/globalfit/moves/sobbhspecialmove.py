@@ -78,8 +78,8 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
         '''
 
         super().setup_likelihood_here(coords)            # <d|d> per split -> self.acs.cpp_split(i).d_d
-        # Residuals and PSDs per split. 
-        self._data_gwtf, self._psd_gwtf = [], []
+        # Residuals and AET inverse covariances (4*dF folded) per split.
+        self._data_gwtf, self._invC_gwtf = [], []
 
         for i, device in enumerate(self.acs.gpus or [None] * self.acs.num_splits):
 
@@ -98,7 +98,7 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
                 invC = self.acs.linear_psd_arr[i].reshape(n, *self.acs.shape_sens, *self.acs.end_shape)
 
                 self._data_gwtf.append(gen.to_gwtf_layout_from_xyz(data))
-                self._psd_gwtf.append(gen.psd_aet_from_invC(invC))
+                self._invC_gwtf.append(gen.invC_aet_from_invC(invC))
 
     def _compute_like_chunk(self, coords_in, data_index):
         '''
@@ -124,7 +124,7 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
             idx = gen.xp.asarray(intra[i], dtype=gen.xp.int32)
 
             # Grab the inner-product terms for each walker in this split, and compute the log-likelihood.
-            d_h,h_h = gen.compute_inner_products(coords_in[positions[i]], idx, self._data_gwtf[i], self._psd_gwtf[i])
+            d_h,h_h = gen.compute_inner_products(coords_in[positions[i]], idx, self._data_gwtf[i], self._invC_gwtf[i])
             d_d = self.acs.cpp_split(i).d_d[idx]
 
             return asnumpy(-0.5 * (d_d + h_h.real - 2 * d_h.real))

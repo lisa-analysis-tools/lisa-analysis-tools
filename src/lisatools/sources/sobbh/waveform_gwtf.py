@@ -14,7 +14,7 @@ from pygwtf.generator import AnalyticTimeFrequencyWaveform
 
 from ...utils.constants import C_SI
 from ...utils.utility import asnumpy
-from ..utils import SOBHB_GWTF_PHASE_OFFSET
+from ..utils import sobhb_coalescence_phase
 from ...detector import Orbits
 from ...domains import STFTSettings, STFTSignal
 
@@ -37,18 +37,33 @@ class GWTF_generator:
                  fresnel_kernel_width = 10,
                  use_GPU = True,
                  psd_drop_bands = DEFAULT_PSD_DROP_BANDS,
-                 tukey_alpha = None):
+                 tukey_alpha = None,
+                 phase_at_coalescence: bool = False):
         """
         Assumptions:
-        - PSD and data are already pre-processed and in the correct shape corresponding to the tf grid provided.
-          Use to_gwtf_layout to map lisatools STFT arrays onto the gwtf grid.
-        - PSD is clipped around the zeros as expected.
+        - Data and noise are lisatools XYZ STFT arrays on the active band. Map the data with to_gwtf_layout_from_xyz
+          and the XYZ inverse covariance with invC_aet_from_invC before calling compute_inner_products.
+        - Inner products use the full AET inverse covariance (off-diagonal channel terms kept), not a diagonal PSD.
+        - The TDI transfer-function nulls are removed with psd_drop_bands (invC set to zero there).
         - tukey_alpha: None -> box-car Fresnel kernel. Otherwise the Tukey-windowed Fresnel kernel with this taper
           fraction, which should match the per-segment STFT window of the data (window_taper_duration / dT).
 
-        Frequency grid: gwtf bin k is centred on (k+1)*dF, i.e. the grid always starts at dF (no DC bin).
-        The gwtf grid therefore covers lisatools STFT bins 1..settings.ind_max, and bins below settings.ind_min
-        (outside the active band) are zero-filled in the data and given infinite PSD by to_gwtf_layout.
+        Frequency grid: the gwtf grid is the lisatools active band, STFT bins settings.ind_min..settings.ind_max
+        (nF = settings.NF_active), with gwtf bin 0 centred on settings.f_arr[0] (config 'fmin').
+
+        Parameters:
+            settings: STFTSettings object, which contains the STFT grid and windowing information.
+            orbits: Orbits object, which contains the spacecraft positions and light travel times.
+            T_obs: Observation time in seconds.
+            fresnel_kernel_width: Width of the Fresnel kernel in number of frequency bins (default 10).
+            use_GPU: Whether to use GPU (cupy) or CPU (numpy)
+            psd_drop_bands: List of (f_lo, f_hi) tuples [Hz] where the inverse covariance is set to zero (zero information).
+            tukey_alpha: Tukey window alpha parameter for the Fresnel kernel. 
+                If None, a box-car kernel is used. Otherwise, the Tukey windowed Fresnel kernel is used.
+            phase_at_coalescence: meaning of parameter column 7. False (default): phi_0, the orbital phase at the
+                data start settings.t0 (where the GW frequency is f0), converted internally to the coalescence
+                phase pygwtf takes. True: phi_coal, the coalescence phase, passed through. Same convention as
+                SOBBHTaylorT3TDIWaveform(phase_at_coalescence=...).
         """
 
         # Constructor arguments, used by MultiGPUResidualAddRemoveMove to build one replica per GPU
@@ -57,6 +72,7 @@ class GWTF_generator:
         self.psd_drop_bands = psd_drop_bands
         self.tukey_alpha = tukey_alpha
         self.use_tukey = tukey_alpha is not None
+        self.phase_at_coalescence = bool(phase_at_coalescence)
 
         self.kwargs = dict(settings=settings,
                            orbits=orbits,
@@ -64,7 +80,8 @@ class GWTF_generator:
                            fresnel_kernel_width=fresnel_kernel_width,
                            use_GPU=use_GPU,
                            psd_drop_bands=self.psd_drop_bands,
-                           tukey_alpha=self.tukey_alpha)
+                           tukey_alpha=self.tukey_alpha,
+                           phase_at_coalescence=self.phase_at_coalescence)
 
 
         self.settings = settings
@@ -73,9 +90,8 @@ class GWTF_generator:
         self.dT = settings.dt # Time bin width
 
         self.nT = settings.NT # Number of time segments
-        # nF here is not the same as settings.NF_active, as the gwtf grid always starts at dF (no DC bin) and goes up to settings.ind_max.
-        # LISAtools uses a more general (and better) setup where the STFT grid starts at settings.ind_min and goes up to settings.ind_max, and the active band is settings.ind_min..settings.ind_max.
-        self.nF = settings.NF_active # Number of gwtf frequency bins, STFT bins ind_min..ind_max (must match the data/PSD width: gwtf does not check this at call time)
+        # The gwtf grid is the lisatools active band, STFT bins settings.ind_min..settings.ind_max ('fmin' = settings.f_arr[0] below).
+        self.nF = settings.NF_active # Number of gwtf frequency bins (must match the data/invC width)
 
         # gwtf t=0 is the start of the first segment, i.e. settings.t0 (= t_init + 850.5 + pad_trim)
         self.t_grid = settings.t0 + np.arange(self.nT + 1) * self.dT # (nT+1,) segment edges for GWTF
@@ -115,7 +131,7 @@ class GWTF_generator:
         self.spacecraft_positions = self.xp.asarray(spacecraft_positions)
         self.spacecraft_LTTs = self.xp.asarray(spacecraft_LTTs)
 
-        # Waveform generator object which computes raw <h|h> and <d|d> statistics per waveform generator.
+        # gwtf generator that computes the per-segment <d|h> and <h|h> inner products (global-fit mode, full invC).
         self.inner_product_statistics_object = AnalyticTimeFrequencyWaveform(model_class=TaylorT3Spin,
                                                                 config=config,
                                                                 tdi_type=2,
@@ -123,8 +139,9 @@ class GWTF_generator:
                                                                 spacecraft_orbits=self.spacecraft_positions,
                                                                 spacecraft_ltts=self.spacecraft_LTTs,
                                                                 block_vectorised_gpu = use_GPU, # Block vectorised mode (GPU only), better for small batches -> global fit
-                                                                gf_mode = True, # Use the GF mode, allowing for one PSD and DATA array per walker.
+                                                                gf_mode = True, # Use the GF mode, allowing for one data and invC array per walker.
                                                                 use_tukey = self.use_tukey,
+                                                                full_invC = True, # Full inverse covariance kernels (required: invC is only passed at call time).
                                                                 )
 
         # Waveform-only generator (non-gf_mode), built lazily in compute_time_frequency_waveform.
@@ -133,16 +150,15 @@ class GWTF_generator:
 
     def to_gwtf_layout(self, arr):
         """
-        Map a lisatools STFT array onto the gwtf grid. 
-        Used for both the data and the PSD.
-        
+        Map a lisatools STFT array onto the gwtf grid (used for the data, via to_gwtf_layout_from_xyz).
+
         - Reshape from ([#nWalkers,] #nChannels, #nT, #NF_active) to ([#nWalkers,] #nT, #nF, #nChannels)
 
         Parameters:
             arr: ([#nWalkers,] #nChannels, #nT, #NF_active) array on the active band settings.ind_min..settings.ind_max.
                  The walker axis is optional.
         Returns:
-            ([#nWalkers,] #nT, #nF, #nChannels) array on the gwtf grid (STFT bins 1..settings.ind_max).
+            ([#nWalkers,] #nT, #nF, #nChannels) view on the gwtf grid (the same active band, nF = NF_active).
         """
         out = self.xp.asarray(arr)          # ([nW,] 3, nT, NF_active)
 
@@ -166,19 +182,22 @@ class GWTF_generator:
         data_aet = self.xp.einsum("ci,...itf->...ctf", M, data_xyz) # ([nW,] 3 AET, nT, NF_active)
         return self.xp.ascontiguousarray(self.to_gwtf_layout(data_aet))
 
-    def psd_aet_from_invC(self, invC):
+    def invC_aet_from_invC(self, invC):
         """
-        Diagonal AET PSD on the gwtf grid from the lisatools XYZ inverse covariance.
+        Full AET inverse covariance on the gwtf grid from the lisatools XYZ inverse covariance.
 
-        Inverts invC to the XYZ covariance per (segment, bin), rotates it to AET and keeps the
-        (real) diagonal. Exact only if the noise is diagonal in AET (equal arms); the off-diagonal
-        AET terms are dropped. Bins with f <= 0 are not invertible and never used, so they get an
-        infinite PSD. 
+        M_AET is orthonormal, so C_AET = M C_XYZ M^T and invC_AET = M invC_XYZ M^T: a rotation per
+        (segment, bin), no matrix inversion. The full complex 3x3 matrix is kept, including the
+        off-diagonal AET terms, so the gwtf inner products equal lisatools' XYZ inner products.
+
+        The 4*dF inner-product factor is folded in here, once, so compute_inner_products passes the
+        result to gwtf with invC_prefolded=True (no per-call multiply or copy). Bins with f <= 0 and
+        the psd_drop_bands are set to zero (zero information).
 
         Parameters:
             invC: ([#nWalkers,] 3, 3, #nT, #NF_active) XYZ inverse covariance.
         Returns:
-            ([#nWalkers,] #nT, #nF, 3 AET) contiguous real array on self.xp.
+            ([#nWalkers,] #nT, #nF, 3 AET, 3 AET) contiguous array on self.xp, same dtype as invC, times 4*dF.
         """
         invC = self.xp.asarray(invC)
         batched = invC.ndim == 5
@@ -186,50 +205,55 @@ class GWTF_generator:
             invC = invC[None]
 
         M = self.xp.asarray(M_AET)
-        # Isolate the positive frequency bins, as the negative frequencies are not invertible and never used.
-        fpos = self.xp.asarray(self.settings.f_arr) > 0
 
-        S_aet = self.xp.full((invC.shape[0], 3) + invC.shape[-2:], self.xp.inf)  # (nW, 3 AET, nT, NF_active)
+        out = self.xp.empty((invC.shape[0],) + invC.shape[-2:] + (3, 3), dtype=invC.dtype)  # (nW, nT, NF_active, 3, 3)
 
-        # One walker at a time (PSD is unique per walker): the batched 3x3 inverse needs a full (nT, NF_active, 3, 3) temporary.
+        # invC_AET = M · invC_XYZ · M^T, one walker at a time so the einsum temporary is one walker's size.
         for w in range(invC.shape[0]):
-            # Only taking the diagonal of the AET covariance. 
-            C_xyz = self.xp.linalg.inv(self.xp.moveaxis(invC[w][:, :, :, fpos], (0, 1), (-2, -1)))  # (nT, nF_pos, 3, 3)
+            out[w] = self.xp.einsum("ci,ijkl,dj->klcd", M, invC[w], M)   # rotate, keep the full complex matrix
 
-            S_aet[w][..., fpos] = self.xp.einsum("ci,klij,cj->ckl", M, C_xyz, M).real
-            del C_xyz
+        out *= 4*self.dF # Fold in the 4*dF inner-product factor once; gwtf is called with invC_prefolded=True
 
         f = self.xp.asarray(self.settings.f_arr)
-        drop = self.xp.zeros(f.shape, dtype=bool)
+        drop = f <= 0 # Drop the DC bin (f=0) and any negative frequencies (shouldn't be present, but just in case).
         for f_lo, f_hi in (self.psd_drop_bands or []):
             drop |= (f >= f_lo) & (f <= f_hi)
-        S_aet[..., drop] = self.xp.inf      # zero information: the bins drop out of <d|h> and <h|h>
+        out[:, :, drop] = 0.0                                             # zero information (also overwrites any inf/NaN at f <= 0)
 
-        out = self.xp.ascontiguousarray(self.to_gwtf_layout(S_aet))  # (nW, nT, nF, 3 AET)
         return out if batched else out[0]
 
     def _to_gwtf_parameters(self, params):
         """
         Convert the lisatools parameters to the gwtf (TaylorT3Spin) parameters.
 
+        Note this is in the waveform basis not the sampling basis. This is simply converting the variables internally.
+
         params: (#nSources, 11) array of parameters (the SOBBHTaylorT3TDIWaveform basis), where the columns are:
         0: m1 (Msun), 1: m2 (Msun), 2: s1, 3: s2 (aligned spins), 4: dist (Gpc), 5: inc (rad),
         6: f0 (Hz, GW frequency at the data start settings.t0, i.e. gwtf t=0),
-        7: phi_coal (rad, coalescence orbital phase, Phi(x) = phi_coal - P(x), in the mojito /
-           SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True) strain convention), 8: psi (rad),
-        9: ra, 10: dec (rad, in the frame of the orbits)
+        7: the orbital phase (rad, mojito / SOBBHTaylorT3TDIWaveform strain convention):
+           phi_0, the phase at the data start (where the GW frequency is f0), if not self.phase_at_coalescence;
+           phi_coal, the coalescence phase (Phi(x) = phi_coal - P(x)), if self.phase_at_coalescence,
+        8: psi (rad), 9: ra, 10: dec (rad, in the frame of the orbits)
 
-        Returns Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec (distance in pc), with
-        phi_coal shifted by SOBHB_GWTF_PHASE_OFFSET: the pygwtf strain has the opposite sign
-        (tasks/sobbh_gwtf_td_discrepancies.md), so gwtf(phi_coal + pi/2) == TD(phi_coal).
+        Returns Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec (distance in pc). phi_0 is converted
+        to phi_coal = phi_0 + P(x0) (sobhb_coalescence_phase, on the host); phi_coal is passed through. pygwtf
+        uses the mojito polarisation convention, so gwtf(phi_coal) == TD(phi_coal) with no phase offset.
         """
-        m1, m2, s1, s2, dist, inc, f0, phi_coal, psi, ra, dec = params.T
+        m1, m2, s1, s2, dist, inc, f0, phase, psi, ra, dec = params.T
 
         Mc = (m1 * m2)**(3/5) / (m1 + m2)**(1/5)
         eta = (m1 * m2) / (m1 + m2)**2
         cosinc = self.xp.cos(inc)
         dist_pc = dist * 1.0e9 # Convert distance from Gpc to pc
-        phi_coal = phi_coal + SOBHB_GWTF_PHASE_OFFSET  # pygwtf strain sign -> mojito / TD convention
+
+        if self.phase_at_coalescence:
+            phi_coal = phase
+        else:
+            # sobhb_coalescence_phase is numpy-only: evaluate on the host, return on this generator's backend
+            phi_coal = self.xp.asarray(np.atleast_1d(sobhb_coalescence_phase(
+                *(asnumpy(a) for a in (m1, m2, s1, s2, f0, phase))
+            )))
 
         return Mc, eta, cosinc, dist_pc, f0, s1, s2, phi_coal, psi, ra, dec
 
@@ -268,7 +292,7 @@ class GWTF_generator:
         wf_params, resp_params = self._split_parameters(params)
 
         # gf_mode only supports the inner-product kernels, so waveforms come from a separate
-        # non-gf_mode generator on the same grid/orbits. Built on first use, no data/PSD needed.
+        # non-gf_mode generator on the same grid/orbits. Built on first use, no data/invC needed.
         if self.waveform_gen_object is None:
             self.waveform_gen_object = AnalyticTimeFrequencyWaveform(model_class=TaylorT3Spin,
                                                                     config=self.config,
@@ -324,15 +348,17 @@ class GWTF_generator:
 
         return signals[0] if single else signals
 
-    def compute_inner_products_per_segment(self, params, data_indices, data, psd):
+    def compute_inner_products_per_segment(self, params, data_indices, data, noise):
         """
         Per time-segment inner products.
 
         params: (#nSources, 11) array of parameters, see _to_gwtf_parameters.
 
-        data_indices: (#nSources,) array of indices corresponding to walker for the data and psd arrays for each source.
+        data_indices: (#nSources,) array of indices corresponding to walker for the data and invC arrays for each source.
 
-        data, psd: (#nWalkers, #nT, #nF, #nChannels) on the gwtf grid.
+        data: (#nWalkers, #nT, #nF, 3 AET) on the gwtf grid (to_gwtf_layout_from_xyz).
+
+        noise: (#nWalkers, #nT, #nF, 3, 3) AET inverse covariance with 4*dF folded in (invC_aet_from_invC).
 
         Returns d_h, h_h each of shape (#nSources, #nT).
         """
@@ -343,23 +369,25 @@ class GWTF_generator:
         # Contains the inner product statistics for each source, shape (nSources, nT, 2) -> (d_h, h_h) per segment.
         statistic_array = self.inner_product_statistics_object(parameters=wf_params,#(#nSources)
                                         channels=self.xp.asarray(data), #(#nWalkers, #nT, #nF, #nChannels)
-                                        psds=self.xp.asarray(psd),#(#nWalkers, #nT, #nF, #nChannels)
+                                        invC=self.xp.asarray(noise),#(#nWalkers, #nT, #nF, #nChannels, #nChannels)
                                         parameters_response=resp_params,
                                         out = None,
                                         compute_statistic=True,
-                                        data_indices = data_indices) # (nSources)
+                                        data_indices = data_indices,
+                                        invC_prefolded = True) # (nSources)
 
         return statistic_array[:,:,0], statistic_array[:,:,1]
 
 
-    def compute_inner_products(self, params, data_indices, data, psd):
+    def compute_inner_products(self, params, data_indices, data, noise):
         """
         Compute inner products <d|h> and <h|h> for each source, summed over time segments.
 
         Args:
             params: (#nSources, 11) array of parameters, see _to_gwtf_parameters.
-            data_indices: (#nSources,) array of indices corresponding to walker for the data and psd arrays for each source.
-            data, psd: (#nWalkers, #nT, #nF, #nChannels) on the gwtf grid.
+            data_indices: (#nSources,) array of indices corresponding to walker for the data and invC arrays for each source.
+            data: (#nWalkers, #nT, #nF, 3 AET) on the gwtf grid (to_gwtf_layout_from_xyz).
+            noise: (#nWalkers, #nT, #nF, 3, 3) AET inverse covariance with 4*dF folded in (invC_aet_from_invC).
 
         Returns d_h_per_source, h_h_per_source each of shape (#nSources,).
 
@@ -367,7 +395,7 @@ class GWTF_generator:
         """
         data_indices = self.xp.asarray(data_indices)
 
-        d_h, h_h = self.compute_inner_products_per_segment(params, data_indices, data, psd)
+        d_h, h_h = self.compute_inner_products_per_segment(params, data_indices, data, noise)
 
         d_h_per_source = self.xp.sum(d_h, axis=1)
         h_h_per_source = self.xp.sum(h_h, axis=1)
