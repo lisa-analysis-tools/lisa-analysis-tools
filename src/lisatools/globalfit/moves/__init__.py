@@ -2,6 +2,7 @@
 
 from .addremovemove import ResidualAddOneRemoveOneMove
 from .gbspecialmove import (
+    FStatResidualSearch,
     GBFStatRJMove,
     GBFStatSettings,
     GBSpecialRJPriorMove,

@@ -4356,34 +4356,13 @@ class GBFStatSettings:
             )
 
 
-class GBFStatRJMove(GBSpecialBase):
-    """Reversible-jump GB move whose births come from an F-statistic search of the bands, on the STFT/DFFR response.
+class FStatSearchBase:
+    """The columns, constants and static math of the F-statistic search: the start draws, the amplitudes and their map to
+    the extrinsic parameters, the gate, the theta rows, the samplers and the mixture fit.
 
-    It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back). :meth:`setup`
-    searches when the schedule of ``search_interval`` says so, and the search's mixture becomes the RJ proposal. A
-    search runs on the residual of the max-likelihood walker, in every interior band that is not shut off:
-
-    1. stage 1 samples f0, fdot and the sky of each band with the F-statistic, which maximizes the four amplitude
-       parameters analytically; one Eryn sampler per band (``nsamplers``) runs on the run's own prior restricted to
-       the band (:class:`BandMaskTransform`);
-    2. a band passes when the largest stored cold sqrt(2F) exceeds the gate's threshold (:meth:`detection_gate`);
-    3. stage 2 samples every column of the passing bands with the full likelihood, from the F-statistic maximizers at
-       stage 1's last state;
-    4. one Gaussian mixture per passing band, fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
-       theta+-, lam periodic, becomes the RJ proposal (:class:`FStatPhaseProposal`).
-
-    On several cards the walker's data and noise rows are copied to every card (:meth:`_fill_search_holder`), and each
-    likelihood call's rows are shared out in equal blocks, so every card works on every stage of the search.
-
-    A search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
-    ``save_search_records`` asks for one. The math (the start draws, the amplitudes and their map to the extrinsic
-    parameters, the gate, the theta rows) sits in static and class methods. Points are in the GB sampling basis, with
+    :class:`FStatResidualSearch`, which runs the search, and :class:`GBFStatRJMove`, which keeps these names as its own
+    class attributes, both inherit it. It has no constructor and holds no state. Points are in the GB sampling basis, with
     the columns ``COL_*``.
-
-    Args:
-        *args: :class:`GBSpecialBase`'s arguments.
-        fstat_settings: The search's settings; None takes the defaults of :class:`GBFStatSettings`.
-        **kwargs: :class:`GBSpecialBase`'s keyword arguments.
     """
 
     # Sampling columns of the GB branch: ln A, f0 (mHz), fdot, phi0, cos iota, psi, lam, sin beta
@@ -4416,293 +4395,6 @@ class GBFStatRJMove(GBSpecialBase):
         "stage2_cold_coords", "stage2_cold_ll",
     )
     SEARCH_LOG_NAME = "fstat_search.log"
-
-    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None, **kwargs):
-        # * always an RJ move: its proposal only arrives with the first search, after construction
-        super().__init__(*args, **{**kwargs, "is_rj_prop": True})
-        self.fstat_settings = deepcopy(fstat_settings) if fstat_settings is not None else GBFStatSettings()
-        settings = self.fstat_settings
-        if not isinstance(self._basis_settings, STFTSettings):
-            raise NotImplementedError(
-                f"{type(self).__name__} searches on the STFT response only, not on "
-                f"{type(self._basis_settings).__name__}."
-            )
-        response = getattr(self.gb_stft_comp, "response", None)
-        if response != "dffr":
-            raise NotImplementedError(
-                f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
-            )
-        # * The value rules are GBFStatSettings' own (__post_init__); output_dir is filled by the builders, so here.
-        if settings.save_search_records != "none" and settings.output_dir is None:
-            raise ValueError(
-                "fstat_settings: save_search_records needs output_dir; the recipe builders set "
-                "<run>_artifacts/fstat_search/"
-            )
-        # index of the next saved record, counted on from the files in output_dir at the first save
-        self._next_record = None
-        # one container per card that receives the searched walker, built at the first search on several cards
-        self._search_holder = None
-
-    def setup(self, model, branches):
-        """Search when this propose is due, else keep the proposal of the latest search.
-
-        The search runs at the move's proposes 0, M, 2M and so on, with M the setting ``search_interval`` (1: at every
-        propose). ``num_proposals`` counts the move's earlier proposes (``propose()`` raises it after ``setup()``). A
-        move without a proposal searches whatever the schedule, since ``propose()`` skips the whole propose of an RJ
-        move that has none: after a restart, which keeps no proposal, or after searches that found nothing.
-        """
-        interval = int(self.fstat_settings.search_interval)
-        if self.num_proposals % interval != 0 and self.rj_proposal_distribution is not None:
-            logger.info("[GB_FSTAT_SEARCH %s] propose %d: no search (interval %d); the latest proposal stays",
-                        self.name, self.num_proposals, interval)
-            return
-        self._search(model, branches)
-
-    # ==================================================================================================================
-    # The search, in its steps
-    # ==================================================================================================================
-
-    def _search(self, model, branches):
-        """One search, in the steps of the class docstring. The steps' outputs go into one dict, from which
-        :meth:`_finish_search` writes the logs and the record."""
-        time_start = time.perf_counter()
-        holder = model.analysis_container_arr
-        walker = int(np.argmax(asnumpy(holder.likelihood())))
-        search = {"walker": walker, "num_proposals": int(self.num_proposals), "bands": self._search_bands()}
-        if not search["bands"]["active"].any():
-            self.rj_proposal_distribution = self.gpu_priors if self.backend.uses_cupy else self.priors
-            self._finish_search(search, time_start, "every band is shut off; the prior is the proposal")
-            return
-        search_holder, owners = self._search_owners(holder, walker)
-        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, search["bands"])
-        search["gate"] = self._apply_gate(search["stage_1"], search["bands"])
-        if not search["gate"]["detected"].any():
-            self._finish_search(search, time_start, "no band passes; the latest proposal stays")
-            return
-        search["start"] = self._stage_2_start(search["likelihood_1"], search["stage_1"], search["gate"])
-        search["stage_2"], search["likelihood_2"] = self._run_stage_2(
-            search_holder, owners, search["bands"], search["gate"], search["start"])
-        search["mixtures"] = self._build_proposal(search["stage_2"])
-        if search["mixtures"]["proposal"] is None:
-            self._finish_search(
-                search, time_start, "no passing band has a usable stage-2 chain; the latest proposal stays", warn=True)
-            return
-        self.rj_proposal_distribution = {"gb": search["mixtures"]["proposal"]}
-        self._finish_search(search, time_start, f"{int(search['mixtures']['usable'].sum())} bands in the proposal")
-
-    def _search_bands(self):
-        """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
-        those searched, which leaves out the bands that found nothing in the last ``shutoff_band_iteration`` searches
-        and lie wholly above ``shutoff_high_frequency_threshold`` or wholly below ``shutoff_low_frequency_threshold``."""
-        settings = self.fstat_settings
-        edges_mhz = asnumpy(self.band_edges) * 1e3
-        ids = np.array([0]) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
-        low, high = edges_mhz[ids], edges_mhz[ids + 1]
-        active = np.ones(len(ids), dtype=bool)
-        history = getattr(self, "found_source_in_band", None)
-        iterations = int(settings.shutoff_band_iteration)
-        if history is not None and len(history) >= iterations:
-            silent = np.all(~history[-iterations:], axis=0)
-            # * two separate shutoffs, each off when its threshold is None
-            eligible = np.zeros(len(ids), dtype=bool)
-            if settings.shutoff_high_frequency_threshold is not None:
-                eligible |= low * 1e-3 >= float(settings.shutoff_high_frequency_threshold)
-            if settings.shutoff_low_frequency_threshold is not None:
-                eligible |= high * 1e-3 <= float(settings.shutoff_low_frequency_threshold)
-            active = ~(silent & eligible)
-        return {"ids": ids, "low_mhz": low, "high_mhz": high, "active": active}
-
-    def _band_mask(self, low_mhz, high_mhz):
-        """The band restriction of the run prior for Eryn's samplers, one band per sampler."""
-        # below the run prior's f0 range, where the joint prior is -inf with finite fdot bounds
-        outside_f0 = 0.5 * float(self.joint_f0_fdot_prior(self.priors["gb"]).f0_min)
-        return BandMaskTransform(low_mhz, high_mhz, outside_f0)
-
-    def _search_owners(self, holder, walker):
-        """The holder the search reads and its rows that hold the walker's residual. On several cards: the search
-        holder, with the walker copied into its row on every card; else ``holder`` and the walker itself."""
-        gpus = getattr(holder, "gpus", None)
-        if gpus is None or len(gpus) < 2:
-            return holder, [walker]
-        return self._fill_search_holder(holder, walker), list(range(len(gpus)))
-
-    def _build_search_holder(self, holder):
-        """One container per card of ``holder`` on its full STFT grid, built as the GB band buffer builds its cells:
-        data and noise rows of zeros on the card, a sensitivity backend made from the card's split, and the split's
-        Fresnel settings. Its rows receive the searched walker at each search."""
-        xp = self.xp
-        settings = holder.settings
-        data_shape = (int(holder.nchannels),) + tuple(holder.end_shape)
-        noise_shape = tuple(holder.shape_sens) + tuple(holder.end_shape)
-        containers = []
-        for split, card in enumerate(holder.gpus):
-            with xp.cuda.Device(int(card)):
-                # ! A backend of its own: the array rebinds its containers' noise arrays, which must not be the main
-                # ! holder's. The split's backend holds the card's own orbit tables.
-                split_backend = holder.cpp_splits[split].sensitivity_backend
-                sensitivity = type(split_backend)(**dict(split_backend.kwargs))
-                sensitivity.data_shape = settings.basis_shape_active
-                noise_zeros = xp.zeros(noise_shape, dtype=xp.complex128)
-                sensitivity.sens_mat = noise_zeros
-                sensitivity.invC = noise_zeros
-                sensitivity.channel_shape = tuple(holder.shape_sens)
-                data = settings.associated_class(xp.zeros(data_shape, dtype=xp.complex128), settings)
-                containers.append(AnalysisContainer(data, sensitivity))
-        group = holder.cpp_splits[0]
-        cards = [int(card) for card in holder.gpus]
-        return AnalysisContainerArray(
-            containers, gpus=cards, complex_psd=True, gpu_assignment=cards,
-            domain_group_kwargs=dict(tdi_type=group.tdi_type, window_alpha=group.window_alpha,
-                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope))
-
-    def _fill_search_holder(self, holder, walker):
-        """The search holder, built at the first call, with ``walker``'s data and noise rows of ``holder`` copied card
-        to card into its row on every card, and its (d|d) for those rows."""
-        if self._search_holder is None:
-            self._search_holder = self._build_search_holder(holder)
-        search_holder = self._search_holder
-        xp = self.xp
-        split = int(np.asarray(asnumpy(holder.split_map))[walker])
-        row = int(np.flatnonzero(np.asarray(asnumpy(holder.gpu_splits[split])) == walker)[0])
-        data_size = int(holder.nchannels) * int(holder.data_length)
-        noise_size = int(np.prod(holder.shape_sens)) * int(holder.data_length)
-        data_row = holder.linear_data_arr[split][row * data_size:(row + 1) * data_size]
-        noise_row = holder.linear_psd_arr[split][row * noise_size:(row + 1) * noise_size]
-        # ! The walker's rows come from its card's stream; each copy runs on its target card's stream, which the
-        # ! search's kernels then follow.
-        xp.cuda.Device(int(holder.gpus[split])).synchronize()
-        for target, card in enumerate(search_holder.gpus):
-            with xp.cuda.Device(int(card)):
-                for source, destination in ((data_row, search_holder.linear_data_arr[target]),
-                                            (noise_row, search_holder.linear_psd_arr[target])):
-                    if destination.size != source.size:
-                        raise ValueError(f"search holder row of {destination.size} entries for a walker row of "
-                                         f"{source.size}")
-                    destination.data.copy_from_device_async(source.data, source.nbytes)
-        search_holder.compute_d_d_terms()
-        return search_holder
-
-    def _run_stage_1(self, holder, owners, bands):
-        """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
-        restricted to each band. Returns the samplers' outputs and the likelihood, whose terms the maximizers reuse."""
-        settings = self.fstat_settings
-        betas = np.asarray(settings.betas_1, dtype=float)
-        low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
-        mask = np.zeros(self.NDIM, dtype=bool)
-        mask[list(self.SAMPLED_COLUMNS)] = True
-        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
-                                           fstat=True)
-        start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
-        output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
-                                        self.periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
-                                        progress=bool(settings.progress))
-        return output, likelihood
-
-    def _apply_gate(self, stage_1, bands):
-        """The gate on each searched band's stage-1 maximum, and the shutoff history's row of this search. Returns the
-        decisions, the thresholds, the targets and sqrt(2F) of the stored cold samples."""
-        settings = self.fstat_settings
-        # sqrt(2F) is the optimal SNR of the template at the F-statistic maximum
-        snr = np.sqrt(np.maximum(2.0 * stage_1["cold_ll"], 0.0))
-        # * the gate reads the maximum: the stage-1 cold walkers sit on several peaks without mixing, so the median and
-        # * the minimum read the lower peaks
-        detected, thresholds, targets = self.detection_gate(
-            snr, bands["low_mhz"][bands["active"]] * 1e-3, float(settings.snr_eff_threshold),
-            settings.shutoff_high_frequency_threshold, float(settings.galfor_inflation_factor))
-        found_row = np.zeros(len(bands["ids"]), dtype=bool)
-        found_row[np.flatnonzero(bands["active"])[detected]] = True
-        history = getattr(self, "found_source_in_band", None)
-        self.found_source_in_band = found_row[None] if history is None else np.vstack([history, found_row])
-        return {"detected": detected, "thresholds": thresholds, "targets": targets, "snr": snr}
-
-    def _stage_2_start(self, likelihood, stage_1, gate):
-        """Stage 2's start in the passing bands: the last stage-1 cold rows with the four analytic columns at their
-        maximizers. Returns the rows (bands, walkers, 8), F there, the rows replaced and the seconds."""
-        time_start = time.perf_counter()
-        nwalkers = int(self.fstat_settings.nwalkers)
-        n_detected = int(gate["detected"].sum())
-        last = stage_1["last_cold"][gate["detected"]].reshape(-1, self.NDIM)
-        rows, fstat, replaced = self._maximized_rows(likelihood, last)
-        return {
-            "rows": rows.reshape(n_detected, nwalkers, self.NDIM), "fstat": fstat.reshape(n_detected, nwalkers),
-            "replaced": replaced.reshape(n_detected, nwalkers), "seconds": time.perf_counter() - time_start,
-        }
-
-    def _maximized_rows(self, likelihood, coords):
-        """Rows with ln A, phi0, cos iota and psi at the F-statistic maximum, F there, and the rows replaced.
-
-        A row keeps its old values where it cannot be scored, where the maximum has no amplitude, or where the maximized
-        point falls outside the run prior; an amplitude beyond the prior's range is clipped into it first.
-        """
-        xp = likelihood.engine.xp
-        transform = self.parameter_transforms
-        coords = np.asarray(coords, dtype=float)
-        params_phys = transform.both_transforms(coords)
-        projections, overlaps, two_f, keep = likelihood.terms(xp.asarray(params_phys))
-        amplitudes = self.fstat_amplitudes(projections, overlaps, keep)
-        amplitude, cos_iota, psi, phi0 = (np.asarray(asnumpy(value), dtype=float)
-                                          for value in self.extrinsics_from_amplitudes(amplitudes))
-        fstat = np.asarray(asnumpy(xp.where(keep, 0.5 * two_f, self.REJECTED_LL)), dtype=float)
-        fstat[~np.isfinite(fstat)] = self.REJECTED_LL
-        maximized_phys = params_phys.copy()
-        maximized_phys[:, self.PHYS_AMP] = amplitude
-        maximized_phys[:, self.PHYS_PHI0] = phi0
-        maximized_phys[:, self.PHYS_IOTA] = np.arccos(cos_iota)
-        maximized_phys[:, self.PHYS_PSI] = psi
-        scored = (fstat > self.REJECTED_LL) & (amplitude > 0.0) & np.isfinite(amplitude)
-        maximized = coords.copy()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            maximized[scored] = transform.both_inverse_transforms(maximized_phys[scored])
-        prior_container = self.priors["gb"]
-        bounds = self.one_column_bounds(prior_container, self.COL_LN_AMP)
-        if bounds is not None:
-            # a hair inside the box, so the clipped point is not on the edge the prior may exclude
-            margin = 1e-9 * (bounds[1] - bounds[0])
-            maximized[scored, self.COL_LN_AMP] = np.clip(maximized[scored, self.COL_LN_AMP], bounds[0] + margin,
-                                                         bounds[1] - margin)
-        outside = ~np.isfinite(asnumpy(prior_container.logpdf(maximized)))
-        maximized[outside] = coords[outside]
-        return maximized, fstat, scored & ~outside
-
-    def _run_stage_2(self, holder, owners, bands, gate, start):
-        """Stage 2 in the passing bands: the full likelihood over every column (phi0 left to the analytic maximum when
-        phase_maximize), from the maximized rows at every temperature. Returns the samplers' outputs, with the cold
-        chains, and the likelihood."""
-        settings = self.fstat_settings
-        betas = np.asarray(settings.betas_2, dtype=float)
-        passing = np.flatnonzero(bands["active"])[gate["detected"]]
-        low, high = bands["low_mhz"][passing], bands["high_mhz"][passing]
-        mask = np.ones(self.NDIM, dtype=bool)
-        if self.phase_maximize:
-            mask[self.COL_PHI0] = False
-        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
-                                           fstat=False, phase_maximize=self.phase_maximize,
-                                           waveform_kwargs=self.waveform_kwargs)
-        output = self.run_band_samplers(
-            likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
-            self._band_mask(low, high), mask, self.periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
-            record_cold_coords=True, progress=bool(settings.progress))
-        return output, likelihood
-
-    def _build_proposal(self, stage_2):
-        """The RJ proposal from the passing bands' stage-2 cold chains: one mixture per band over :meth:`theta_rows`
-        with theta+, theta- and lam periodic (:class:`FStatPhaseProposal`). Returns the usable bands, the proposal
-        (None when no band is usable), the mixture's seven component lists, the bands per fit chunk and the seconds."""
-        time_start = time.perf_counter()
-        cold_coords = stage_2["cold_coords"]
-        samples = cold_coords.reshape(cold_coords.shape[0], -1, self.NDIM)
-        # * a band whose chain never moved in a column (zero range, which the mixture's box map divides by) or holds a
-        # * value that is not finite is left out, not the search
-        usable = np.all(np.isfinite(samples), axis=(1, 2)) & np.all(np.ptp(samples, axis=1) > 0.0, axis=1)
-        if not usable.any():
-            return {"usable": usable, "proposal": None, "components": None, "chunk": None,
-                    "seconds": time.perf_counter() - time_start}
-        gpu = int(self.xp.cuda.runtime.getDevice()) if self.backend.uses_cupy else None
-        theta = self.theta_rows(cold_coords[usable].reshape(int(usable.sum()), -1, self.NDIM))
-        components, chunk = self.fit_band_mixtures(theta, gpu, periodic=self.GMM_PERIODIC)
-        mixture = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy, periodic=self.GMM_PERIODIC)
-        return {"usable": usable, "proposal": FStatPhaseProposal(mixture), "components": components, "chunk": chunk,
-                "seconds": time.perf_counter() - time_start}
 
     # ==================================================================================================================
     # Eryn's samplers of the search and the mixture fit
@@ -4790,122 +4482,8 @@ class GBFStatRJMove(GBSpecialBase):
         return components, chunk
 
     # ==================================================================================================================
-    # The search's logs and record
+    # The mixtures' padded arrays, as the record keeps them
     # ==================================================================================================================
-
-    def _finish_search(self, search, time_start, outcome, warn=False):
-        """The search's line in the run log, its block in the search log and, when asked, its saved record."""
-        search["total_seconds"] = time.perf_counter() - time_start
-        search["outcome"] = outcome
-        (logger.warning if warn else logger.info)("[GB_FSTAT_SEARCH %s] %s", self.name, self._search_summary(search))
-        settings = self.fstat_settings
-        if settings.output_dir is None:
-            return
-        os.makedirs(settings.output_dir, exist_ok=True)
-        with open(os.path.join(settings.output_dir, self.SEARCH_LOG_NAME), "a") as handle:
-            handle.write(self._search_log_block(search))
-        if settings.save_search_records != "none":
-            self._save_record(self._search_record(search))
-
-    def _search_summary(self, search):
-        """One line: the propose, the walker, the bands searched and passing, the outcome and the times."""
-        active = search["bands"]["active"]
-        parts = [f"propose {search['num_proposals']}, walker {search['walker']}, {int(active.sum())} of "
-                 f"{len(active)} bands searched"]
-        if "gate" in search:
-            gate = search["gate"]
-            thresholds = ", ".join(f"{value:.2f}" for value in np.unique(gate["thresholds"]))
-            parts.append(f"{int(gate['detected'].sum())} pass (thresholds {thresholds})")
-        parts.append(search["outcome"])
-        times = [f"{name} {search[key]['seconds']:.1f} s" for name, key in
-                 (("stage 1", "stage_1"), ("stage 2", "stage_2"), ("mixtures", "mixtures")) if key in search]
-        times.append(f"total {search['total_seconds']:.1f} s")
-        return "; ".join(parts) + "; " + ", ".join(times)
-
-    def _search_log_block(self, search):
-        """The search's block in fstat_search.log: its line, the stages and one line per passing band."""
-        lines = [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.name}: {self._search_summary(search)}"]
-        if "stage_1" in search:
-            stage_1, likelihood = search["stage_1"], search["likelihood_1"]
-            lines.append(
-                f"  stage 1: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s in the "
-                f"F-statistic; cold acceptance {stage_1['acceptance_cold'].min():.3f} to "
-                f"{stage_1['acceptance_cold'].max():.3f}")
-        if "start" in search:
-            replaced = search["start"]["replaced"]
-            lines.append(f"  maximizers: {int(replaced.sum())} of {replaced.size} start rows moved to the maximum, "
-                         f"{search['start']['seconds']:.1f} s")
-        if "stage_2" in search:
-            likelihood = search["likelihood_2"]
-            lines.append(f"  stage 2: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s "
-                         "in the likelihood")
-        if "gate" in search and search["gate"]["detected"].any():
-            bands, gate = search["bands"], search["gate"]
-            searched = np.flatnonzero(bands["active"])
-            largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
-            mixtures = search.get("mixtures")
-            counts = iter([] if mixtures is None or mixtures["components"] is None
-                          else [len(asnumpy(weights)) for weights in mixtures["components"][0]])
-            for order, position in enumerate(np.flatnonzero(gate["detected"])):
-                band = searched[position]
-                line = (f"    band {bands['ids'][band]}: {bands['low_mhz'][band]:.6f} to {bands['high_mhz'][band]:.6f} "
-                        f"mHz, largest sqrt(2F) {largest[position]:.2f} against {gate['thresholds'][position]:.2f}")
-                if "stage_2" in search:
-                    line += f", stage-2 cold acceptance {search['stage_2']['acceptance_cold'][order]:.3f}"
-                if mixtures is not None:
-                    line += (f", {next(counts)} mixture components" if mixtures["usable"][order]
-                             else ", chain not usable")
-                lines.append(line)
-        return "\n".join(lines) + "\n"
-
-    def _search_record(self, search):
-        """The search's arrays, under the keys of the port's earlier record; at "summary" without CHAIN_KEYS."""
-        settings = self.fstat_settings
-        bands = search["bands"]
-        record = {
-            "walker": search["walker"], "num_proposals": search["num_proposals"], "band_ids": bands["ids"],
-            "band_low_mhz": bands["low_mhz"], "band_high_mhz": bands["high_mhz"], "active": bands["active"],
-            "settings": json.dumps(asdict(settings)), "outcome": search["outcome"],
-            "total_seconds": search["total_seconds"],
-        }
-        if "stage_1" in search:
-            stage_1, likelihood, gate = search["stage_1"], search["likelihood_1"], search["gate"]
-            snr = gate["snr"]
-            record.update({
-                "stage1_cold_fstat": stage_1["cold_ll"].astype(np.float32),
-                "stage1_snr_quantiles": np.quantile(snr.reshape(len(snr), -1), [0.0, 0.05, 0.5, 0.95, 1.0], axis=1).T,
-                "stage1_last_cold": stage_1["last_cold"], "stage1_acceptance_cold": stage_1["acceptance_cold"],
-                "stage1_swap_acceptance": stage_1["swap_acceptance"], "stage1_seconds": stage_1["seconds"],
-                "stage1_betas_start": np.asarray(settings.betas_1, dtype=float), "stage1_betas_end": stage_1["betas"],
-                "stage1_rows": likelihood.rows, "stage1_calls": likelihood.calls,
-                "stage1_likelihood_seconds": likelihood.seconds,
-                "detected": gate["detected"], "detection_rule": "maximum", "detection_thresholds": gate["thresholds"],
-                "detection_targets": gate["targets"],
-            })
-        if "start" in search:
-            start = search["start"]
-            record.update({"stage2_start": start["rows"], "stage2_start_fstat": start["fstat"],
-                           "stage2_start_replaced": start["replaced"], "maximize_seconds": start["seconds"]})
-        if "stage_2" in search:
-            stage_2, likelihood = search["stage_2"], search["likelihood_2"]
-            record.update({
-                "stage2_cold_coords": stage_2["cold_coords"], "stage2_cold_ll": stage_2["cold_ll"],
-                "stage2_acceptance_cold": stage_2["acceptance_cold"],
-                "stage2_swap_acceptance": stage_2["swap_acceptance"],
-                "stage2_betas_start": np.asarray(settings.betas_2, dtype=float), "stage2_betas_end": stage_2["betas"],
-                "stage2_seconds": stage_2["seconds"], "stage2_rows": likelihood.rows, "stage2_calls": likelihood.calls,
-                "stage2_likelihood_seconds": likelihood.seconds,
-            })
-        if "mixtures" in search:
-            mixtures = search["mixtures"]
-            record.update({"gmm_usable": mixtures["usable"], "gmm_seconds": mixtures["seconds"]})
-            if mixtures["components"] is not None:
-                record.update(self.padded_components(mixtures["components"]), gmm_layout="theta_lam",
-                              gmm_chunk_bands=mixtures["chunk"])
-        if settings.save_search_records != "full":
-            for key in self.CHAIN_KEYS:
-                record.pop(key, None)
-        return record
 
     @staticmethod
     def padded_components(components):
@@ -4926,18 +4504,6 @@ class GBFStatRJMove(GBSpecialBase):
             padded["gmm_means"][band, :count] = asnumpy(means[band])
             padded["gmm_covs"][band, :count] = asnumpy(covs[band])
         return padded
-
-    def _save_record(self, record):
-        """The record as <move name>_search_<n>.npz in output_dir, n counting on from the files there, so that a
-        continued run adds to them."""
-        folder = self.fstat_settings.output_dir
-        prefix = f"{self.name.replace(' ', '_')}_search_"
-        if self._next_record is None:
-            taken = [int(name[len(prefix):-4]) for name in os.listdir(folder)
-                     if name.startswith(prefix) and name.endswith(".npz") and name[len(prefix):-4].isdigit()]
-            self._next_record = max(taken, default=-1) + 1
-        np.savez_compressed(os.path.join(folder, f"{prefix}{self._next_record:05d}.npz"), **record)
-        self._next_record += 1
 
     # ==================================================================================================================
     # Math of the search: the band-restricted start draws, the F-statistic algebra, the gate and the theta rows
@@ -5068,6 +4634,540 @@ class GBFStatRJMove(GBSpecialBase):
         psi = xp.mod(0.25 * (theta_plus + theta_minus) + 0.5 * np.pi * phase_copy + np.pi * psi_copy, 2.0 * np.pi)
         return phi0, psi
 
+
+class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
+    """The F-statistic search of bands on the residual of one walker, on the STFT/DFFR response.
+
+    :meth:`run` searches the bands it is given, in these steps, and returns what each step made:
+
+    1. stage 1 samples f0, fdot and the sky of each band with the F-statistic, which maximizes the four amplitude
+       parameters analytically; one Eryn sampler per band (``nsamplers``) runs on the run's own prior restricted to
+       the band (:class:`BandMaskTransform`);
+    2. a band passes when the largest stored cold sqrt(2F) exceeds the gate's threshold (:meth:`detection_gate`);
+    3. stage 2 samples every column of the passing bands with the full likelihood, from the F-statistic maximizers at
+       stage 1's last state;
+    4. one Gaussian mixture per passing band is fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
+       theta+-, lam periodic.
+
+    On several cards each :meth:`run` copies the walker's data and noise rows to every card (:meth:`_fill_search_holder`),
+    and each likelihood call's rows are shared out in equal blocks, so every card works on every stage of the search.
+
+    The search chooses neither the bands nor the walker and changes nothing of the run: the caller turns the fit into a
+    proposal. It keeps no sampler and no data between calls, except the containers of those copies, which it builds
+    once. :meth:`finish` writes one line to the run log and a block to ``fstat_search.log``, and saves the search's
+    record when ``save_search_records`` asks for one.
+
+    Args:
+        fstat_settings: The search's settings, kept as given (the owner of the search holds the copy); None takes the
+            defaults of :class:`GBFStatSettings`.
+        priors: The run's prior dict; its ``"gb"`` entry is the container of the start draws and of the prior test.
+        parameter_transforms: The GB parameter transform container.
+        phase_maximize: Whether stage 2 leaves phi0 to the analytic maximum.
+        waveform_kwargs: The waveform keywords of stage 2's likelihood; None takes none.
+        name: The label of the log lines and the prefix of the record files.
+        force_backend: The backend, as for the moves; None takes the preferred one.
+    """
+
+    def __init__(self, fstat_settings: Optional[GBFStatSettings] = None, *, priors, parameter_transforms,
+                 phase_maximize=False, waveform_kwargs=None, name="fstat search", force_backend=None):
+        LISAToolsParallelModule.__init__(self, force_backend=force_backend)
+        self.fstat_settings = fstat_settings if fstat_settings is not None else GBFStatSettings()
+        self.priors = priors
+        self.parameter_transforms = parameter_transforms
+        self.phase_maximize = phase_maximize
+        self.waveform_kwargs = waveform_kwargs if waveform_kwargs is not None else {}
+        self.name = name
+        # index of the next saved record, counted on from the files in output_dir at the first save
+        self._next_record = None
+        # one container per card that receives the searched walker, built at the first search on several cards
+        self._search_holder = None
+
+    @classmethod
+    def supported_backends(cls):
+        return ["lisatools_" + backend_name for backend_name in cls.GPU_RECOMMENDED()]
+
+    # ==================================================================================================================
+    # The search, in its steps
+    # ==================================================================================================================
+
+    def run(self, holder, walker, bands, *, engine, periodic):
+        """One search of the walker's residual in the bands, from stage 1 to the mixture fit.
+
+        ``holder`` is the model's analysis container array, ``walker`` the index of the walker in it, ``bands`` a dict
+        of ``ids``, ``low_mhz``, ``high_mhz`` (the f0 edges in mHz) and ``active`` (the bands to search), ``engine`` the
+        caller's band likelihood engine and ``periodic`` its Eryn periodic container. Returns a dict with ``walker``,
+        ``bands``, the output of each step that ran and ``status``: "no_range" (no band is active), "no_detection" (no
+        band passes the gate), "no_usable_fit" (no passing band has a usable stage-2 chain) or "fitted".
+        """
+        search = {"walker": walker, "bands": bands}
+        if not bands["active"].any():
+            search["status"] = "no_range"
+            return search
+        search_holder, owners = self._search_owners(holder, walker)
+        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, bands, engine, periodic)
+        search["gate"] = self._apply_gate(search["stage_1"], bands)
+        if not search["gate"]["detected"].any():
+            search["status"] = "no_detection"
+            return search
+        search["start"] = self._stage_2_start(search["likelihood_1"], search["stage_1"], search["gate"])
+        search["stage_2"], search["likelihood_2"] = self._run_stage_2(
+            search_holder, owners, bands, search["gate"], search["start"], engine, periodic)
+        search["mixtures"] = self._fit_mixtures(search["stage_2"])
+        search["status"] = "fitted" if search["mixtures"]["usable"].any() else "no_usable_fit"
+        return search
+
+    def _band_mask(self, low_mhz, high_mhz):
+        """The band restriction of the run prior for Eryn's samplers, one band per sampler."""
+        # below the run prior's f0 range, where the joint prior is -inf with finite fdot bounds
+        outside_f0 = 0.5 * float(self.joint_f0_fdot_prior(self.priors["gb"]).f0_min)
+        return BandMaskTransform(low_mhz, high_mhz, outside_f0)
+
+    def _search_owners(self, holder, walker):
+        """The holder the search reads and its rows that hold the walker's residual. On several cards: the search
+        holder, with the walker copied into its row on every card; else ``holder`` and the walker itself."""
+        gpus = getattr(holder, "gpus", None)
+        if gpus is None or len(gpus) < 2:
+            return holder, [walker]
+        return self._fill_search_holder(holder, walker), list(range(len(gpus)))
+
+    def _build_search_holder(self, holder):
+        """One container per card of ``holder`` on its full STFT grid, built as the GB band buffer builds its cells:
+        data and noise rows of zeros on the card, a sensitivity backend made from the card's split, and the split's
+        Fresnel settings. Its rows receive the searched walker at each search."""
+        xp = self.xp
+        settings = holder.settings
+        data_shape = (int(holder.nchannels),) + tuple(holder.end_shape)
+        noise_shape = tuple(holder.shape_sens) + tuple(holder.end_shape)
+        containers = []
+        for split, card in enumerate(holder.gpus):
+            with xp.cuda.Device(int(card)):
+                # ! A backend of its own: the array rebinds its containers' noise arrays, which must not be the main
+                # ! holder's. The split's backend holds the card's own orbit tables.
+                split_backend = holder.cpp_splits[split].sensitivity_backend
+                sensitivity = type(split_backend)(**dict(split_backend.kwargs))
+                sensitivity.data_shape = settings.basis_shape_active
+                noise_zeros = xp.zeros(noise_shape, dtype=xp.complex128)
+                sensitivity.sens_mat = noise_zeros
+                sensitivity.invC = noise_zeros
+                sensitivity.channel_shape = tuple(holder.shape_sens)
+                data = settings.associated_class(xp.zeros(data_shape, dtype=xp.complex128), settings)
+                containers.append(AnalysisContainer(data, sensitivity))
+        group = holder.cpp_splits[0]
+        cards = [int(card) for card in holder.gpus]
+        return AnalysisContainerArray(
+            containers, gpus=cards, complex_psd=True, gpu_assignment=cards,
+            domain_group_kwargs=dict(tdi_type=group.tdi_type, window_alpha=group.window_alpha,
+                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope))
+
+    def _fill_search_holder(self, holder, walker):
+        """The search holder, built at the first call, with ``walker``'s data and noise rows of ``holder`` copied card
+        to card into its row on every card, and its (d|d) for those rows."""
+        if self._search_holder is None:
+            self._search_holder = self._build_search_holder(holder)
+        search_holder = self._search_holder
+        xp = self.xp
+        split = int(np.asarray(asnumpy(holder.split_map))[walker])
+        row = int(np.flatnonzero(np.asarray(asnumpy(holder.gpu_splits[split])) == walker)[0])
+        data_size = int(holder.nchannels) * int(holder.data_length)
+        noise_size = int(np.prod(holder.shape_sens)) * int(holder.data_length)
+        data_row = holder.linear_data_arr[split][row * data_size:(row + 1) * data_size]
+        noise_row = holder.linear_psd_arr[split][row * noise_size:(row + 1) * noise_size]
+        # ! The walker's rows come from its card's stream; each copy runs on its target card's stream, which the
+        # ! search's kernels then follow.
+        xp.cuda.Device(int(holder.gpus[split])).synchronize()
+        for target, card in enumerate(search_holder.gpus):
+            with xp.cuda.Device(int(card)):
+                for source, destination in ((data_row, search_holder.linear_data_arr[target]),
+                                            (noise_row, search_holder.linear_psd_arr[target])):
+                    if destination.size != source.size:
+                        raise ValueError(f"search holder row of {destination.size} entries for a walker row of "
+                                         f"{source.size}")
+                    destination.data.copy_from_device_async(source.data, source.nbytes)
+        search_holder.compute_d_d_terms()
+        return search_holder
+
+    def _run_stage_1(self, holder, owners, bands, engine, periodic):
+        """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
+        restricted to each band. ``holder`` and ``owners`` are those of :meth:`_search_owners`. Returns the samplers'
+        outputs and the likelihood, whose terms the maximizers reuse."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_1, dtype=float)
+        low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
+        mask = np.zeros(self.NDIM, dtype=bool)
+        mask[list(self.SAMPLED_COLUMNS)] = True
+        likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms,
+                                           fstat=True)
+        start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
+        output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
+                                        periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
+                                        progress=bool(settings.progress))
+        return output, likelihood
+
+    def _apply_gate(self, stage_1, bands):
+        """The gate on each searched band's stage-1 maximum. Returns the decisions, the thresholds, the targets and
+        sqrt(2F) of the stored cold samples."""
+        settings = self.fstat_settings
+        # sqrt(2F) is the optimal SNR of the template at the F-statistic maximum
+        snr = np.sqrt(np.maximum(2.0 * stage_1["cold_ll"], 0.0))
+        # * the gate reads the maximum: the stage-1 cold walkers sit on several peaks without mixing, so the median and
+        # * the minimum read the lower peaks
+        detected, thresholds, targets = self.detection_gate(
+            snr, bands["low_mhz"][bands["active"]] * 1e-3, float(settings.snr_eff_threshold),
+            settings.shutoff_high_frequency_threshold, float(settings.galfor_inflation_factor))
+        return {"detected": detected, "thresholds": thresholds, "targets": targets, "snr": snr}
+
+    def _stage_2_start(self, likelihood, stage_1, gate):
+        """Stage 2's start in the passing bands: the last stage-1 cold rows with the four analytic columns at their
+        maximizers. Returns the rows (bands, walkers, 8), F there, the rows replaced and the seconds."""
+        time_start = time.perf_counter()
+        nwalkers = int(self.fstat_settings.nwalkers)
+        n_detected = int(gate["detected"].sum())
+        last = stage_1["last_cold"][gate["detected"]].reshape(-1, self.NDIM)
+        rows, fstat, replaced = self._maximized_rows(likelihood, last)
+        return {
+            "rows": rows.reshape(n_detected, nwalkers, self.NDIM), "fstat": fstat.reshape(n_detected, nwalkers),
+            "replaced": replaced.reshape(n_detected, nwalkers), "seconds": time.perf_counter() - time_start,
+        }
+
+    def _maximized_rows(self, likelihood, coords):
+        """Rows with ln A, phi0, cos iota and psi at the F-statistic maximum, F there, and the rows replaced.
+
+        A row keeps its old values where it cannot be scored, where the maximum has no amplitude, or where the maximized
+        point falls outside the run prior; an amplitude beyond the prior's range is clipped into it first.
+        """
+        xp = likelihood.engine.xp
+        transform = self.parameter_transforms
+        coords = np.asarray(coords, dtype=float)
+        params_phys = transform.both_transforms(coords)
+        projections, overlaps, two_f, keep = likelihood.terms(xp.asarray(params_phys))
+        amplitudes = self.fstat_amplitudes(projections, overlaps, keep)
+        amplitude, cos_iota, psi, phi0 = (np.asarray(asnumpy(value), dtype=float)
+                                          for value in self.extrinsics_from_amplitudes(amplitudes))
+        fstat = np.asarray(asnumpy(xp.where(keep, 0.5 * two_f, self.REJECTED_LL)), dtype=float)
+        fstat[~np.isfinite(fstat)] = self.REJECTED_LL
+        maximized_phys = params_phys.copy()
+        maximized_phys[:, self.PHYS_AMP] = amplitude
+        maximized_phys[:, self.PHYS_PHI0] = phi0
+        maximized_phys[:, self.PHYS_IOTA] = np.arccos(cos_iota)
+        maximized_phys[:, self.PHYS_PSI] = psi
+        scored = (fstat > self.REJECTED_LL) & (amplitude > 0.0) & np.isfinite(amplitude)
+        maximized = coords.copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            maximized[scored] = transform.both_inverse_transforms(maximized_phys[scored])
+        prior_container = self.priors["gb"]
+        bounds = self.one_column_bounds(prior_container, self.COL_LN_AMP)
+        if bounds is not None:
+            # a hair inside the box, so the clipped point is not on the edge the prior may exclude
+            margin = 1e-9 * (bounds[1] - bounds[0])
+            maximized[scored, self.COL_LN_AMP] = np.clip(maximized[scored, self.COL_LN_AMP], bounds[0] + margin,
+                                                         bounds[1] - margin)
+        outside = ~np.isfinite(asnumpy(prior_container.logpdf(maximized)))
+        maximized[outside] = coords[outside]
+        return maximized, fstat, scored & ~outside
+
+    def _run_stage_2(self, holder, owners, bands, gate, start, engine, periodic):
+        """Stage 2 in the passing bands: the full likelihood over every column (phi0 left to the analytic maximum when
+        phase_maximize), from the maximized rows at every temperature. ``holder`` and ``owners`` are those of
+        :meth:`_search_owners`. Returns the samplers' outputs, with the cold chains, and the likelihood."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_2, dtype=float)
+        passing = np.flatnonzero(bands["active"])[gate["detected"]]
+        low, high = bands["low_mhz"][passing], bands["high_mhz"][passing]
+        mask = np.ones(self.NDIM, dtype=bool)
+        if self.phase_maximize:
+            mask[self.COL_PHI0] = False
+        likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms,
+                                           fstat=False, phase_maximize=self.phase_maximize,
+                                           waveform_kwargs=self.waveform_kwargs)
+        output = self.run_band_samplers(
+            likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
+            self._band_mask(low, high), mask, periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
+            record_cold_coords=True, progress=bool(settings.progress))
+        return output, likelihood
+
+    def _fit_mixtures(self, stage_2):
+        """The mixtures of the passing bands' stage-2 cold chains: one per band over :meth:`theta_rows` with theta+,
+        theta- and lam periodic. Returns the usable bands, the mixture's seven component lists (None when no band is
+        usable), the bands per fit chunk and the seconds."""
+        time_start = time.perf_counter()
+        cold_coords = stage_2["cold_coords"]
+        samples = cold_coords.reshape(cold_coords.shape[0], -1, self.NDIM)
+        # * a band whose chain never moved in a column (zero range, which the mixture's box map divides by) or holds a
+        # * value that is not finite is left out, not the search
+        usable = np.all(np.isfinite(samples), axis=(1, 2)) & np.all(np.ptp(samples, axis=1) > 0.0, axis=1)
+        if not usable.any():
+            return {"usable": usable, "components": None, "chunk": None,
+                    "seconds": time.perf_counter() - time_start}
+        gpu = int(self.xp.cuda.runtime.getDevice()) if self.backend.uses_cupy else None
+        theta = self.theta_rows(cold_coords[usable].reshape(int(usable.sum()), -1, self.NDIM))
+        components, chunk = self.fit_band_mixtures(theta, gpu, periodic=self.GMM_PERIODIC)
+        return {"usable": usable, "components": components, "chunk": chunk,
+                "seconds": time.perf_counter() - time_start}
+
+    # ==================================================================================================================
+    # The search's logs and record
+    # ==================================================================================================================
+
+    def finish(self, search, time_start, outcome, warn=False):
+        """The search's line in the run log, its block in the search log and, when asked, its saved record."""
+        search["total_seconds"] = time.perf_counter() - time_start
+        search["outcome"] = outcome
+        (logger.warning if warn else logger.info)("[GB_FSTAT_SEARCH %s] %s", self.name, self._search_summary(search))
+        settings = self.fstat_settings
+        if settings.output_dir is None:
+            return
+        os.makedirs(settings.output_dir, exist_ok=True)
+        with open(os.path.join(settings.output_dir, self.SEARCH_LOG_NAME), "a") as handle:
+            handle.write(self._search_log_block(search))
+        if settings.save_search_records != "none":
+            self._save_record(self._search_record(search))
+
+    def _search_summary(self, search):
+        """One line: the propose, the walker, the bands searched and passing, the outcome and the times."""
+        active = search["bands"]["active"]
+        parts = [f"propose {search['num_proposals']}, walker {search['walker']}, {int(active.sum())} of "
+                 f"{len(active)} bands searched"]
+        if "gate" in search:
+            gate = search["gate"]
+            thresholds = ", ".join(f"{value:.2f}" for value in np.unique(gate["thresholds"]))
+            parts.append(f"{int(gate['detected'].sum())} pass (thresholds {thresholds})")
+        parts.append(search["outcome"])
+        times = [f"{name} {search[key]['seconds']:.1f} s" for name, key in
+                 (("stage 1", "stage_1"), ("stage 2", "stage_2"), ("mixtures", "mixtures")) if key in search]
+        times.append(f"total {search['total_seconds']:.1f} s")
+        return "; ".join(parts) + "; " + ", ".join(times)
+
+    def _search_log_block(self, search):
+        """The search's block in fstat_search.log: its line, the stages and one line per passing band."""
+        lines = [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.name}: {self._search_summary(search)}"]
+        if "stage_1" in search:
+            stage_1, likelihood = search["stage_1"], search["likelihood_1"]
+            lines.append(
+                f"  stage 1: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s in the "
+                f"F-statistic; cold acceptance {stage_1['acceptance_cold'].min():.3f} to "
+                f"{stage_1['acceptance_cold'].max():.3f}")
+        if "start" in search:
+            replaced = search["start"]["replaced"]
+            lines.append(f"  maximizers: {int(replaced.sum())} of {replaced.size} start rows moved to the maximum, "
+                         f"{search['start']['seconds']:.1f} s")
+        if "stage_2" in search:
+            likelihood = search["likelihood_2"]
+            lines.append(f"  stage 2: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s "
+                         "in the likelihood")
+        if "gate" in search and search["gate"]["detected"].any():
+            bands, gate = search["bands"], search["gate"]
+            searched = np.flatnonzero(bands["active"])
+            largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
+            mixtures = search.get("mixtures")
+            counts = iter([] if mixtures is None or mixtures["components"] is None
+                          else [len(asnumpy(weights)) for weights in mixtures["components"][0]])
+            for order, position in enumerate(np.flatnonzero(gate["detected"])):
+                band = searched[position]
+                line = (f"    band {bands['ids'][band]}: {bands['low_mhz'][band]:.6f} to {bands['high_mhz'][band]:.6f} "
+                        f"mHz, largest sqrt(2F) {largest[position]:.2f} against {gate['thresholds'][position]:.2f}")
+                if "stage_2" in search:
+                    line += f", stage-2 cold acceptance {search['stage_2']['acceptance_cold'][order]:.3f}"
+                if mixtures is not None:
+                    line += (f", {next(counts)} mixture components" if mixtures["usable"][order]
+                             else ", chain not usable")
+                lines.append(line)
+        return "\n".join(lines) + "\n"
+
+    def _search_record(self, search):
+        """The search's arrays, under the keys of the port's earlier record; at "summary" without CHAIN_KEYS."""
+        settings = self.fstat_settings
+        bands = search["bands"]
+        record = {
+            "walker": search["walker"], "num_proposals": search["num_proposals"], "band_ids": bands["ids"],
+            "band_low_mhz": bands["low_mhz"], "band_high_mhz": bands["high_mhz"], "active": bands["active"],
+            "settings": json.dumps(asdict(settings)), "outcome": search["outcome"],
+            "total_seconds": search["total_seconds"],
+        }
+        if "stage_1" in search:
+            stage_1, likelihood, gate = search["stage_1"], search["likelihood_1"], search["gate"]
+            snr = gate["snr"]
+            record.update({
+                "stage1_cold_fstat": stage_1["cold_ll"].astype(np.float32),
+                "stage1_snr_quantiles": np.quantile(snr.reshape(len(snr), -1), [0.0, 0.05, 0.5, 0.95, 1.0], axis=1).T,
+                "stage1_last_cold": stage_1["last_cold"], "stage1_acceptance_cold": stage_1["acceptance_cold"],
+                "stage1_swap_acceptance": stage_1["swap_acceptance"], "stage1_seconds": stage_1["seconds"],
+                "stage1_betas_start": np.asarray(settings.betas_1, dtype=float), "stage1_betas_end": stage_1["betas"],
+                "stage1_rows": likelihood.rows, "stage1_calls": likelihood.calls,
+                "stage1_likelihood_seconds": likelihood.seconds,
+                "detected": gate["detected"], "detection_rule": "maximum", "detection_thresholds": gate["thresholds"],
+                "detection_targets": gate["targets"],
+            })
+        if "start" in search:
+            start = search["start"]
+            record.update({"stage2_start": start["rows"], "stage2_start_fstat": start["fstat"],
+                           "stage2_start_replaced": start["replaced"], "maximize_seconds": start["seconds"]})
+        if "stage_2" in search:
+            stage_2, likelihood = search["stage_2"], search["likelihood_2"]
+            record.update({
+                "stage2_cold_coords": stage_2["cold_coords"], "stage2_cold_ll": stage_2["cold_ll"],
+                "stage2_acceptance_cold": stage_2["acceptance_cold"],
+                "stage2_swap_acceptance": stage_2["swap_acceptance"],
+                "stage2_betas_start": np.asarray(settings.betas_2, dtype=float), "stage2_betas_end": stage_2["betas"],
+                "stage2_seconds": stage_2["seconds"], "stage2_rows": likelihood.rows, "stage2_calls": likelihood.calls,
+                "stage2_likelihood_seconds": likelihood.seconds,
+            })
+        if "mixtures" in search:
+            mixtures = search["mixtures"]
+            record.update({"gmm_usable": mixtures["usable"], "gmm_seconds": mixtures["seconds"]})
+            if mixtures["components"] is not None:
+                record.update(self.padded_components(mixtures["components"]), gmm_layout="theta_lam",
+                              gmm_chunk_bands=mixtures["chunk"])
+        if settings.save_search_records != "full":
+            for key in self.CHAIN_KEYS:
+                record.pop(key, None)
+        return record
+
+    def _save_record(self, record):
+        """The record as <move name>_search_<n>.npz in output_dir, n counting on from the files there, so that a
+        continued run adds to them."""
+        folder = self.fstat_settings.output_dir
+        prefix = f"{self.name.replace(' ', '_')}_search_"
+        if self._next_record is None:
+            taken = [int(name[len(prefix):-4]) for name in os.listdir(folder)
+                     if name.startswith(prefix) and name.endswith(".npz") and name[len(prefix):-4].isdigit()]
+            self._next_record = max(taken, default=-1) + 1
+        np.savez_compressed(os.path.join(folder, f"{prefix}{self._next_record:05d}.npz"), **record)
+        self._next_record += 1
+
+
+class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
+    """Reversible-jump GB move whose births come from an F-statistic search of the bands, on the STFT/DFFR response.
+
+    It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back). :meth:`setup`
+    searches when the schedule of ``search_interval`` says so, and the search's mixture becomes the RJ proposal. A
+    search runs on the residual of the max-likelihood walker, in every interior band that is not shut off, in the steps
+    of :class:`FStatResidualSearch`: the F-statistic over f0, fdot and the sky (stage 1), the gate on its maximum, the
+    full likelihood over every column of the passing bands (stage 2) and one Gaussian mixture per passing band over
+    theta+- = 2 psi +- phi0 with theta+-, lam periodic, which becomes the RJ proposal (:class:`FStatPhaseProposal`).
+
+    The move keeps the schedule, the choice of the bands with the history that shuts them off, and the proposal. The
+    search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
+    ``save_search_records`` asks for one. The columns, the constants and the math of the search are class attributes
+    of the move as well (:class:`FStatSearchBase`).
+
+    Args:
+        *args: :class:`GBSpecialBase`'s arguments.
+        fstat_settings: The search's settings; None takes the defaults of :class:`GBFStatSettings`.
+        **kwargs: :class:`GBSpecialBase`'s keyword arguments.
+    """
+
+    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None, **kwargs):
+        # * always an RJ move: its proposal only arrives with the first search, after construction
+        super().__init__(*args, **{**kwargs, "is_rj_prop": True})
+        self.fstat_settings = deepcopy(fstat_settings) if fstat_settings is not None else GBFStatSettings()
+        settings = self.fstat_settings
+        if not isinstance(self._basis_settings, STFTSettings):
+            raise NotImplementedError(
+                f"{type(self).__name__} searches on the STFT response only, not on "
+                f"{type(self._basis_settings).__name__}."
+            )
+        response = getattr(self.gb_stft_comp, "response", None)
+        if response != "dffr":
+            raise NotImplementedError(
+                f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
+            )
+        # * The value rules are GBFStatSettings' own (__post_init__); output_dir is filled by the builders, so here.
+        if settings.save_search_records != "none" and settings.output_dir is None:
+            raise ValueError(
+                "fstat_settings: save_search_records needs output_dir; the recipe builders set "
+                "<run>_artifacts/fstat_search/"
+            )
+        # the search of this move, built at the first search (see residual_search)
+        self._residual_search = None
+
+    @property
+    def residual_search(self):
+        """The search this move runs, built at the first use from the move's own settings, priors, transforms, name and
+        backend."""
+        if self._residual_search is None:
+            self._residual_search = FStatResidualSearch(
+                self.fstat_settings, priors=self.priors, parameter_transforms=self.parameter_transforms,
+                phase_maximize=self.phase_maximize, waveform_kwargs=self.waveform_kwargs, name=self.name,
+                force_backend=self.force_backend)
+        return self._residual_search
+
+    def setup(self, model, branches):
+        """Search when this propose is due, else keep the proposal of the latest search.
+
+        The search runs at the move's proposes 0, M, 2M and so on, with M the setting ``search_interval`` (1: at every
+        propose). ``num_proposals`` counts the move's earlier proposes (``propose()`` raises it after ``setup()``). A
+        move without a proposal searches whatever the schedule, since ``propose()`` skips the whole propose of an RJ
+        move that has none: after a restart, which keeps no proposal, or after searches that found nothing.
+        """
+        interval = int(self.fstat_settings.search_interval)
+        if self.num_proposals % interval != 0 and self.rj_proposal_distribution is not None:
+            logger.info("[GB_FSTAT_SEARCH %s] propose %d: no search (interval %d); the latest proposal stays",
+                        self.name, self.num_proposals, interval)
+            return
+        self._search(model, branches)
+
+    # ==================================================================================================================
+    # The search of the move: its bands, its history and its proposal
+    # ==================================================================================================================
+
+    def _search(self, model, branches):
+        """One search of the max-likelihood walker's residual (:meth:`FStatResidualSearch.run`), then the history row
+        and the proposal of this move, then the logs and the record (:meth:`FStatResidualSearch.finish`)."""
+        time_start = time.perf_counter()
+        holder = model.analysis_container_arr
+        walker = int(np.argmax(asnumpy(holder.likelihood())))
+        search = self.residual_search.run(holder, walker, self._search_bands(),
+                                          engine=self._likelihood_engine, periodic=self.periodic)
+        search["num_proposals"] = int(self.num_proposals)
+        status = search["status"]
+        if "gate" in search:
+            self._record_found_bands(search["bands"], search["gate"])
+        if status == "no_range":
+            self.rj_proposal_distribution = self.gpu_priors if self.backend.uses_cupy else self.priors
+            outcome = "every band is shut off; the prior is the proposal"
+        elif status == "no_detection":
+            outcome = "no band passes; the latest proposal stays"
+        elif status == "no_usable_fit":
+            outcome = "no passing band has a usable stage-2 chain; the latest proposal stays"
+        else:
+            self.rj_proposal_distribution = {"gb": self._proposal_from_fit(search["mixtures"]["components"])}
+            outcome = f"{int(search['mixtures']['usable'].sum())} bands in the proposal"
+        self.residual_search.finish(search, time_start, outcome, warn=status == "no_usable_fit")
+
+    def _search_bands(self):
+        """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
+        those searched, which leaves out the bands that found nothing in the last ``shutoff_band_iteration`` searches
+        and lie wholly above ``shutoff_high_frequency_threshold`` or wholly below ``shutoff_low_frequency_threshold``."""
+        settings = self.fstat_settings
+        edges_mhz = asnumpy(self.band_edges) * 1e3
+        ids = np.array([0]) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+        low, high = edges_mhz[ids], edges_mhz[ids + 1]
+        active = np.ones(len(ids), dtype=bool)
+        history = getattr(self, "found_source_in_band", None)
+        iterations = int(settings.shutoff_band_iteration)
+        if history is not None and len(history) >= iterations:
+            silent = np.all(~history[-iterations:], axis=0)
+            # * two separate shutoffs, each off when its threshold is None
+            eligible = np.zeros(len(ids), dtype=bool)
+            if settings.shutoff_high_frequency_threshold is not None:
+                eligible |= low * 1e-3 >= float(settings.shutoff_high_frequency_threshold)
+            if settings.shutoff_low_frequency_threshold is not None:
+                eligible |= high * 1e-3 <= float(settings.shutoff_low_frequency_threshold)
+            active = ~(silent & eligible)
+        return {"ids": ids, "low_mhz": low, "high_mhz": high, "active": active}
+
+    def _record_found_bands(self, bands, gate):
+        """Append this search's row to the history that shuts bands off: the bands that passed the gate."""
+        found_row = np.zeros(len(bands["ids"]), dtype=bool)
+        found_row[np.flatnonzero(bands["active"])[gate["detected"]]] = True
+        history = getattr(self, "found_source_in_band", None)
+        self.found_source_in_band = found_row[None] if history is None else np.vstack([history, found_row])
+
+    def _proposal_from_fit(self, components):
+        """The RJ proposal from the fit's seven component lists: one mixture over every band, wrapped by
+        :class:`FStatPhaseProposal`."""
+        mixture = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy, periodic=self.GMM_PERIODIC)
+        return FStatPhaseProposal(mixture)
 
 # ======================================================================================================================
 # The objects the F-statistic search hands to Eryn and the band sorter
