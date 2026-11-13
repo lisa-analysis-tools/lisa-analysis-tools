@@ -840,9 +840,9 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             prev_logp[(temp_inds_update, walker_inds_update)] = logp[keep].flatten()
             prev_logP[(temp_inds_update, walker_inds_update)] = logP[keep].flatten()
 
-            if _is_flow(move):
+            # if _is_flow(move):
                 # log debug information for flow move
-                logger.debug(f"Flow move {move_name} accepted {np.sum(keep)} out of {len(keep.flatten())} proposals for leaf {leaf}.")
+                # logger.debug(f"Flow move {move_name} accepted {np.sum(keep)} out of {len(keep.flatten())} proposals for leaf {leaf}.")
 
                 # logger.debug(f"MH factors: {factors.flatten()}")
                 # logger.debug(f"prev_logP: {prev_logP_here.flatten()}")
