@@ -73,6 +73,8 @@ if typing.TYPE_CHECKING:
     from .stock.erebor import GBSetup, GeneralSetup
     from ..analysiscontainer import AnalysisContainerArray
 
+from lisatools.utils.utility import set_attribute
+
 logger = logging.getLogger(__name__)
 
 MOJITO_REFERENCE_TIME = 97729089.327664
@@ -271,6 +273,7 @@ class BaseRecipeStep(RecipeStep):
     # defaults for subclasses that do not call this __init__
     repeat_controllers: dict = {}
     kept_repeats: tuple = ()
+    move_attributes: dict = {}
     name: str | None = None
     backend = None
 
@@ -281,6 +284,7 @@ class BaseRecipeStep(RecipeStep):
         move_settings: dict[str, dict] | None = None,
         repeat_controllers: dict[str, "RepeatController"] | None = None,
         kept_repeats: typing.Iterable[str] = (),
+        move_attributes: dict[str, dict] | None = None,
     ):
         super().__init__(moves=moves, weights=weights)
         self.move_settings = move_settings or {}
@@ -288,6 +292,8 @@ class BaseRecipeStep(RecipeStep):
         self.repeat_controllers = repeat_controllers or {}
         # branches whose repeats earlier steps tuned: this step runs with the kept value, fixed
         self.kept_repeats = tuple(kept_repeats)
+        # branch -> {attribute path: value} set on the branch's moves when the step starts (set_attribute)
+        self.move_attributes = move_attributes or {}
         self.name: str | None = None  # the step's name in the Recipe (set by Recipe._start_current_step)
         self.backend = None  # the Recipe's backend (same)
 
@@ -303,6 +309,28 @@ class BaseRecipeStep(RecipeStep):
                 if not any(sub is other for other in listed):
                     listed.append(sub)
         return out
+
+    def apply_move_attributes(self, dry_run: bool = False) -> None:
+        """Set each branch's :attr:`move_attributes` on its moves in this step (:func:`set_attribute`).
+
+        A path is set on every move of the branch that has it, and must be there on one at least: an unknown
+        branch or a path that no move of the branch has is an error. ``dry_run`` only checks that.
+        """
+        moves = self._branch_moves()
+        for branch, attributes in self.move_attributes.items():
+            if branch not in moves:
+                raise ValueError(f"move attributes for {branch!r}: this step has no move of that branch.")
+            for path, value in attributes.items():
+                done, errors = [], []
+                for move in moves[branch]:
+                    try:
+                        done.append(set_attribute(move, path, value, dry_run=dry_run))
+                    except (AttributeError, IndexError) as err:
+                        errors.append(f"{type(move).__name__}: {err}")
+                if not done:
+                    raise ValueError(f"{branch} move attribute {path!r} fits no move of the branch: {errors}.")
+                if not dry_run:
+                    logger.info(f"{branch} move attribute: {done[0]}")
 
     def _stored_repeats(self, branch: str) -> dict:
         if self.backend is None or not hasattr(self.backend, "recipe_repeats"):
@@ -362,6 +390,7 @@ class BaseRecipeStep(RecipeStep):
         sampler's periodicity.
         """
         self.apply_move_settings()
+        self.apply_move_attributes()
         self.apply_repeat_control()
         for move in self.moves:
             if sampler.periodic is not None and move.periodic is None:

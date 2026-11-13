@@ -116,6 +116,15 @@ class StageSpec(_Spec):
     num_prop_repeats: PositiveInt | None = None
     inner_move_weights: list[NonNegativeFloat] | None = None  # in the order of the block's inner_moves
     flow_weight: NonNegativeFloat | None = None
+    # Anything else of the PE move: attribute path -> value, set when the stage starts (recipe.set_attribute).
+    # The path goes through attributes and integer indices and may end on a method, which is then called with
+    # the value (a dict as keyword arguments): {flow_buffer_thin: 10, "moves[-1].executor.tune": {train_every: 10}}.
+    # They stay set in the later stages (a restart into a later stage sets them again, in the stages' order).
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def needs_apply_settings(self) -> bool:
+        return any(v is not None for v in (self.num_prop_repeats, self.inner_move_weights, self.flow_weight))
 
 
 class AdaptiveRepeatsSpec(_Spec):
@@ -510,11 +519,16 @@ class SourceBlock(MoveBlock):
             return self
         # * The capability, not where the class lives: stage settings reach the move through apply_settings.
         cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
-        if not hasattr(cls, "apply_settings"):
+        if not hasattr(cls, "apply_settings") and any(stage.needs_apply_settings for stage in self.stages.values()):
             raise ValueError(
-                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings)."
-                + self.STAGES_HINT
+                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings);"
+                " a stage can still set its attributes." + self.STAGES_HINT
             )
+        from lisatools.utils.utility import attribute_path  # the path syntax only: the moves are not built yet
+
+        for stage in self.stages.values():
+            for path in stage.attributes:
+                attribute_path(path)
         for name, stage in self.stages.items():
             weights = stage.inner_move_weights
             if weights is not None and self.inner_moves is None:

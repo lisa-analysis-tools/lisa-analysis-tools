@@ -766,5 +766,163 @@ class AdaptiveRepeatsSchemaTest(BlockStagesTest):
                 self.config({"mbh": {**MBH, "adaptive_repeats": adaptive, **extra}}, recipe)
 
 
+# --- stage attributes: anything of a move, set by path when a stage starts --- #
+
+class TunedExecutor:
+    """A stand-in for eryn's trainer executors: records what ``tune`` is called with."""
+
+    def __init__(self):
+        self.tuned, self.max_buffer_samples = [], 4000
+
+    def tune(self, **changes):
+        self.tuned.append(changes)
+
+
+def move_with_flow():
+    """The fake PE move with a flow move last among its inner moves, as ``blocks.base.build_source`` appends it."""
+    move = fake_move()
+    flow = types.SimpleNamespace(executor=TunedExecutor(), temperature=1.0)
+    move.moves = [types.SimpleNamespace(a=2.0), types.SimpleNamespace(a=2.0), flow]
+    move.flow_buffer_thin, move.betas = 5, [1.0, 0.5, 0.25]
+    return move, flow
+
+
+class SetAttributeTest(unittest.TestCase):
+    def test_attributes_items_and_methods(self):
+        from lisatools.utils.utility import attribute_path, set_attribute
+
+        self.assertEqual(attribute_path("moves[-1].executor.tune"), ["moves", -1, "executor", "tune"])
+        self.assertEqual(attribute_path("grid[2][0]"), ["grid", 2, 0])
+        move, flow = move_with_flow()
+        set_attribute(move, "flow_buffer_thin", 10)
+        set_attribute(move, "moves[0].a", 1.5)
+        set_attribute(move, "moves[-1].temperature", 2.0)
+        set_attribute(move, "betas[1]", 0.7)
+        self.assertEqual((move.flow_buffer_thin, move.moves[0].a, flow.temperature, move.betas), (10, 1.5, 2.0, [1.0, 0.7, 0.25]))
+        # a path ending on a method calls it: a dict as keyword arguments, a list as arguments, else one argument
+        set_attribute(move, "moves[-1].executor.tune", {"max_buffer_samples": None, "train_every": 10})
+        self.assertEqual(flow.executor.tuned, [{"max_buffer_samples": None, "train_every": 10}])
+        set_attribute(move, "apply_settings", {"num_repeats": 7})
+        self.assertEqual(move.num_repeats, 7)
+        set_attribute(move, "betas.append", 0.1)
+        set_attribute(move, "betas.insert", [0, 2.0])
+        self.assertEqual(move.betas, [2.0, 1.0, 0.7, 0.25, 0.1])
+
+    def test_a_path_that_leaves_the_object_is_an_error(self):
+        from lisatools.utils.utility import set_attribute
+
+        move, flow = move_with_flow()
+        for path, err, msg in [
+            ("flow_bufer_thin", AttributeError, "no attribute 'flow_bufer_thin'"),  # misspelt: not a new attribute
+            ("moves[-1].executer.tune", AttributeError, "executer"),
+            ("moves[7].a", IndexError, "moves"),
+            ("betas[5]", IndexError, "no item 5"),
+            ("moves[x].a", ValueError, "cannot read"),
+            ("moves..a", ValueError, "cannot read"),
+        ]:
+            with self.subTest(path=path), self.assertRaisesRegex(err, msg):
+                set_attribute(move, path, 1)
+
+    def test_dry_run_changes_nothing(self):
+        from lisatools.utils.utility import set_attribute
+
+        move, flow = move_with_flow()
+        set_attribute(move, "flow_buffer_thin", 10, dry_run=True)
+        set_attribute(move, "moves[-1].executor.tune", {"train_every": 10}, dry_run=True)
+        set_attribute(move, "betas[1]", 0.7, dry_run=True)
+        self.assertEqual((move.flow_buffer_thin, flow.executor.tuned, move.betas[1]), (5, [], 0.5))
+        with self.assertRaises(AttributeError):
+            set_attribute(move, "nope", 1, dry_run=True)
+
+
+class StageAttributesTest(unittest.TestCase):
+    STAGES = [{"name": "warm", "iterations": 3}, {"name": "tune", "iterations": 3}, {"name": "pe"}]
+    GROW = {"moves[-1].executor.tune": {"max_buffer_samples": None, "train_every": 10}}
+
+    def attributes(self, stage):
+        """As ``stage_move_attributes``: what is in force in the stage (the earlier stages' included)."""
+        return {
+            "warm": {},
+            "tune": {"mbh": {"flow_buffer_thin": 10}},
+            "pe": {"mbh": {"flow_buffer_thin": 10, **self.GROW}},
+        }[stage]
+
+    def recipe(self, move, attributes=None, backend=None):
+        recipe = gf_recipe.Recipe()
+        StockRecipe(stages=self.STAGES).add_steps(
+            recipe, {"mbh": BranchMoves([], [move])}, move_attributes=attributes or self.attributes
+        )
+        recipe.backend = backend or FakeBackend()
+        return recipe
+
+    def run_recipe(self, recipe, sampler, until):
+        local = 0
+        while sampler.iteration < until:
+            sampler.iteration += 1
+            if recipe(local, None, sampler):
+                return
+            local += 1
+
+    def test_set_when_the_stage_starts(self):
+        (move, flow), sampler = move_with_flow(), FakeSampler()
+        recipe = self.recipe(move)
+        self.assertEqual((move.flow_buffer_thin, flow.executor.tuned), (5, []))  # building the steps sets nothing
+        recipe.setup_first_recipe_step(0, None, sampler)
+        self.assertEqual(move.flow_buffer_thin, 5)
+        self.run_recipe(recipe, sampler, until=3)
+        self.assertEqual((recipe.current_recipe_step["name"], move.flow_buffer_thin), ("tune", 10))
+        self.assertEqual(flow.executor.tuned, [])
+        self.run_recipe(recipe, sampler, until=6)
+        self.assertEqual(recipe.current_recipe_step["name"], "pe")
+        self.assertEqual(flow.executor.tuned, [{"max_buffer_samples": None, "train_every": 10}])
+
+    def test_restart_into_the_last_stage_sets_the_earlier_ones_too(self):
+        (move, flow), sampler = move_with_flow(), FakeSampler(iteration=9)
+        recipe = self.recipe(move, backend=FakeBackend({"warm": 0, "tune": 3, "pe": 6}))
+        recipe.recipe[0]["status"] = recipe.recipe[1]["status"] = True
+        recipe.setup_first_recipe_step(sampler.iteration, None, sampler)
+        self.assertEqual(move.flow_buffer_thin, 10)
+        self.assertEqual(flow.executor.tuned, [{"max_buffer_samples": None, "train_every": 10}])
+
+    def test_a_path_no_move_has_fails_when_the_steps_are_built(self):
+        move, _flow = move_with_flow()
+        for attributes, msg in [
+            ({"mbh": {"flow_bufer_thin": 10}}, "fits no move of the branch"),
+            ({"mbh": {"moves[-1].trainer.tune": {}}}, "fits no move of the branch"),
+            ({"emri": {"flow_buffer_thin": 10}}, "no move of that branch"),
+        ]:
+            with self.subTest(attributes=attributes), self.assertRaisesRegex(ValueError, msg):
+                self.recipe(move, attributes=lambda stage: attributes if stage == "pe" else {})
+
+
+class StageAttributesSchemaTest(BlockStagesTest):
+    STAGES3 = {"class": "StockRecipe", "kwargs": {"stages": [
+        {"name": "warm", "iterations": 5}, {"name": "tune", "iterations": 5}, {"name": "pe"}]}}
+
+    def test_attributes_in_force_per_stage(self):
+        from lisatools.globalfit.stock.l2d.build_recipe import stage_move_attributes
+
+        grow = {"moves[-1].executor.tune": {"max_buffer_samples": None, "train_every": 10}}
+        stages = {
+            "pe": {"attributes": {**grow, "flow_buffer_thin": 20}},  # listed first, last in the recipe
+            "tune": {"attributes": {"flow_buffer_thin": 10, "permute_every": 50}},
+        }
+        cfg = self.config({"mbh": {**MBH, "stages": stages}}, self.STAGES3)
+        order = ["warm", "tune", "pe"]
+        self.assertEqual(stage_move_attributes(cfg, "warm", order), {})
+        self.assertEqual(stage_move_attributes(cfg, "tune", order), {"mbh": {"flow_buffer_thin": 10, "permute_every": 50}})
+        self.assertEqual(
+            stage_move_attributes(cfg, "pe", order), {"mbh": {"flow_buffer_thin": 20, "permute_every": 50, **grow}}
+        )
+        # attributes alone set no repeats or weights
+        info = types.SimpleNamespace(inner_moves=[("a", 0.35), ("b", 0.05), ("c", 0.05)])
+        curr = types.SimpleNamespace(source_info={"mbh": info})
+        self.assertEqual(stage_move_settings(cfg, curr, "pe"), {})
+
+    def test_a_bad_path_fails_at_load(self):
+        with self.assertRaisesRegex(Exception, "cannot read"):
+            self.config({"mbh": {**MBH, "stages": {"pe": {"attributes": {"moves[last].a": 1}}}}}, self.STAGES3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import typing
 from typing import Tuple
 
@@ -693,3 +694,69 @@ class ErynEtaMcPrior(object):
         return np.stack((Mc, eta), axis=-1).reshape(size + (2,))
 
         
+
+
+# --- setting attributes by path (the l2d recipe stages' `attributes`) --- #
+
+_PATH_SEGMENT = re.compile(r"([A-Za-z_]\w*)((?:\[-?\d+\])*)")
+
+
+def attribute_path(path: str) -> list:
+    """``"moves[-1].executor.tune"`` -> ``["moves", -1, "executor", "tune"]`` (names and integer indices)."""
+    tokens: list = []
+    for segment in str(path).split("."):
+        match = _PATH_SEGMENT.fullmatch(segment)
+        if match is None:
+            raise ValueError(f"attribute path {path!r}: cannot read {segment!r} (use name, name[i], name.sub).")
+        tokens.append(match.group(1))
+        tokens.extend(int(index) for index in re.findall(r"-?\d+", match.group(2)))
+    return tokens
+
+
+def set_attribute(obj, path: str, value, dry_run: bool = False) -> str:
+    """Set ``obj.<path>`` to ``value``; ``path`` goes through attributes and integer indices
+    (``flow_buffer_thin``, ``moves[-1].executor.tune``, ``temperature_controls[0].betas``).
+
+    What the path ends on decides what is done:
+
+    - a method (anything callable): it is called, with a dict as keyword arguments, a list as positional
+      arguments, anything else as its one argument;
+    - an attribute: it is set. It must exist already, so a misspelt name is an error and not a new attribute;
+    - an index: that item is set.
+
+    ``dry_run`` walks the path and checks it ends on something, without setting or calling. Raises
+    ``AttributeError`` or ``IndexError`` where the path leaves the object. Returns what was done, for the log.
+    """
+    tokens = attribute_path(path)
+    holder, walked = obj, type(obj).__name__
+    for token in tokens[:-1]:
+        try:
+            holder = holder[token] if isinstance(token, int) else getattr(holder, token)
+        except (AttributeError, IndexError, TypeError, KeyError) as err:
+            raise type(err)(f"{path!r}: {walked} has no {token!r} ({err}).") from err
+        walked += f"[{token}]" if isinstance(token, int) else f".{token}"
+    last = tokens[-1]
+    if isinstance(last, int):
+        try:
+            holder[last]
+        except (IndexError, TypeError, KeyError) as err:
+            raise IndexError(f"{path!r}: {walked} has no item {last} ({err}).") from err
+        if not dry_run:
+            holder[last] = value
+        return f"{path} = {value!r}"
+    if not hasattr(holder, last):
+        raise AttributeError(f"{path!r}: {walked} ({type(holder).__name__}) has no attribute {last!r}.")
+    target = getattr(holder, last)
+    if not callable(target):
+        if not dry_run:
+            setattr(holder, last, value)
+        return f"{path} = {value!r}"
+    if dry_run:
+        return f"{path}({value!r})"
+    if isinstance(value, dict):
+        target(**value)
+    elif isinstance(value, (list, tuple)):
+        target(*value)
+    else:
+        target(value)
+    return f"{path}({value!r})"

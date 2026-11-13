@@ -54,6 +54,44 @@ stages:
   pe:      {num_prop_repeats: 50}
 ```
 
+### Anything else of the move, per stage (`attributes`)
+
+A stage can set any attribute of the block's PE move, or of something the move holds, by its path:
+
+```yaml
+stages:
+  tune: {flow_weight: 0.5, attributes: {flow_buffer_thin: 10}}
+  pe:
+    flow_weight: 0.5
+    attributes:
+      "moves[-1].executor.tune": {max_buffer_samples: null, train_every: 10}
+```
+
+| the path ends on | what is done | example |
+|---|---|---|
+| an attribute | it is set; it must exist already, so a misspelt name is an error | `flow_buffer_thin: 10`, `moves[0].a: 1.5` |
+| an index | that item is set | `betas[1]: 0.7` |
+| a method | it is called with the value: a dict as keyword arguments, a list as arguments, anything else as its one argument | `"moves[-1].executor.tune": {train_every: 10}` |
+
+- A path goes through attribute names and integer indices (`name`, `name[i]`, `name.sub`, negative indices too).
+  Quote a path with brackets in YAML.
+- It is set when the stage starts and **stays set in the later stages**. A restart into a later stage sets the
+  earlier stages' attributes again, in the stages' order, so the move ends up as in a run through all of them.
+- The syntax is checked when the config loads. Whether the path exists is checked on the built moves when the
+  recipe's steps are added, before the first iteration, for every stage.
+- It works for any source block's PE move, also one without `apply_settings` (gb), which cannot take
+  `num_prop_repeats`, `inner_move_weights` or `flow_weight` per stage.
+- The flow move is the last of the PE move's inner moves (`moves[-1]`), and its `executor` is the flow trainer.
+
+**The flow trainer in the stage that keeps its samples.** The trainer refits the flow on a buffer of the chain's
+recent samples (`flow.trainer.max_buffer_samples`, a few iterations' worth), so the proposal follows the chain
+closely. That is what burn-in needs; in the stage whose samples are kept, a proposal that depends on the latest
+samples is no longer a fixed proposal. `executor.tune` (eryn, `TrainerExecutor.tune`) changes the trainer while
+it runs: `max_buffer_samples: null` lets the buffer grow with the run and `train_every: 10` refits on every tenth
+batch only, so each refit changes the flow less than the one before. Tunable: `max_buffer_samples`, `train_every`,
+`min_train_samples`, `epochs_per_round`, `refit_transform_every`, `fit_kwargs`, `save_every`, `diagnostics_every`,
+`plot_corner`. A restarted run starts its trainer with an empty buffer, as before.
+
 ### Moves that take turns (`blocks/gb.yaml`, `extra_moves`)
 
 ```yaml
@@ -226,6 +264,9 @@ Two checks keep a recipe file from silently dropping what the blocks set:
   - every `stages` and `stage_weights` key must name one of its steps;
   - every extra move must sit in some step.
 
+A recipe file passes a stage's attributes as `move_attributes=l2d.move_attributes(stage)` to its step (in force
+in the order the block lists its `stages`); a block that sets stage attributes must have them in some step.
+
 A recipe file gets the same from `recipe.RepeatController` (`repeat_controllers=` of a step, with
 `l2d.adaptive_repeats()` for the blocks' settings; `kept_repeats=` on the step that keeps its samples) and
 `recipe.ConvergenceRecipeStep` (`monitors=` from `build_recipe.stage_monitors`). A block with `adaptive_repeats`
@@ -252,3 +293,5 @@ must have a controller in some step.
 - `tests/test_l2d_gb.py::GBSchemaTest::test_extra_moves`: the `stage_weights` schema and its checks.
 - `tests/test_l2d_stages.py`: `ActTest` (the estimates on AR(1) chains), `MoveInnerActTest`, `RepeatControllerTest`,
   `AdaptiveStagesTest` (tuning, freezing, restarts), `ConvergenceStepTest`, `AdaptiveRepeatsSchemaTest`.
+- `tests/test_l2d_stages.py`: `SetAttributeTest` (paths, methods, errors, dry run), `StageAttributesTest` (set at
+  stage start, restart, paths checked when the steps are built), `StageAttributesSchemaTest`.
