@@ -123,6 +123,30 @@ class TemperingSpec(_Spec):
     ratio: float = Field(default=1.2, gt=1.0)  # geometric ladder: betas = ratio ** -arange(ntemps)
     # the hottest rung's temperature: its beta becomes 1 / Tmax, the other rungs stay ratio ** -k
     Tmax: float | None = Field(default=None, gt=1.0)
+    # the ladder itself, coldest first (strictly decreasing, in (0, 1]); replaces ntemps, ratio and Tmax
+    betas: list[float] | None = None
+
+    @model_validator(mode="after")
+    def _ladder_is_consistent(self):
+        if self.betas is None:
+            return self
+        # * by value, not by fields set: a snapshot writes every field out (ratio at its default, the others None)
+        clashing = [key for key in ("ntemps", "ratio", "Tmax") if getattr(self, key) != type(self).model_fields[key].default]
+        if clashing:
+            raise ValueError(f"tempering.betas gives the ladder itself; leave out {clashing}.")
+        betas = np.asarray(self.betas, dtype=float)
+        # * The cold chain samples the posterior: the ladder starts at beta 1, as the ratio and Tmax ladders do.
+        if betas.size == 0 or np.any(np.diff(betas) >= 0) or betas[0] != 1.0 or betas[-1] <= 0.0:
+            raise ValueError(
+                f"tempering.betas {self.betas} must be a strictly decreasing list from 1.0 (the cold chain), "
+                "positive to the end."
+            )
+        return self
+
+    @property
+    def rungs(self) -> int | None:
+        """The ladder's number of rungs when the spec fixes it (betas or ntemps); None -> sampler.ntemps."""
+        return len(self.betas) if self.betas is not None else self.ntemps
 
 class FlowSpec(_Spec):
     """A normalizing-flow proposal (``ConditionalFlowMove``) trained online by a ``ProcessExecutor``.
@@ -181,8 +205,8 @@ class SearchSpec(_Spec):
     """
 
     search_type: Literal["prior", "distribution", "samples", "point_estimate", "catalog"] = "catalog"
-    # samples / point estimates: a file or a folder (one file per source); catalog: an HDF5 file whose root holds
-    # one dataset per catalogue column, read in place of the loaded catalogue
+    # samples / point estimates: a file or a folder (one file per source), each a .npy of physical values or an
+    # .h5/.hdf5 catalogue table (one root dataset per catalogue column); catalog reads the injection catalogue, no file
     search_path: RunPath | None = None
     parameters_searched: list[str] | Literal["all"] = "all"  # names in the prior's input (sampling) basis
     # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
@@ -195,6 +219,11 @@ class SearchSpec(_Spec):
     def _same_rules_as_the_interface(self):
         if self.search_type not in ("catalog", "prior") and self.search_path is None:
             raise ValueError(f"search_type {self.search_type!r} needs search_path.")
+        if self.search_type == "catalog" and self.search_path is not None:
+            raise ValueError(
+                "search_type 'catalog' seeds from the injection catalogue and reads no search_path; give a search "
+                "file as point_estimate (one point per source) or samples."
+            )
         if self.search_type in ("catalog", "point_estimate") and self.spread is None:
             raise ValueError(f"search_type {self.search_type!r} needs spread.")
         if self.search_path is not None and not self.search_path.exists():
@@ -340,6 +369,7 @@ class MoveBlock(BlockBase):
 
     PE_MOVES: ClassVar[dict[str, PEMove]]  # classes this block may name in pe_move
     FULL_LADDER: ClassVar[bool] = False  # True -> tempering.ntemps must equal sampler.ntemps
+    STAGES_HINT: ClassVar[str] = ""  # what a block whose pe_move takes no stage settings uses instead
 
     # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
     pe_move: ClassSpec
@@ -434,8 +464,13 @@ class SourceBlock(MoveBlock):
     def _stages_fit_the_moves(self):
         if not self.stages:
             return self
-        if self.PE_MOVES[self.pe_move.class_name].module != SPECIAL_MOVES:
-            raise ValueError(f"stages: need a special pe_move; {self.pe_move.class_name} takes no stage settings.")
+        # * The capability, not where the class lives: stage settings reach the move through apply_settings.
+        cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
+        if not hasattr(cls, "apply_settings"):
+            raise ValueError(
+                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings)."
+                + self.STAGES_HINT
+            )
         for name, stage in self.stages.items():
             weights = stage.inner_move_weights
             if weights is not None and self.inner_moves is None:
@@ -460,6 +495,10 @@ class SourceBlock(MoveBlock):
     def waveform_t0(self, ctx: BuildContext) -> float:
         """The absolute SSB time (s) the block's waveforms are referenced to (``time_reference``)."""
         return ctx.cfg.data.reference_time if self.time_reference == "mojito" else ctx.general.data_t0
+
+    def search_interface_kwargs(self) -> dict[str, Any]:
+        """Extra constructor arguments of the block's search interface (``SEARCH_INTERFACE``); none by default."""
+        return {}
 
     def engine_waveform_kwargs(self, ctx: BuildContext) -> dict[str, Any]:
         """The builder-filled constructor arguments of the block's waveform (``ENGINE_WAVEFORM_KWARGS``).
@@ -625,6 +664,8 @@ def make_betas(tempering: TemperingSpec | None, default_ntemps: int):
 
     if tempering is None:
         return None
+    if tempering.betas is not None:
+        return np.asarray(tempering.betas, dtype=float)
     ntemps = tempering.ntemps or default_ntemps
     betas = 1.0 / tempering.ratio ** np.arange(ntemps)
     if tempering.Tmax is not None:

@@ -52,6 +52,8 @@ class Recorder:
 
     def __init__(self, *args, **kwargs):
         self.args, self.kwargs = args, kwargs
+        # * as the real PE moves (ResidualAddOneRemoveOneMove): the inner moves they were given, on .moves
+        self.moves = list(kwargs.get("inner_moves") or [])
 
 
 class _Recipe(_Sources):
@@ -537,40 +539,58 @@ class StockRecipeTest(unittest.TestCase):
         self.assertEqual(pe["name"], "pe")
 
     def test_alternating_pe_moves_take_turns_in_weighted_steps(self):
-        alternatives = [Alternative("gb prior", 0.6, 0.3), Alternative("gb fstat", 0.4, 0.5),
-                        Alternative("gb jump", 0.0, 0.2)]
+        # as the settings files: gb prior and gb refit taking turns 0.95 / 0.05 in PE, with the mbh and psd moves
+        alternatives = (Alternative("gb refit", 0.05, {"burn-in": 0.5}), Alternative("gb jump", 0.0, {"burn-in": 0.2}))
         moves = {
             "gb": BranchMoves([], ["gb prior"], alternatives),
+            "mbh": BranchMoves([], ["mbh pe"]),
             "psd": BranchMoves(["psd search"], ["psd pe"]),
         }
         search, burn_in, pe = self.steps(moves, burn_in_iterations=10)
         self.assertEqual([s["name"] for s in (search, burn_in, pe)], ["psd search", "burn-in", "pe"])
         self.assertIsInstance(pe["adjust"], gf_recipe.PERecipeStep)
-        self.assertEqual(pe["adjust"].weights, [0.6, 0.4])
-        prior_combined, fstat_combined = pe["adjust"].moves
-        # each alternative with every other branch's PE moves, in the branches' order
-        self.assertEqual(prior_combined.moves, ["gb prior", "psd pe"])
-        self.assertEqual(fstat_combined.moves, ["gb fstat", "psd pe"])
-        self.assertFalse(fstat_combined.share_temperature_control)
-        # the burn-in step takes the burn-in shares, the alternative without a PE share among them, and the same
-        # combined moves as the PE step for the alternatives in both
+        np.testing.assert_allclose(pe["adjust"].weights, [0.95, 0.05])
+        prior_combined, refit_combined = pe["adjust"].moves
+        # each choice with every other branch's PE moves, in the branches' order
+        self.assertEqual(prior_combined.moves, ["gb prior", "mbh pe", "psd pe"])
+        self.assertEqual(refit_combined.moves, ["gb refit", "mbh pe", "psd pe"])
+        self.assertFalse(refit_combined.share_temperature_control)
+        # the burn-in step takes the burn-in shares, the move without a PE share among them, and the same combined
+        # moves as the PE step for the choices in both
         self.assertIsInstance(burn_in["adjust"], gf_recipe.IterationCountRecipeStep)
-        self.assertEqual(burn_in["adjust"].weights, [0.3, 0.5, 0.2])
-        self.assertEqual(burn_in["adjust"].moves[:2], pe["adjust"].moves)
-        self.assertEqual(burn_in["adjust"].moves[2].moves, ["gb jump", "psd pe"])
+        np.testing.assert_allclose(burn_in["adjust"].weights, [0.3, 0.5, 0.2])
+        self.assertIs(burn_in["adjust"].moves[0], prior_combined)
+        self.assertIs(burn_in["adjust"].moves[1], refit_combined)
+        self.assertEqual(burn_in["adjust"].moves[2].moves, ["gb jump", "mbh pe", "psd pe"])
 
-    def test_a_burn_in_only_move_needs_a_burn_in_step(self):
-        moves = {"gb": BranchMoves([], ["a"], [Alternative("a", 1.0, 0.5), Alternative("b", 0.0, 0.5)])}
-        with self.assertRaisesRegex(ValueError, "no burn-in step"):
-            self.steps(moves)
+    def test_stages_carry_the_turns_and_the_move_settings(self):
+        alternatives = (Alternative("gb fstat", 0.1, {"warm": 0.0, "hot": 0.4}),)
+        moves = {"gb": BranchMoves([], ["gb prior"], alternatives), "mbh": BranchMoves([], ["mbh pe"])}
+        settings = {"warm": {"mbh": {"num_repeats": 2}}, "hot": {"mbh": {"num_repeats": 5}}, "pe": {}}
+        recipe = gf_recipe.Recipe()
+        stages = [{"name": "warm", "iterations": 3}, {"name": "hot", "iterations": 4}, {"name": "pe"}]
+        with mock.patch.object(gf_moves, "GFCombineMove", FakeCombine):
+            StockRecipe(stages=stages).add_steps(recipe, moves, settings.get)
+        warm, hot, pe = (step["adjust"] for step in recipe.recipe)
+        self.assertEqual([step["name"] for step in recipe.recipe], ["warm", "hot", "pe"])
+        self.assertEqual([warm.num_iters, hot.num_iters], [3, 4])
+        self.assertIsInstance(pe, gf_recipe.PERecipeStep)
+        # warm: no fstat share, so one combined move; hot and pe: the stage's share and its own default
+        self.assertEqual(warm.weights, [1.0])
+        np.testing.assert_allclose(hot.weights, [0.6, 0.4])
+        np.testing.assert_allclose(pe.weights, [0.9, 0.1])
+        self.assertEqual(len({id(m) for step in (warm, hot, pe) for m in step.moves}), 2)  # built once, shared
+        self.assertEqual([warm.move_settings, hot.move_settings, pe.move_settings],
+                         [settings["warm"], settings["hot"], {}])
 
-    def test_only_one_block_may_alternate(self):
+    def test_several_blocks_take_turns_independently(self):
         moves = {
-            "gb": BranchMoves([], ["a"], [Alternative("a", 0.5, 0.5), Alternative("b", 0.5, 0.5)]),
-            "mbh": BranchMoves([], ["c"], [Alternative("c", 0.5, 0.5), Alternative("d", 0.5, 0.5)]),
+            "gb": BranchMoves([], ["a"], (Alternative("b", 0.25),)),
+            "mbh": BranchMoves([], ["c"], (Alternative("d", 0.5),)),
         }
-        with self.assertRaisesRegex(ValueError, "only one block"):
-            self.steps(moves)
+        (pe,) = self.steps(moves)
+        self.assertEqual([m.moves for m in pe["adjust"].moves], [["a", "c"], ["a", "d"], ["b", "c"], ["b", "d"]])
+        np.testing.assert_allclose(pe["adjust"].weights, [0.375, 0.375, 0.125, 0.125])
 
     def test_nothing_to_sample(self):
         with self.assertRaisesRegex(ValueError, "nothing to sample"):
@@ -579,12 +599,57 @@ class StockRecipeTest(unittest.TestCase):
             self.steps({})
 
 
+class RecipeUsesTheBlocksTest(unittest.TestCase):
+    """``check_recipe_uses_the_blocks``: after the recipe has added its steps, before the first iteration."""
+
+    def setUp(self):
+        from lisatools.globalfit.moves import GFCombineMove
+
+        self.combine = lambda *moves: GFCombineMove(moves=list(moves), share_temperature_control=False)
+        self.gb_pe, self.fstat, self.mbh = (types.SimpleNamespace(name=n) for n in ("gb pe", "gb fstat", "mbh pe"))
+        self.built = {"gb": BranchMoves([], [self.gb_pe], (Alternative(self.fstat, 0.1),)),
+                      "mbh": BranchMoves([], [self.mbh])}
+
+    def cfg(self, stage_weights=None, stages=None):
+        extra = types.SimpleNamespace(stage_weights=stage_weights or {})
+        return types.SimpleNamespace(blocks={
+            "gb": types.SimpleNamespace(enabled=True, stages={}, extra_moves={"fstat": extra}),
+            "mbh": types.SimpleNamespace(enabled=True, stages=stages or {}),
+        })
+
+    def recipe(self, *steps):
+        recipe = gf_recipe.Recipe()
+        for name, moves in steps:
+            recipe.add_recipe_component(gf_recipe.PERecipeStep(moves=moves), name=name)
+        return recipe
+
+    def test_a_recipe_running_every_move_passes(self):
+        recipe = self.recipe(("pe", [self.combine(self.gb_pe, self.mbh), self.combine(self.fstat, self.mbh)]))
+        build_recipe.check_recipe_uses_the_blocks(recipe, self.cfg({"pe": 0.2}, {"pe": {}}), self.built)
+
+    def test_an_extra_move_in_no_step(self):
+        recipe = self.recipe(("pe", [self.combine(self.gb_pe, self.mbh)]))  # the file combined only gb's pe move
+        with self.assertRaisesRegex(ValueError, r"extra moves \['gb fstat'\] are in no recipe step"):
+            build_recipe.check_recipe_uses_the_blocks(recipe, self.cfg(), self.built)
+
+    def test_stage_names_must_name_steps(self):
+        recipe = self.recipe(("pe", [self.combine(self.gb_pe, self.mbh), self.combine(self.fstat, self.mbh)]))
+        with self.assertRaisesRegex(ValueError, r"extra_moves fstat stage_weights \['warm'\] name no recipe step"):
+            build_recipe.check_recipe_uses_the_blocks(recipe, self.cfg({"warm": 0.2}), self.built)
+        with self.assertRaisesRegex(ValueError, r"'mbh': stages \['warm'\] name no recipe step"):
+            build_recipe.check_recipe_uses_the_blocks(recipe, self.cfg(stages={"warm": {}}), self.built)
+
+    def test_extra_moves_need_the_block_moves(self):
+        with self.assertRaisesRegex(ValueError, "never built the block moves"):
+            build_recipe.check_recipe_uses_the_blocks(self.recipe(), self.cfg(), None)
+
+
 class SetupFunctionTest(_Runtime):
     def run_setup(self, cfg, general=None):
         builds = {"mbh": types.SimpleNamespace(waveform_class=FakeWaveform)}
         setup = make_setup_function(cfg, builds)
         curr = types.SimpleNamespace(general_info=general or fake_general(cfg.sampler.ntemps))
-        args = ("recipe", "engine_info", curr, "acs", "priors", "state")
+        args = (gf_recipe.Recipe(), "engine_info", curr, "acs", "priors", "state")
 
         def prepare(cfg_, curr_, state):
             self.events.append(("prepare", state))
@@ -609,12 +674,13 @@ class SetupFunctionTest(_Runtime):
         return args, result
 
     def test_stock_recipe_prepares_then_builds_moves_then_adds_steps(self):
-        self.run_setup(self.config({}, {"class": "StockRecipe", "kwargs": {"burn_in_iterations": 5}}))
+        args, _ = self.run_setup(self.config({}, {"class": "StockRecipe", "kwargs": {"burn_in_iterations": 5}}))
         self.assertEqual([e[0] for e in self.events], ["prepare", "signal_gens", "moves", "steps"])
         self.assertEqual(self.events[0][1], "state")  # the engine's (already seeded) state
         self.assertEqual(self.events[1][1:], ({"mbh": "generator"}, {}))  # the stand-in build has no TD generator
         self.assertEqual(self.events[2][1], {"mbh": "generator"})
-        self.assertEqual(self.events[3][1:], ("recipe", {"psd": BranchMoves([], ["pe"])}))
+        self.assertIs(self.events[3][1], args[0])  # the engine's recipe
+        self.assertEqual(self.events[3][2], {"psd": BranchMoves([], ["pe"])})
 
     def test_recipe_file_runs_after_seeding_with_the_engine_arguments(self):
         (self.run_dir / "plain.py").write_text(
@@ -655,6 +721,18 @@ class SetupFunctionTest(_Runtime):
         self.assertIsInstance(ctx, RecipeContext)
         self.assertIs(ctx.cfg, cfg)
         self.assertEqual(ctx.wave_gens, {"mbh": "generator"})
+
+    def test_a_recipe_file_without_l2d_cannot_use_block_stages(self):
+        # * without l2d the function never gets the blocks' stage settings, so the config is refused at load
+        (self.run_dir / "plain.py").write_text("def setup_recipe(recipe, engine_info, curr, acs, priors, state):\n    pass\n")
+        mbh = {**mbh_with_search(), "stages": {"pe": {"num_prop_repeats": 10}}}
+        with self.assertRaises(ValidationError) as caught:
+            self.config({"mbh": mbh}, {"file": "plain.py"})
+        self.assertIn("takes no l2d argument", str(caught.exception))
+        (self.run_dir / "ctx.py").write_text(
+            "def setup_recipe(recipe, engine_info, curr, acs, priors, state, l2d=None):\n    pass\n"
+        )
+        self.config({"mbh": mbh}, {"file": "ctx.py"})  # with l2d: the step names are checked once it has run
 
     def test_device_is_selected_on_the_gpu_backend_only(self):
         cfg = self.config({})

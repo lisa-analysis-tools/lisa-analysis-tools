@@ -686,7 +686,9 @@ def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: fl
 
     The sampling basis is the input basis of erebor-priors ``SOBHBPrior`` (the default of
     :class:`~lisatools.globalfit.stock.erebor.SOBBHTFSetup`):
-    ``[Mc, eta, s1, s2, d_L [Gpc], cos_iota, f0, phi_coal, psi, alpha, sin_delta]``.
+    ``[Mc, eta, s1, s2, d_L [Gpc], cos_iota, f0, phi_0, psi, alpha, sin_delta]``, with ``phi_0`` the
+    orbital phase at the data start (mojito / TD convention), as the waveforms take it with
+    ``phase_at_coalescence=False``.
     Its transform gives the ``GWTF_generator`` basis, built here by
     :func:`~lisatools.globalfit.searches.sobhb_catalogue_to_gwtf_basis`.
 
@@ -708,12 +710,12 @@ def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: fl
     """
     from .searches import sobhb_catalogue_to_gwtf_basis
 
-    m1, m2, s1, s2, dist, iota, f0, phi_coal, psi, ra, dec = sobhb_catalogue_to_gwtf_basis(
+    m1, m2, s1, s2, dist, iota, f0, phi_0, psi, ra, dec = sobhb_catalogue_to_gwtf_basis(
         catalogue_entry, trim_plus_shift
     )
     Mc = (m1 * m2) ** 0.6 / (m1 + m2) ** 0.2
     eta = m1 * m2 / (m1 + m2) ** 2
-    return np.array([Mc, eta, s1, s2, dist, np.cos(iota), f0, phi_coal, psi, ra, np.sin(dec)])
+    return np.array([Mc, eta, s1, s2, dist, np.cos(iota), f0, phi_0, psi, ra, np.sin(dec)])
 
 
 def emri_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float = 0.0) -> np.ndarray:

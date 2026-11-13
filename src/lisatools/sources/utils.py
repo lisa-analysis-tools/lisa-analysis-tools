@@ -781,12 +781,7 @@ def evolve_sobhb(
     return f_end if xp is np else xp.asarray(f_end)
 
 
-# Orbital-phase offset between the pygwtf and the mojito / TD (``SOBBHTaylorT3TDIWaveform``) strain
-# conventions: for the same coalescence phase the pygwtf waveform is the negative of the TD one, i.e.
-# pygwtf(phi_coal + pi/2) == TD(phi_coal). ``GWTF_generator`` adds it internally, so its public phi_coal
-# is in the mojito / TD convention. Measured by scripts/sobbh/sobbh_gwtf_td_convention_check.py; see
-# tasks/sobbh_gwtf_td_discrepancies.md. Set to 0 once pygwtf matches.
-SOBHB_GWTF_PHASE_OFFSET = np.pi / 2
+
 
 
 def sobhb_coalescence_phase(
@@ -802,8 +797,8 @@ def sobhb_coalescence_phase(
     TaylorT3 writes the orbital phase as ``Phi(x) = phi_coal - P(x)`` with ``P -> 0`` at merger, so
     ``phi_coal = phi_ref + P(x_ref)`` with ``x_ref = (pi M f_ref)^(2/3)``. Use it to map the catalogue
     ``TrueAnomaly`` (the orbital phase where ``f == GW22FrequencySSBFrame``) to the coalescence phase of
-    ``SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True)`` and ``GWTF_generator`` (which applies
-    :data:`SOBHB_GWTF_PHASE_OFFSET` internally). Only the reference frequency enters, not the reference time.
+    ``SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True)`` and ``GWTF_generator``. 
+    Only the reference frequency enters, not the reference time.
 
     Args:
         m1, m2: component masses (Msun). s1, s2: aligned spins.
@@ -830,6 +825,32 @@ def sobhb_coalescence_phase(
     x_ref = (np.pi * total_mass_seconds * f_ref) ** (2 / 3)
     phi_coal = np.mod(phi_ref + phase(x_ref, sigma, delta, eta, s), 2 * np.pi)
     return float(phi_coal) if phi_coal.ndim == 0 else phi_coal
+
+
+def sobhb_reference_phase(
+        m1: float,
+        m2: float,
+        s1: float,
+        s2: float,
+        f_ref: float,
+        phi_coal: float,
+    ):
+    """Orbital phase of a SOBHB where its GW frequency is ``f_ref``, from its coalescence phase.
+
+    The inverse of :func:`sobhb_coalescence_phase`: ``phi_ref = phi_coal - P(x_ref)`` (mod 2 pi). With
+    ``f_ref = f0`` it gives ``phi_0``, the orbital phase at the data start that ``GWTF_generator`` and
+    ``SOBBHTaylorT3TDIWaveform`` take with ``phase_at_coalescence=False``.
+
+    Args:
+        m1, m2: component masses (Msun). s1, s2: aligned spins.
+        f_ref: GW frequency at the reference epoch (Hz). phi_coal: coalescence orbital phase (rad).
+
+    Returns:
+        ``phi_ref`` in ``[0, 2 pi)``; numpy arrays broadcast (float for all-scalar input).
+    """
+    phase_offset = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, 0.0)  # P(x_ref) mod 2 pi
+    phi_ref = np.mod(np.asarray(phi_coal, dtype=np.float64) - phase_offset, 2 * np.pi)
+    return float(phi_ref) if phi_ref.ndim == 0 else phi_ref
 
 
 def psi_rotation_icrs_to_ecliptic(lam_ecl, beta_ecl):

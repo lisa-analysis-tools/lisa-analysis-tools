@@ -188,6 +188,13 @@ class BaseSearchInterface(ABC):
         if self.search_type not in ["catalog", "prior"] and self.search_path is None:
             raise ValueError(f"Search path must be provided for search type {self.search_type}")
 
+        # * catalog is the injection catalogue (curr.general_info.catalogue): a file would be silently ignored
+        if self.search_type == "catalog" and self.search_path is not None:
+            raise ValueError(
+                f"search type catalog seeds from the injection catalogue and reads no search_path ({self.search_path});"
+                " give a search file as point_estimate (one point per source) or samples."
+            )
+
         if self.search_type in ["catalog", "point_estimate"] and self.spread is None:
             raise ValueError(f"Spread must be provided for search type {self.search_type}")
 
@@ -228,32 +235,11 @@ class BaseSearchInterface(ABC):
         """
         Returns the source catalog for the specific source type.
         """
-
-        if self.search_path is not None:
-            return self.get_search_catalog()
-
         catalog = getattr(curr.general_info, "catalogue", {}).get(self.catalog_source_name, {})
         if not catalog:
             raise ValueError(f"No catalog found for source type {self.catalog_source_name}")
 
         entries = [catalog[source_id] for source_id in sorted(catalog.keys())]
-        return entries
-
-    def get_search_catalog(self) -> list[dict]:
-        """
-        Returns the catalog of the search results at ``search_path``, one entry per source: the rows of an HDF5
-        file whose root holds one dataset per catalogue column.
-        """
-        import h5py
-
-        with h5py.File(self.search_path, "r") as catalog_file:
-            columns = {name: np.atleast_1d(item[()]) for name, item in catalog_file.items()
-                       if isinstance(item, h5py.Dataset)}
-        if not columns:
-            raise ValueError(f"{self.search_path} holds no catalogue columns at its root")
-
-        num_sources = len(next(iter(columns.values())))
-        entries = [{name: values[row] for name, values in columns.items()} for row in range(num_sources)]
         return entries
 
     @abstractmethod
@@ -273,7 +259,7 @@ class BaseSearchInterface(ABC):
         sampling_params = self.transform_to_sampling_basis(physical_params)
         return self.wrap_periodic(sampling_params) #shape: (num_leaves, num_dim)
 
-    def read_samples_from_file(self) -> np.ndarray:
+    def read_samples_from_file(self, curr: CurrentInfoGlobalFit = None) -> np.ndarray:
         """
         Reads samples from a file or directory for the specific source type.
 
@@ -282,10 +268,20 @@ class BaseSearchInterface(ABC):
         filename order: a 2-D array is ``(num_samples, num_dim)`` and a 1-D array is ``(num_dim,)``. These files hold
         physical-basis values and are inverse-transformed to the sampling basis.
 
-        Eryn backends are read from the cold chain as ``(num_leaves, num_samples, num_dim)`` and must already be in
-        the sampling basis of this branch (no inverse transform is applied). Only the samples where a leaf is active
-        are kept, and leaves that are never active are dropped; for reversible-jump chains, leaf ``k`` is assumed to
-        track the same source across walkers and steps.
+        A file is a ``.npy`` array of the physical parameters, or an ``.h5`` catalogue table: one root dataset per
+        catalogue column, unpacked per entry by ``unpack_catalog_entries`` into the array of the columns' shape
+        (``(num_rows,)`` columns give the 2-D array above, ``(num_sources, num_samples)`` columns the 3-D one).
+
+        Eryn backends (``is_eryn_backend``) are read from the cold chain as ``(num_leaves, num_samples, num_dim)``
+        and must already be in the sampling basis of this branch (no inverse transform is applied). Only the samples
+        where a leaf is active are kept, and leaves that are never active are dropped; for reversible-jump chains,
+        leaf ``k`` is assumed to track the same source across walkers and steps.
+
+        Parameters
+        ----------
+        curr : CurrentInfoGlobalFit, optional
+            The current information holder for the global fit, for ``unpack_catalog_entries`` (e.g. the data start
+            the GB parameters are evolved to); needed only for an ``.h5`` catalogue table.
 
         Returns
         -------
@@ -299,7 +295,8 @@ class BaseSearchInterface(ABC):
         if not os.path.exists(self.search_path):
             raise FileNotFoundError("Search path does not exist.")
 
-        supported_extensions = ["npy", "h5"]
+        hdf5_extensions = ("h5", "hdf5")  # the galaxy search writes gb_candidates.hdf5
+        supported_extensions = ["npy", *hdf5_extensions]
 
         def stack_sources(all_samples, source_label):
             # sources can have different numbers of samples: subsample each to the smallest so they can be stacked
@@ -314,7 +311,7 @@ class BaseSearchInterface(ABC):
 
         def read_from_one_file(filepath, one_source_per_file):
             extension = filepath.split(".")[-1]
-            if extension == "h5" and self.is_eryn_backend:
+            if extension in hdf5_extensions and self.is_eryn_backend:
                 from eryn.backends.hdfbackend import HDFBackend
                 backend = HDFBackend(filepath, read_only=True)
                 chain = backend.get_chain(temp_index=0)[self.branch_name] # shape: (num_steps, num_walkers, num_leaves, num_dim)
@@ -334,12 +331,13 @@ class BaseSearchInterface(ABC):
                 # eryn chains are already in the sampling basis
                 return stack_sources(active_leaves, filepath)
 
-            if extension == "npy":
+            if extension in hdf5_extensions:
+                # * A catalogue table holds physical values, as a .npy does: unpacked per entry into the file's own
+                # * shape, it takes the same shape rules and transform below.
+                entries, shape = self.read_file_as_catalog(filepath)
+                samples = np.array([self.unpack_catalog_entries(entry, curr) for entry in entries]).reshape(*shape, -1)
+            elif extension == "npy":
                 samples = np.load(filepath)
-            elif extension == "h5":
-                import h5py
-                with h5py.File(filepath, "r") as f:
-                    samples = f["samples"][:]
             else:
                 raise ValueError(f"Unsupported file extension: {extension}. Supported extensions are: {supported_extensions}")
 
@@ -374,6 +372,29 @@ class BaseSearchInterface(ABC):
         logger.info(f"Read samples from {self.search_path} with shape {samples.shape}")
 
         return samples
+
+    @staticmethod
+    def read_file_as_catalog(filepath: str) -> tuple[list[dict], tuple[int, ...]]:
+        """The entries of the catalogue table at ``filepath`` and their shape.
+
+        The file's root holds one dataset per catalogue column (groups, such as a search's own columns, are
+        skipped). The columns share one shape: ``(num_rows,)``, or ``(num_sources, num_samples)`` for samples of
+        each source. Returns one ``{column: value}`` dict per entry, in C order over that shape, and the shape.
+        """
+        import h5py
+
+        with h5py.File(filepath, "r") as catalog_file:
+            columns = {name: np.atleast_1d(item[()]) for name, item in catalog_file.items()
+                       if isinstance(item, h5py.Dataset)}
+        if not columns:
+            raise ValueError(f"{filepath} holds no catalogue columns at its root")
+
+        shapes = {name: values.shape for name, values in columns.items()}
+        shape = next(iter(shapes.values()))
+        if any(column_shape != shape for column_shape in shapes.values()):
+            raise ValueError(f"the catalogue columns of {filepath} must share one shape; got {shapes}")
+        entries = [{name: values[index] for name, values in columns.items()} for index in np.ndindex(shape)]
+        return entries, shape
 
     def get_covariance_matrices_from_spread(self, num_leaves: int, num_dim: int) -> np.ndarray:
         """
@@ -586,12 +607,17 @@ class BaseSearchInterface(ABC):
 
         else:
             if self.search_type == "samples":
-                samples = self.read_samples_from_file()
+                samples = self.read_samples_from_file(curr)
+                if samples.shape[1] < 2:  # the covariance of one point is NaN
+                    raise ValueError(
+                        f"samples needs several samples per source; {self.search_path} holds one point per source "
+                        f"(shape {samples.shape}): use search_type point_estimate."
+                    )
                 starting_points = self.wrap_periodic(np.median(samples, axis=1))
                 covariances = self.get_covariance_matrices_from_samples(samples)
 
             elif self.search_type == "point_estimate":
-                starting_points = self.read_samples_from_file()
+                starting_points = self.read_samples_from_file(curr)
                 if starting_points.ndim == 3:
                     if starting_points.shape[1] != 1:
                         raise ValueError(f"point_estimate expects one point per source; got shape {starting_points.shape}")
@@ -775,9 +801,10 @@ class GBSearchInterface(BaseSearchInterface):
     """
     Search interface for GB sources.
 
-    A ``catalog`` search with a ``search_path`` seeds from the rows of that file, such as the galaxy
-    search's ``gb_candidates.hdf5``. The STFT GB computations take the parameters at the catalogue's
-    reference epoch (their ``t_ref``), so STFT runs need ``evolve_to_data_start=False``.
+    A ``point_estimate`` search seeds from the rows of a catalogue table at ``search_path``, such as the galaxy
+    search's ``gb_candidates.hdf5`` (``read_samples_from_file``). The injection catalogue holds the GB population as
+    one entry of arrays, so a ``catalog`` search cannot seed GBs. The STFT GB computations take the parameters at the
+    catalogue's reference epoch (their ``t_ref``), so STFT runs need ``evolve_to_data_start=False``.
 
     Attributes
     ----------
@@ -938,21 +965,27 @@ class VGBSearchInterface(GBSearchInterface):
         """
         return "VGB"
 
-def sobhb_catalogue_to_gwtf_basis(catalogue_entry: dict, delta_t: float = 0.0) -> np.ndarray:
+def sobhb_catalogue_to_gwtf_basis(
+    catalogue_entry: dict, delta_t: float = 0.0, phase_at_coalescence: bool = False
+) -> np.ndarray:
     """One Mojito SOBHB catalogue entry in the ``GWTF_generator`` waveform basis.
 
-    ``[m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec]``, the output basis of
-    erebor-priors ``SOBHBPrior``. Masses are reordered so that ``m1 >= m2`` (spins follow);
-    the catalogue ``GW22FrequencySSBFrame`` is evolved by ``delta_t`` seconds (reference epoch ->
-    data start) with :func:`~lisatools.sources.utils.evolve_sobhb`; ``phi_coal`` is the coalescence phase of the
-    catalogue ``TrueAnomaly`` (:func:`~lisatools.sources.utils.sobhb_coalescence_phase`, mojito / TD convention;
-    ``GWTF_generator`` applies its own strain-sign offset).
+    ``[m1, m2, s1, s2, dist [Gpc], iota, f0, phase, psi, ra, dec]``, the output basis of erebor-priors
+    ``SOBHBPrior``. Masses are reordered so that ``m1 >= m2`` (spins follow); the catalogue
+    ``GW22FrequencySSBFrame`` is evolved by ``delta_t`` seconds (reference epoch -> data start) with
+    :func:`~lisatools.sources.utils.evolve_sobhb`. The catalogue ``TrueAnomaly`` (orbital phase where
+    ``f == GW22FrequencySSBFrame``) is mapped to the coalescence phase
+    (:func:`~lisatools.sources.utils.sobhb_coalescence_phase`) and, unless ``phase_at_coalescence``, on to
+    ``phi_0``, the orbital phase at the evolved ``f0`` (:func:`~lisatools.sources.utils.sobhb_reference_phase`).
+    Mojito / TD convention throughout.
 
     Args:
         catalogue_entry: catalogue parameters of one SOBHB source.
         delta_t: time (s) from the catalogue reference epoch to the data start (gwtf t=0).
+        phase_at_coalescence: the phase column is ``phi_coal`` (True) or ``phi_0`` (False, default); must
+            match the waveforms' ``phase_at_coalescence``.
     """
-    from ..sources.utils import evolve_sobhb, sobhb_coalescence_phase
+    from ..sources.utils import evolve_sobhb, sobhb_coalescence_phase, sobhb_reference_phase
 
     m1 = float(catalogue_entry["PrimaryMassSSBFrame"])
     m2 = float(catalogue_entry["SecondaryMassSSBFrame"])
@@ -966,13 +999,15 @@ def sobhb_catalogue_to_gwtf_basis(catalogue_entry: dict, delta_t: float = 0.0) -
     f_ref = float(catalogue_entry["GW22FrequencySSBFrame"])
     f0 = evolve_sobhb(0.0, delta_t, m1, m2, s1, s2, f_ref) if delta_t != 0.0 else f_ref
 
-    phi_coal = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, float(catalogue_entry["TrueAnomaly"]))
+    phase = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, float(catalogue_entry["TrueAnomaly"]))
+    if not phase_at_coalescence:
+        phase = sobhb_reference_phase(m1, m2, s1, s2, f0, phase)  # phi_coal -> phi_0 at the data start
 
     psi = float(catalogue_entry["PolarisationAngle"]) % (2 * np.pi)
     ra = float(catalogue_entry["RightAscension"]) % (2 * np.pi)
     dec = float(catalogue_entry["Declination"])
 
-    return np.array([m1, m2, s1, s2, dist, iota, f0, phi_coal, psi, ra, dec])
+    return np.array([m1, m2, s1, s2, dist, iota, f0, phase, psi, ra, dec])
 
 
 class SOBHBSearchInterface(BaseSearchInterface):
@@ -983,11 +1018,15 @@ class SOBHBSearchInterface(BaseSearchInterface):
     ----
     evolve_to_data_start: bool
         If True, when seeding from the catalog values evolve the source parameters to the start of the data segment using the provided evolution function. If False, use the catalog values directly without evolution.
+    phase_at_coalescence: bool
+        The phase the seeds carry: the coalescence phase (True) or ``phi_0``, the orbital phase at the data start
+        (False, default). Must match the waveforms' ``phase_at_coalescence`` (the SOBBH block sets all of them).
     """
 
-    def __init__(self, evolve_to_data_start: bool = True, **kwargs):
+    def __init__(self, evolve_to_data_start: bool = True, phase_at_coalescence: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.evolve_to_data_start = evolve_to_data_start
+        self.phase_at_coalescence = phase_at_coalescence
 
     @property
     def branch_name(self):
@@ -1022,15 +1061,16 @@ class SOBHBSearchInterface(BaseSearchInterface):
     def unpack_catalog_entries(self, catalog_entry: dict, curr: CurrentInfoGlobalFit) -> np.ndarray:
         """
         Unpacks the catalog entries into the GWTF_generator basis
-        ``m1, m2, s1, s2, dist [Gpc], iota, f0, phi_coal, psi, ra, dec``.
+        ``m1, m2, s1, s2, dist [Gpc], iota, f0, phase, psi, ra, dec``.
 
-        ``phi_coal`` is the gwtf coalescence phase mapped from the catalogue ``TrueAnomaly`` (orbital
-        phase where ``f == GW22FrequencySSBFrame``), in the mojito / TD convention.
+        ``phase`` is mapped from the catalogue ``TrueAnomaly`` (orbital phase where ``f == GW22FrequencySSBFrame``)
+        to ``phi_0`` at the data start, or to the coalescence phase with ``phase_at_coalescence`` (mojito / TD
+        convention).
         """
         delta_t = 0.0
         if self.evolve_to_data_start:
             delta_t = curr.general_info.data_t0 - float(catalog_entry["TimeReferenceSSBFrame"])
-        return sobhb_catalogue_to_gwtf_basis(catalog_entry, delta_t)
+        return sobhb_catalogue_to_gwtf_basis(catalog_entry, delta_t, self.phase_at_coalescence)
 
 class NoiseSearchInterface(BaseSearchInterface):
     """

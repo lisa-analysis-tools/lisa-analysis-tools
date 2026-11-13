@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict,PositiveInt, PositiveFloat, Field, PrivateAttr, field_validator, model_validator
 
 from typing import Annotated
 from pydantic import BeforeValidator, AfterValidator, ValidationInfo, Discriminator, Tag
@@ -100,16 +100,25 @@ class ComputeSection(_Section):
     @model_validator(mode="after")
     def _validate_gpus(self):
         if self.gpus is not None:
-            import jax
-            jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in self.gpus))
-
-            visible = _keeping_current_device(lambda: jax.devices("gpu"))
+            visible = _jax_gpus(self.gpus)
             if len(self.gpus) != len(visible):
                 raise ValueError(
                     f"gpus {self.gpus} does not match the GPUs JAX sees: {visible}. "
                     "Check CUDA_VISIBLE_DEVICES or jax_cuda_visible_devices."
                 )
         return self
+
+
+def _jax_gpus(gpus: list[int]) -> list:
+    """Pin JAX to ``gpus`` and return the GPU devices it then sees.
+
+    The pin is process-wide and takes effect only before JAX starts its GPU backend: afterwards JAX keeps the
+    devices it started with (e.g. every card, each with its memory preallocated), which the count check reports.
+    """
+    import jax
+
+    jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in gpus))
+    return _keeping_current_device(lambda: jax.devices("gpu"))
 
 
 def _keeping_current_device(call):
@@ -257,6 +266,12 @@ WindowType = Literal[
 ]
 
 
+# The fraction of its span a window's taper may take, for the types that read alpha = taper / span as a taper
+# (utility.windowfun): tukey asserts 0 < alpha < 1, planck tapers both ends by alpha. The others ignore it or read it
+# as a shape parameter (kaiser's beta).
+WINDOW_TAPER_LIMITS = {"tukey": 1.0, "planck": 0.5}
+
+
 class WindowSection(_Section):
     type: WindowType = "tukey"
     taper_duration: Literal["auto"] | Duration = "auto"  # auto -> 1/domain.min_freq (builder)
@@ -338,12 +353,15 @@ class RecipeFile(_Section):
 
     file: RunPath
     function: str = "setup_recipe"
+    # whether the function takes the ``l2d`` RecipeContext (the blocks' moves and stage settings), read at load
+    _takes_l2d: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
     def _function_fits(self):
         from .build_recipe import load_recipe_function
 
-        load_recipe_function(self.file, self.function)
+        fn = load_recipe_function(self.file, self.function)
+        self._takes_l2d = "l2d" in inspect.signature(fn).parameters
         return self
 
 
@@ -389,6 +407,52 @@ class RunConfig(_Section):
                 )
         return self
 
+    @property
+    def taper_duration(self) -> float:
+        """The window taper in seconds: ``window.taper_duration``, or ``1 / domain.min_freq`` when ``auto``."""
+        taper = self.window.taper_duration
+        return 1.0 / self.domain.min_freq if taper == "auto" else float(taper)
+
+    @model_validator(mode="after")
+    def _window_fits_the_domain(self):
+        """The taper must fit the span the window covers (GeneralSetup: alpha = taper / span).
+
+        STFT: the span is one segment, a whole number of data.dt steps, so the check is exact. FD: the span is the
+        preprocessed data, at most data.Tobs (trimming shortens it), so only taper < limit * Tobs is checked here.
+        """
+        if self.domain.type == "stft":
+            steps = self.domain.segment_duration / self.data.dt
+            if abs(steps - round(steps)) > 1e-10 * steps:
+                raise ValueError(
+                    f"domain.segment_duration ({self.domain.segment_duration} s) must be a whole number of "
+                    f"data.dt ({self.data.dt} s)."
+                )
+            span, what = float(self.domain.segment_duration), "an stft segment"
+        else:
+            span, what = float(self.data.Tobs), "the data (data.Tobs)"
+        limit = WINDOW_TAPER_LIMITS.get(self.window.type)
+        if limit is not None and not self.taper_duration < limit * span:
+            source = "auto = 1/domain.min_freq" if self.window.taper_duration == "auto" else "window.taper_duration"
+            raise ValueError(
+                f"the {self.window.type} taper ({source} = {self.taper_duration:g} s) must be below {limit:g} of "
+                f"{what} ({span:g} s): lengthen the segment or give a shorter window.taper_duration."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _extra_moves_fit_the_domain(self):
+        """An extra move the block's table marks ``stft_only`` needs an STFT domain (the block cannot see it)."""
+        for name, block in self.blocks.items():
+            if not block.enabled:
+                continue
+            for key, spec in (getattr(block, "extra_moves", None) or {}).items():
+                if block.EXTRA_MOVES[spec.class_name].stft_only and self.domain.type != "stft":
+                    raise ValueError(
+                        f"block {name!r}: extra_moves {key} ({spec.class_name}) runs on an stft domain only, not "
+                        f"{self.domain.type}."
+                    )
+        return self
+
     @model_validator(mode="after")
     def _blocks_fit_the_run(self):
         """Check the blocks against the data section (reference time, source ids and types)."""
@@ -401,14 +465,15 @@ class RunConfig(_Section):
                 continue
             # a ladder may use a subset of the sampler's temperatures, never more (galfor has none: the psd move's)
             tempering = getattr(block, "tempering", None)
-            ntemps = None if tempering is None else tempering.ntemps
+            ntemps = None if tempering is None else tempering.rungs  # len(betas) or ntemps
+            what = "the length of tempering.betas" if tempering is not None and tempering.betas else "tempering.ntemps"
             if ntemps is not None and ntemps > self.sampler.ntemps:
                 raise ValueError(
-                    f"block {name!r}: tempering.ntemps ({ntemps}) is above sampler.ntemps ({self.sampler.ntemps})."
+                    f"block {name!r}: {what} ({ntemps}) is above sampler.ntemps ({self.sampler.ntemps})."
                 )
             if ntemps is not None and block.FULL_LADDER and ntemps != self.sampler.ntemps:
                 raise ValueError(
-                    f"block {name!r}: its ladder spans every temperature; tempering.ntemps ({ntemps}) "
+                    f"block {name!r}: its ladder spans every temperature; {what} ({ntemps}) "
                     f"must equal sampler.ntemps ({self.sampler.ntemps}) or be left out."
                 )
             if tempering is not None and tempering.Tmax is not None:
@@ -432,16 +497,38 @@ class RunConfig(_Section):
 
     @model_validator(mode="after")
     def _block_stages_are_recipe_stages(self):
-        """A block's ``stages`` keys must be stages of the stock recipe (a recipe file decides its own steps)."""
+        """A block's ``stages`` keys, and the ``stage_weights`` keys of its ``extra_moves``, must be stages of the
+        stock recipe.
+
+        A recipe file decides its own steps, so their names are checked once it has run
+        (``build_recipe.check_recipe_uses_the_blocks``); here, it must at least take ``l2d``, the only way it gets
+        the blocks' extra moves and stage settings.
+        """
         if not isinstance(self.recipe, StockRecipeSpec):
+            uses = sorted(
+                f"{name}.{key}" for name, block in self.blocks.items() if block.enabled
+                for key in ("stages", "extra_moves") if getattr(block, key, None)
+            )
+            if uses and not self.recipe._takes_l2d:
+                raise ValueError(
+                    f"{uses} are set, but the recipe function {self.recipe.function} takes no l2d argument, so it "
+                    "never gets them: add l2d to its parameters and build the steps from l2d.block_moves "
+                    "(build_recipe.JointPEMoves) and l2d.move_settings."
+                )
             return self
         from .build_recipe import make_stock_recipe  # local: build_recipe is the runtime side
 
         names = make_stock_recipe(self.recipe.class_name, self.recipe.kwargs).stage_names
         for name, block in self.blocks.items():
-            unknown = sorted(set(getattr(block, "stages", None) or ()) - set(names))
-            if block.enabled and unknown:
-                raise ValueError(f"block {name!r}: stages {unknown} are not recipe stages {names}.")
+            if not block.enabled:
+                continue
+            named = {"stages": set(getattr(block, "stages", None) or ())}
+            for key, spec in (getattr(block, "extra_moves", None) or {}).items():
+                named[f"extra_moves {key} stage_weights"] = set(spec.stage_weights)
+            for where, stages in named.items():
+                unknown = sorted(stages - set(names))
+                if unknown:
+                    raise ValueError(f"block {name!r}: {where} {unknown} are not recipe stages {names}.")
         return self
 
     @model_validator(mode="after")

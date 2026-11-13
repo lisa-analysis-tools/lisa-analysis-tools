@@ -4291,6 +4291,10 @@ from lisatools.sampling.gmm import vec_fit_gmm_min_bic
 # ======================================================================================================================
 
 
+# The levels of GBFStatSettings.save_search_records
+FSTAT_RECORD_LEVELS = ("none", "summary", "full")
+
+
 @dataclass
 class GBFStatSettings:
     """Settings of :class:`GBFStatRJMove`: its search of the bands, the search's schedule and what a search writes.
@@ -4333,6 +4337,23 @@ class GBFStatSettings:
     # Folder of the search log (fstat_search.log) and of the saved records; the recipe builders fill
     # <run>_artifacts/fstat_search/, and None writes neither
     output_dir: Optional[str] = None
+
+    def __post_init__(self):
+        # * The value rules live here, so a config layer that builds the settings checks them at load.
+        interval = self.search_interval
+        if isinstance(interval, bool) or int(interval) != interval or interval < 1:
+            raise ValueError(f"fstat_settings: search_interval must be a positive integer, not {interval}")
+        if self.save_search_records not in FSTAT_RECORD_LEVELS:
+            raise ValueError(
+                f"fstat_settings: save_search_records must be one of {list(FSTAT_RECORD_LEVELS)}, not "
+                f"{self.save_search_records!r}"
+            )
+        low_edge, high_edge = self.shutoff_low_frequency_threshold, self.shutoff_high_frequency_threshold
+        if low_edge is not None and high_edge is not None and not float(low_edge) < float(high_edge):
+            raise ValueError(
+                f"fstat_settings: shutoff_low_frequency_threshold ({low_edge}) must lie below "
+                f"shutoff_high_frequency_threshold ({high_edge})"
+            )
 
 
 class GBFStatRJMove(GBSpecialBase):
@@ -4389,8 +4410,7 @@ class GBFStatRJMove(GBSpecialBase):
     GATE_DROP_DOF = 4
     # Upper-triangle order of the F-statistic overlaps (numpy.triu_indices(4))
     TRIU = np.triu_indices(4)
-    # The levels of save_search_records, and the record's arrays with a steps or walkers axis, which only "full" keeps
-    RECORD_LEVELS = ("none", "summary", "full")
+    # The record's arrays with a steps or walkers axis, which only save_search_records "full" keeps
     CHAIN_KEYS = (
         "stage1_cold_fstat", "stage1_last_cold", "stage2_start", "stage2_start_fstat", "stage2_start_replaced",
         "stage2_cold_coords", "stage2_cold_ll",
@@ -4412,24 +4432,11 @@ class GBFStatRJMove(GBSpecialBase):
             raise NotImplementedError(
                 f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
             )
-        interval = settings.search_interval
-        if int(interval) != interval or interval < 1:
-            raise ValueError(f"fstat_settings: search_interval must be a positive integer, not {interval}")
-        if settings.save_search_records not in self.RECORD_LEVELS:
-            raise ValueError(
-                f"fstat_settings: save_search_records must be one of {list(self.RECORD_LEVELS)}, not "
-                f"{settings.save_search_records!r}"
-            )
+        # * The value rules are GBFStatSettings' own (__post_init__); output_dir is filled by the builders, so here.
         if settings.save_search_records != "none" and settings.output_dir is None:
             raise ValueError(
                 "fstat_settings: save_search_records needs output_dir; the recipe builders set "
                 "<run>_artifacts/fstat_search/"
-            )
-        low_edge, high_edge = settings.shutoff_low_frequency_threshold, settings.shutoff_high_frequency_threshold
-        if low_edge is not None and high_edge is not None and not float(low_edge) < float(high_edge):
-            raise ValueError(
-                f"fstat_settings: shutoff_low_frequency_threshold ({low_edge}) must lie below "
-                f"shutoff_high_frequency_threshold ({high_edge})"
             )
         # index of the next saved record, counted on from the files in output_dir at the first save
         self._next_record = None

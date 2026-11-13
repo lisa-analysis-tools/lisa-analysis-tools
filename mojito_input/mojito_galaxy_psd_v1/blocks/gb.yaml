@@ -20,7 +20,7 @@ pe_move:
     phase_maximize: false
     ranks_needed: 0
 search:
-  search_type: catalog
+  search_type: point_estimate  # the candidates file, a catalogue table: one point per source
   # the galaxy search's candidates, layout version 0.2 (GBs and VGBs in one table)
   search_path: /workspace/rrondeel/erebor_dev/data/gb_candidates.hdf5
   # ln A, f0 [mHz], fdot, phi0, cos iota, psi, alpha, sin delta; hotter chains are wider

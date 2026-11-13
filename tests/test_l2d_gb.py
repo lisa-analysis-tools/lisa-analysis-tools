@@ -58,10 +58,13 @@ CANDIDATE_COLUMNS = dict(
 # ? Sampling basis: ln A, f0 [mHz], fdot, phi0, cos iota, psi, alpha, sin delta.
 SPREAD = [1.0e-3, 1.0e-9, 1.0e-19, 1.0e-2, 1.0e-2, 1.0e-2, 1.0e-3, 1.0e-3]
 STFT_DOMAIN = {"type": "stft", "min_freq": 1e-4, "max_freq": 2.9e-2, "segment_duration": "2 h"}
+# the reference run's pe_move knobs, as the run folders write them out
 REFERENCE_PE_MOVE_KWARGS = dict(
     stretch_probability=0.0, num_stationary_fim_steps=1, run_swaps=True, use_prior_removal=False,
     phase_maximize=False, ranks_needed=0,
 )
+# the block's default: the Fisher matrix held for 50 proposals (the interval the Fisher-proposal study recommends)
+DEFAULT_PE_MOVE_KWARGS = {**REFERENCE_PE_MOVE_KWARGS, "num_stationary_fim_steps": 50}
 
 
 def write_candidates(path: Path) -> None:
@@ -77,12 +80,14 @@ def gb_raw(block_changes=None, **data_changes):
     block = {"type": "gb", "priors": {"class": "mojitolight.GBPrior"}, **(block_changes or {})}
     raw = cpu_raw({"gb": block})
     raw["domain"] = dict(STFT_DOMAIN)
+    # * A small grid of 2 h segments: the auto taper (1/min_freq = 10000 s) would not fit one, so taper 1 h of each.
+    raw["window"] = {**raw.get("window", {}), "taper_duration": "1 h"}
     raw["data"] = {**raw["data"], "source_types": ["noise", "gb"], **data_changes}
     return raw
 
 
 def gb_search(**changes):
-    return {"search_type": "catalog", "search_path": CANDIDATES_FILE, "spread": SPREAD, **changes}
+    return {"search_type": "point_estimate", "search_path": CANDIDATES_FILE, "spread": SPREAD, **changes}
 
 
 class _GBConfig(unittest.TestCase):
@@ -92,13 +97,14 @@ class _GBConfig(unittest.TestCase):
         self.run_dir = Path(folder.name)
         write_candidates(self.run_dir / CANDIDATES_FILE)
 
-    def config(self, block_changes=None, **data_changes) -> RunConfig:
+    def config(self, block_changes=None, burn_in=False, **data_changes) -> RunConfig:
+        raw = gb_raw(block_changes, **data_changes)
+        if burn_in:  # the stock recipe's stages burn-in and pe
+            raw["recipe"] = {"class": "StockRecipe", "kwargs": {"burn_in_iterations": 10}}
         with warnings.catch_warnings():
             # ? A block without a search warns that its branch starts empty.
             warnings.simplefilter("ignore", UserWarning)
-            return RunConfig.model_validate(
-                gb_raw(block_changes, **data_changes), context={"run_dir": self.run_dir}
-            )
+            return RunConfig.model_validate(raw, context={"run_dir": self.run_dir})
 
     def assertConfigError(self, message: str, block_changes=None, **data_changes) -> None:
         with self.assertRaises(ValidationError) as caught:
@@ -115,7 +121,7 @@ class GBSchemaTest(_GBConfig):
         self.assertEqual((block.tempering.ntemps, block.tempering.ratio, block.tempering.Tmax), (None, 1.2, 1e4))
         self.assertEqual(block.waveform.class_name, "GBGPU")
         self.assertEqual(block.pe_move.class_name, "GBSpecialRJPriorMove")
-        self.assertEqual(block.pe_move.kwargs, REFERENCE_PE_MOVE_KWARGS)
+        self.assertEqual(block.pe_move.kwargs, DEFAULT_PE_MOVE_KWARGS)
 
     def test_proposals_belong_to_the_pe_move(self):
         self.assertConfigError("takes no inner_moves", {"inner_moves": [{"class": "StretchMove", "weight": 1.0}]})
@@ -142,19 +148,21 @@ class GBSchemaTest(_GBConfig):
         from lisatools.globalfit.moves.gbspecialmove import GBFStatSettings
 
         self.assertEqual(self.config().blocks["gb"].extra_moves, {})
-        fstat = {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.3,
+        fstat = {"class": "GBFStatRJMove", "weight": 0.1, "stage_weights": {"burn-in": 0.3},
                  "kwargs": {"fstat_settings": {"nsteps_1": 100}}}
-        block = self.config({"extra_moves": {"fstat": fstat}}).blocks["gb"]
+        block = self.config({"extra_moves": {"fstat": fstat}}, burn_in=True).blocks["gb"]
         spec = block.extra_moves["fstat"]
-        self.assertEqual((spec.class_name, spec.weight, spec.burn_in_share), ("GBFStatRJMove", 0.1, 0.3))
+        self.assertEqual((spec.class_name, spec.weight, spec.share("burn-in"), spec.share("pe")),
+                         ("GBFStatRJMove", 0.1, 0.3, 0.1))
         # the mapping becomes the move's settings dataclass, its other fields at their defaults
         self.assertEqual(gb_move_kwargs(block, spec.kwargs)["fstat_settings"], GBFStatSettings(nsteps_1=100))
-        # without burn_in_weight the burn-in share is the PE share; a share of one phase only is allowed
+        # a stage without stage_weights takes weight; a share of one stage only is allowed
         block = self.config({"extra_moves": {
             "fstat": {"class": "GBFStatRJMove", "weight": 0.2},
-            "second": {"class": "GBFStatRJMove", "weight": 0.0, "burn_in_weight": 0.5},
-        }}).blocks["gb"]
-        self.assertEqual([spec.burn_in_share for spec in block.extra_moves.values()], [0.2, 0.5])
+            "second": {"class": "GBFStatRJMove", "weight": 0.0, "stage_weights": {"burn-in": 0.5}},
+        }}, burn_in=True).blocks["gb"]
+        self.assertEqual([spec.share("burn-in") for spec in block.extra_moves.values()], [0.2, 0.5])
+        self.assertEqual([spec.share("pe") for spec in block.extra_moves.values()], [0.2, 0.0])
 
         def extra(**fields):
             return {"extra_moves": {"x": {"class": "GBFStatRJMove", "weight": 0.5, **fields}}}
@@ -163,14 +171,16 @@ class GBSchemaTest(_GBConfig):
             ({"extra_moves": {"x": {"class": "GBFStatRJMove"}}}, "Field required"),
             (extra(weight=1.0), "less than 1"),
             (extra(weight=-0.1), "greater than or equal to 0"),
-            (extra(burn_in_weight=1.0), "less than 1"),
-            # no burn_in_weight: the burn-in share is the PE share, here 0 as well
+            (extra(stage_weights={"pe": 1.0}), "less than 1"),
             (extra(weight=0.0), "would never run"),
+            (extra(weight=0.0, stage_weights={"pe": 0.0}), "would never run"),
             ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.6},
-                              "b": {"class": "GBFStatRJMove", "weight": 0.4}}}, "of the PE iterations"),
-            ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.5},
-                              "b": {"class": "GBFStatRJMove", "weight": 0.1, "burn_in_weight": 0.5}}},
-             "of the burn-in iterations"),
+                              "b": {"class": "GBFStatRJMove", "weight": 0.4}}}, "of a stage without stage_weights"),
+            ({"extra_moves": {"a": {"class": "GBFStatRJMove", "weight": 0.1, "stage_weights": {"pe": 0.5}},
+                              "b": {"class": "GBFStatRJMove", "weight": 0.1, "stage_weights": {"pe": 0.5}}}},
+             "of stage 'pe'"),
+            # a stage_weights key must be a recipe stage
+            (extra(stage_weights={"burn-in": 0.2}), "extra_moves x stage_weights ['burn-in'] are not recipe"),
             ({"extra_moves": {"pe": {"class": "GBFStatRJMove", "weight": 0.5}}}, "the name pe"),
             ({"extra_moves": {"x": {"class": "GBSpecialRJPriorMove", "weight": 0.5}}}, "is not one of"),
             (extra(seed=1), "Extra inputs are not permitted"),
@@ -178,6 +188,11 @@ class GBSchemaTest(_GBConfig):
             (extra(kwargs={"fstat_search": {}}), "does not accept"),
             (extra(kwargs={"fstat_settings": {"nsteps": 10}}), "GBFStatSettings does not accept"),
             (extra(kwargs={"fstat_settings": True}), "must be a mapping"),
+            # * the settings' own value rules, at load (GBFStatSettings.__post_init__ through gb_move_kwargs)
+            (extra(kwargs={"fstat_settings": {"search_interval": 0}}), "search_interval must be a positive integer"),
+            (extra(kwargs={"fstat_settings": {"search_interval": 1.5}}), "search_interval must be a positive integer"),
+            (extra(kwargs={"fstat_settings": {"save_search_records": "fulll"}}), "save_search_records must be one of"),
+            (extra(kwargs={"fstat_settings": {"shutoff_low_frequency_threshold": 1e-2}}), "must lie below"),
             (extra(kwargs={"debug_settings": True}), "must be a mapping"),
             ({**extra(), "stft": {"response": "tdi_on_the_fly"}}, "stft response dffr only"),
         ):
@@ -190,7 +205,7 @@ class GBSchemaTest(_GBConfig):
                                                        "kwargs": kwargs}}}).blocks["gb"]
         kwargs = gb_move_kwargs(block, {**block.pe_move.kwargs, **block.extra_moves["fstat"].kwargs})
         self.assertEqual(kwargs["stretch_probability"], 0.25)
-        self.assertEqual(kwargs["num_stationary_fim_steps"], REFERENCE_PE_MOVE_KWARGS["num_stationary_fim_steps"])
+        self.assertEqual(kwargs["num_stationary_fim_steps"], DEFAULT_PE_MOVE_KWARGS["num_stationary_fim_steps"])
         self.assertEqual(kwargs["debug_settings"].mem_probe, True)
 
     def test_waveform_and_stft_knobs(self):
@@ -214,7 +229,9 @@ class GBSchemaTest(_GBConfig):
         self.assertEqual((search.max_resample_tries, search.kwargs), (2000, {"evolve_to_data_start": False}))
         self.assertEqual(search.search_path, self.run_dir / CANDIDATES_FILE)
         for search_spec, message in (
-            ({"search_type": "catalog", "spread": SPREAD}, "needs search_path"),
+            # * the injection catalogue holds the GB population as one entry of arrays: GBs seed from a candidates file
+            ({"search_type": "catalog", "spread": SPREAD}, "is not available for the 'gb' block"),
+            ({"search_type": "point_estimate", "spread": SPREAD}, "search_path"),
             ({"search_type": "prior"}, "is not available for the 'gb' block"),
             (gb_search(kwargs={"evolve_to_data_star": False}), "does not accept"),
             (gb_search(kwargs={"spread": 1.0}), "are search fields"),
@@ -224,6 +241,30 @@ class GBSchemaTest(_GBConfig):
 
     def test_the_data_holds_the_galaxy(self):
         self.assertConfigError("needs 'gb' in data.source_types", source_types=["noise"])
+
+    def test_fstat_move_needs_an_stft_domain(self):
+        raw = gb_raw({"extra_moves": {"fstat": {"class": "GBFStatRJMove", "weight": 0.1}}})
+        raw["domain"] = {"type": "fd", "min_freq": 1e-4, "max_freq": 2.9e-2}
+        with self.assertRaises(ValidationError) as caught, warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            RunConfig.model_validate(raw, context={"run_dir": self.run_dir})
+        self.assertIn("runs on an stft domain only, not fd", str(caught.exception))
+
+    def test_stages_are_rejected_at_load(self):
+        # * The GB moves have no apply_settings: per-stage settings would crash at recipe setup, after the bands.
+        self.assertConfigError(
+            "extra_moves.<name>.stage_weights", {"stages": {"pe": {"num_prop_repeats": 10}}}
+        )
+
+    def test_direct_betas_span_every_temperature(self):
+        from lisatools.globalfit.stock.l2d.blocks.base import make_betas
+
+        ntemps = self.config().sampler.ntemps
+        betas = list(0.4 ** np.arange(ntemps))
+        # * Given in the YAML, the ladder replaces the block's default (Tmax 1e4) and reaches make_betas as is.
+        tempering = self.config({"tempering": {"betas": betas}}).blocks["gb"].tempering
+        np.testing.assert_array_equal(make_betas(tempering, ntemps), betas)
+        self.assertConfigError("must equal sampler.ntemps", {"tempering": {"betas": betas[:-1]}})
 
     def test_tmax_must_stay_above_the_second_hottest_rung(self):
         ntemps = self.config().sampler.ntemps
@@ -273,9 +314,9 @@ class GBBuildTest(_GBConfig):
         _, build_off = self.build({"search": gb_search(kwargs={"seed_phase_copies": False})})
         self.assertFalse(build_off.setup.search_interface.seed_phase_copies)
         # * The candidates reach the sampling basis inside the setup's prior over the proposed bands.
-        seed = interface.get_catalog_values(curr=None)
-        self.assertEqual(seed.shape, (2, 8))
-        self.assertTrue(np.isfinite(setup.priors["gb"].logpdf(seed)).all())
+        seed = interface.read_samples_from_file(curr=None)  # the candidates file: one point per source
+        self.assertEqual(seed.shape, (2, 1, 8))
+        self.assertTrue(np.isfinite(setup.priors["gb"].logpdf(seed[:, 0])).all())
 
     def test_ladder(self):
         cfg, build = self.build({"search": gb_search()})
@@ -292,6 +333,11 @@ class GBBuildTest(_GBConfig):
         _, build = self.build({"search": gb_search(), "tempering": {"ratio": 1.2, "Tmax": 10.0}})
         np.testing.assert_allclose(build.setup.betas[:-1], 1.0 / 1.2 ** np.arange(ntemps - 1), rtol=1e-12)
         self.assertEqual(build.setup.betas[-1], 0.1)
+
+        # * The ladder as given (replacing the block's default Tmax); the bands span every temperature.
+        betas = list(0.4 ** np.arange(ntemps))
+        _, build = self.build({"search": gb_search(), "tempering": {"betas": betas}})
+        np.testing.assert_array_equal(build.setup.betas, betas)
 
 
 class GBRunFolderTest(_GBConfig):

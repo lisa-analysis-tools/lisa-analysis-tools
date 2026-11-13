@@ -29,6 +29,8 @@ from lisatools.globalfit.preprocessing import BaseProcessingStep, L1ProcessingSt
 from lisatools.globalfit.stock.l2d import load_settings
 from lisatools.globalfit.stock.l2d.io import RunConfig
 from lisatools.globalfit.stock.l2d.load_settings import load_general_setup, make_general_settings
+
+from tests.test_l2d_io import stand_in_jax_gpu_pin
 from lisatools.sensitivity import CompositeSensitivityBackend, XYZSensitivityBackend
 from lisatools.utils.constants import YRSID_SI
 
@@ -117,6 +119,7 @@ def run_1_raw(**changes):
 
 class _Config(unittest.TestCase):
     def setUp(self):
+        stand_in_jax_gpu_pin(self)  # the fixture is a cuda12x run on gpus [0]
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.run_dir = Path(tmp.name)
@@ -239,10 +242,15 @@ class ProcessorTest(_Config):
         self.assertEqual(init["source_types"], ["gb", "mbhb", "noise"])
         self.assertEqual(init["source_ids"], {"mbhb": [18, 5, 16]})
         self.assertIs(init["orbits_class"], L1Orbits)
+        # * the loader's orbits take the orbits spec's backend (default cpu), not compute.backend: the engine builds
+        # * the GPU copy from them (GeneralSetup.gpu_orbits)
         self.assertEqual(
             init["orbits_kwargs"],
-            {"frame": "icrs", "armlength": 2493162305.42235, "force_backend": "cuda12x"},
+            {"frame": "icrs", "armlength": 2493162305.42235, "force_backend": "cpu"},
         )
+        data = dict(run_1_raw()["data"], orbits={"type": "l1", "force_backend": "cuda12x"})
+        _, settings = self.settings(data=data)
+        self.assertEqual(settings.processor_init_kwargs["orbits_kwargs"]["force_backend"], "cuda12x")
 
     def test_defaults(self):
         data = dict(run_1_raw()["data"], orbits={"type": "l1"})

@@ -6,17 +6,18 @@ engine-owned arguments (``recipe.prepare_gb_moves``). The in-model proposals bel
 takes no ``inner_moves`` and no ``flow``. ``waveform.runtime_kwargs`` and ``stft`` hold the knobs of
 ``GBWaveformSettings`` and ``GBSTFTSettings``; the builder fills their time grid, window, orbits and domain
 from the ``GeneralSetup``. ``extra_moves`` adds GB moves that take turns with ``pe_move`` (``EXTRA_MOVES``, the
-F-statistic RJ move ``GBFStatRJMove`` among them), each in its share of the burn-in and the PE iterations. The
+F-statistic RJ move ``GBFStatRJMove`` among them), each in its share of each recipe stage's iterations. The
 search seeds each source's walkers at the four copies of (phi0, psi) where the template is the same
-(``seed_phase_copies`` of ``GBSearchInterface``) unless its ``kwargs`` set ``seed_phase_copies: false``.
+(``seed_phase_copies`` of ``GBSearchInterface``) unless its ``kwargs`` set ``seed_phase_copies: false``. The
+search is a ``point_estimate`` over a candidates file (a catalogue table, e.g. ``gb_candidates.hdf5``): the injection
+catalogue holds the GB population as one entry of arrays, so a ``catalog`` search cannot seed GBs.
 """
 from __future__ import annotations
 
 import dataclasses
 import importlib
 from copy import deepcopy
-from types import SimpleNamespace
-from typing import Any, ClassVar, Literal, NamedTuple
+from typing import Annotated, Any, ClassVar, Literal, NamedTuple
 
 from pydantic import Field, PositiveInt, model_validator
 
@@ -55,20 +56,21 @@ class ExtraMove(NamedTuple):
     # True: the band sorter draws the move's dead rows from the prior, as for pe_move; False: the move builds its own
     # proposal (the F-statistic move at its first search)
     prior_proposal: bool
+    # True: the move runs on an STFT domain only (checked against the run's domain at load, io.RunConfig)
+    stft_only: bool = False
 
 
 class ExtraMoveSpec(ClassSpec):
     """A GB move that takes turns with ``pe_move``: its class, its kwargs over the pe_move's, and its share of the
-    iterations of each phase."""
+    iterations of each recipe stage."""
 
-    # the share of the PE step's iterations in which the block runs this move instead of pe_move; 0: not in PE
+    # the share of a stage's iterations in which the block runs this move instead of pe_move; 0: not in the stage
     weight: float = Field(ge=0.0, lt=1.0)
-    # the same for the burn-in step; None takes weight
-    burn_in_weight: float | None = Field(default=None, ge=0.0, lt=1.0)
+    # recipe stage name (recipe.kwargs.stages) -> the share in that stage; left-out stages take weight
+    stage_weights: dict[str, Annotated[float, Field(ge=0.0, lt=1.0)]] = Field(default_factory=dict)
 
-    @property
-    def burn_in_share(self) -> float:
-        return self.weight if self.burn_in_weight is None else self.burn_in_weight
+    def share(self, stage: str | None) -> float:
+        return self.stage_weights.get(stage, self.weight)
 
 
 class GBBlock(SourceBlock):
@@ -82,8 +84,11 @@ class GBBlock(SourceBlock):
     SETTINGS_NAME: ClassVar[str] = "GBSettings"
     SETUP_NAME: ClassVar[str] = "GBSetup"
     SEARCH_INTERFACE: ClassVar[str] = "GBSearchInterface"
-    SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("catalog", "point_estimate")
+    # * The injection catalogue holds the GB population as one entry of arrays, which the interface cannot unpack per
+    # * source: GBs are seeded from a candidates file (a catalogue table) with point_estimate, never with catalog.
+    SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("point_estimate",)
     FULL_LADDER: ClassVar[bool] = True  # the band temperatures span every temperature
+    STAGES_HINT: ClassVar[str] = " Set the moves' shares per stage in extra_moves.<name>.stage_weights."
     # ? The STFT computations take the parameters at the mojito catalogue epoch, not at data.reference_time.
     NEEDS_REFERENCE_TIME: ClassVar[bool] = False
     PE_MOVES: ClassVar[dict[str, PEMove]] = {
@@ -91,7 +96,7 @@ class GBBlock(SourceBlock):
     }
     # * The classes extra_moves may name; the recipe fills GB_SPECIAL_MOVE_FILLED for them as for pe_move
     EXTRA_MOVES: ClassVar[dict[str, ExtraMove]] = {
-        "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False),
+        "GBFStatRJMove": ExtraMove(SPECIAL_MOVES, prior_proposal=False, stft_only=True),
     }
 
     nleaves: PositiveInt = 8000  # the most sources at once (nleaves_max); the least is 0
@@ -105,12 +110,12 @@ class GBBlock(SourceBlock):
     pe_move: ClassSpec = Field(default_factory=lambda: ClassSpec.model_validate({
         "class": "GBSpecialRJPriorMove",
         "kwargs": dict(
-            stretch_probability=0.0, num_stationary_fim_steps=1, run_swaps=True, use_prior_removal=False,
+            stretch_probability=0.0, num_stationary_fim_steps=50, run_swaps=True, use_prior_removal=False,
             phase_maximize=False, ranks_needed=0,
         ),
     }))
     # * Moves that take turns with pe_move, keyed by a name that names the move ("gb <name> move"). Each runs in its
-    # * share of each phase's iterations and pe_move in the rest. Their kwargs go over the pe_move's, so the moves share
+    # * share of each stage's iterations and pe_move in the rest. Their kwargs go over the pe_move's, so the moves share
     # * the in-model knobs unless an entry sets its own.
     extra_moves: dict[str, ExtraMoveSpec] = Field(default_factory=dict)
 
@@ -123,8 +128,8 @@ class GBBlock(SourceBlock):
                 raise ValueError(
                     f"extra_moves {name}: the class {spec.class_name} is not one of {sorted(self.EXTRA_MOVES)}."
                 )
-            if spec.weight == 0.0 and spec.burn_in_share == 0.0:
-                raise ValueError(f"extra_moves {name} has no share in either phase, so it would never run.")
+            if spec.weight == 0.0 and not any(spec.stage_weights.values()):
+                raise ValueError(f"extra_moves {name} has no share in any stage, so it would never run.")
             if spec.class_name == "GBFStatRJMove" and self.stft.get("response", "dffr") != "dffr":
                 raise ValueError(
                     f"extra_moves {name}: GBFStatRJMove computes its F-statistic with the stft response dffr only."
@@ -137,11 +142,14 @@ class GBBlock(SourceBlock):
                     raise ValueError(f"extra_moves {name} kwargs {key} must be a mapping of {class_name} fields.")
                 if value is not None:
                     check_kwargs(value, find_class(class_name, (module,)), frozenset())
-        for phase, shares in (("PE", [spec.weight for spec in self.extra_moves.values()]),
-                              ("burn-in", [spec.burn_in_share for spec in self.extra_moves.values()])):
-            if sum(shares) >= 1.0:
+        # None: any stage none of them names
+        stages = [None, *sorted({stage for spec in self.extra_moves.values() for stage in spec.stage_weights})]
+        for stage in stages:
+            total = sum(spec.share(stage) for spec in self.extra_moves.values())
+            if total >= 1.0:
+                where = "a stage without stage_weights" if stage is None else f"stage {stage!r}"
                 raise ValueError(
-                    f"the gb block's extra_moves take {sum(shares):g} of the {phase} iterations; they must leave "
+                    f"the gb block's extra_moves take {total:g} of the iterations of {where}; they must leave "
                     "pe_move a share above 0."
                 )
         return self
@@ -175,12 +183,16 @@ class GBBlock(SourceBlock):
         return self
 
     @model_validator(mode="after")
-    def _catalog_reads_a_file(self):
-        if self.search is not None and self.search.search_type == "catalog" and self.search.search_path is None:
-            raise ValueError(
-                "the gb catalog search needs search_path, e.g. gb_candidates.hdf5: the loaded catalogue holds "
-                "the GB population as one entry of arrays, which the interface cannot unpack per source."
-            )
+    def _move_settings_are_valid(self):
+        """Build the moves' settings dataclasses as the builder does (``gb_move_kwargs``), so their own value rules
+        (e.g. ``GBFStatSettings.__post_init__``) fail at load, not after the band setup. After the key checks above."""
+        merged = [("pe_move", None)]
+        merged += [(f"extra_moves {key}", {**self.pe_move.kwargs, **spec.kwargs}) for key, spec in self.extra_moves.items()]
+        for where, kwargs in merged:
+            try:
+                gb_move_kwargs(self, kwargs)
+            except (TypeError, ValueError) as err:  # pydantic reports only ValueError as a config error
+                raise ValueError(f"{where}: {err}") from err
         return self
 
     def build_source(self, ctx: BuildContext) -> BlockBuild:
@@ -210,10 +222,6 @@ class GBBlock(SourceBlock):
             search_interface=search_interface,
         )
         setup = GBSetup(settings)
-        if search_interface is not None and search_interface.search_type == "catalog":
-            # * As SourceBlock.build_source: the plots' truths, set here so a restart (which does not seed) keeps
-            # * them. GBSettings has no injection field; the plots read the setup's attribute if present.
-            setup.injection = search_interface.catalog_truths(SimpleNamespace(general_info=general_setup))
         metadata = setup.make_source_metadata(
             waveform_model_code_link=self.links.waveform_model_code_link,
             prior_model_code_link=self.links.prior_model_code_link,

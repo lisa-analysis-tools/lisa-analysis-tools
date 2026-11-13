@@ -305,7 +305,9 @@ class GeneralSetup(Setup, GeneralSettings):
     def init_orbit_information(self):
         """Construct orbit objects, defaulting to :class:`EqualArmlengthOrbits`."""
         if self.orbits is None:
-            self.orbits = EqualArmlengthOrbits()
+            # * orbits is the host copy: without force_backend the default backend is the first GPU one when there is
+            # * a GPU, and a cpu run then pairs cupy orbits with a numpy sensitivity.
+            self.orbits = EqualArmlengthOrbits(force_backend="cpu")
             self.gpu_orbits = EqualArmlengthOrbits(force_backend=self.force_backend)
         else:
             if self.gpu_orbits is None and self.force_backend == self.gpu_backend:

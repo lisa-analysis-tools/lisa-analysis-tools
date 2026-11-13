@@ -17,7 +17,9 @@ import numpy as np
 
 from lisatools.globalfit import recipe as gf_recipe
 from lisatools.globalfit.moves.addremovemove import ResidualAddOneRemoveOneMove
-from lisatools.globalfit.stock.l2d.build_recipe import BranchMoves, StockRecipe, stage_move_settings
+from lisatools.globalfit.stock.l2d.build_recipe import (
+    Alternative, BranchMoves, StockRecipe, stage_move_settings,
+)
 from lisatools.globalfit.stock.l2d.io import RunConfig
 
 from tests.test_l2d_sources import MBH_BLOCK, _Sources, source_raw
@@ -145,6 +147,31 @@ class RecipeStepTest(unittest.TestCase):
         recipe.backend = FakeBackend({"warm": 0, "pe": 3})
         recipe.setup_first_recipe_step(sampler.iteration, None, sampler)
         self.assertEqual(move.num_repeats, 10)
+        np.testing.assert_allclose(move.move_weights, [0.25, 0.25, 0.5])
+
+    def test_turns_and_settings_together(self):
+        # a gb move taking turns in pe only: warm keeps one combined move, pe two, both carrying the mbh move
+        from lisatools.globalfit.moves import GFCombineMove
+
+        move, sampler = fake_move(), FakeSampler()
+        gb_prior, gb_fstat = types.SimpleNamespace(name="gb prior"), types.SimpleNamespace(name="gb fstat")
+        recipe = gf_recipe.Recipe()
+        moves = {"gb": BranchMoves([], [gb_prior], (Alternative(gb_fstat, 0.25, {"warm": 0.0}),)),
+                 "mbh": BranchMoves([], [move])}
+        StockRecipe(stages=self.STAGES).add_steps(recipe, moves, self.SETTINGS.get)
+        recipe.backend = FakeBackend()
+        recipe.setup_first_recipe_step(0, None, sampler)
+        (warm,) = sampler.moves
+        self.assertIsInstance(warm, GFCombineMove)
+        self.assertEqual(warm.sub_moves, [gb_prior, move])
+        self.assertEqual(move.num_repeats, 50)
+
+        self.run_recipe(recipe, sampler, until=3)
+        self.assertEqual(recipe.current_recipe_step["name"], "pe")
+        self.assertIs(sampler.moves[0], warm)
+        self.assertEqual(sampler.moves[1].sub_moves, [gb_fstat, move])
+        np.testing.assert_allclose(sampler.weights, [0.75, 0.25])
+        self.assertEqual(move.num_repeats, 10)  # the settings reach the move inside both combined moves
         np.testing.assert_allclose(move.move_weights, [0.25, 0.25, 0.5])
 
     def test_settings_for_a_branch_without_moves(self):
