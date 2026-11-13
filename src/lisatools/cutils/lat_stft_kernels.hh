@@ -1648,7 +1648,7 @@ template <class TileT>
 CUDA_KERNEL
 void stft_get_ll_grad_kernel(
     double* grad_out,
-    typename TileT::Inputs inputs, STFTDomain* stft,
+    typename TileT::Inputs inputs_param, STFTDomain* stft,
     double* params_all, int* data_index_all, int* noise_index_all,
     double* param_eps,
     int num_bin, int nparams, int n_side_bins,
@@ -1658,6 +1658,12 @@ void stft_get_ll_grad_kernel(
     CUDA_SHARED cmplx h_h_tmp[NUM_THREADS_HERE];
     CUDA_SHARED double params[N_PARAMS_MAX];
     CUDA_SHARED typename TileT::BlockShared tile_shared;
+    // ! Block-shared copy of the launch inputs: the tile binds references to their fields, and
+    // ! references into the by-value kernel parameter are lowered to invalid local loads here.
+    CUDA_SHARED alignas(typename TileT::Inputs) unsigned char inputs_storage[sizeof(typename TileT::Inputs)];
+    typename TileT::Inputs& inputs = *reinterpret_cast<typename TileT::Inputs*>(inputs_storage);
+    if (THREAD_START_X == 0) inputs = inputs_param;
+    CUDA_SYNC_THREADS;
 
     typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
@@ -1780,7 +1786,7 @@ template <class TileT>
 CUDA_KERNEL
 void stft_swap_ll_grad_kernel(
     double* grad_add_out, double* grad_remove_out,
-    typename TileT::Inputs inputs, STFTDomain* stft,
+    typename TileT::Inputs inputs_param, STFTDomain* stft,
     double* params_add_all, double* params_remove_all,
     int* data_index_all, int* noise_index_all,
     double* param_eps_add, double* param_eps_remove,
@@ -1795,6 +1801,12 @@ void stft_swap_ll_grad_kernel(
     CUDA_SHARED double params_add[N_PARAMS_MAX];
     CUDA_SHARED double params_remove[N_PARAMS_MAX];
     CUDA_SHARED typename TileT::BlockShared tile_shared;
+    // ! Block-shared copy of the launch inputs: the tile binds references to their fields, and
+    // ! references into the by-value kernel parameter are lowered to invalid local loads here.
+    CUDA_SHARED alignas(typename TileT::Inputs) unsigned char inputs_storage[sizeof(typename TileT::Inputs)];
+    typename TileT::Inputs& inputs = *reinterpret_cast<typename TileT::Inputs*>(inputs_storage);
+    if (THREAD_START_X == 0) inputs = inputs_param;
+    CUDA_SYNC_THREADS;
 
     typename TileT::Context context(inputs, stft, tile_shared);
     CUDA_SYNC_THREADS;
