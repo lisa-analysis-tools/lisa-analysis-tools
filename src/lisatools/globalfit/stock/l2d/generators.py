@@ -9,6 +9,7 @@ selected the device by then). The PE move, ``RecipeContext.signal_gens`` and the
 from __future__ import annotations
 
 from typing import Any
+import warnings
 
 import numpy as np
 
@@ -71,5 +72,11 @@ class SignalGen:
             coords = self.transform.both_transforms(coords)
         # contiguous columns, as subtract_initial_signal passes them
         columns = [xp.ascontiguousarray(col) for col in xp.asarray(coords).T]
-        out = getattr(waveform, self.method)(*columns, **{**self.runtime_kwargs, **kwargs})
+        columns_host = [np.ascontiguousarray(col) for col in coords.T]
+        try:
+            out = getattr(waveform, self.method)(*columns, **{**self.runtime_kwargs, **kwargs})
+        except TypeError as e:
+            out = getattr(waveform, self.method)(*columns_host, **{**self.runtime_kwargs, **kwargs})
+            warnings.warn(f"waveform.{self.method} failed on device arrays, ran on host instead: {e}")
+        
         return out[0] if single else out

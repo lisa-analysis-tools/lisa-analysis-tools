@@ -116,6 +116,39 @@ class StageSpec(_Spec):
     num_prop_repeats: PositiveInt | None = None
     inner_move_weights: list[NonNegativeFloat] | None = None  # in the order of the block's inner_moves
     flow_weight: NonNegativeFloat | None = None
+    # Anything else of the PE move: attribute path -> value, set when the stage starts (recipe.set_attribute).
+    # The path goes through attributes and integer indices and may end on a method, which is then called with
+    # the value (a dict as keyword arguments): {flow_buffer_thin: 10, "moves[-1].executor.tune": {train_every: 10}}.
+    # They stay set in the later stages (a restart into a later stage sets them again, in the stages' order).
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def needs_apply_settings(self) -> bool:
+        return any(v is not None for v in (self.num_prop_repeats, self.inner_move_weights, self.flow_weight))
+
+
+class AdaptiveRepeatsSpec(_Spec):
+    """A source block's proposal repeats follow its inner autocorrelation time (``recipe.RepeatController``).
+
+    In every recipe stage but the last the repeats go to ``per_act`` inner ACTs, starting from the block's
+    ``num_prop_repeats``; the last stage, which keeps its samples, runs with the value reached, fixed. A stage
+    whose ``stages`` entry sets ``num_prop_repeats`` runs with that number instead.
+    """
+
+    min: PositiveInt = 10
+    max: PositiveInt = 500
+    per_act: PositiveFloat = 2.0  # inner ACTs per iteration
+    every: PositiveInt = 10  # iterations of the block's move between updates
+    window: PositiveInt = 20  # iterations of the block's move the ACT is measured over
+    max_step: float = Field(default=2.0, gt=1.0)  # largest factor the repeats change by in one update
+
+    @model_validator(mode="after")
+    def _bounds(self):
+        if self.min > self.max:
+            raise ValueError(f"adaptive_repeats: min ({self.min}) is above max ({self.max}).")
+        if self.window < self.every:
+            raise ValueError(f"adaptive_repeats: window ({self.window}) is below every ({self.every}).")
+        return self
 
 
 class TemperingSpec(_Spec):
@@ -444,6 +477,8 @@ class SourceBlock(MoveBlock):
     time_reference: Literal["mojito", "data_start"] = "mojito"
     # recipe stage name -> the PE move's settings in that stage (special pe_moves only; see StageSpec)
     stages: dict[str, StageSpec] = Field(default_factory=dict)
+    # the proposal repeats follow the inner autocorrelation time (special pe_moves with inner_act; see the spec)
+    adaptive_repeats: AdaptiveRepeatsSpec | None = None
     # per-leaf priors for the PE move (the branch prior `priors` stays for the transform, seeding and sampler)
     proposal_priors: ProposalPriorsSpec | None = None
 
@@ -461,16 +496,39 @@ class SourceBlock(MoveBlock):
         return self
 
     @model_validator(mode="after")
+    def _adaptive_repeats_fit_the_move(self):
+        spec = self.adaptive_repeats
+        if spec is None:
+            return self
+        cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
+        if not hasattr(cls, "inner_act"):
+            raise ValueError(
+                f"adaptive_repeats: the pe_move {self.pe_move.class_name} measures no inner autocorrelation time "
+                "(only the single-source special moves of mbh, emri and sobbh do)."
+            )
+        if not spec.min <= self.num_prop_repeats <= spec.max:
+            raise ValueError(
+                f"adaptive_repeats: num_prop_repeats ({self.num_prop_repeats}), the starting value, must be within "
+                f"[min, max] = [{spec.min}, {spec.max}]."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _stages_fit_the_moves(self):
         if not self.stages:
             return self
         # * The capability, not where the class lives: stage settings reach the move through apply_settings.
         cls = resolve_class(self.pe_move.class_name, (self.PE_MOVES[self.pe_move.class_name].module,))
-        if not hasattr(cls, "apply_settings"):
+        if not hasattr(cls, "apply_settings") and any(stage.needs_apply_settings for stage in self.stages.values()):
             raise ValueError(
-                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings)."
-                + self.STAGES_HINT
+                f"stages: the pe_move {self.pe_move.class_name} takes no stage settings (it has no apply_settings);"
+                " a stage can still set its attributes." + self.STAGES_HINT
             )
+        from lisatools.utils.utility import attribute_path  # the path syntax only: the moves are not built yet
+
+        for stage in self.stages.values():
+            for path in stage.attributes:
+                attribute_path(path)
         for name, stage in self.stages.items():
             weights = stage.inner_move_weights
             if weights is not None and self.inner_moves is None:

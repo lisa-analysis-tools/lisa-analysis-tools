@@ -289,5 +289,640 @@ class BlockStagesTest(_Sources):
         self.assertEqual(stage_move_settings(self.config({"mbh": MBH}, self.STAGED), curr, "pe"), {})
 
 
+# --- runtime autocorrelation: the convergence stop and the adaptive proposal repeats --- #
+
+def ar1(nsteps, nwalkers, tau, seed=0, ncols=1):
+    """A stationary AR(1) chain ``[nsteps, nwalkers, ncols]`` with integrated ACT ``tau`` (unit variance)."""
+    rng = np.random.default_rng(seed)
+    phi = (tau - 1.0) / (tau + 1.0)
+    x = np.empty((nsteps, nwalkers, ncols))
+    x[0] = rng.normal(size=(nwalkers, ncols))
+    for i in range(1, nsteps):
+        x[i] = phi * x[i - 1] + np.sqrt(1.0 - phi**2) * rng.normal(size=(nwalkers, ncols))
+    return x
+
+
+class ActTest(unittest.TestCase):
+    def test_stored_chain(self):
+        from eryn.utils import get_integrated_act
+
+        from lisatools.sampling.utility import cold_chain_act
+
+        x = ar1(20000, 16, 20.0)
+        tau, reliable = cold_chain_act(x)
+        self.assertAlmostEqual(tau[0], 20.0, delta=2.0)
+        self.assertTrue(reliable[0])
+        # eryn's own estimate, where its fixed 50 lags are enough
+        self.assertAlmostEqual(tau[0], get_integrated_act(x[:, None])[0, 0], delta=2.0)
+        # ... and where they are not: it cannot say more than about 100
+        slow = ar1(60000, 8, 300.0, seed=1)
+        self.assertLess(get_integrated_act(slow[:, None])[0, 0], 100.0)
+        self.assertAlmostEqual(cold_chain_act(slow)[0][0], 300.0, delta=60.0)
+
+    def test_short_stuck_and_fixed_chains_are_not_reliable(self):
+        from lisatools.sampling.utility import cold_chain_act
+
+        tau, reliable = cold_chain_act(ar1(200, 16, 20.0))  # 10 ACTs: an estimate, not a reliable one
+        self.assertFalse(reliable[0])
+        stuck = np.broadcast_to(np.arange(8.0)[None, :, None], (500, 8, 1))  # each walker at its own value
+        tau, reliable = cold_chain_act(stuck)
+        self.assertTrue(np.isnan(tau[0]))
+        self.assertFalse(reliable[0])
+        one_stuck = ar1(5000, 8, 5.0)
+        one_stuck[:, 3] = 1.0
+        self.assertFalse(cold_chain_act(one_stuck)[1][0])
+
+    def test_periodic_column(self):
+        from lisatools.sampling.utility import cold_chain_act
+
+        angle = np.mod(0.3 * ar1(20000, 16, 10.0), 2.0 * np.pi)  # sits on the wrap
+        tau, reliable = cold_chain_act(angle, periods={0: 2.0 * np.pi})
+        self.assertAlmostEqual(tau[0], 10.0, delta=2.0)
+        self.assertLess(cold_chain_act(angle)[0][0], 0.8 * tau[0])  # as it is, the jumps at the wrap read as mixing
+
+    def test_inner_act(self):
+        from eryn.utils import get_acf
+
+        from lisatools.sampling.utility import _windowed_act, variogram, variogram_act
+
+        tau, rng = 20.0, np.random.default_rng(5)
+
+        def chain(steps, offset=0.0, seed=0):
+            # each walker around its own mean: it carries its own state of the other blocks
+            return ar1(steps, 14, tau, seed=seed) + offset * rng.normal(size=(1, 14, 1))
+
+        for offset in (0.0, 5.0):
+            for ratio, expected in [(50, tau), (20, tau), (3, np.nan), (1, np.nan)]:  # steps per ACT
+                estimates = [variogram_act(variogram(chain(int(ratio * tau), offset, seed))) for seed in range(8)]
+                with self.subTest(offset=offset, ratio=ratio):
+                    if np.isnan(expected):
+                        self.assertGreaterEqual(np.isnan(estimates).mean(), 0.75, msg=f"read as {estimates}")
+                    else:
+                        self.assertLessEqual(np.isnan(estimates).mean(), 0.25)
+                        self.assertAlmostEqual(np.nanmean(estimates), expected, delta=0.2 * tau)
+        # each walker's own mean (eryn's get_acf) falls short on a series of 10 ACTs
+        own_mean = np.mean([_windowed_act(get_acf(chain(200, seed=s)).mean(axis=1))[0] for s in range(8)])
+        self.assertLess(own_mean, 0.7 * tau)
+
+    def test_inner_act_edges(self):
+        from lisatools.sampling.utility import variogram, variogram_act
+
+        direct = ar1(300, 5, 10.0, ncols=3).cumsum(axis=0)  # the FFT form against the definition
+        expected = [0.5 * ((direct[k:] - direct[: 300 - k]) ** 2).mean(axis=(0, 1)) for k in range(300)]
+        np.testing.assert_allclose(variogram(direct), expected, rtol=1e-8, atol=1e-8)
+
+        self.assertTrue(np.isnan(variogram_act(variogram(ar1(5, 32, 3.0)))))  # too few steps to say anything
+        self.assertAlmostEqual(variogram_act(variogram(ar1(400, 256, 1.0))), 1.0, delta=0.4)  # independent draws
+        drift = ar1(2000, 14, 3.0).cumsum(axis=0)  # a chain that diffuses (burn-in): the variogram never flattens
+        self.assertTrue(np.isnan(variogram_act(variogram(drift))))
+        fixed = ar1(2000, 32, 5.0, ncols=2)
+        fixed[:, :, 1] = 3.0  # a parameter held fixed does not hide the other
+        self.assertAlmostEqual(variogram_act(variogram(fixed)), 5.0, delta=1.5)
+        stuck = np.broadcast_to(np.arange(32.0)[None, :, None], (200, 32, 1))  # nothing accepted
+        self.assertTrue(np.isnan(variogram_act(variogram(stuck))))
+
+
+class MoveInnerActTest(unittest.TestCase):
+    """The move's running inner ACT, fed with leaf visits as its repeat loop feeds it."""
+
+    def build(self, periodic=None):
+        move = fake_move()  # the accumulator reads only the branch name and the periodic container
+        move._periodic = periodic
+        return move
+
+    def test_off_by_default_and_empty_after_a_reset(self):
+        move = self.build()
+        self.assertFalse(move.record_inner_chain)
+        tau, ncalls = move.inner_act()
+        self.assertTrue(np.isnan(tau))
+        self.assertEqual(ncalls, 0)
+
+    def test_act_is_the_slowest_parameter_of_the_slowest_leaf(self):
+        move = self.build()
+        slow = np.concatenate([ar1(4000, 14, 5.0, 1), ar1(4000, 14, 20.0, 2)], axis=-1)
+        fast = np.concatenate([ar1(4000, 14, 5.0, 3), ar1(4000, 14, 8.0, 4)], axis=-1)
+        for call in range(20):  # twenty calls of 200 repeats
+            move._add_inner_visit(0, fast[call * 200 : (call + 1) * 200])
+            move._add_inner_visit(1, slow[call * 200 : (call + 1) * 200])
+        self.assertAlmostEqual(move.inner_act()[0], 20.0, delta=5.0)
+        move.reset_inner_act(keep_chain=True)
+        self.assertAlmostEqual(move.inner_act()[0], 20.0, delta=5.0)
+        move.reset_inner_act()
+        self.assertTrue(np.isnan(move.inner_act()[0]))
+
+    def test_the_chain_runs_on_across_calls(self):
+        # an ACT of 100 repeats in calls of 50: no call holds it, twenty calls end to end do
+        move, chain = self.build(), ar1(4000, 14, 100.0, 7, ncols=2)
+        move._add_inner_visit(0, chain[:50])
+        self.assertTrue(np.isnan(move.inner_act()[0]))
+        for call in range(1, 80):
+            move._add_inner_visit(0, chain[call * 50 : (call + 1) * 50])
+        self.assertEqual(len(move._inner_chains[0]), move.inner_window)  # the last 20 calls: 1000 repeats
+        self.assertAlmostEqual(move.inner_act()[0], 100.0, delta=35.0)
+        move.inner_window = 80  # set by the controller (window)
+        for call in range(80):
+            move._add_inner_visit(0, chain[call * 50 : (call + 1) * 50])
+        self.assertAlmostEqual(move.inner_act()[0], 100.0, delta=25.0)
+
+    def test_one_leaf_not_resolved(self):
+        move = self.build()
+        fast, slow = ar1(4000, 14, 5.0, 1, ncols=2), ar1(4000, 14, 3000.0, 2, ncols=2)  # about one ACT in the window
+        for call in range(20):
+            move._add_inner_visit(0, fast[call * 200 : (call + 1) * 200])
+            move._add_inner_visit(1, slow[call * 200 : (call + 1) * 200])
+        self.assertTrue(np.isnan(move.inner_act()[0]))
+
+    def test_periodic_parameter(self):
+        from eryn.utils import PeriodicContainer
+
+        # by name, as a prior gives it: the container resolves the index
+        move = self.build(PeriodicContainer({"mbh": {"phi": 2.0 * np.pi}}, key_order={"mbh": ["m", "phi"]}))
+        chain = ar1(4000, 14, 10.0, 3, ncols=2)
+        chain[:, :, 1] = np.mod(0.3 * chain[:, :, 1], 2.0 * np.pi)  # sits on the wrap
+        for call in range(20):
+            move._add_inner_visit(0, chain[call * 200 : (call + 1) * 200])
+        self.assertAlmostEqual(move.inner_act()[0], 10.0, delta=3.0)
+
+
+class InnerActMove:
+    """What a RepeatController needs of a move; its inner ACT is ``true_tau`` repeats, resolved when the window
+    (``inner_window`` calls at the current repeats) holds ten ACTs."""
+
+    def __init__(self, true_tau, num_repeats=50):
+        self.true_tau, self.num_repeats, self.calls = true_tau, num_repeats, 0
+        self.record_inner_chain, self.inner_window = False, None
+
+    def apply_settings(self, num_repeats=None, weights=None):
+        self.num_repeats = num_repeats
+
+    def reset_inner_act(self, keep_chain=False):
+        self.calls = 0
+
+    def inner_act(self):
+        resolved = self.inner_window * self.num_repeats >= 10 * self.true_tau
+        return (self.true_tau if resolved else np.nan), self.calls
+
+
+class RepeatControllerTest(unittest.TestCase):
+    def tune(self, move, updates=20, stored=None, **kwargs):
+        controller = gf_recipe.RepeatController("mbh", **{"min": 5, "max": 1000, "every": 10, **kwargs})
+        controller.attach(move, stored)
+        history = []
+        for _ in range(updates):
+            move.calls = controller.every
+            controller.update()
+            history.append(move.num_repeats)
+        return controller, history
+
+    def test_settles_at_per_act_acts(self):
+        for tau, start in [(20.0, 50), (3.0, 400), (60.0, 10)]:
+            with self.subTest(tau=tau):
+                move = InnerActMove(tau, start)
+                controller, history = self.tune(move)
+                self.assertEqual(history[-5:], [int(2 * tau)] * 5)  # no oscillation
+                self.assertEqual(controller.kept, int(2 * tau))
+                self.assertTrue(move.record_inner_chain)
+                self.assertEqual(move.inner_window, 20)
+
+    def test_step_limit_and_bounds(self):
+        _controller, history = self.tune(InnerActMove(60.0, 10))
+        self.assertEqual(history[:4], [20, 40, 80, 120])  # not resolved, then resolved: a factor max_step at a time
+        controller, history = self.tune(InnerActMove(5000.0, 50), max=300)
+        self.assertEqual(history[-1], 300)
+        self.assertEqual(controller.kept, 300)  # never resolved: the maximum
+        controller, history = self.tune(InnerActMove(400.0, 50), max=300)
+        self.assertEqual((history[-1], controller.kept, controller.tau), (300, 300, 400.0))  # resolved, above max
+        controller, history = self.tune(InnerActMove(0.2, 50), min=20)
+        self.assertEqual((history[-1], controller.kept), (20, 20))
+
+    def test_waits_for_enough_calls(self):
+        move = InnerActMove(20.0, 50)
+        controller = gf_recipe.RepeatController("mbh", min=5, max=1000, every=10)
+        controller.attach(move)
+        move.calls = 9  # e.g. the block's move took turns with another one
+        self.assertIsNone(controller.update())
+        self.assertEqual(move.num_repeats, 50)
+        move.calls = 10
+        self.assertEqual(controller.update(), {"tuning": 40, "kept": 40, "tau": 20.0})
+
+    def test_resumes_stored_values(self):
+        move = InnerActMove(20.0, 50)
+        controller, _history = self.tune(move, updates=0, stored={"tuning": 200.0, "kept": 40.0, "tau": 20.0})
+        self.assertEqual((move.num_repeats, controller.kept), (200, 40))
+
+
+class RepeatsBackend(FakeBackend):
+    def __init__(self, starts=None, repeats=None):
+        super().__init__(starts)
+        self.repeats = dict(repeats or {})
+
+    def recipe_repeats(self, branch, values=None):
+        if values is not None:
+            self.repeats[branch] = dict(values)
+        return dict(self.repeats.get(branch, {}))
+
+
+class AdaptiveStagesTest(unittest.TestCase):
+    STAGES = [{"name": "warm", "iterations": 30}, {"name": "tune", "iterations": 60}, {"name": "pe"}]
+    SETTINGS = {name: {"mbh": {"num_repeats": 50}} for name in ("warm", "tune", "pe")}
+    ADAPTIVE = {"mbh": ({"min": 5, "max": 1000, "every": 10}, set())}
+
+    def recipe(self, move, backend, adaptive=None, stages=None):
+        from lisatools.globalfit.moves import GFCombineMove  # noqa: F401  (the steps walk combined moves)
+
+        recipe = gf_recipe.Recipe()
+        StockRecipe(stages=stages or self.STAGES).add_steps(
+            recipe, {"mbh": BranchMoves([], [move])}, self.SETTINGS.get, adaptive=adaptive or self.ADAPTIVE
+        )
+        recipe.backend = backend
+        return recipe
+
+    def run_recipe(self, recipe, sampler, move, until):
+        local = 0
+        while sampler.iteration < until:
+            sampler.iteration += 1
+            move.calls += 1  # the move ran in this iteration
+            if recipe(local, None, sampler):
+                return
+            local += 1
+
+    def move(self, tau=20.0):
+        move = InnerActMove(tau)
+        move.branch_name = "mbh"
+        return move
+
+    def test_tunes_then_freezes(self):
+        move, sampler, backend = self.move(), FakeSampler(), RepeatsBackend()
+        recipe = self.recipe(move, backend)
+        recipe.setup_first_recipe_step(0, None, sampler)
+        self.run_recipe(recipe, sampler, move, until=30)
+        self.assertEqual(recipe.current_recipe_step["name"], "tune")
+        self.assertEqual(move.num_repeats, 40)  # two inner ACTs; the stage settings (50) did not reset the tuning
+        self.run_recipe(recipe, sampler, move, until=89)
+        self.assertEqual(move.num_repeats, 40)
+        self.assertEqual(backend.repeats["mbh"]["kept"], 40)
+
+        self.run_recipe(recipe, sampler, move, until=90)
+        self.assertEqual(recipe.current_recipe_step["name"], "pe")
+        self.assertEqual(move.num_repeats, 40)  # as tuned, fixed
+        self.assertFalse(move.record_inner_chain)
+        move.true_tau = 100.0
+        self.run_recipe(recipe, sampler, move, until=150)
+        self.assertEqual(move.num_repeats, 40)
+
+    def test_restart_inside_tuning_and_into_the_last_stage(self):
+        stored = {"mbh": {"tuning": 200.0, "kept": 40.0, "tau": 20.0}}
+        move, sampler = self.move(), FakeSampler(iteration=45)
+        recipe = self.recipe(move, RepeatsBackend({"warm": 0, "tune": 30}, stored))
+        recipe.recipe[0]["status"] = True
+        recipe.setup_first_recipe_step(sampler.iteration, None, sampler)
+        self.assertEqual(move.num_repeats, 200)
+        self.assertTrue(move.record_inner_chain)
+
+        move, sampler = self.move(), FakeSampler(iteration=120)
+        recipe = self.recipe(move, RepeatsBackend({"warm": 0, "tune": 30, "pe": 90}, stored))
+        recipe.recipe[0]["status"] = recipe.recipe[1]["status"] = True
+        recipe.setup_first_recipe_step(sampler.iteration, None, sampler)
+        self.assertEqual(move.num_repeats, 40)
+
+    def test_a_stage_with_its_own_repeats_is_left_alone(self):
+        move, sampler = self.move(), FakeSampler()
+        recipe = self.recipe(move, RepeatsBackend(), adaptive={"mbh": (self.ADAPTIVE["mbh"][0], {"warm"})})
+        recipe.setup_first_recipe_step(0, None, sampler)
+        self.run_recipe(recipe, sampler, move, until=29)
+        self.assertEqual(move.num_repeats, 50)
+        self.assertFalse(move.record_inner_chain)
+        self.run_recipe(recipe, sampler, move, until=60)
+        self.assertEqual(move.num_repeats, 40)
+
+    def test_backend_stores_the_repeats(self):
+        import os
+        import tempfile
+
+        from lisatools.globalfit.hdfbackend import GFHDFBackend
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "backend.h5")
+        backend = GFHDFBackend(path)
+        backend.reset(4, [3], ntemps=1, nleaves_max=[1], branch_names=["mbh"])
+        recipe = gf_recipe.Recipe()
+        recipe.add_recipe_component(gf_recipe.PERecipeStep(moves=[]), name="pe")
+        backend.add_recipe(recipe)
+        self.assertEqual(backend.recipe_repeats("mbh"), {})
+        backend.recipe_repeats("mbh", {"tuning": 200, "kept": 40, "tau": 20.0})
+        backend.recipe_repeats("emri", {"tuning": 30, "kept": 6, "tau": 3.0})
+        self.assertEqual(GFHDFBackend(path).recipe_repeats("mbh"), {"tuning": 200.0, "kept": 40.0, "tau": 20.0})
+
+
+class ChainBackend:
+    """A backend holding cold chains ``{branch: [nsteps, nwalkers, nleaves, ndim]}`` (and gb band counts)."""
+
+    def __init__(self, chains, inds=None, bands=None):
+        self.chains, self.bands = chains, bands
+        self.inds = inds or {name: np.ones(chain.shape[:3], dtype=bool) for name, chain in chains.items()}
+        self.iteration = 0
+        self.sub_backend = {"gb": self}
+        self.starts, self.completed = {}, []
+
+    def get_chain(self, slice_vals, temp_index, branch_names):
+        assert temp_index == 0
+        return {name: self.chains[name][slice_vals] for name in branch_names}
+
+    def get_inds(self, slice_vals, temp_index, branch_names):
+        return {name: self.inds[name][slice_vals] for name in branch_names}
+
+    def get_band_info(self, slice_vals):
+        return {"band_num_binaries": self.bands[slice_vals][:, None]}  # a temperature axis, as stored
+
+    def recipe_step_start(self, name, iteration):
+        return self.starts.setdefault(name, iteration)
+
+    def completed_recipe_step(self, name):
+        self.completed.append(name)
+
+
+class ConvergenceStepTest(unittest.TestCase):
+    NWALKERS = 16
+
+    def chain(self, nsteps, tau, nleaves=1, ndim=2, seed=0):
+        return ar1(nsteps, self.NWALKERS, tau, seed, ncols=nleaves * ndim).reshape(nsteps, self.NWALKERS, nleaves, ndim)
+
+    def stops_at(self, backend, monitors, target_ess, until, start=0, check_every=50):
+        """The iteration the step stops at (None if it never does up to ``until``), and the step."""
+        step = gf_recipe.ConvergenceRecipeStep(
+            moves=[], monitors=monitors, target_ess=target_ess, check_every=check_every
+        )
+        step.start_iteration, step.name = start, "pe"
+        sampler = types.SimpleNamespace(backend=backend, periodic=None)
+        for iteration in range(start + 1, until + 1):
+            backend.iteration = iteration
+            if step.stopping_function(iteration, None, sampler):
+                return iteration, step
+        return None, step
+
+    def test_stops_when_the_slowest_block_has_the_target(self):
+        backend = ChainBackend({"mbh": self.chain(6000, 4.0), "emri": self.chain(6000, 20.0, seed=1)})
+        monitors = [gf_recipe.ChainMonitor("mbh"), gf_recipe.ChainMonitor("emri")]
+        stopped, step = self.stops_at(backend, monitors, target_ess=2000, until=6000)
+        # emri gates: 16 walkers / ACT 20 -> 2000 samples after about 2500 iterations
+        self.assertIsNotNone(stopped)
+        self.assertGreater(stopped, 1800)
+        self.assertLess(stopped, 3500)
+        report = step.last_report
+        self.assertGreater(report["mbh"]["ess"], 3 * report["emri"]["ess"])
+        self.assertAlmostEqual(report["emri"]["tau"], 20.0, delta=5.0)
+
+    def test_counts_from_the_stage_start(self):
+        chain = self.chain(3000, 4.0)
+        chain[:1000] += np.linspace(50.0, 0.0, 1000)[:, None, None, None]  # burn-in: a drift, not part of the stage
+        backend = ChainBackend({"mbh": chain})
+        stopped, _ = self.stops_at(backend, [gf_recipe.ChainMonitor("mbh")], 2000, until=3000, start=1000)
+        self.assertIsNotNone(stopped)
+        self.assertLess(stopped - 1000, 1200)
+        stopped, _ = self.stops_at(backend, [gf_recipe.ChainMonitor("mbh")], 2000, until=3000, start=0)
+        self.assertIsNone(stopped)  # with the drift in, the ACT is long
+
+    def test_does_not_stop_on_a_stuck_or_short_chain(self):
+        stuck = self.chain(2000, 4.0)
+        stuck[:, 3, 0, 1] = stuck[0, 3, 0, 1]  # one walker never moves in one parameter
+        stopped, step = self.stops_at(ChainBackend({"mbh": stuck}), [gf_recipe.ChainMonitor("mbh")], 100, until=2000)
+        self.assertIsNone(stopped)
+        self.assertTrue(np.isnan(step.last_report["mbh"]["tau"]))
+        # 150 iterations of ACT 20: ESS 16 * 150 / 20 = 120 > 100, but the ACT is not reliable yet
+        stopped, step = self.stops_at(
+            ChainBackend({"mbh": self.chain(150, 20.0)}), [gf_recipe.ChainMonitor("mbh")], 100, until=150
+        )
+        self.assertIsNone(stopped)
+        self.assertFalse(step.last_report["mbh"]["reliable"])
+
+    def test_inactive_leaves_and_fixed_parameters_do_not_hold_the_run(self):
+        chain = self.chain(3000, 4.0, nleaves=3, ndim=2)
+        chain[:, :, 1] = 0.0  # an inactive leaf slot
+        chain[:, :, :, 1] = 7.0  # a parameter held fixed
+        inds = {"mbh": np.ones(chain.shape[:3], dtype=bool)}
+        inds["mbh"][:, :, 1] = False
+        stopped, step = self.stops_at(ChainBackend({"mbh": chain}, inds), [gf_recipe.ChainMonitor("mbh")], 2000, 3000)
+        self.assertIsNotNone(stopped)
+        self.assertIn("1 inactive leaves", step.last_report["mbh"]["note"])
+        self.assertIn("2 fixed parameters", step.last_report["mbh"]["note"])
+
+    def test_gb_gates_on_the_number_of_sources(self):
+        nbands = 5
+        bands = np.round(10.0 + 2.0 * ar1(4000, self.NWALKERS, 6.0, seed=4, ncols=nbands))
+        bands[:, :, 0] = 4.0  # a band whose count never changes
+        bands[:, :, 1] = 3.0
+        bands[100, :, 1] = 4.0  # ... and one that flips once: would never be reliable
+        backend = ChainBackend({}, bands=bands)
+        stopped, step = self.stops_at(backend, [gf_recipe.GBCountMonitor("gb")], 2000, until=4000)
+        self.assertIsNotNone(stopped)
+        self.assertIn("4 of 5 bands change", step.last_report["gb"]["note"])
+        # a constant number of sources gates nothing, and with nothing gating the step runs on
+        frozen = ChainBackend({}, bands=np.full((1000, self.NWALKERS, nbands), 3.0))
+        stopped, step = self.stops_at(frozen, [gf_recipe.GBCountMonitor("gb")], 10, until=1000)
+        self.assertIsNone(stopped)
+        self.assertFalse(step.last_report["gb"]["gating"])
+
+    def test_stock_recipe_last_stage(self):
+        recipe = gf_recipe.Recipe()
+        stages = [{"name": "tune", "iterations": 5}, {"name": "pe", "target_ess": 1000, "check_every": 25}]
+        monitors = [gf_recipe.ChainMonitor("mbh")]
+        StockRecipe(stages=stages).add_steps(recipe, {"mbh": BranchMoves([], [fake_move()])}, monitors=monitors)
+        step = recipe.recipe[-1]["adjust"]
+        self.assertIsInstance(step, gf_recipe.ConvergenceRecipeStep)
+        self.assertEqual((step.target_ess, step.check_every, step.monitors), (1000, 25, monitors))
+        for stages, msg in [
+            ([{"name": "a", "iterations": 5, "target_ess": 10}, {"name": "pe"}], "must be"),
+            ([{"name": "pe", "target_ess": 0}], "positive integer"),
+            ([{"name": "pe", "check_every": 10}], "needs target_ess"),
+        ]:
+            with self.subTest(stages=stages), self.assertRaisesRegex(ValueError, msg):
+                StockRecipe(stages=stages)
+
+
+class AdaptiveRepeatsSchemaTest(BlockStagesTest):
+    TUNED = {"class": "StockRecipe", "kwargs": {"stages": [{"name": "tune", "iterations": 5}, {"name": "pe"}]}}
+
+    def test_schema_and_controller_settings(self):
+        from lisatools.globalfit.stock.l2d.build_recipe import adaptive_repeats
+
+        block = {**MBH, "adaptive_repeats": {"min": 10, "max": 400}, "stages": {"pe": {"num_prop_repeats": 30}}}
+        cfg = self.config({"mbh": block}, self.TUNED)
+        kwargs, fixed = adaptive_repeats(cfg)["mbh"]
+        self.assertEqual(kwargs, {"min": 10, "max": 400, "per_act": 2.0, "every": 10, "window": 20, "max_step": 2.0})
+        self.assertEqual(fixed, {"pe"})
+        gf_recipe.RepeatController("mbh", **kwargs)
+        self.assertEqual(adaptive_repeats(self.config({"mbh": MBH}, self.TUNED)), {})
+
+    def test_errors(self):
+        for adaptive, recipe, extra, msg in [
+            ({"min": 60}, self.TUNED, {}, "within"),  # num_prop_repeats is 50
+            ({"min": 20, "max": 10}, self.TUNED, {}, "above max"),
+            ({"window": 5}, self.TUNED, {}, "below every"),
+            ({}, None, {}, "there is none"),  # one stage: nowhere to tune
+            ({}, self.TUNED, {"stages": {"tune": {"num_prop_repeats": 20}}}, "there is none"),
+        ]:
+            with self.subTest(adaptive=adaptive, extra=extra), self.assertRaisesRegex(Exception, msg):
+                self.config({"mbh": {**MBH, "adaptive_repeats": adaptive, **extra}}, recipe)
+
+
+# --- stage attributes: anything of a move, set by path when a stage starts --- #
+
+class TunedExecutor:
+    """A stand-in for eryn's trainer executors: records what ``tune`` is called with."""
+
+    def __init__(self):
+        self.tuned, self.max_buffer_samples = [], 4000
+
+    def tune(self, **changes):
+        self.tuned.append(changes)
+
+
+def move_with_flow():
+    """The fake PE move with a flow move last among its inner moves, as ``blocks.base.build_source`` appends it."""
+    move = fake_move()
+    flow = types.SimpleNamespace(executor=TunedExecutor(), temperature=1.0)
+    move.moves = [types.SimpleNamespace(a=2.0), types.SimpleNamespace(a=2.0), flow]
+    move.flow_buffer_thin, move.betas = 5, [1.0, 0.5, 0.25]
+    return move, flow
+
+
+class SetAttributeTest(unittest.TestCase):
+    def test_attributes_items_and_methods(self):
+        from lisatools.utils.utility import attribute_path, set_attribute
+
+        self.assertEqual(attribute_path("moves[-1].executor.tune"), ["moves", -1, "executor", "tune"])
+        self.assertEqual(attribute_path("grid[2][0]"), ["grid", 2, 0])
+        move, flow = move_with_flow()
+        set_attribute(move, "flow_buffer_thin", 10)
+        set_attribute(move, "moves[0].a", 1.5)
+        set_attribute(move, "moves[-1].temperature", 2.0)
+        set_attribute(move, "betas[1]", 0.7)
+        self.assertEqual((move.flow_buffer_thin, move.moves[0].a, flow.temperature, move.betas), (10, 1.5, 2.0, [1.0, 0.7, 0.25]))
+        # a path ending on a method calls it: a dict as keyword arguments, a list as arguments, else one argument
+        set_attribute(move, "moves[-1].executor.tune", {"max_buffer_samples": None, "train_every": 10})
+        self.assertEqual(flow.executor.tuned, [{"max_buffer_samples": None, "train_every": 10}])
+        set_attribute(move, "apply_settings", {"num_repeats": 7})
+        self.assertEqual(move.num_repeats, 7)
+        set_attribute(move, "betas.append", 0.1)
+        set_attribute(move, "betas.insert", [0, 2.0])
+        self.assertEqual(move.betas, [2.0, 1.0, 0.7, 0.25, 0.1])
+
+    def test_a_path_that_leaves_the_object_is_an_error(self):
+        from lisatools.utils.utility import set_attribute
+
+        move, flow = move_with_flow()
+        for path, err, msg in [
+            ("flow_bufer_thin", AttributeError, "no attribute 'flow_bufer_thin'"),  # misspelt: not a new attribute
+            ("moves[-1].executer.tune", AttributeError, "executer"),
+            ("moves[7].a", IndexError, "moves"),
+            ("betas[5]", IndexError, "no item 5"),
+            ("moves[x].a", ValueError, "cannot read"),
+            ("moves..a", ValueError, "cannot read"),
+        ]:
+            with self.subTest(path=path), self.assertRaisesRegex(err, msg):
+                set_attribute(move, path, 1)
+
+    def test_dry_run_changes_nothing(self):
+        from lisatools.utils.utility import set_attribute
+
+        move, flow = move_with_flow()
+        set_attribute(move, "flow_buffer_thin", 10, dry_run=True)
+        set_attribute(move, "moves[-1].executor.tune", {"train_every": 10}, dry_run=True)
+        set_attribute(move, "betas[1]", 0.7, dry_run=True)
+        self.assertEqual((move.flow_buffer_thin, flow.executor.tuned, move.betas[1]), (5, [], 0.5))
+        with self.assertRaises(AttributeError):
+            set_attribute(move, "nope", 1, dry_run=True)
+
+
+class StageAttributesTest(unittest.TestCase):
+    STAGES = [{"name": "warm", "iterations": 3}, {"name": "tune", "iterations": 3}, {"name": "pe"}]
+    GROW = {"moves[-1].executor.tune": {"max_buffer_samples": None, "train_every": 10}}
+
+    def attributes(self, stage):
+        """As ``stage_move_attributes``: what is in force in the stage (the earlier stages' included)."""
+        return {
+            "warm": {},
+            "tune": {"mbh": {"flow_buffer_thin": 10}},
+            "pe": {"mbh": {"flow_buffer_thin": 10, **self.GROW}},
+        }[stage]
+
+    def recipe(self, move, attributes=None, backend=None):
+        recipe = gf_recipe.Recipe()
+        StockRecipe(stages=self.STAGES).add_steps(
+            recipe, {"mbh": BranchMoves([], [move])}, move_attributes=attributes or self.attributes
+        )
+        recipe.backend = backend or FakeBackend()
+        return recipe
+
+    def run_recipe(self, recipe, sampler, until):
+        local = 0
+        while sampler.iteration < until:
+            sampler.iteration += 1
+            if recipe(local, None, sampler):
+                return
+            local += 1
+
+    def test_set_when_the_stage_starts(self):
+        (move, flow), sampler = move_with_flow(), FakeSampler()
+        recipe = self.recipe(move)
+        self.assertEqual((move.flow_buffer_thin, flow.executor.tuned), (5, []))  # building the steps sets nothing
+        recipe.setup_first_recipe_step(0, None, sampler)
+        self.assertEqual(move.flow_buffer_thin, 5)
+        self.run_recipe(recipe, sampler, until=3)
+        self.assertEqual((recipe.current_recipe_step["name"], move.flow_buffer_thin), ("tune", 10))
+        self.assertEqual(flow.executor.tuned, [])
+        self.run_recipe(recipe, sampler, until=6)
+        self.assertEqual(recipe.current_recipe_step["name"], "pe")
+        self.assertEqual(flow.executor.tuned, [{"max_buffer_samples": None, "train_every": 10}])
+
+    def test_restart_into_the_last_stage_sets_the_earlier_ones_too(self):
+        (move, flow), sampler = move_with_flow(), FakeSampler(iteration=9)
+        recipe = self.recipe(move, backend=FakeBackend({"warm": 0, "tune": 3, "pe": 6}))
+        recipe.recipe[0]["status"] = recipe.recipe[1]["status"] = True
+        recipe.setup_first_recipe_step(sampler.iteration, None, sampler)
+        self.assertEqual(move.flow_buffer_thin, 10)
+        self.assertEqual(flow.executor.tuned, [{"max_buffer_samples": None, "train_every": 10}])
+
+    def test_a_path_no_move_has_fails_when_the_steps_are_built(self):
+        move, _flow = move_with_flow()
+        for attributes, msg in [
+            ({"mbh": {"flow_bufer_thin": 10}}, "fits no move of the branch"),
+            ({"mbh": {"moves[-1].trainer.tune": {}}}, "fits no move of the branch"),
+            ({"emri": {"flow_buffer_thin": 10}}, "no move of that branch"),
+        ]:
+            with self.subTest(attributes=attributes), self.assertRaisesRegex(ValueError, msg):
+                self.recipe(move, attributes=lambda stage: attributes if stage == "pe" else {})
+
+
+class StageAttributesSchemaTest(BlockStagesTest):
+    STAGES3 = {"class": "StockRecipe", "kwargs": {"stages": [
+        {"name": "warm", "iterations": 5}, {"name": "tune", "iterations": 5}, {"name": "pe"}]}}
+
+    def test_attributes_in_force_per_stage(self):
+        from lisatools.globalfit.stock.l2d.build_recipe import stage_move_attributes
+
+        grow = {"moves[-1].executor.tune": {"max_buffer_samples": None, "train_every": 10}}
+        stages = {
+            "pe": {"attributes": {**grow, "flow_buffer_thin": 20}},  # listed first, last in the recipe
+            "tune": {"attributes": {"flow_buffer_thin": 10, "permute_every": 50}},
+        }
+        cfg = self.config({"mbh": {**MBH, "stages": stages}}, self.STAGES3)
+        order = ["warm", "tune", "pe"]
+        self.assertEqual(stage_move_attributes(cfg, "warm", order), {})
+        self.assertEqual(stage_move_attributes(cfg, "tune", order), {"mbh": {"flow_buffer_thin": 10, "permute_every": 50}})
+        self.assertEqual(
+            stage_move_attributes(cfg, "pe", order), {"mbh": {"flow_buffer_thin": 20, "permute_every": 50, **grow}}
+        )
+        # attributes alone set no repeats or weights
+        info = types.SimpleNamespace(inner_moves=[("a", 0.35), ("b", 0.05), ("c", 0.05)])
+        curr = types.SimpleNamespace(source_info={"mbh": info})
+        self.assertEqual(stage_move_settings(cfg, curr, "pe"), {})
+
+    def test_a_bad_path_fails_at_load(self):
+        with self.assertRaisesRegex(Exception, "cannot read"):
+            self.config({"mbh": {**MBH, "stages": {"pe": {"attributes": {"moves[last].a": 1}}}}}, self.STAGES3)
+
+
 if __name__ == "__main__":
     unittest.main()

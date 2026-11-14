@@ -73,6 +73,8 @@ if typing.TYPE_CHECKING:
     from .stock.erebor import GBSetup, GeneralSetup
     from ..analysiscontainer import AnalysisContainerArray
 
+from lisatools.utils.utility import set_attribute
+
 logger = logging.getLogger(__name__)
 
 MOJITO_REFERENCE_TIME = 97729089.327664
@@ -165,6 +167,8 @@ class Recipe:
         if self.backend_added and hasattr(self.backend, "recipe_step_start"):
             start = self.backend.recipe_step_start(step["name"], start)
         step["adjust"].start_iteration = start
+        step["adjust"].name = step["name"]
+        step["adjust"].backend = self.backend if self.backend_added else None
         logger.info(f"Starting recipe step {step['name']!r} (from iteration {start}).")
         step["adjust"].setup_run(iteration, last_sample, sampler)
 
@@ -184,6 +188,9 @@ class Recipe:
         Returns:
             ``True`` if the entire recipe has finished, ``False`` otherwise.
         """
+        after_iteration = getattr(self._current_recipe_step["adjust"], "after_iteration", None)
+        if after_iteration is not None:
+            after_iteration(iteration, last_sample, sampler)
         stop_here = self._current_recipe_step["adjust"].stopping_function(
             iteration, last_sample, sampler
         )
@@ -263,9 +270,100 @@ class BaseRecipeStep(RecipeStep):
             restart). The moves may sit inside a ``CombineMove``.
     """
 
-    def __init__(self, moves=None, weights=None, move_settings: dict[str, dict] | None = None):
+    # defaults for subclasses that do not call this __init__
+    repeat_controllers: dict = {}
+    kept_repeats: tuple = ()
+    move_attributes: dict = {}
+    name: str | None = None
+    backend = None
+
+    def __init__(
+        self,
+        moves=None,
+        weights=None,
+        move_settings: dict[str, dict] | None = None,
+        repeat_controllers: dict[str, "RepeatController"] | None = None,
+        kept_repeats: typing.Iterable[str] = (),
+        move_attributes: dict[str, dict] | None = None,
+    ):
         super().__init__(moves=moves, weights=weights)
         self.move_settings = move_settings or {}
+        # branch -> RepeatController: the branch's proposal repeats follow its inner ACT during this step
+        self.repeat_controllers = repeat_controllers or {}
+        # branches whose repeats earlier steps tuned: this step runs with the kept value, fixed
+        self.kept_repeats = tuple(kept_repeats)
+        # branch -> {attribute path: value} set on the branch's moves when the step starts (set_attribute)
+        self.move_attributes = move_attributes or {}
+        self.name: str | None = None  # the step's name in the Recipe (set by Recipe._start_current_step)
+        self.backend = None  # the Recipe's backend (same)
+
+    def _branch_moves(self) -> dict[str, list]:
+        """The moves of each branch in this step (inside the combined moves too), each once."""
+        from eryn.moves import CombineMove
+
+        out: dict[str, list] = {}
+        for move in self.moves:
+            move = move[0] if isinstance(move, tuple) else move
+            for sub in move.sub_moves if isinstance(move, CombineMove) else [move]:
+                listed = out.setdefault(getattr(sub, "branch_name", None), [])
+                if not any(sub is other for other in listed):
+                    listed.append(sub)
+        return out
+
+    def apply_move_attributes(self, dry_run: bool = False) -> None:
+        """Set each branch's :attr:`move_attributes` on its moves in this step (:func:`set_attribute`).
+
+        A path is set on every move of the branch that has it, and must be there on one at least: an unknown
+        branch or a path that no move of the branch has is an error. ``dry_run`` only checks that.
+        """
+        moves = self._branch_moves()
+        for branch, attributes in self.move_attributes.items():
+            if branch not in moves:
+                raise ValueError(f"move attributes for {branch!r}: this step has no move of that branch.")
+            for path, value in attributes.items():
+                done, errors = [], []
+                for move in moves[branch]:
+                    try:
+                        done.append(set_attribute(move, path, value, dry_run=dry_run))
+                    except (AttributeError, IndexError) as err:
+                        errors.append(f"{type(move).__name__}: {err}")
+                if not done:
+                    raise ValueError(f"{branch} move attribute {path!r} fits no move of the branch: {errors}.")
+                if not dry_run:
+                    logger.info(f"{branch} move attribute: {done[0]}")
+
+    def _stored_repeats(self, branch: str) -> dict:
+        if self.backend is None or not hasattr(self.backend, "recipe_repeats"):
+            return {}
+        return self.backend.recipe_repeats(branch)
+
+    def apply_repeat_control(self):
+        """After :meth:`apply_move_settings`: start this step's controllers, or fix the repeats a step tuned."""
+        moves = self._branch_moves()
+        for branch, controller in self.repeat_controllers.items():
+            (move,) = moves[branch]
+            controller.attach(move, self._stored_repeats(branch))
+        for branch, move_list in moves.items():
+            if branch in self.repeat_controllers:
+                continue
+            for move in move_list:  # a move shared with a tuning step: stop recording
+                if getattr(move, "record_inner_chain", False):
+                    move.record_inner_chain = False
+            if branch in self.kept_repeats:
+                kept = self._stored_repeats(branch).get("kept")
+                if kept is None:
+                    logger.warning(f"{branch}: no tuned repeats stored; step {self.name!r} keeps the configured value.")
+                    continue
+                for move in move_list:
+                    move.apply_settings(num_repeats=int(kept))
+                logger.info(f"{branch}: {int(kept)} proposal repeats in step {self.name!r}, as tuned.")
+
+    def after_iteration(self, iteration, last_sample, sampler):
+        """Called by the Recipe after every stored iteration, before :meth:`stopping_function`."""
+        for branch, controller in self.repeat_controllers.items():
+            values = controller.update()
+            if values is not None and self.backend is not None and hasattr(self.backend, "recipe_repeats"):
+                self.backend.recipe_repeats(branch, values)
 
     def apply_move_settings(self):
         """Hand each branch's ``move_settings`` to its moves' ``apply_settings``."""
@@ -292,6 +390,8 @@ class BaseRecipeStep(RecipeStep):
         sampler's periodicity.
         """
         self.apply_move_settings()
+        self.apply_move_attributes()
+        self.apply_repeat_control()
         for move in self.moves:
             if sampler.periodic is not None and move.periodic is None:
                 logger.debug(f"Setting periodicity of move {move} to {sampler.periodic}")
@@ -336,8 +436,9 @@ class IterationCountRecipeStep(BaseRecipeStep):
         weights: typing.Optional[list] = None,
         num_iters: int = 100,
         move_settings: dict[str, dict] | None = None,
+        **kwargs,
     ):
-        super().__init__(moves, weights, move_settings=move_settings)
+        super().__init__(moves, weights, move_settings=move_settings, **kwargs)
         self.num_iters = num_iters
 
     def setup_run(self, iteration, last_sample, sampler):
@@ -351,6 +452,235 @@ class IterationCountRecipeStep(BaseRecipeStep):
         if stop:
             logger.info(f"IterationCountRecipeStep stopping after {self.num_iters} iterations.")
 
+        return stop
+
+
+class RepeatController:
+    """Keeps a single-source move's proposal repeats at a multiple of its inner autocorrelation time.
+
+    The inner ACT is the move's own (``move.inner_act()``): that of the cold chain in units of proposal repeats,
+    over the move's last ``window`` calls put end to end. It is what more repeats per iteration buy; the ACT of
+    the stored chain, in iterations, is the same thing seen once per call.
+
+    Every ``every`` calls the repeats go to ``per_act`` inner ACTs, by at most a factor ``max_step``, within
+    ``[min, max]``. While the ACT is not resolved (the window is shorter than about five ACTs, or the chain is
+    still burning in) they grow by ``max_step``, which also lengthens the window. The repeats change between
+    iterations only, from past calls. :attr:`kept` is the value for the stage that keeps its samples.
+
+    Args:
+        branch: the branch of the move.
+        min, max: bounds of the repeats.
+        per_act: inner ACTs per call.
+        every: calls of the move between updates.
+        window: calls of the move the ACT is measured over (at least ``every``).
+        max_step: largest factor the repeats change by in one update.
+    """
+
+    def __init__(self, branch, min, max, per_act=2.0, every=10, window=20, max_step=2.0):
+        self.branch, self.min, self.max = branch, int(min), int(max)
+        self.per_act, self.every, self.window, self.max_step = float(per_act), int(every), int(window), float(max_step)
+        self.move = None
+        self.tau = np.nan  # the last resolved inner ACT
+        self._tuning = None  # the repeats this controller last set (carried from one tuning step to the next)
+
+    def _clip(self, value) -> int:
+        return int(np.clip(int(np.ceil(value)), self.min, self.max))
+
+    @property
+    def kept(self) -> int:
+        """The repeats for the stage that keeps its samples; ``max`` while the ACT is not resolved."""
+        return self.max if np.isnan(self.tau) else self._clip(self.per_act * self.tau)
+
+    def values(self) -> dict:
+        return {"tuning": int(self.move.num_repeats), "kept": self.kept, "tau": float(self.tau)}
+
+    def attach(self, move, stored: dict | None = None) -> None:
+        """Take over ``move`` at the start of a step; ``stored`` are the values tuned so far (an earlier step, or
+        this one before a restart)."""
+        self.move = move
+        stored = stored or {}
+        if stored.get("tuning") is not None:
+            move.apply_settings(num_repeats=self._clip(stored["tuning"]))
+            self.tau = float(stored.get("tau", np.nan))
+        else:  # nothing stored: carry on from an earlier step of this run, or start from the block's value
+            move.apply_settings(num_repeats=self._clip(self._tuning or move.num_repeats))
+        self._tuning = int(move.num_repeats)
+        move.record_inner_chain, move.inner_window = True, self.window
+        move.reset_inner_act()
+        logger.info(f"{self.branch}: adaptive proposal repeats, starting from {move.num_repeats}.")
+
+    def update(self) -> dict | None:
+        """Set the repeats from the last ``window`` calls; the new values, or None if it is not time yet."""
+        tau, ncalls = self.move.inner_act()
+        if ncalls < self.every:
+            return None
+        current = int(self.move.num_repeats)
+        if np.isnan(tau):  # not resolved: the ACT is above about a fifth of the window, or the chain is drifting
+            target = self.max_step * current
+            if current >= self.max:
+                logger.warning(
+                    f"{self.branch}: inner ACT not resolved over the last {self.window} calls at {current} repeats "
+                    f"(the maximum); the kept stage will run with {self.max}."
+                )
+            self.tau = np.nan
+        else:
+            target, self.tau = self.per_act * tau, tau
+        new = self._clip(np.clip(target, current / self.max_step, current * self.max_step))
+        if new != current:
+            self.move.apply_settings(num_repeats=new)
+        self._tuning = new
+        self.move.reset_inner_act(keep_chain=True)
+        logger.info(
+            f"{self.branch}: inner ACT {'not resolved' if np.isnan(tau) else f'{tau:.1f} repeats'}; "
+            f"repeats {current} -> {new} (kept stage: {self.kept})."
+        )
+        return self.values()
+
+
+class ChainMonitor:
+    """The cold-chain series of one block that gate a :class:`ConvergenceRecipeStep`: its sampled parameters."""
+
+    def __init__(self, branch: str):
+        self.branch = branch
+
+    def series(self, backend, start: int, stop: int, periodic) -> tuple[np.ndarray | None, dict | None, str]:
+        """``(x[nsteps, nwalkers, nseries], periods, note)`` since iteration ``start``; ``x`` None if nothing gates.
+
+        Left out: leaf slots not active through the whole stretch, and parameters with no variance at all (the
+        same value in every walker and iteration: fixed by construction). A parameter where each walker sits at
+        its own value stays in, and reads as not converged.
+        """
+        from lisatools.sampling.utility import branch_periods
+
+        kwargs = dict(slice_vals=slice(start, stop), temp_index=0, branch_names=[self.branch])
+        chain = np.asarray(backend.get_chain(**kwargs)[self.branch])  # (nsteps, nwalkers, nleaves, ndim)
+        inds = np.asarray(backend.get_inds(**kwargs)[self.branch])
+        active = inds.all(axis=(0, 1))
+        ndim = chain.shape[-1]
+        x = chain[:, :, active].reshape(chain.shape[0], chain.shape[1], -1)
+        periods_branch = branch_periods(periodic, self.branch)
+        varies = np.ptp(x, axis=(0, 1)) > 0.0
+        columns = np.flatnonzero(varies)
+        periods = {}
+        for new, old in enumerate(columns):
+            period = periods_branch.get(int(old % ndim))
+            if period is not None:
+                periods[new] = period
+        note = ""
+        if not active.all():
+            note += f" {int((~active).sum())} inactive leaves left out;"
+        if not varies.all():
+            note += f" {int((~varies).sum())} fixed parameters left out;"
+        if columns.size == 0:
+            return None, None, note + " nothing to monitor;"
+        return x[:, :, columns], periods, note
+
+
+class GBCountMonitor:
+    """The gb block's gating series: the cold-chain number of sources, from the per-band counts the gb
+    sub-backend stores every iteration (``band_num_binaries``). The per-band counts are reported, not gating."""
+
+    def __init__(self, branch: str = "gb"):
+        self.branch = branch
+
+    def band_counts(self, backend, start: int, stop: int) -> np.ndarray:
+        info = backend.sub_backend[self.branch].get_band_info(slice_vals=slice(start, stop))
+        return np.asarray(info["band_num_binaries"])[:, 0].astype(float)  # (nsteps, nwalkers, nbands)
+
+    def series(self, backend, start: int, stop: int, periodic) -> tuple[np.ndarray | None, dict | None, str]:
+        from lisatools.sampling.utility import cold_chain_act
+
+        bands = self.band_counts(backend, start, stop)
+        total = bands.sum(axis=-1, keepdims=True)
+        moving = np.ptp(bands, axis=(0, 1)) > 0.0
+        note = ""
+        if moving.any():
+            tau, reliable = cold_chain_act(bands[:, :, moving])
+            with np.errstate(invalid="ignore"):
+                slowest = "not defined" if np.isnan(tau).all() else f"{np.nanmax(tau):.1f}"
+            note = (
+                f" per-band counts: {int(moving.sum())} of {moving.size} bands change, slowest ACT {slowest}, "
+                f"{int(reliable.sum())} reliable;"
+            )
+        if np.ptp(total) == 0.0:
+            return None, None, note + " the number of sources never changes: not gating;"
+        return total, None, note
+
+
+class ConvergenceRecipeStep(BaseRecipeStep):
+    """Recipe step that stops once every monitored block has ``target_ess`` independent cold-chain samples.
+
+    Every ``check_every`` iterations the cold chain since the step started is read from the backend, and for each
+    monitor ``tau`` is the largest integrated ACT over its series (:func:`lisatools.sampling.utility.cold_chain_act`)
+    and ``ESS = nwalkers * nsteps / tau``, the count postprocessing gets by thinning by the ACT. The step stops
+    when the smallest ESS reaches ``target_ess`` and every ``tau`` is reliable (``nsteps > 50 tau``); an ACT that
+    is not defined (a walker that never moved) is not reliable. Without ``target_ess`` nothing stops the step
+    (a :class:`PERecipeStep` that reports its ACTs). The run's iteration count remains the hard limit.
+
+    Args:
+        monitors: objects with ``branch`` and ``series(backend, start, stop, periodic)`` (:class:`ChainMonitor`,
+            :class:`GBCountMonitor`).
+        target_ess: independent samples wanted of the slowest block.
+        check_every: iterations between checks.
+    """
+
+    def __init__(self, moves=None, weights=None, monitors=(), target_ess=None, check_every=50, **kwargs):
+        super().__init__(moves, weights, **kwargs)
+        self.monitors, self.target_ess, self.check_every = list(monitors), target_ess, int(check_every)
+        self.last_report: dict[str, dict] = {}
+
+    def setup_run(self, iteration, last_sample, sampler):
+        super().setup_run(iteration, last_sample, sampler)
+        if self.start_iteration is None:  # outside a Recipe, which sets it (restart-aware)
+            self.start_iteration = int(sampler.iteration)
+
+    def report(self, sampler) -> dict[str, dict]:
+        """``{branch: {tau, ess, reliable, note}}`` from the cold chain since the step started."""
+        from lisatools.sampling.utility import cold_chain_act
+
+        backend, stop = sampler.backend, int(sampler.backend.iteration)
+        out = {}
+        for monitor in self.monitors:
+            x, periods, note = monitor.series(backend, self.start_iteration, stop, getattr(sampler, "periodic", None))
+            if x is None:
+                out[monitor.branch] = {"gating": False, "note": note}
+                continue
+            tau, reliable = cold_chain_act(x, periods)
+            defined = not np.isnan(tau).any()
+            slowest = float(tau.max()) if defined else np.nan
+            out[monitor.branch] = {
+                "gating": True,
+                "tau": slowest,
+                "ess": x.shape[0] * x.shape[1] / slowest if defined else 0.0,
+                "reliable": bool(reliable.all()),
+                "note": note,
+            }
+        return out
+
+    def stopping_function(self, iteration, last_sample, sampler):
+        done = int(sampler.backend.iteration) - self.start_iteration
+        if done <= 0 or done % self.check_every != 0:
+            return False
+        self.last_report = report = self.report(sampler)
+        repeats = {branch: [m.num_repeats for m in moves if hasattr(m, "num_repeats")]
+                   for branch, moves in self._branch_moves().items()}
+        lines = [f"Convergence after {done} iterations of step {self.name!r} (target ESS: {self.target_ess}):"]
+        for branch, row in report.items():
+            if not row["gating"]:
+                lines.append(f"  {branch}: not gating;{row['note']}")
+                continue
+            lines.append(
+                f"  {branch}: ACT {row['tau']:.1f}, "
+                f"ESS {row['ess']:.0f}, {'reliable' if row['reliable'] else 'not reliable yet'}"
+                + (f", repeats {repeats[branch]}" if repeats.get(branch) else "") + f";{row['note']}"
+            )
+        logger.info("\n".join(lines))
+        gating = [row for row in report.values() if row["gating"]]
+        if self.target_ess is None or not gating:
+            return False
+        stop = all(row["reliable"] and row["ess"] >= self.target_ess for row in gating)
+        if stop:
+            logger.info(f"Step {self.name!r} reached {self.target_ess} independent samples in every block.")
         return stop
 
 

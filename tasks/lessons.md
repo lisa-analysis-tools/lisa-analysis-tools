@@ -77,3 +77,15 @@ Correction: for the catalogue-shaped .h5 search file I planned to always add a s
 input format joins an existing reader, route it through the reader's existing dimensionality rules (here
 the .npy 1-D/2-D/3-D normalization, where 2-D means sources in a file but samples in a per-source folder)
 instead of a fixed reshape, and test each layout against the format it must match.
+
+## 2026-11-12 — read the library call before building a design rule on it (permuting swap)
+Planned to cut the inner-chain series at the walker-permuting temperature swap, assuming it reshuffles which
+walker sits in which slot. User: "I thought that permuting the walker there was helpful to decorrelate them".
+eryn's `temperature_swaps(permute_here=True)` only randomises the *pairing* across rungs; a cold slot changes only
+on an accepted swap, which is a proper transition. **Pattern**: same as 2026-10-28 — a rule that rests on what a
+library call does needs that call read (or run) first, also when the rule is "defensive".
+
+## 2026-11-12 — reuse eryn's utilities before writing a new one (ACT)
+Planned a new `sampling/act.py` estimator; user: "use the utilities already in eryn as much as possible to prevent
+code duplication". **Pattern**: for sampler diagnostics (ACF, ACT, stopping rules) start from `eryn.utils`; add only
+what it measurably cannot do, and show the measurement.

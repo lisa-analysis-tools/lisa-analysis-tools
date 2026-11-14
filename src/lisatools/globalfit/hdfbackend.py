@@ -550,6 +550,18 @@ class GFHDFBackend(eryn_HDFBackend):
                 attrs["start iteration"] = int(iteration)
             return int(attrs["start iteration"])
 
+    def recipe_repeats(self, branch, values=None):
+        """The proposal repeats the recipe tuned for ``branch`` (``{"tuning", "kept", "tau"}``): stored when
+        ``values`` is given, read back otherwise (``{}`` if none were stored), so a restart resumes the tuning and
+        the step that keeps its samples runs with the kept value."""
+        prefix = f"repeats {branch} "
+        with self.open("a" if values is not None else "r") as f:
+            attrs = f[self.name]["recipe"].attrs
+            if values is not None:
+                for key, value in values.items():
+                    attrs[prefix + key] = float(value)
+            return {key[len(prefix):]: float(value) for key, value in attrs.items() if key.startswith(prefix)}
+
     def completed_recipe_step(self, step_name):
         """Mark ``step_name`` as completed in the on-disk recipe metadata."""
         with self.open("a") as f:
