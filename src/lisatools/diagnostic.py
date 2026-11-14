@@ -83,8 +83,9 @@ def inner_product(
             raise ValueError(
                 "inner_product: raw-array inputs require ``basis_settings``."
             )
-        xp = get_array_module(sig)
-        arr = xp.atleast_2d(sig)
+        # a list holds one array per channel
+        xp = get_array_module(sig[0] if isinstance(sig, (list, tuple)) else sig)
+        arr = xp.atleast_2d(xp.asarray(sig))
         return basis_settings.associated_class(arr, basis_settings)
 
     sig1 = _coerce(sig1)
@@ -502,7 +503,8 @@ def h_var_p_eps(
         waveform_kwargs: kwargs for the waveform generation.
 
     Returns:
-        Perturbation to the waveform in the given parameter. Will always be 2D array with shape ``(num channels, data length)``
+        Perturbation to the waveform in the given parameter. A 2D array with shape ``(num channels, data length)``
+        when the waveform returns arrays; a :class:`~lisatools.domains.DomainBase` object is returned as it is.
 
     """
     params_p_eps = params.copy()
@@ -510,7 +512,8 @@ def h_var_p_eps(
 
     if parameter_transforms is not None:
         # transform
-        params_p_eps = parameter_transforms.transform_base_parameters(params_p_eps[None, :])[0]
+        # fills the fixed parameters, then transforms (as the docstring promises)
+        params_p_eps = parameter_transforms.both_transforms(params_p_eps[None, :])[0]
 
     args_in = tuple(params_p_eps) + tuple(waveform_args)
     dh = waveform_model(*args_in, **waveform_kwargs)
@@ -528,26 +531,86 @@ def h_var_p_eps(
     return dh
 
 
+def _place_on_grid(h: domains.DomainBase, basis_settings: domains.DomainSettingsBase) -> domains.DomainBase:
+    """``h`` on the grid of ``basis_settings``: zeros there, plus ``h`` where the two overlap."""
+    if h.settings == basis_settings:
+        return h
+    xp = basis_settings.xp
+    grid = basis_settings.associated_class(
+        xp.zeros((h.nchannels,) + tuple(basis_settings.basis_shape_active), dtype=h.arr.dtype),
+        basis_settings,
+    )
+    return grid.add_signal(h)
+
+
+def _domain_stencil(
+    signals: list,
+    weights: list,
+    basis_settings: Optional[domains.DomainSettingsBase],
+) -> domains.DomainBase:
+    """``sum_k weights[k] * signals[k]`` for :class:`~lisatools.domains.DomainBase` stencil points.
+
+    With ``basis_settings`` every point is first placed on that grid (see :func:`dh_dlambda`);
+    without it the points must already share their settings.
+    """
+    for h in signals:
+        if not isinstance(h, domains.DomainBase):
+            raise TypeError(
+                "The waveform returned a DomainBase at one stencil point and "
+                f"{type(h).__name__} at another."
+            )
+        if h.is_batched:
+            raise ValueError("The waveform returned a batch of signals; derivatives take one source per call.")
+
+    if basis_settings is not None:
+        signals = [_place_on_grid(h, basis_settings) for h in signals]
+
+    settings = signals[0].settings
+    if any(h.settings != settings for h in signals[1:]):
+        raise ValueError(
+            "The waveform's domain settings change with the parameters (e.g. each template on its "
+            "own span), so the stencil points cannot be differenced. Pass ``basis_settings`` to "
+            "place them on a common grid."
+        )
+
+    out = weights[0] * signals[0].arr
+    for weight, h in zip(weights[1:], signals[1:]):
+        out += weight * h.arr
+    return settings.associated_class(out, settings)
+
+
 def dh_dlambda(
     eps: float,
     *args: tuple,
     more_accurate: Optional[bool] = True,
+    basis_settings: Optional[domains.DomainSettingsBase] = None,
     **kwargs: dict,
-) -> np.ndarray:
+) -> np.ndarray | domains.DomainBase:
     """Derivative of the waveform.
 
     Calculate the derivative of the waveform with precision of order (step^4)
     with respect to the variable V in the i direction.
 
+    The waveform may return arrays or a :class:`~lisatools.domains.DomainBase` object
+    (``FDSignal``, ``TDSignal``, ...). For a domain object the derivative is taken on its
+    array and returned as the same kind of object. Its settings must then be the same at every
+    stencil point; a waveform whose span follows the parameters (a template on its own time or
+    frequency range) needs ``basis_settings``.
+
     Args:
         eps: Absolute **derivative** step size for variable of interest.
         *args: Arguments passed to :func:`h_var_p_eps`.
         more_accurate: If ``True``, run a more accurate derivate requiring 2x more waveform generations.
+        basis_settings: Only for waveforms returning domain objects. Common grid on which every
+            stencil point is placed before differencing (zero outside the waveform's own span,
+            as :meth:`~lisatools.domains.DomainBase.add_signal` does); typically the settings of the
+            data and of the PSD. The derivative is returned on this grid.
         **kwargs: Keyword arguments passed to :func:`h_var_p_eps`.
 
     Returns:
-        Numerical derivative of the waveform with respect to a varibale of interest. Will be 2D array
-        with shape ``(num channels, data length)``.
+        Numerical derivative of the waveform with respect to a varibale of interest. For array
+        waveforms a 2D array with shape ``(num channels, data length)``; for domain waveforms a
+        domain object.
 
     """
     if more_accurate:
@@ -558,6 +621,11 @@ def dh_dlambda(
         # down
         h_I_down_2eps = h_var_p_eps(-2 * eps, *args, **kwargs)
         h_I_down_eps = h_var_p_eps(-eps, *args, **kwargs)
+
+        stencil = [h_I_up_2eps, h_I_up_eps, h_I_down_2eps, h_I_down_eps]
+        if any(isinstance(h, domains.DomainBase) for h in stencil):
+            scale = 1.0 / (12 * eps)
+            return _domain_stencil(stencil, [-scale, 8 * scale, scale, -8 * scale], basis_settings)
 
         # make sure they are all the same length
         ind_max = np.min(
@@ -583,6 +651,11 @@ def dh_dlambda(
         # down
         h_I_down_eps = h_var_p_eps(-eps, *args, **kwargs)
 
+        stencil = [h_I_up_eps, h_I_down_eps]
+        if any(isinstance(h, domains.DomainBase) for h in stencil):
+            scale = 1.0 / (2 * eps)
+            return _domain_stencil(stencil, [scale, -scale], basis_settings)
+
         ind_max = np.min([h_I_up_eps.shape[1], h_I_down_eps.shape[1]])
 
         # TODO: check what error scales as.
@@ -592,8 +665,99 @@ def dh_dlambda(
     return dh_I
 
 
+def estimate_eps(
+    waveform_model: callable,
+    params: np.ndarray | list,
+    deriv_inds: Optional[np.ndarray | list] = None,
+    inner_product_kwargs: Optional[dict] = {},
+    steps: Optional[np.ndarray | list] = None,
+    return_changes: Optional[bool] = False,
+    **kwargs: dict,
+) -> np.ndarray | Tuple[np.ndarray, list, list]:
+    """Estimate the derivative step size of each parameter at ``params``.
+
+    For each parameter the derivative :math:`h_i = \\partial h/\\partial\\lambda_i` is computed with
+    :func:`dh_dlambda` over a ladder of steps. Between neighbouring steps :math:`k` and :math:`k+1` the
+    relative change is
+
+    .. math::
+
+        c_k = \\frac{\\langle h_i^{(k)} - h_i^{(k+1)} | h_i^{(k)} - h_i^{(k+1)} \\rangle}{\\langle h_i^{(k)} | h_i^{(k)} \\rangle}.
+
+    A step that is too large has truncation error and one that is too small amplifies the numerical
+    noise of the waveform, so :math:`c_k` has a minimum in between; the step there is returned.
+
+    Each parameter costs ``len(ladder)`` derivatives (4 waveforms each with ``more_accurate``). The result
+    depends on the source and on the point, so it is estimated per call rather than tabulated. It can be
+    passed as the ``eps`` of :func:`info_matrix` (``info_matrix(estimate_eps, ...)``; use
+    :func:`functools.partial` to set ``steps``).
+
+    Args:
+        waveform_model: Callable function to the waveform generator, as for :func:`info_matrix`.
+        params: Source parameters.
+        deriv_inds: Subset of parameters to estimate the step for, by index. If ``None``, all of them.
+        inner_product_kwargs: Keyword arguments for the inner product function, as for :func:`info_matrix`.
+        steps: Ladder of absolute steps, in increasing order. A 1D array is used for every parameter; a
+            sequence of 1D arrays gives one ladder per parameter in ``deriv_inds``. If ``None``, each
+            parameter gets ``np.logspace(-11, -1, 11) * max(abs(value), 1)``.
+        return_changes: If ``True``, also return the ladders and the changes :math:`c_k`.
+        **kwargs: Keyword arguments passed to :func:`dh_dlambda`.
+
+    Returns:
+        Array with one step per parameter in ``deriv_inds``. If ``return_changes is True``, a tuple
+        ``(eps, ladders, changes)`` with one array per parameter in the two lists (``changes`` is one
+        shorter than its ladder).
+
+    Raises:
+        ValueError: If a ladder has fewer than two steps, or no pair of neighbouring steps of a parameter
+            gives a finite change (e.g. every step leaves the waveform's domain).
+
+    """
+    params = np.asarray(params, dtype=float)
+    if deriv_inds is None:
+        deriv_inds = np.arange(len(params))
+
+    if steps is None:
+        ladders = [np.logspace(-11, -1, 11) * max(abs(params[i]), 1.0) for i in deriv_inds]
+    elif np.ndim(steps[0]) == 0:
+        ladders = [np.asarray(steps, dtype=float)] * len(deriv_inds)
+    else:
+        ladders = [np.asarray(ladder, dtype=float) for ladder in steps]
+        if len(ladders) != len(deriv_inds):
+            raise ValueError(f"Got {len(ladders)} step ladders for {len(deriv_inds)} parameters.")
+
+    def difference(a, b):
+        if isinstance(a, domains.DomainBase):
+            return a.settings.associated_class(a.arr - b.arr, a.settings)
+        ind_max = min(a.shape[1], b.shape[1])
+        return a[:, :ind_max] - b[:, :ind_max]
+
+    eps, changes = np.zeros(len(deriv_inds)), []
+    for n, (i, ladder) in enumerate(zip(deriv_inds, ladders)):
+        if len(ladder) < 2:
+            raise ValueError("A step ladder needs at least two steps.")
+        change = np.full(len(ladder) - 1, np.nan)
+        previous = dh_dlambda(ladder[0], waveform_model, params, i, **kwargs)
+        for k in range(1, len(ladder)):
+            current = dh_dlambda(ladder[k], waveform_model, params, i, **kwargs)
+            diff = difference(previous, current)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                change[k - 1] = inner_product(diff, diff, **inner_product_kwargs) / inner_product(
+                    previous, previous, **inner_product_kwargs
+                )
+            previous = current
+        if not np.any(np.isfinite(change)):
+            raise ValueError(f"No step of parameter {i} gives a finite derivative; ladder: {ladder}.")
+        eps[n] = ladder[int(np.nanargmin(change))]
+        changes.append(change)
+
+    if return_changes:
+        return eps, ladders, changes
+    return eps
+
+
 def info_matrix(
-    eps: float | np.ndarray,
+    eps: float | np.ndarray | callable,
     waveform_model: callable,
     params: np.ndarray | list,
     deriv_inds: Optional[np.ndarray | list] = None,
@@ -617,13 +781,18 @@ def info_matrix(
     Args:
         eps: Absolute **derivative** step size for variable of interest. Can be provided as a ``float`` value that applies
             to all variables or an array, one for each parameter being evaluated in the information matrix.
+            A callable is called as ``eps(waveform_model, params, deriv_inds=..., inner_product_kwargs=..., **kwargs)``
+            and returns that array; :func:`estimate_eps` is one.
         waveform_model: Callable function to the waveform generator with signature ``(*params, **waveform_kwargs)``.
+            It returns arrays or a :class:`~lisatools.domains.DomainBase` object (see :func:`dh_dlambda`).
         params: Source parameters.
         deriv_inds: Subset of parameters of interest for which to calculate the information matrix, by index.
             If ``None``, it will be ``np.arange(len(params))``.
-        inner_product_kwargs: Keyword arguments for the inner product function.
+        inner_product_kwargs: Keyword arguments for the inner product function. Array waveforms need
+            ``basis_settings`` here; domain waveforms need a ``psd`` on the derivatives' settings.
         return_derivs: If ``True``, also returns computed numerical derivatives.
-        **kwargs: Keyword arguments passed to :func:`dh_dlambda`.
+        **kwargs: Keyword arguments passed to :func:`dh_dlambda` (e.g. ``more_accurate``, and
+            ``basis_settings`` for domain waveforms whose span follows the parameters).
 
     Returns:
         If ``not return_derivs``, this will be the information matrix as a numpy array. If ``return_derivs is True``,
@@ -639,7 +808,11 @@ def info_matrix(
 
     num_info_params = len(deriv_inds)
 
-    if isinstance(eps, float):
+    if callable(eps):
+        eps = eps(
+            waveform_model, params, deriv_inds=deriv_inds, inner_product_kwargs=inner_product_kwargs, **kwargs
+        )
+    elif isinstance(eps, float):
         eps = np.full_like(params, eps)
 
     # collect derivatives over the variables of interest
@@ -653,11 +826,15 @@ def info_matrix(
     info = np.zeros((num_info_params, num_info_params))
     for i in range(num_info_params):
         for j in range(i, num_info_params):
-            info[i][j] = inner_product(
-                [dh[i][k] for k in range(len(dh[i]))],
-                [dh[j][k] for k in range(len(dh[i]))],
-                **inner_product_kwargs,
-            )
+            if isinstance(dh[i], domains.DomainBase):
+                # carries its own basis: no ``basis_settings`` needed in inner_product_kwargs
+                info[i][j] = inner_product(dh[i], dh[j], **inner_product_kwargs)
+            else:
+                info[i][j] = inner_product(
+                    [dh[i][k] for k in range(len(dh[i]))],
+                    [dh[j][k] for k in range(len(dh[i]))],
+                    **inner_product_kwargs,
+                )
             info[j][i] = info[i][j]
 
     if return_derivs:
@@ -674,7 +851,7 @@ def covariance(
     precision: Optional[bool] = False,
     **info_mat_kwargs: dict,
 ) -> np.ndarray | list:
-    """Calculate covariance matrix for a set of EMRI parameters, computing the information matrix if not supplied.
+    """Calculate covariance matrix for a set of source parameters, computing the information matrix if not supplied.
 
     Args:
         *info_mat_args: Set of arguments to pass to :func:`info_matrix`. Not required if ``info_mat`` is not ``None``.

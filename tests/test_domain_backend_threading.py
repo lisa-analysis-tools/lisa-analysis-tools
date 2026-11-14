@@ -7,9 +7,9 @@ source signal's backend. ``FDSignal.ifft(settings=None)`` constructed a
 default-backend ``TDSettings`` mid-chain, so on GPU runs the chain went
 gpu -> cpu -> NumPy/CuPy mixing error.
 
-Also covers the new fail-fast guard: ``transform`` raises immediately (with
-an actionable message) when the TARGET settings live on a different backend
-than the signal, instead of erroring deep inside the chain.
+Also covers a TARGET settings object on a different backend than the signal:
+``transform`` moves the signal to the target's backend once, at entry, and the
+whole chain runs there (``DomainBase._coerce_transform_backend``).
 """
 import unittest
 
@@ -66,7 +66,9 @@ class DomainBackendThreadingTest(unittest.TestCase):
         td = self._td(n, dt)
         wdm_set = WDMSettings(Nf=32, Nt=64, dt=dt, force_backend=FORCE)
         wdm = td.transform(wdm_set)
-        self.assertEqual(_flavor(wdm), FORCE if gpu_available else "cpu")
+        # FORCE is an alias ("gpu" resolves to e.g. cuda12x): compare with the signal built from it
+        self.assertEqual(_flavor(wdm), _flavor(td))
+        self.assertIs(wdm.xp, td.xp)
 
         times = np.arange(n) * dt
         stft_set = get_stft_settings(times, big_dt=640.0, force_backend=FORCE)
@@ -84,13 +86,17 @@ class DomainBackendThreadingTest(unittest.TestCase):
         self.assertIs(wdm2.xp, wdm.xp)
 
     @unittest.skipUnless(gpu_available, "needs a GPU backend to build a true mismatch")
-    def test_transform_target_backend_mismatch_raises(self):
-        """GPU signal + CPU target settings -> immediate, actionable error."""
+    def test_transform_target_backend_mismatch_transfers(self):
+        """GPU signal + CPU target settings -> the output is on the target's backend, same values."""
         td = self._td()
         cpu_target = FDSettings(td.N // 2 + 1, 1.0 / (td.N * td.dt), force_backend="cpu")
-        with self.assertRaises(ValueError) as ctx:
-            td.transform(cpu_target)
-        self.assertIn("force_backend", str(ctx.exception))
+        out = td.transform(cpu_target)
+        self.assertEqual(_flavor(out), "cpu")
+        self.assertIsInstance(out.arr, np.ndarray)
+        on_gpu = td.transform(FDSettings(td.N // 2 + 1, 1.0 / (td.N * td.dt), force_backend=FORCE))
+        np.testing.assert_allclose(out.arr, cp.asnumpy(on_gpu.arr), rtol=1e-12, atol=0)
+        # the input stays where it was
+        self.assertIs(td.xp, cp)
 
 
 if __name__ == "__main__":

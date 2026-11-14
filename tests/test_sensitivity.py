@@ -7,9 +7,11 @@ import unittest
 
 try:
     import cupy as cp
+
+    cp.abs(cp.ones(2))  # cupy imports without a device; using it does not
     gpu_available = True
 
-except (ImportError, ModuleNotFoundError) as e:
+except Exception:
     import numpy as xp
 
     gpu_available = False
@@ -35,6 +37,7 @@ from lisatools.sensitivity import (
 from lisatools.stochastic import PowerLawSGWB
 from lisatools.domains import FDSettings, STFTSettings
 from lisatools.utils.constants import *
+from lisatools.utils.utility import asnumpy
 from lisatools import detector as lisa
 
 import sys
@@ -97,7 +100,7 @@ class SensitivityTest(unittest.TestCase):
         settings = self._make_fd_settings()
         Sn = sens_mat_class(settings, model=model)
         # The matrix must be finite on the active band and inv/det must compute.
-        self.assertFalse(np.any(np.isnan(np.asarray(Sn.sens_mat))))
+        self.assertFalse(np.any(np.isnan(asnumpy(Sn.sens_mat))))
         self.assertEqual(Sn.sens_mat.shape[-1], settings.N_active)
         # Reading invC triggers the lazy compute path.
         _ = Sn.invC
@@ -139,15 +142,15 @@ class SensitivityTest(unittest.TestCase):
         stft = self._make_stft_settings(NT=NT)
         Sn = XYZ1SensitivityMatrix(stft, model=lisa.sangria)
 
-        stft_mat = np.asarray(Sn.sens_mat)
+        stft_mat = asnumpy(Sn.sens_mat)
         self.assertEqual(stft_mat.shape, (3, 3, NT, stft.NF_active))
         self.assertFalse(np.any(np.isnan(stft_mat)))
         # Lazy inverse / determinant must compute on the (NT, NF_active) grid.
-        self.assertEqual(np.asarray(Sn.invC).shape, (3, 3, NT, stft.NF_active))
-        self.assertEqual(np.asarray(Sn.detC).shape, (NT, stft.NF_active))
+        self.assertEqual(asnumpy(Sn.invC).shape, (3, 3, NT, stft.NF_active))
+        self.assertEqual(asnumpy(Sn.detC).shape, (NT, stft.NF_active))
 
         # Each STFT time segment equals the FD matrix on the matching band.
-        fd_mat = np.asarray(XYZ1SensitivityMatrix(self._make_fd_settings(), model=lisa.sangria).sens_mat)
+        fd_mat = asnumpy(XYZ1SensitivityMatrix(self._make_fd_settings(), model=lisa.sangria).sens_mat)
         for it in range(NT):
             np.testing.assert_array_equal(stft_mat[:, :, it, :], fd_mat)
 

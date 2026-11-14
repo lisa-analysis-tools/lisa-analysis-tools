@@ -252,7 +252,8 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
             # ``domain_settings.t_arr[::nperseg]`` without materializing the
             # full N-sample time array on every access.
             ds = self.domain_settings
-            return ds.t0 + ds.xp.arange(0, ds.N, self.nperseg) * ds.dt
+            # on the waveform's array module: the data settings may live on another backend
+            return ds.t0 + self.xp.arange(0, ds.N, self.nperseg) * ds.dt
         else:
             return None
 
