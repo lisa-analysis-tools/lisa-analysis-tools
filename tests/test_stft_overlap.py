@@ -1,7 +1,7 @@
 """Overlapping STFT grids: settings, the numerical STFT, its normalisation, the noise term, guards.
 
-A contiguous grid (overlap = 1) must be unchanged bit for bit. An overlapping grid puts a Hann
-window on segments of overlap hops, whose squares sum to window_power at every sample, so that
+A contiguous grid (overlap = 1) must be unchanged bit for bit. An overlapping grid puts a Tukey
+window with alpha = 1 (Hann) on segments of overlap hops, whose squares sum to window_power at every sample, so that
 differential_component weights the pixels to the time-domain inner product exactly (white noise).
 """
 
@@ -108,7 +108,7 @@ class ContiguousGridTest(unittest.TestCase):
 
 
 class OverlappingGridTest(unittest.TestCase):
-    """overlap = 3: Hann segments of NPERSEG samples every NHOP samples."""
+    """overlap = 3: Tukey alpha = 1 (Hann) segments of NPERSEG samples every NHOP samples."""
 
     def setUp(self):
         self.settings = get_stft_settings(
@@ -146,7 +146,7 @@ class OverlappingGridTest(unittest.TestCase):
         np.testing.assert_allclose(coverage, 9.0 / 8.0, rtol=1e-14)
 
     def test_frames(self):
-        """Segment k holds samples k NHOP ... k NHOP + NPERSEG - 1 under the Hann window."""
+        """Segment k holds samples k NHOP ... k NHOP + NPERSEG - 1 under the Tukey alpha = 1 window."""
         rng = np.random.default_rng(3)
         x = rng.standard_normal(N)
         out = td_signal(x).stft(self.settings).arr[0]

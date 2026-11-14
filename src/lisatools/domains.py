@@ -1607,10 +1607,11 @@ class STFTSettings(DomainSettingsBase):
             is used.
         overlap: Number of segments covering each sample, ``seg_duration / dt``.
             ``1`` (default) is the contiguous grid, windowed by the caller.
-            ``3`` or more overlaps segments of ``overlap * dt`` under a Hann
-            window, whose squares sum to the constant :attr:`window_power` at
-            every sample (a Tukey window does so only at hop = alpha T / m with
-            m >= 3, which excludes ``2``).
+            ``3`` or more overlaps segments of ``overlap * dt`` under a Tukey
+            window with alpha = 1 (Hann), whose squares sum to the constant
+            :attr:`window_power` at every sample: a Tukey window does so only
+            at hop = alpha T / m with m >= 3, so at hop T / overlap it takes
+            alpha = 1, and ``2`` is excluded.
         **kwargs: Forwarded to :class:`DomainSettingsBase` (e.g. ``force_backend``).
     """
 
@@ -1637,7 +1638,8 @@ class STFTSettings(DomainSettingsBase):
     ):
         if overlap != int(overlap) or not (overlap == 1 or overlap >= 3):
             raise ValueError(
-                f"overlap must be 1 or an integer of at least 3 (Hann window), got {overlap}."
+                f"overlap must be 1 or an integer of at least 3 (Tukey alpha = 1 window), "
+                f"got {overlap}."
             )
         self.overlap = int(overlap)
         self.t0 = t0
@@ -1829,7 +1831,8 @@ class STFTSettings(DomainSettingsBase):
         """The constant sum of squared segment windows at every sample.
 
         ``1`` on the contiguous grid (today's convention: the caller's taper is not
-        compensated); ``3 overlap / 8`` for the Hann window at hop ``seg_duration / overlap``.
+        compensated); ``3 overlap / 8`` for the Tukey alpha = 1 (Hann) window at hop
+        ``seg_duration / overlap``.
         """
         return 1.0 if self.overlap == 1 else 3.0 * self.overlap / 8.0
 
@@ -1840,7 +1843,7 @@ class STFTSettings(DomainSettingsBase):
         return 1.0 / self.overlap
 
     def segment_window(self, small_dt: float):
-        """The segment window of an overlapping grid: Hann over ``get_nperseg(small_dt)``
+        """The segment window of an overlapping grid: Tukey alpha = 1 (Hann) over ``get_nperseg(small_dt)``
         samples, sampled at half-sample offsets so that its shifted squares sum exactly to
         :attr:`window_power`. ``None`` on the contiguous grid, whose window the caller sets."""
         if self.overlap == 1:
@@ -1992,7 +1995,8 @@ def get_stft_settings(
         min_freq: Minimum frequency to consider.
         max_freq: Maximum frequency to consider.
         overlap: Segments covering each sample (see :class:`STFTSettings`); the hop is
-            ``big_dt / overlap`` and must be a whole number of samples.
+            ``big_dt / overlap`` and must be a whole number of samples. Above 1 the
+            segments take a Tukey window with alpha = 1 (Hann).
         **kwargs: Additional keyword arguments to pass to STFTSettings.
 
     Returns:

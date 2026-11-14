@@ -17,7 +17,8 @@ Hann window at hop = T_seg / overlap (overlap = 3), `dt` = hop, `overlap = 1` bi
       waveformbase, which only builds contiguous grids), stft_band_structure, GWTF
 - [x] `tests/test_stft_overlap.py` (19 tests, one GPU)
 - [x] Regression: same tests as baseline, identical results
-- [ ] Commit + push branch
+- [x] Commit + push branch (c248fad4)
+- [x] Follow-up: name the overlapping window "Tukey alpha = 1 (Hann)" in docs and messages
 
 ## Review
 - New tests: 19 passed (CPU + GPU 5). Contiguous `TDSignal.stft` is bit-equal to the pre-change
