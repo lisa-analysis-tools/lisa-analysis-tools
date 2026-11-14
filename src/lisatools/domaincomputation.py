@@ -424,6 +424,14 @@ class STFTComputationGroup(DomainKernelStrategy):
             raise ValueError(
                 "settings must be an instance of STFTSettings for STFTComputationGroup."
             )
+        if acs.settings.overlap != 1:
+            # ! The C++ STFTDomain / STFTFresnel / DFFR take the hop for the segment length and df
+            # ! for the inner-product weight; on an overlapping grid both are wrong.
+            raise NotImplementedError(
+                f"STFTComputationGroup supports contiguous STFT grids only (overlap = 1), got "
+                f"overlap = {acs.settings.overlap}: the C++ STFT kernels do not yet separate the hop "
+                "from the segment length."
+            )
         super().__init__(acs, split_index, tdi_type, force_backend)
 
         self.window_alpha = window_alpha

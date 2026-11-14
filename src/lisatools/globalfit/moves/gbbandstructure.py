@@ -321,6 +321,12 @@ def stft_band_structure(domain_settings: STFTSettings, alpha: float, *,
     Sequential scalar recurrence, so it runs on the host whatever ``xp``
     is; only the finished edge array is moved, once.
     """
+    if domain_settings.overlap != 1:
+        # ! The span below is NT * dt, the length of contiguous segments only.
+        raise NotImplementedError(
+            f"stft_band_structure supports contiguous STFT grids only (overlap = 1), got "
+            f"overlap = {domain_settings.overlap}."
+        )
     if convention not in ("midpoint", "max_over_band"):
         raise ValueError(f"convention must be 'midpoint' or 'max_over_band'; "
                          f"got {convention!r}")

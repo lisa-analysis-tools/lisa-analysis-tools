@@ -66,6 +66,13 @@ class GWTF_generator:
                 SOBBHTaylorT3TDIWaveform(phase_at_coalescence=...).
         """
 
+        if settings.overlap != 1:
+            # ! gwtf builds its pixels on contiguous segments of length settings.dt.
+            raise NotImplementedError(
+                f"GWTF_generator supports contiguous STFT grids only (overlap = 1), got "
+                f"overlap = {settings.overlap}."
+            )
+
         # Constructor arguments, used by MultiGPUResidualAddRemoveMove to build one replica per GPU
         # (it rebuilds the generator as GWTF_generator(**self.kwargs) with "orbits" swapped for that device's orbits).
 

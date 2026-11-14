@@ -315,6 +315,9 @@ def noise_likelihood_term(psd: SensitivityMatrixBase) -> float:
 
         \\log{\\mathcal{L}}_n = -\\sum \\log{\\vec{S}_n}.
 
+    On a redundant basis (an overlapping STFT grid) each basis element carries
+    ``basis_settings.redundancy`` of a degree of freedom, which weights its log-det.
+
     Args:
         psd: Sensitivity information.
 
@@ -333,7 +336,7 @@ def noise_likelihood_term(psd: SensitivityMatrixBase) -> float:
     keep = (detC != 0.0) & (~np.isinf(detC)) & (~np.isnan(detC))
 
     nl_val = -np.sum(np.log(np.abs(detC[keep])))
-    return nl_val
+    return nl_val * getattr(psd.basis_settings, "redundancy", 1.0)
 
 
 def residual_full_source_and_noise_likelihood(

@@ -3873,6 +3873,14 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         """One ``psd_likelihood_wrap`` call for ``len(log_like_out)`` PSDs; writes into
         ``log_like_out`` (contiguous). Arguments are sanitized 1D arrays, see
         :meth:`compute_log_like`."""
+        redundancy = getattr(self.basis_settings, "redundancy", 1.0)
+        if redundancy != 1.0:
+            # ! Both kernels below count a full log-det per basis element; a redundant basis needs
+            # ! it weighted by the redundancy (diagnostic.noise_likelihood_term does so).
+            raise NotImplementedError(
+                f"The batched PSD likelihood supports non-redundant bases only, got redundancy = "
+                f"{redundancy} (an overlapping STFT grid)."
+            )
         xp = self.xp
         num_psds = len(log_like_out)
 

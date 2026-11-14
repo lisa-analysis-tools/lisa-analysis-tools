@@ -80,6 +80,14 @@ class DomainSettingsBase(LISAToolsParallelModule):
         """
         return ["lisatools_" + _tmp for _tmp in cls.GPU_RECOMMENDED()]
 
+    @property
+    def redundancy(self) -> float:
+        """Degrees of freedom per basis element: the weight of each element's noise log-det.
+
+        ``1.0`` for every non-redundant basis; an overlapping STFT grid overrides it.
+        """
+        return 1.0
+
     def get_slice(self, index: tuple) -> DomainSettingsBase:
         """Return a new settings object describing a sliced view of this domain."""
         raise NotImplementedError("get_slice needs to be implemented for this signal type.")
@@ -572,6 +580,12 @@ def _apply_td_add(target, sign, template_arr, template_settings):
 def _apply_stft_add(target, sign, template_arr, template_settings):
     """Add ``sign * template_arr`` (STFT) to ``target.arr`` over the (t, f) overlap."""
     data_settings = target.settings
+    if data_settings.overlap != template_settings.overlap:
+        raise ValueError(
+            f"Data overlap ({data_settings.overlap}) and template overlap "
+            f"({template_settings.overlap}) must match for STFT add_signal: the templates must be "
+            "built on the data's segment grid."
+        )
     if not np.isclose(data_settings.df, template_settings.df):
         raise ValueError(
             f"Data df ({data_settings.df}) and template df "
@@ -818,7 +832,9 @@ class TDSignal(DomainBase, TDSettings):
 
         Args:
             settings: :class:`STFTSettings` describing the segment grid (required).
-            window: Optional per-segment window (length ``nperseg``).
+            window: Optional per-segment window (length ``nperseg``). On an
+                overlapping grid it defaults to ``settings.segment_window`` and
+                must satisfy :meth:`STFTSettings.check_segment_window`.
 
         Returns:
             :class:`STFTSignal` containing the time-frequency array sliced to
@@ -827,6 +843,8 @@ class TDSignal(DomainBase, TDSettings):
         if settings is None:
             raise ValueError("Must provide STFTSettings for stft transform.")
         assert isinstance(settings, STFTSettings)
+        if settings.overlap > 1:
+            return self._stft_overlapping(settings, window)
         big_dt = settings.dt
 
         # Validate that big_dt is an integer multiple of self.dt
@@ -863,6 +881,28 @@ class TDSignal(DomainBase, TDSettings):
             self.xp.asarray(window[None, :]) * _arr.reshape(self.outer_shape + (Nsegments, nperseg)),
             axis=-1,
         )
+
+        return STFTSignal(stft_arr[..., settings.active_slice], settings)  # (nchannels, NT, NF)
+
+    def _stft_overlapping(self, settings, window):
+        """:meth:`stft` on an overlapping grid: segment k holds samples k nhop .. k nhop + nperseg - 1,
+        zero-padded past the end of the signal as on the contiguous grid."""
+        nperseg = settings.get_nperseg(self.dt)
+        nhop = settings.get_nhop(self.dt)
+        if window is None:
+            window = settings.segment_window(self.dt)
+        window = self.xp.asarray(window)
+        settings.check_segment_window(window, self.dt)
+
+        required_samples = (settings.NT - 1) * nhop + nperseg
+        if required_samples > self.N:
+            pad_width = [(0, 0)] * len(self.outer_shape) + [(0, required_samples - self.N)]
+            _arr = self.xp.pad(self.arr, pad_width, mode="constant", constant_values=0)
+        else:
+            _arr = self.arr[..., :required_samples]
+
+        frames = self.xp.arange(settings.NT)[:, None] * nhop + self.xp.arange(nperseg)[None, :]
+        stft_arr = self.dt * self.xp.fft.rfft(window[None, :] * _arr[..., frames], axis=-1)
 
         return STFTSignal(stft_arr[..., settings.active_slice], settings)  # (nchannels, NT, NF)
 
@@ -1557,13 +1597,20 @@ class STFTSettings(DomainSettingsBase):
 
     Args:
         t0: Time of the first segment (seconds).
-        dt: Segment cadence in seconds (spacing between successive STFT slices).
-        df: Frequency bin spacing in Hz.
+        dt: Segment cadence in seconds (spacing between successive STFT slices,
+            the hop).
+        df: Frequency bin spacing in Hz, ``1 / seg_duration``.
         NT: Number of time segments.
         NF: Number of frequency bins per segment.
         min_freq: Lower edge of the active band (Hz). Defaults to ``0.0``.
         max_freq: Upper edge of the active band (Hz). If ``None``, the full range
             is used.
+        overlap: Number of segments covering each sample, ``seg_duration / dt``.
+            ``1`` (default) is the contiguous grid, windowed by the caller.
+            ``3`` or more overlaps segments of ``overlap * dt`` under a Hann
+            window, whose squares sum to the constant :attr:`window_power` at
+            every sample (a Tukey window does so only at hop = alpha T / m with
+            m >= 3, which excludes ``2``).
         **kwargs: Forwarded to :class:`DomainSettingsBase` (e.g. ``force_backend``).
     """
 
@@ -1574,6 +1621,7 @@ class STFTSettings(DomainSettingsBase):
     NF: int
     min_freq: Optional[float] = 0.0
     max_freq: Optional[float] = None
+    overlap: int = 1
 
     def __init__(
         self,
@@ -1584,11 +1632,21 @@ class STFTSettings(DomainSettingsBase):
         NF: int,
         min_freq: Optional[float] = 0.0,
         max_freq: Optional[float] = None,
+        overlap: int = 1,
         **kwargs,
     ):
+        if overlap != int(overlap) or not (overlap == 1 or overlap >= 3):
+            raise ValueError(
+                f"overlap must be 1 or an integer of at least 3 (Hann window), got {overlap}."
+            )
+        self.overlap = int(overlap)
         self.t0 = t0
         self.dt = dt
         self.df = df
+        if self.overlap > 1 and abs(df * self.seg_duration - 1.0) > 1e-12:
+            raise ValueError(
+                f"df ({df}) must be 1 / seg_duration ({self.seg_duration}) on an overlapping grid."
+            )
         self.NT = NT
         self.NF = NF
         self.min_freq = min_freq
@@ -1596,22 +1654,31 @@ class STFTSettings(DomainSettingsBase):
         super().__init__(**kwargs)
 
     def __repr__(self):
+        overlap = f", overlap={self.overlap}" if self.overlap != 1 else ""
         return (
             f"STFTSettings(t0={self.t0}, dt={self.dt}, df={self.df}, NT={self.NT}, NF={self.NF}, "
-            f"min_freq={self.min_freq}, max_freq={self.max_freq}, backend={self.backend_name.split('_')[-1]})"
+            f"min_freq={self.min_freq}, max_freq={self.max_freq}{overlap}, "
+            f"backend={self.backend_name.split('_')[-1]})"
         )
 
     @staticmethod
-    def make_factory(big_dt: float, min_freq: Optional[float] = 0.0, max_freq: Optional[float] = None):
+    def make_factory(
+        big_dt: float,
+        min_freq: Optional[float] = 0.0,
+        max_freq: Optional[float] = None,
+        overlap: int = 1,
+    ):
         """Build a ``(times, dt, force_backend) -> STFTSettings`` factory.
 
-        Delegates to :func:`get_stft_settings`, which fits ``big_dt`` to an
-        integer multiple of ``dt`` and derives ``NT``/``NF`` from there.
+        Delegates to :func:`get_stft_settings`, which fits ``big_dt`` (the
+        segment length) to an integer multiple of ``dt`` and derives the hop,
+        ``NT`` and ``NF`` from there.
         """
         def _factory(times, dt, force_backend):
             return get_stft_settings(
                 times=times, big_dt=big_dt,
                 min_freq=min_freq, max_freq=max_freq,
+                overlap=overlap,
                 force_backend=force_backend,
             )
         return _factory
@@ -1722,9 +1789,13 @@ class STFTSettings(DomainSettingsBase):
 
     @property
     def kwargs(self) -> dict:
-        return dict(
+        kwargs = dict(
             min_freq=self.min_freq_input, max_freq=self.max_freq_input, force_backend=self.backend
         )
+        # * Only when it differs from the default, so contiguous grids keep their recorded kwargs.
+        if self.overlap != 1:
+            kwargs["overlap"] = self.overlap
+        return kwargs
 
     @property
     def f_arr_edges(self) -> np.ndarray:
@@ -1742,14 +1813,59 @@ class STFTSettings(DomainSettingsBase):
             and (value.NF == self.NF)
             and (value.dt == self.dt)
             and (value.df == self.df)
+            and (value.overlap == self.overlap)
             and (self.xp.isclose(value.t0, self.t0))
             and (self.xp.isclose(value.min_freq, self.min_freq))
             and (self.xp.isclose(value.max_freq, self.max_freq))
         )
 
     @property
+    def seg_duration(self) -> float:
+        """Length of one segment (seconds): ``overlap`` hops."""
+        return self.overlap * self.dt
+
+    @property
+    def window_power(self) -> float:
+        """The constant sum of squared segment windows at every sample.
+
+        ``1`` on the contiguous grid (today's convention: the caller's taper is not
+        compensated); ``3 overlap / 8`` for the Hann window at hop ``seg_duration / overlap``.
+        """
+        return 1.0 if self.overlap == 1 else 3.0 * self.overlap / 8.0
+
+    @property
+    def redundancy(self) -> float:
+        """Each sample enters ``overlap`` segments, so a pixel carries ``1 / overlap`` of a
+        degree of freedom: the weight of its noise log-det."""
+        return 1.0 / self.overlap
+
+    def segment_window(self, small_dt: float):
+        """The segment window of an overlapping grid: Hann over ``get_nperseg(small_dt)``
+        samples, sampled at half-sample offsets so that its shifted squares sum exactly to
+        :attr:`window_power`. ``None`` on the contiguous grid, whose window the caller sets."""
+        if self.overlap == 1:
+            return None
+        nperseg = self.get_nperseg(small_dt)
+        return self.xp.sin(np.pi * (self.xp.arange(nperseg) + 0.5) / nperseg) ** 2
+
+    def check_segment_window(self, window, small_dt: float):
+        """Raise ``ValueError`` unless ``window`` fits this overlapping grid: ``nperseg`` samples
+        whose squares, summed over the ``overlap`` segments covering a sample, equal
+        :attr:`window_power` at every sample."""
+        nperseg = self.get_nperseg(small_dt)
+        nhop = self.get_nhop(small_dt)
+        if window.shape != (nperseg,):
+            raise ValueError(f"The segment window must have {nperseg} samples, got {window.shape}.")
+        coverage = (window**2).reshape(self.overlap, nhop).sum(axis=0)
+        if not bool(self.xp.allclose(coverage, self.window_power, rtol=1e-10, atol=0.0)):
+            raise ValueError(
+                "The squared segment windows must sum to window_power at every sample "
+                f"({self.window_power}); this window does not."
+            )
+
+    @property
     def differential_component(self) -> float:
-        return self.df
+        return self.df / self.window_power
 
     @property
     def active_slice(
@@ -1764,13 +1880,24 @@ class STFTSettings(DomainSettingsBase):
 
     def get_nperseg(self, small_dt: float):
         """Number of samples per segment given the underlying sample step ``small_dt``."""
-        nperseg = round(self.dt / small_dt)
+        seg_duration = self.seg_duration
+        nperseg = round(seg_duration / small_dt)
 
         assert (
-            abs(nperseg * small_dt - self.dt) < 1e-10 * self.dt
-        ), f"big_dt={self.dt} must be an integer multiple of dt={small_dt}"
+            abs(nperseg * small_dt - seg_duration) < 1e-10 * seg_duration
+        ), f"big_dt={seg_duration} must be an integer multiple of dt={small_dt}"
 
         return nperseg
+
+    def get_nhop(self, small_dt: float):
+        """Number of samples between segment starts given the underlying sample step ``small_dt``."""
+        nhop = round(self.dt / small_dt)
+
+        assert (
+            abs(nhop * small_dt - self.dt) < 1e-10 * self.dt
+        ), f"hop={self.dt} must be an integer multiple of dt={small_dt}"
+
+        return nhop
 
     def compute_slice_indices(
         self, tmin: float, tmax: float, fmin: float, fmax: float
@@ -1790,8 +1917,9 @@ class STFTSettings(DomainSettingsBase):
 
         if tmin < self.t0:
             raise ValueError("tmin must be greater than or equal to t0.")
-        if tmax > self.t0 + self.NT * self.dt:
-            raise ValueError("tmax must be less than or equal to t0 + NT*dt.")
+        # * The last segment ends overlap - 1 hops after the last start: t0 + NT dt when contiguous.
+        if tmax > self.t0 + (self.NT + self.overlap - 1) * self.dt:
+            raise ValueError("tmax must be less than or equal to the end of the last segment.")
         f_min_active = self.f_arr[0]
         f_max_active = self.f_arr[-1]
         if fmin < f_min_active:
@@ -1842,6 +1970,7 @@ class STFTSettings(DomainSettingsBase):
             NF=new_NF,
             min_freq=new_min_freq,
             max_freq=new_max_freq,
+            overlap=self.overlap,
             force_backend=self.backend,
         )
 
@@ -1851,6 +1980,7 @@ def get_stft_settings(
     big_dt: float,
     min_freq: Optional[float] = 0.0,
     max_freq: Optional[float] = None,
+    overlap: int = 1,
     **kwargs,
 ) -> STFTSettings:
     """
@@ -1858,9 +1988,11 @@ def get_stft_settings(
 
     Args:
         times: Time array.
-        big_dt: Desired time resolution for STFT segments.
+        big_dt: Desired length of the STFT segments.
         min_freq: Minimum frequency to consider.
         max_freq: Maximum frequency to consider.
+        overlap: Segments covering each sample (see :class:`STFTSettings`); the hop is
+            ``big_dt / overlap`` and must be a whole number of samples.
         **kwargs: Additional keyword arguments to pass to STFTSettings.
 
     Returns:
@@ -1874,14 +2006,30 @@ def get_stft_settings(
     big_dt = int(big_dt / dt) * dt  # make sure big_dt is an integer multiple of dt
     # now make sure that Tobs is an integer multiple of big_dt
 
-    # NT = int(np.ceil(N / (big_dt / dt))) # number of segments
-    NT = int(np.floor(N / (big_dt / dt))) # number of segments
     DF = 1 / big_dt
     nperseg = int(big_dt / dt)
     NF = nperseg // 2 + 1
 
+    if overlap == 1:
+        # NT = int(np.ceil(N / (big_dt / dt))) # number of segments
+        NT = int(np.floor(N / (big_dt / dt))) # number of segments
+        return STFTSettings(
+            t0=t0, dt=big_dt, df=DF, NT=NT, NF=NF, min_freq=min_freq, max_freq=max_freq, **kwargs
+        )
+
+    if nperseg % overlap != 0:
+        raise ValueError(
+            f"The hop big_dt / overlap must be a whole number of samples: {nperseg} samples per "
+            f"segment do not divide by overlap = {overlap}."
+        )
+    if N < nperseg:
+        raise ValueError(f"{N} samples hold no segment of {nperseg} samples.")
+    nhop = nperseg // overlap
+    # * Every segment lies inside the record: the last one starts at (NT - 1) nhop.
+    NT = (N - nperseg) // nhop + 1
     return STFTSettings(
-        t0=t0, dt=big_dt, df=DF, NT=NT, NF=NF, min_freq=min_freq, max_freq=max_freq, **kwargs
+        t0=t0, dt=nhop * dt, df=DF, NT=NT, NF=NF, min_freq=min_freq, max_freq=max_freq,
+        overlap=overlap, **kwargs
     )
 
 
