@@ -402,9 +402,10 @@ class STFTComputationGroup(DomainKernelStrategy):
         """
         Args:
             window_alpha: Tukey-window parameter for the Fresnel transform
-                (``0.0`` = rectangular window).
+                (``0.0`` = rectangular window). An overlapping grid needs ``1.0``,
+                the window its data are cut with.
             use_midpoint: If ``True``, the Fresnel transform anchors each
-                linear-chirp expansion at the bin midpoint (``t0 + dt/2``)
+                linear-chirp expansion at the bin midpoint (``t0 + seg_duration/2``)
                 instead of the bin start, which is more accurate for signals
                 with frequency curvature. The caller must then supply the
                 per-window ``(amp, phase0, f0, fdot0)`` evaluated at the bin
@@ -424,13 +425,12 @@ class STFTComputationGroup(DomainKernelStrategy):
             raise ValueError(
                 "settings must be an instance of STFTSettings for STFTComputationGroup."
             )
-        if acs.settings.overlap != 1:
-            # ! The C++ STFTDomain / STFTFresnel / DFFR take the hop for the segment length and df
-            # ! for the inner-product weight; on an overlapping grid both are wrong.
-            raise NotImplementedError(
-                f"STFTComputationGroup supports contiguous STFT grids only (overlap = 1), got "
-                f"overlap = {acs.settings.overlap}: the C++ STFT kernels do not yet separate the hop "
-                "from the segment length."
+        if acs.settings.overlap != 1 and window_alpha != 1.0:
+            # ! The data of an overlapping grid are cut with the Tukey alpha = 1 (Hann) window;
+            # ! templates under another window would not match them.
+            raise ValueError(
+                f"An overlapping STFT grid (overlap = {acs.settings.overlap}) needs the Tukey "
+                f"alpha = 1 (Hann) template window, got window_alpha = {window_alpha}."
             )
         super().__init__(acs, split_index, tdi_type, force_backend)
 
@@ -473,13 +473,24 @@ class STFTComputationGroup(DomainKernelStrategy):
         # The rows hold the full active grid, so the kernels read them at a pixel's active bin.
         return [int(self.noise_row_shape[-1]), True]
 
+    @property
+    def seg_duration(self) -> float:
+        """Window length of a segment; the hop between segment starts is ``settings.dt``."""
+        return float(self.settings.seg_duration)
+
     def _create_cpp_domain(self):
-        self._cpp_domain = self.backend.STFTDomainWrap(*self.domain_args)
+        # * By keyword: the positional tail of domain_args varies with the noise layout.
+        self._cpp_domain = self.backend.STFTDomainWrap(
+            *self.domain_args,
+            seg_duration=self.seg_duration,
+            diff_comp=float(self.settings.differential_component),
+        )
         self._cpp_fresnel = self.backend.STFTFresnelWrap(
             *self.domain_args[:8],
             window_alpha=self.window_alpha,
             use_midpoint=self.use_midpoint,
             linear_envelope=self.linear_envelope,
+            seg_duration=self.seg_duration,
         )
 
     @property
@@ -519,6 +530,7 @@ class STFTComputationGroup(DomainKernelStrategy):
                     window_alpha=self.window_alpha,
                     use_midpoint=self.use_midpoint,
                     linear_envelope=wanted,
+                    seg_duration=self.seg_duration,
                 )
         saved = self._cpp_fresnel
         self._cpp_fresnel = cache[wanted]
@@ -554,9 +566,10 @@ class STFTComputationGroup(DomainKernelStrategy):
                 name: self.xp.zeros(int(np.prod(shape)) * num_times, dtype=self.xp.float64)
                 for name, shape in KINEMATICS_TABLE_FIELDS
             }
-            # * Midpoints of the windows whose starts the STFT kernels place at t0 + i dt.
+            # * Midpoints of the windows of length seg_duration whose starts the STFT kernels
+            # * place at t0 + i dt.
             table = self.backend.KinematicsTableWrap(
-                float(self.settings.t0) + 0.5 * float(self.settings.dt),
+                float(self.settings.t0) + 0.5 * self.seg_duration,
                 float(self.settings.dt),
                 num_times,
                 *arrays.values(),

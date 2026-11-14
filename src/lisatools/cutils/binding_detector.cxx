@@ -890,13 +890,17 @@ void domains_part(nb::module_ &m) {
 #endif
     .def(nb::init<int, int, int, double, double, double, double, double,
                   array_type<std::complex<double>>, array_type<std::complex<double>>,
-                  int, int, int, int, bool>(),
+                  int, int, int, int, bool, double, double>(),
          nb::arg("num_times"), nb::arg("num_freqs"), nb::arg("num_channels"),
          nb::arg("t0"), nb::arg("f_min"), nb::arg("f_max"),
          nb::arg("dt"), nb::arg("df"),
          nb::arg("data"), nb::arg("invC"),
          nb::arg("num_data"), nb::arg("num_noise"), nb::arg("tdi_type"),
-         nb::arg("num_freqs_noise") = -1, nb::arg("noise_full_grid") = false)
+         nb::arg("num_freqs_noise") = -1, nb::arg("noise_full_grid") = false,
+         // Negative: the contiguous-grid values seg_duration = dt, diff_comp = df.
+         nb::arg("seg_duration") = -1.0, nb::arg("diff_comp") = -1.0)
+    .def_prop_ro("seg_duration", [](STFTDomainWrap& self) { return self.domain->seg_duration; })
+    .def_prop_ro("diff_comp", [](STFTDomainWrap& self) { return self.domain->diff_comp; })
     .def("compute_likelihood_terms", &STFTDomainWrap::compute_likelihood_terms,
          nb::arg("d_h_out"), nb::arg("h_h_out"), nb::arg("template_vals"),
          nb::arg("start_times"), nb::arg("start_freqs"), nb::arg("num_binaries"),
@@ -943,11 +947,17 @@ void domains_part(nb::module_ &m) {
 #else
     nb::class_<STFTFresnelWrap>(m, "STFTFresnelWrapCPU")
 #endif
-    .def(nb::init<int, int, int, double, double, double, double, double, double, bool, bool>(),
+    .def(nb::init<int, int, int, double, double, double, double, double, double, bool, bool,
+                  double>(),
          nb::arg("num_times"), nb::arg("num_freqs"), nb::arg("num_channels"),
          nb::arg("t0"), nb::arg("f_min"), nb::arg("f_max"),
          nb::arg("dt"), nb::arg("df"), nb::arg("window_alpha") = 0.0,
-         nb::arg("use_midpoint") = false, nb::arg("linear_envelope") = false)
+         nb::arg("use_midpoint") = false, nb::arg("linear_envelope") = false,
+         // Negative: the contiguous-grid window length seg_duration = dt.
+         nb::arg("seg_duration") = -1.0)
+    .def_prop_ro("seg_duration", [](STFTFresnelWrap& self) { return self.fresnel->seg_duration; })
+    .def_prop_ro("taper_duration",
+                 [](STFTFresnelWrap& self) { return self.fresnel->taper_duration; })
     .def("compute_phase_kernel_moments", &STFTFresnelWrap::compute_phase_kernel_moments,
          nb::arg("kernel_out"), nb::arg("moment_out"), nb::arg("f_effs"),
          nb::arg("t_refs"), nb::arg("f0s"), nb::arg("fdot0s"),

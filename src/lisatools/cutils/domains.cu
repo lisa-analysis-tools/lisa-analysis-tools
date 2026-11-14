@@ -793,7 +793,7 @@ CUDA_DEVICE
 void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
                                             double f, cmplx* kernel_out,
                                             cmplx* moment_out) {
-  double t_end = t0 + dt;
+  double t_end = t0 + seg_duration;
   double t_roll_on = t0 + taper_duration;
   double t_roll_off = t_end - taper_duration;
 
@@ -802,7 +802,7 @@ void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
   // automatically picks up the correct per-effective-frequency compensating
   // phase inside get_phase_kernel_core and the output stays in the standard
   // STFT convention.  Integration bounds remain the physical window times.
-  double t_ref = use_midpoint ? (t0 + 0.5 * dt) : t0;
+  double t_ref = use_midpoint ? (t0 + 0.5 * seg_duration) : t0;
   bool with_moment = (moment_out != nullptr);
 
   // The seven terms, in order: the rectangular window, then the left ramp's DC and its two
@@ -820,12 +820,12 @@ void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
 
   // The right-ramp half-cosine is referenced to the segment END,
   // cos(pi*(t_end - t)/taper). Re-expressed as frequency shifts referenced to
-  // the Fourier origin t0 it carries constant phases exp(-/+ 2 pi i f_taper*dt)
-  // on the (f -/+ f_taper) terms. Those are unity iff f_taper*dt = 1/alpha is an
+  // the Fourier origin t0 it carries constant phases exp(-/+ 2 pi i f_taper*seg_duration)
+  // on the (f -/+ f_taper) terms. Those are unity iff f_taper*seg_duration = 1/alpha is an
   // integer (true for all historical alphas: 0.1, 0.5, 1.0); omitting them for
   // an off-grid taper silently degraded the windowed template to mm ~ 1e-2
   // (found 2026-07-02 with taper = 1e4 s at dt = 1 day, alpha = 0.2315).
-  double taper_rot = 2.0 * M_PI * f_taper * dt;
+  double taper_rot = 2.0 * M_PI * f_taper * seg_duration;
   cmplx right_rot_p = gcmplx::polar(1.0, -taper_rot);  // multiplies (f - f_taper)
   cmplx right_rot_m = gcmplx::polar(1.0, +taper_rot);  // multiplies (f + f_taper)
 
@@ -898,9 +898,9 @@ cmplx STFTFresnel::get_fourier_value(double amp, double phase0, double f0,
     // Chirp reference: bin start (default) or bin midpoint (more accurate). The
     // Fourier-transform origin stays at the window start t0; the compensating
     // phase added in get_phase_kernel_core keeps the standard STFT convention.
-    double t_ref = use_midpoint ? (t0 + 0.5 * dt) : t0;
+    double t_ref = use_midpoint ? (t0 + 0.5 * seg_duration) : t0;
     cmplx phase_kernel, moment_kernel;
-    get_phase_kernel_core(f, t_ref, f0, fdot0, t0, t0 + dt, t0, &phase_kernel,
+    get_phase_kernel_core(f, t_ref, f0, fdot0, t0, t0 + seg_duration, t0, &phase_kernel,
                           &moment_kernel);
     return pref * phase_kernel + slope * pref * moment_kernel;
   }
@@ -924,8 +924,8 @@ CUDA_DEVICE
 cmplx STFTFresnel::get_fourier_kernel(double f0, double fdot0, double t0,
                                       double f) {
   if (window_alpha > 0.0) return get_windowed_fourier_kernel(f0, fdot0, t0, f);
-  double t_ref = use_midpoint ? (t0 + 0.5 * dt) : t0;
-  return get_phase_kernel_product(f, t_ref, f0, fdot0, t0, t0 + dt, t0);
+  double t_ref = use_midpoint ? (t0 + 0.5 * seg_duration) : t0;
+  return get_phase_kernel_product(f, t_ref, f0, fdot0, t0, t0 + seg_duration, t0);
 }
 
 // ============================================================

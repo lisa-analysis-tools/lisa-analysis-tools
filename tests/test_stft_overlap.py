@@ -208,6 +208,122 @@ class OverlappingGridGPUTest(unittest.TestCase):
         np.testing.assert_allclose(out_gpu, out_cpu, rtol=0.0, atol=1e-12 * np.abs(out_cpu).max())
 
 
+# * Native grid: one-day segments every third of a day, as in production.
+DAY = 86400.0
+NATIVE_T0 = 1.0e7
+
+
+def _native_backends():
+    import lisatools
+
+    names = ["cpu"]
+    if _gpu_available() and lisatools.has_backend("cuda12x"):
+        names.append("cuda12x")
+    return [(name, lisatools.get_backend(name)) for name in names]
+
+
+def _host(array):
+    return array.get() if hasattr(array, "get") else np.asarray(array)
+
+
+class NativeGridTest(unittest.TestCase):
+    """The C++ STFT objects separate the hop dt from the window length seg_duration (round 2a)."""
+
+    NT, NF = 9, 16
+
+    def _domain(self, backend, **kwargs):
+        xp = backend.xp
+        num = 2 * self.NT * self.NF
+        rng = np.random.default_rng(7)
+        data = xp.asarray(rng.standard_normal(num) + 1j * rng.standard_normal(num))
+        invc = xp.asarray(1.0 + rng.random(num)).astype(xp.complex128)
+        domain = backend.STFTDomainWrap(
+            self.NT, self.NF, 2, NATIVE_T0, 1e-3, 1e-3 + self.NF / DAY, DAY / 3.0, 1.0 / DAY,
+            data, invc, 1, 1, backend.TDITypeDict["AE"], **kwargs,
+        )
+        return domain, (data, invc)
+
+    def test_wrap_defaults_are_the_contiguous_grid(self):
+        for name, backend in _native_backends():
+            with self.subTest(backend=name):
+                domain, _ = self._domain(backend)
+                self.assertEqual((domain.seg_duration, domain.diff_comp), (DAY / 3.0, 1.0 / DAY))
+                domain, _ = self._domain(backend, seg_duration=DAY, diff_comp=8.0 / (9.0 * DAY))
+                self.assertEqual((domain.seg_duration, domain.diff_comp), (DAY, 8.0 / (9.0 * DAY)))
+                grid = (3, 4, 3, NATIVE_T0, 1e-3, 1e-3 + 4 / DAY, DAY / 3.0, 1.0 / DAY)
+                fresnel = backend.STFTFresnelWrap(*grid, window_alpha=1.0)
+                self.assertEqual((fresnel.seg_duration, fresnel.taper_duration), (DAY / 3.0, DAY / 6.0))
+                fresnel = backend.STFTFresnelWrap(*grid, window_alpha=1.0, seg_duration=DAY)
+                self.assertEqual((fresnel.seg_duration, fresnel.taper_duration), (DAY, DAY / 2.0))
+
+    def test_inner_product_weight_is_diff_comp(self):
+        for name, backend in _native_backends():
+            with self.subTest(backend=name):
+                xp = backend.xp
+                values = []
+                for kwargs in ({}, {"diff_comp": 8.0 / (9.0 * DAY)}):
+                    domain, keep = self._domain(backend, **kwargs)
+                    rng = np.random.default_rng(8)
+                    num = 2 * self.NT * 5
+                    template = xp.asarray(rng.standard_normal(num) + 1j * rng.standard_normal(num))
+                    d_h, h_h = xp.zeros(1, dtype=complex), xp.zeros(1, dtype=complex)
+                    domain.compute_likelihood_terms(
+                        d_h, h_h, template, xp.asarray([NATIVE_T0]), xp.asarray([1e-3 + 3 / DAY]),
+                        1, xp.zeros(1, dtype=xp.int32), xp.zeros(1, dtype=xp.int32), self.NT, 5,
+                    )
+                    values.append((_host(d_h)[0], _host(h_h)[0]))
+                for default, weighted in zip(*values):
+                    self.assertAlmostEqual(abs(weighted / default - 8.0 / 9.0), 0.0, delta=1e-15)
+
+    def test_fresnel_window_is_seg_duration(self):
+        """A pixel's value depends on the window length, never on the hop."""
+        for name, backend in _native_backends():
+            with self.subTest(backend=name):
+                xp = backend.xp
+                freqs = 2e-3 + np.arange(-4, 5) / DAY
+                args = dict(
+                    amps=xp.asarray([1.0]), phase0s=xp.asarray([0.3]), f0s=xp.asarray([2e-3 + 0.2 / DAY]),
+                    fdot0s=xp.asarray([3e-15]), t0s=xp.asarray([NATIVE_T0 + 5.0 * DAY / 3.0]),
+                    freqs=xp.asarray(freqs), window_factor=1.0, num_binaries=1, num_freqs=len(freqs),
+                )
+
+                def value(dt, **kwargs):
+                    grid = (4, len(freqs), 3, NATIVE_T0, freqs[0], freqs[-1], dt, 1.0 / DAY)
+                    out = xp.zeros(len(freqs), dtype=complex)
+                    backend.STFTFresnelWrap(*grid, window_alpha=1.0, use_midpoint=True,
+                                            **kwargs).compute_fourier_values(out, **args)
+                    return _host(out)
+
+                contiguous = value(DAY)
+                np.testing.assert_array_equal(value(DAY / 3.0, seg_duration=DAY), contiguous)
+                self.assertGreater(np.max(np.abs(value(DAY / 3.0) - contiguous)), 0.1 * np.max(np.abs(contiguous)))
+
+    def test_kinematics_midpoints_and_spacing(self):
+        """The group's kinematics table starts at the first window's midpoint and steps by the hop."""
+        import contextlib
+        from types import SimpleNamespace
+
+        from lisatools.domaincomputation import STFTComputationGroup
+
+        settings = STFTSettings(NATIVE_T0, DAY / 3.0, 1.0 / DAY, 30, 5, overlap=3)
+        calls = []
+
+        class _Table:
+            def __init__(self, *args):
+                calls.append(args[:3])
+
+            def build(self, orbits):
+                pass
+
+        stub = SimpleNamespace(
+            settings=settings, xp=np, backend=SimpleNamespace(KinematicsTableWrap=_Table),
+            group_device_context=contextlib.nullcontext,
+        )
+        stub.seg_duration = STFTComputationGroup.seg_duration.fget(stub)
+        STFTComputationGroup.cpp_kinematics(stub, object())
+        self.assertEqual(calls, [(NATIVE_T0 + 0.5 * DAY, DAY / 3.0, 30)])
+
+
 class InvalidInputTest(unittest.TestCase):
     def test_overlap_two_is_refused(self):
         with self.assertRaises(ValueError):
@@ -248,13 +364,14 @@ class GuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _apply_stft_add(target, 1.0, template, contiguous)
 
-    def test_computation_group(self):
+    def test_computation_group_needs_hann(self):
+        """The group runs on an overlapping grid, but only with the window its data are cut with."""
         from types import SimpleNamespace
 
         from lisatools.domaincomputation import STFTComputationGroup
 
-        with self.assertRaises(NotImplementedError):
-            STFTComputationGroup(SimpleNamespace(settings=self.settings))
+        with self.assertRaises(ValueError):
+            STFTComputationGroup(SimpleNamespace(settings=self.settings), window_alpha=0.2)
 
     def test_batched_psd_likelihood(self):
         from types import SimpleNamespace

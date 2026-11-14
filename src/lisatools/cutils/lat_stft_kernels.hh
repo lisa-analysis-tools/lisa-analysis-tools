@@ -501,7 +501,7 @@ struct FresnelColumn
         }
         
         constexpr double A_J_AMP_GUARD = 1.0e-12;   // relative amplitude floor
-        double a_j_max = (s.fresnel->use_midpoint ? 2.0 : 1.0) / s.fresnel->dt;
+        double a_j_max = (s.fresnel->use_midpoint ? 2.0 : 1.0) / s.fresnel->seg_duration;
         double amp_floor = A_J_AMP_GUARD * s.amp[ch_loudest];
         for (int j = 0; j < 3; j += 1)
         {
@@ -780,7 +780,7 @@ struct ColumnTile
                 return;
             // Midpoint anchoring: sample the source and (f0, fdot0) at the bin midpoint, but pass
             // the WINDOW START to the Fresnel evaluator, which re-anchors internally.
-            double t_anchor_shift = inputs.fresnel->use_midpoint ? 0.5 * context.stft->dt : 0.0;
+            double t_anchor_shift = inputs.fresnel->use_midpoint ? 0.5 * inputs.fresnel->seg_duration : 0.0;
             int time_i = row_base + row;
             double t_seg = context.stft->t0 + time_i * context.stft->dt;   // window start
             ColumnT::setup(col, context.src, inputs.fresnel, context.stft, params, k, u, v,
@@ -2053,7 +2053,7 @@ CUDA_DEVICE void stft_eval_block_information(
     int num_freqs_noise = stft->num_freqs_noise;
     bool cross_channel = (stft->tdi_type == TDI_XYZ);
     int num_contract_channels = cross_channel ? 3 : stft->num_channels;
-    double t_anchor_shift = fresnel->use_midpoint ? 0.5 * dt : 0.0;
+    double t_anchor_shift = fresnel->use_midpoint ? 0.5 * fresnel->seg_duration : 0.0;
 
     for (int i = 0; i < num_derivs; i += 1)
     {

@@ -44,7 +44,8 @@ public:
                    array_type<std::complex<double>> data_arr,
                    array_type<std::complex<double>> invC_arr,
                    int num_data, int num_noise, int tdi_type,
-                   int num_freqs_noise = -1, bool noise_full_grid = false)
+                   int num_freqs_noise = -1, bool noise_full_grid = false,
+                   double seg_duration = -1.0, double diff_comp = -1.0)
     {
         // ! A full-grid noise row must hold every window of the data rows, or the kernels read past it.
         if (noise_full_grid && num_freqs_noise < num_freqs)
@@ -60,7 +61,8 @@ public:
                                 t0, f_min, f_max, dt, df,
                                 data_ptr, invC_ptr,
                                 num_data, num_noise, tdi_type,
-                                num_freqs_noise, noise_full_grid);
+                                num_freqs_noise, noise_full_grid,
+                                seg_duration, diff_comp);
     }
 
     ~STFTDomainWrap() {
@@ -162,11 +164,12 @@ public:
     STFTFresnelWrap(int num_times, int num_freqs, int num_channels,
                     double t0, double f_min, double f_max,
                     double dt, double df, double window_alpha = 0.0,
-                    bool use_midpoint = false, bool linear_envelope = false)
+                    bool use_midpoint = false, bool linear_envelope = false,
+                    double seg_duration = -1.0)
     {
         fresnel = new STFTFresnel(num_times, num_freqs, num_channels,
                                   t0, f_min, f_max, dt, df, window_alpha,
-                                  use_midpoint, linear_envelope);
+                                  use_midpoint, linear_envelope, seg_duration);
     }
 
     ~STFTFresnelWrap() { delete fresnel; }

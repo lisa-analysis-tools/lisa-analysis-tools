@@ -34,8 +34,9 @@
 // * largest 4.8e-4, template mismatch 6.5e-10 to 1.2e-9. The Fresnel functions of lat_fresnel.hh
 // * contribute at most 1.6e-10.
 // ! Assumptions, checked on the host by dffr_make_settings and dffr_check_table:
-// !   df * dt = 1 to within 1e-12 (contiguous segments); otherwise the band-bin phases of the
-// !   window endpoints are wrong without any sign of it.
+// !   df * seg_duration = 1 to within 1e-12 (the window spans one frequency bin's inverse);
+// !   otherwise the band-bin phases of the window endpoints are wrong without any sign of it.
+// !   The segment starts may overlap (hop dt < seg_duration).
 // !   The kinematics table holds the midpoints of the grid's segments, in the time frame of the
 // !   orbits, the frame of t_ref.
 // !   XYZ channels, with the combinations of TDIConfig("1st generation") or ("2nd generation").
@@ -128,7 +129,7 @@ inline cmplx dffr_mul(const cmplx &left, const cmplx &right) {
 
 struct DFFRSettings {
   int num_time_segments;
-  double segment_duration;  // Delta T, the dt of the STFT grid, 1 / df [s]
+  double segment_duration;  // Delta T, the window length seg_duration of the STFT grid, 1 / df [s]
   double half_duration;
 
   double f_min;  // frequency of active bin zero [Hz]
@@ -153,16 +154,16 @@ struct DFFRSettings {
 inline DFFRSettings dffr_make_settings(const STFTFresnel &fresnel, bool linear_envelope,
                                        bool first_order_delays, int tdi_generation,
                                        int num_side_bins) {
-  const double segment_duration = fresnel.dt;
+  const double segment_duration = fresnel.seg_duration;
   const double window_taper = fresnel.window_alpha;
   if (!(segment_duration > 0.0))
-    throw std::invalid_argument("dffr: the segment duration dt must be positive.");
+    throw std::invalid_argument("dffr: the segment duration seg_duration must be positive.");
   if (!(window_taper >= 0.0 && window_taper <= 1.0))
     throw std::invalid_argument("dffr: window_alpha must lie in [0, 1], got " +
                                 std::to_string(window_taper) + ".");
-  // ! The band-bin phases of the window endpoints reduce to signs only when df * dt = 1.
+  // ! The band-bin phases of the window endpoints reduce to signs only when df * seg_duration = 1.
   if (!(std::fabs(fresnel.df * segment_duration - 1.0) <= 1.0e-12))
-    throw std::invalid_argument("dffr: df * dt must equal one to within 1e-12, got " +
+    throw std::invalid_argument("dffr: df * seg_duration must equal one to within 1e-12, got " +
                                 std::to_string(fresnel.df * segment_duration) + ".");
   if (fresnel.num_times < 1 || fresnel.num_freqs < 1)
     throw std::invalid_argument("dffr: the grid needs at least one segment and one bin.");
@@ -199,10 +200,11 @@ inline DFFRSettings dffr_make_settings(const STFTFresnel &fresnel, bool linear_e
   return settings;
 }
 
-// Check that a kinematics table holds the midpoints t0 + (i + 1/2) dt of the grid. Host only.
+// Check that a kinematics table holds the midpoints t0 + seg_duration / 2 + i dt of the grid, with
+// dt the hop between segment starts. Host only.
 // ! Raises std::invalid_argument otherwise.
 inline void dffr_check_table(const DFFRSettings &settings, const KinematicsTable &table,
-                             double grid_t0) {
+                             double grid_t0, double grid_dt) {
   if (table.num_time_segments != settings.num_time_segments)
     throw std::invalid_argument("dffr: the kinematics table has " +
                                 std::to_string(table.num_time_segments) +
@@ -214,11 +216,10 @@ inline void dffr_check_table(const DFFRSettings &settings, const KinematicsTable
     throw std::invalid_argument("dffr: the kinematics table starts at the midpoint " +
                                 std::to_string(table.first_segment_midpoint) +
                                 " s, the grid at " + std::to_string(expected_midpoint) + " s.");
-  if (!(std::fabs(table.segment_time - settings.segment_duration) <=
-        1.0e-12 * settings.segment_duration))
+  if (!(std::fabs(table.segment_time - grid_dt) <= 1.0e-12 * grid_dt))
     throw std::invalid_argument("dffr: the kinematics table has a segment spacing of " +
                                 std::to_string(table.segment_time) + " s, the grid dt " +
-                                std::to_string(settings.segment_duration) + " s.");
+                                std::to_string(grid_dt) + " s.");
 }
 
 // ===========================================================================
@@ -1465,13 +1466,13 @@ inline DFFRTileInputs<SourceT> dffr_tile_inputs(STFTFresnel *fresnel, STFTDomain
   // * The Fresnel object carries the window and the domain the grid; both must be one grid.
   if (fresnel->num_times != stft->num_times || fresnel->num_freqs != stft->num_freqs ||
       fresnel->t0 != stft->t0 || fresnel->f_min != stft->f_min || fresnel->dt != stft->dt ||
-      fresnel->df != stft->df)
+      fresnel->df != stft->df || fresnel->seg_duration != stft->seg_duration)
     throw std::invalid_argument(
         "dffr: the STFTFresnel and the STFTDomain describe different grids.");
   DFFRTileInputs<SourceT> inputs;
   inputs.settings = dffr_make_settings(*fresnel, linear_envelope, first_order_delays,
                                        tdi_generation, n_side_bins);
-  dffr_check_table(inputs.settings, *kinematics, stft->t0);
+  dffr_check_table(inputs.settings, *kinematics, stft->t0, stft->dt);
   inputs.kinematics = *kinematics;
   inputs.model = model;
 #ifdef __CUDACC__

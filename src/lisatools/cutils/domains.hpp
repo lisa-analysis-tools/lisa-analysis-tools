@@ -113,13 +113,18 @@ class STFTSettings {
   double t0;         ///< Physical start time of the grid [s]
   double f_min;      ///< Physical minimum frequency of the grid [Hz]
   double f_max;      ///< Physical maximum frequency of the grid [Hz]
-  double dt;         ///< Time-bin spacing [s]
+  double dt;         ///< Spacing of the segment starts (the hop) [s]
   double df;         ///< Frequency-bin spacing [Hz]
-  double diff_comp;  ///< Differential component for inner products (= df)
+  double diff_comp;  ///< Differential component for inner products: df on a
+                     ///< contiguous grid, df / sum_k w_k^2 on an overlapping one
+  double seg_duration;  ///< Length of a segment's window [s]: dt on a
+                        ///< contiguous grid, dt * overlap on an overlapping one
 
+  // * A negative seg_duration_ or diff_comp_ selects the contiguous-grid value (dt_, df_).
   CUDA_CALLABLE_MEMBER
   STFTSettings(int num_times_, int num_freqs_, int num_channels_, double t0_,
-               double f_min_, double f_max_, double dt_, double df_)
+               double f_min_, double f_max_, double dt_, double df_,
+               double seg_duration_ = -1.0, double diff_comp_ = -1.0)
       : num_times(num_times_),
         num_freqs(num_freqs_),
         num_channels(num_channels_),
@@ -128,7 +133,8 @@ class STFTSettings {
         f_max(f_max_),
         dt(dt_),
         df(df_),
-        diff_comp(df_) {}
+        diff_comp(diff_comp_ < 0.0 ? df_ : diff_comp_),
+        seg_duration(seg_duration_ < 0.0 ? dt_ : seg_duration_) {}
 };
 
 /**
@@ -179,9 +185,10 @@ class STFTDomain : public STFTSettings {
   STFTDomain(int num_times_, int num_freqs_, int num_channels_, double t0_,
              double f_min_, double f_max_, double dt_, double df_, cmplx* data_,
              cmplx* invC_, int num_data_, int num_noise_, int tdi_type_,
-             int num_freqs_noise_ = -1, bool noise_full_grid_ = false)
+             int num_freqs_noise_ = -1, bool noise_full_grid_ = false,
+             double seg_duration_ = -1.0, double diff_comp_ = -1.0)
       : STFTSettings(num_times_, num_freqs_, num_channels_, t0_, f_min_, f_max_,
-                     dt_, df_),
+                     dt_, df_, seg_duration_, diff_comp_),
         data(data_),
         invC(invC_),
         num_data(num_data_),
@@ -453,11 +460,11 @@ class STFTFresnel : public STFTSettings {
  public:
   double window_alpha;  ///< Window function parameter (e.g. for a Tukey window)
   double taper_duration;  ///< Duration of the window taper (e.g. for a Tukey
-                          ///< window) [s] alpha * dt / 2
+                          ///< window) [s] alpha * seg_duration / 2
   double f_taper;  /// 1.0 / (2.0 * taper_duration);  ///< Frequency scale
                    /// associated with the window taper [Hz]
   bool use_midpoint;  ///< If true, anchor the linear-chirp expansion at the bin
-                      ///< midpoint (t0 + dt/2) rather than the bin start (t0).
+                      ///< midpoint (t0 + seg_duration/2) rather than the bin start (t0).
                       ///< The caller must then supply (amp, phase0, f0, fdot0)
                       ///< evaluated at the midpoint. The Fourier-transform
                       ///< origin stays at t0, so the output keeps the standard
@@ -472,11 +479,12 @@ class STFTFresnel : public STFTSettings {
   STFTFresnel(int num_times_, int num_freqs_, int num_channels_, double t0_,
               double f_min_, double f_max_, double dt_, double df_,
               double window_alpha_, bool use_midpoint_ = false,
-              bool linear_envelope_ = false)
+              bool linear_envelope_ = false, double seg_duration_ = -1.0)
       : STFTSettings(num_times_, num_freqs_, num_channels_, t0_, f_min_, f_max_,
-                     dt_, df_),
+                     dt_, df_, seg_duration_),
         window_alpha(window_alpha_),
-        taper_duration(window_alpha_ > 0.0 ? window_alpha_ * dt_ / 2.0 : 0.0),
+        // * The base is built first, so seg_duration is already the resolved window length.
+        taper_duration(window_alpha_ > 0.0 ? window_alpha_ * seg_duration / 2.0 : 0.0),
         f_taper(window_alpha_ > 0.0 ? 1.0 / (2.0 * taper_duration) : 0.0),
         use_midpoint(use_midpoint_),
         linear_envelope(linear_envelope_){};

@@ -20,6 +20,7 @@
 //   - KinematicsTable POD field layout (cutils/Detector.hpp)
 //   - WDMSettings class POD field layout
 //   - TDIConfig class POD field layout
+//   - STFTSettings class POD field layout (cutils/domains.hpp; STFTDomain, STFTFresnel)
 //
 // Downstream binding TUs read this macro and static_assert the value
 // they were compiled against. Mismatch = downstream wheel must rebuild.
@@ -28,8 +29,13 @@
 // compile-time error before the user ever loads the broken process.
 //
 // Bump ONE value, in ONE PR, when any of the above layouts changes.
+//
+// History:
+//   1 - initial marker.
+//   2 - STFTSettings gains seg_duration (window length, apart from the hop dt) and an explicit
+//       diff_comp (overlapping STFT grids).
 
-#define LISATOOLS_HEADER_ABI_VERSION 1
+#define LISATOOLS_HEADER_ABI_VERSION 2
 
 // =====================================================================
 // LISATOOLS_IS_WRAPPER_OWNER
