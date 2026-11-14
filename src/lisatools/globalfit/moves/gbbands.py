@@ -1840,6 +1840,9 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 *parent.args,
                 min_freq=max(parent.ind_min - 0.5, 0.0) * parent.df,
                 max_freq=(parent.ind_min + width - 0.5) * parent.df,
+                # ! The cells keep the parent's segment overlap: without it they would be
+                # ! contiguous grids with the hop for the segment length.
+                overlap=parent.overlap,
                 force_backend=parent.kwargs["force_backend"],
             )
             if cell_settings.NF_active != width or cell_settings.min_freq != parent.min_freq:

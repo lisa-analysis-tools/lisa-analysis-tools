@@ -72,5 +72,9 @@ inner-product weight (`diff_comp`). Plan: `~/.claude/plans/nifty-weaving-storm.m
   (central-difference rounding floor, tolerance 1e-5).
 - LAT suite (12 files) and GBGPU STFT suites (4 files): same results and failure sets as base (9
   pre-existing test_sensitivity failures, CuPy-free run).
+- Oracle (strengthened): gradient per column, Fisher per sqrt(F_ii F_jj), F-statistic N/M added. Every
+  gradient column's error falls 9x-150x when the steps widen 100x (rounding); an earlier systematic
+  1e-6 came from the shim's fixed envelope, not the kernels.
+- gbbands store-window cells dropped `overlap` (args round-trip); fixed + test.
 - Harness lesson: KinematicsTableWrap keeps raw pointers; a shim must keep the field arrays alive
   (the Phase 0 script did not, and only got away with it).

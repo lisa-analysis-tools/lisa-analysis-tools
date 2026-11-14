@@ -373,6 +373,19 @@ class GuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             STFTComputationGroup(SimpleNamespace(settings=self.settings), window_alpha=0.2)
 
+    def test_store_window_cells_keep_overlap(self):
+        """The GB band buffer's store-window cells are windows of the same overlapping grid."""
+        from types import SimpleNamespace
+
+        from lisatools.globalfit.moves.gbbands import Buffer
+
+        stub = SimpleNamespace(_basis_settings=self.settings, stft_store_windows=object(),
+                               _stft_cell_width=8)
+        cell = Buffer._build_per_band_basis_settings(stub)
+        self.assertEqual((cell.overlap, cell.dt, cell.seg_duration, cell.NF_active),
+                         (OVERLAP, self.settings.dt, self.settings.seg_duration, 8))
+        self.assertEqual(cell.differential_component, self.settings.differential_component)
+
     def test_batched_psd_likelihood(self):
         from types import SimpleNamespace
 

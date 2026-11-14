@@ -8,8 +8,8 @@ from the three offset grids, for the 24 production sources and both responses:
 * ``fill_global_stft`` on the overlapping grid equals, segment by segment, the templates of the
   offset grids;
 * every inner product the C++ kernels return (d|h), (h|h), the five swap terms, the log-likelihood
-  gradient and the Fisher matrix equals 8/9 (the weight df / window_power) times the sum over the
-  three offset grids.
+  gradient, the Fisher matrix and the F-statistic N and M (DFFR) equals 8/9 (the weight
+  df / window_power) times the sum over the three offset grids.
 
 The overlapping grid runs through a real ``STFTComputationGroup`` (seg_duration, diff_comp and the
 kinematics table from the group); the offset grids run through today's contiguous wraps. The grid
@@ -36,10 +36,13 @@ HANN = 1.0
 N_SIDE_BINS = 4
 TEMPLATE_TOLERANCE = 1e-12  # of the peak pixel of each source
 SCALAR_TOLERANCE = 1e-12  # of the largest magnitude of the quantity over the sources
-# * The gradient is a central difference of the log-likelihood with relative steps near 1e-6, so a
-# * rounding change of 1e-15 in ll (the overlapping grid sums in another order) moves it by up to
-# * about 1e-15 |ll| / (eps |dll/dtheta|); the 8/9 linearity itself is checked exactly on the terms.
-GRADIENT_TOLERANCE = 1e-5
+# * The gradient is a central difference of the log-likelihood, so a rounding change of 1e-15 in ll
+# * (the overlapping grid sums in another order) moves it by about 1e-15 |ll| / (eps |dll/dtheta|).
+# * A gradient column passes when its error is below SCALAR_TOLERANCE or falls at least
+# * GRADIENT_NOISE_DROP times when the steps widen GRADIENT_STEP_FACTOR times: rounding noise
+# * does, a real difference does not.
+GRADIENT_STEP_FACTOR = 100.0
+GRADIENT_NOISE_DROP = 5.0  # observed 9x to 150x; a real difference stays near 1x
 
 
 def make_comp(orbits, device, response, nt):
@@ -114,9 +117,36 @@ def evaluate(comp, params, swap_partner, band):
     for name, value in zip(("d_h_add", "d_h_remove", "add_add", "remove_remove", "add_remove"),
                            swap[2:]):
         out["swap " + name] = to_host(value)
-    out["grad"] = to_host(comp.get_ll_grad_stft(params, data_index=zero, noise_index=zero))
+    # * The envelope is requested explicitly: the shim of the offset grids cannot swap evaluators,
+    # * so the default (off for derivatives) would apply to the real group only.
+    steps, _ = comp._gradient_steps(comp.num_params, None, None, 1e-6)
+    for name, factor in (("grad", 1.0), ("grad wide steps", GRADIENT_STEP_FACTOR)):
+        out[name] = to_host(comp.get_ll_grad_stft(
+            params, param_eps=steps * factor, data_index=zero, noise_index=zero,
+            linear_envelope=True))
     out["fisher"] = to_host(comp.information_matrix(params, noise_index=zero))
+    if comp.response == "dffr":
+        projections, overlaps, _ = comp.get_fstat_terms_stft(params, data_index=zero,
+                                                             noise_index=zero)
+        out["fstat N"], out["fstat M"] = to_host(projections), to_host(overlaps)
     return out
+
+
+def relative_error(name, value, expected):
+    """Largest error, per parameter column for gradients (one value per column), per
+    sqrt(F_ii F_jj) for Fisher matrices, else of the largest magnitude over the sources."""
+    if name.startswith("grad"):
+        scale = np.abs(expected).max(axis=0)
+        return np.abs(value - expected).max(axis=0) / np.where(scale > 0, scale, 1.0)
+    elif name == "fisher":
+        diagonal = np.abs(np.diagonal(expected, axis1=-2, axis2=-1))
+        scale = np.sqrt(diagonal[..., :, None] * diagonal[..., None, :])
+    else:
+        scale = np.abs(expected).max()
+    # * Frozen (all-zero) gradient columns and Fisher rows compare as zero.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(scale > 0, np.abs(value - expected) / scale, np.abs(value - expected))
+    return float(ratio.max())
 
 
 def main():
@@ -190,16 +220,26 @@ def main():
         failures += not ok
         print(f"  templates (k = 3j + o) vs offset grids: max {error:.2e} of peak  "
               f"{'OK' if ok else 'FAIL'}")
+        errors = {}
         for name in overlapping:
             if name == "templates":
                 continue
             expected = 8.0 / 9.0 * sum(offsets[o][name] for o in range(OVERLAP))
-            scale = np.abs(expected).max()
-            error = np.abs(overlapping[name] - expected).max() / scale
-            ok = error <= (GRADIENT_TOLERANCE if name == "grad" else SCALAR_TOLERANCE)
+            errors[name] = relative_error(name, overlapping[name], expected)
+            if name.startswith("grad"):
+                continue
+            ok = errors[name] <= SCALAR_TOLERANCE
             failures += not ok
-            print(f"  {name:20s} = 8/9 sum over offsets: max {error:.2e} of max  "
+            print(f"  {name:20s} = 8/9 sum over offsets: max rel {errors[name]:.2e}  "
                   f"{'OK' if ok else 'FAIL'}")
+        narrow, wide = errors["grad"], errors["grad wide steps"]
+        ok = bool(np.all((narrow <= SCALAR_TOLERANCE)
+                         | (wide <= SCALAR_TOLERANCE)
+                         | (wide * GRADIENT_NOISE_DROP <= narrow)))
+        failures += not ok
+        print(f"  grad columns, rel err at steps x1:   {np.array2string(narrow, precision=1)}")
+        print(f"  grad columns, rel err at steps x{GRADIENT_STEP_FACTOR:g}: "
+              f"{np.array2string(wide, precision=1)}  {'OK (rounding)' if ok else 'FAIL'}")
     print(f"\n{'ALL OK' if failures == 0 else f'{failures} FAILED'}")
     return failures
 
