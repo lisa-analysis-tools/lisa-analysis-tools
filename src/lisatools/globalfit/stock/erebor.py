@@ -1001,9 +1001,6 @@ class EMRISettings(Settings):
     Holds parameter ranges for the intrinsic EMRI parameters (primary mass,
     secondary mass, spin, semi-latus rectum, eccentricity), the waveform
     configuration, and search/sampling helpers consumed by :class:`EMRISetup`.
-
-    # TODO/DOCS: confirm the role of ``info_matrix_gen`` and ``fill_values``
-    # in coordinating EMRI starts with the Fisher / search pipeline.
     """
 
     logm1_lims: typing.List[float] = dataclasses.field(default_factory=list)
@@ -1013,7 +1010,6 @@ class EMRISettings(Settings):
     e0_lims: typing.List[float] = dataclasses.field(default_factory=list)
     waveform_kwargs: Optional[dict] = None
     injection: Optional[np.ndarray] = None  # AS here only for the starting state
-    info_matrix_gen: Optional[Any] = None  # todo change name to info matrix or smth
     fill_values: np.ndarray = dataclasses.field(default_factory=lambda: np.array([1.0, 0.0]))
     betas: Optional[np.ndarray] = None
     inner_moves: Optional[typing.List[Move]] = None
@@ -1272,7 +1268,6 @@ class SOBBHSettings(Settings):
     f_low_lims: typing.List[float] = dataclasses.field(default_factory=list)
     waveform_kwargs: Optional[dict] = None
     injection: Optional[np.ndarray] = None
-    info_matrix_gen: Optional[Any] = None
     # No fill_values used by default; keep the dataclass field for parity
     # with EMRISettings so settings files can opt-in without breakage.
     fill_values: np.ndarray = dataclasses.field(default_factory=lambda: np.array([]))

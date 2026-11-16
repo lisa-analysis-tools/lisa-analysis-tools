@@ -98,6 +98,8 @@ class GBBlock(SourceBlock):
     STAGES_HINT: ClassVar[str] = " Set the moves' shares per stage in extra_moves.<name>.stage_weights."
     # ? The STFT computations take the parameters at the mojito catalogue epoch, not at data.reference_time.
     NEEDS_REFERENCE_TIME: ClassVar[bool] = False
+    # * GBGPU registers no Settings.signal_gen, and the GB move makes its own in-model proposals.
+    SUPPORTS_INFO_MATRIX: ClassVar[bool] = False
     PE_MOVES: ClassVar[dict[str, PEMove]] = {
         "GBSpecialRJPriorMove": PEMove(SPECIAL_MOVES, GB_SPECIAL_MOVE_FILLED),
     }
