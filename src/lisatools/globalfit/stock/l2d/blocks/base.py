@@ -30,7 +30,11 @@ ENGINE_WAVEFORM_KWARGS = frozenset({
 })
 MOVE_MODULES = ("eryn.moves", "lisatools.sampling.moves.skymodehop")
 # filled by the block builder (e.g. MBHBlock.filled_move_kwargs); the YAML gives only `which` and the weight
-ENGINE_MOVE_KWARGS = {"SkyMove": frozenset({"ind_map", "coord_frame", "to_lisa_frame", "from_lisa_frame"})}
+ENGINE_MOVE_KWARGS = {
+    "SkyMove": frozenset({"ind_map", "coord_frame", "to_lisa_frame", "from_lisa_frame"}),
+    # the block's branch and the info_matrix.proposal_basis (SourceBlock.filled_move_kwargs)
+    "InfoMatrixMove": frozenset({"branch_name", "transform", "log_jacobian_fn"}),
+}
 ENGINE_PRIOR_KWARGS = frozenset({"observation_time",})  # filled from GeneralSetup
 
 # flow: classes and the arguments the builder fills (make_flow_move); eryn.flows imports torch only for
@@ -45,13 +49,13 @@ FLOW_GAUSSIAN_FILLED = frozenset({"flow", "branch_name", "flow_params", "executo
 SPECIAL_SOURCE_MOVE_FILLED = frozenset({
     "dcga", "acs", "waveform_gen", "branch_name", "coords_shape", "waveform_gen_method", "waveform_gen_kwargs",
     "waveform_like_method", "waveform_like_kwargs", "num_repeats", "transform_fn", "priors", "inner_moves",
-    "betas_all", "temperature_control", "Tmax", "periodic", "name", "flow_buffer_thin",
+    "betas_all", "temperature_control", "Tmax", "periodic", "name", "flow_buffer_thin", "info_matrix_gen",
 })
 GENERIC_SOURCE_MOVE_FILLED = frozenset({
     "branch_name", "wave_gen", "waveform_gen_kwargs", "waveform_like_kwargs", "num_repeats", "inner_moves",
     "transform", "betas", "Tmax", "move_name",
     # passed on to ResidualAddOneRemoveOneMove by the builder itself
-    "coords_shape", "waveform_gen", "acs", "transform_fn", "priors", "betas_all", "name",
+    "coords_shape", "waveform_gen", "acs", "transform_fn", "priors", "betas_all", "name", "info_matrix_gen",
 })
 SPECIAL_PSD_MOVE_FILLED = frozenset({
     "dcga", "acs", "priors", "max_logl_mode", "name", "num_repeats", "psd_transform_fn", "galfor_transform_fn",
@@ -226,13 +230,35 @@ class FlowSpec(_Spec):
         return self
 
 
+class InfoMatrixSpec(_Spec):
+    """The settings of a source block's information matrix (``lisatools.globalfit.infomatrix.InfoMatrixGenerator``).
+
+    One generator per block serves both uses: the starting scatter of ``search.spread: info_matrix`` and the
+    proposal of an ``InfoMatrixMove`` among the ``inner_moves``. The builder gives it the branch prior; the
+    waveform, the PSD and the grid reach it at each call.
+    """
+
+    more_accurate: bool = True  # five-point stencil for the derivatives (three-point without)
+    # the ladder of derivative steps to choose from: one for every parameter, or one per parameter;
+    # None -> the default ladder of lisatools.diagnostic.estimate_eps
+    steps: list[float] | list[list[float]] | None = None
+    # estimate a leaf's derivative steps again after this many uses; None -> once per leaf
+    eps_every: PositiveInt | None = None
+    # basis of the InfoMatrixMove's Gaussian (lisatools.globalfit.infomatrix.PROPOSAL_BASES), among those of the
+    # block (PROPOSAL_BASES); None -> the sampling basis. The starting scatter is always in the sampling basis.
+    proposal_basis: str | None = None
+
+
 class SearchSpec(_Spec):
     """How a block's walkers are seeded: the arguments of the branch's search interface.
 
     The interface (``lisatools.globalfit.searches``) gets the prior's transform and periodicity from
     the builder and seeds through the inverse transform (``GlobalFit.load_info``, fresh starts). A block
     without ``search`` gets its ``DEFAULT_SEARCH``: none for source branches (they start empty), ``prior`` for
-    psd/galfor. The psd max-likelihood search runs whatever the seeding. ``kwargs`` are the interface
+    psd/galfor. The psd max-likelihood search runs whatever the seeding. ``spread`` scatters the walkers
+    around a point: numbers, or ``info_matrix`` for the covariance from the information matrix at each
+    source's point (mbh, emri, sobbh; a ``catalog`` or ``point_estimate`` search over all parameters, with the
+    block's ``info_matrix`` settings). ``kwargs`` are the interface
     class's own arguments (e.g. ``evolve_to_data_start`` of the GB interface), checked against that class
     at load.
     """
@@ -242,8 +268,11 @@ class SearchSpec(_Spec):
     # .h5/.hdf5 catalogue table (one root dataset per catalogue column); catalog reads the injection catalogue, no file
     search_path: RunPath | None = None
     parameters_searched: list[str] | Literal["all"] = "all"  # names in the prior's input (sampling) basis
-    # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
-    spread: float | list[float] | list[list[float]] | list[list[list[float]]] | None = None
+    # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D); or "info_matrix": the
+    # covariance from the information matrix at each source's point (source blocks; see the block's info_matrix)
+    spread: (
+        Literal["info_matrix"] | float | list[float] | list[list[float]] | list[list[list[float]]] | None
+    ) = None
     is_eryn_backend: bool = False  # search results are an eryn backend, already in the sampling basis
     max_resample_tries: PositiveInt = 50  # redraws of walkers that land outside the prior around a point value
     kwargs: dict[str, Any] = Field(default_factory=dict)  # the interface class's own arguments
@@ -259,6 +288,17 @@ class SearchSpec(_Spec):
             )
         if self.search_type in ("catalog", "point_estimate") and self.spread is None:
             raise ValueError(f"search_type {self.search_type!r} needs spread.")
+        if self.spread == "info_matrix":
+            if self.search_type not in ("catalog", "point_estimate"):
+                raise ValueError(
+                    f"spread 'info_matrix' scatters around one point per source (search_type catalog or "
+                    f"point_estimate), not with search_type {self.search_type!r}."
+                )
+            if self.parameters_searched != "all":
+                raise ValueError(
+                    "spread 'info_matrix' is the covariance of every parameter at the point: it needs "
+                    "parameters_searched: all."
+                )
         if self.search_path is not None and not self.search_path.exists():
             raise ValueError(f"search_path {self.search_path} does not exist.")
         return self
@@ -332,6 +372,9 @@ class BlockBase(_Spec):
     SEARCH_TYPES: ClassVar[tuple[str, ...]] = ("prior", "samples", "point_estimate", "catalog")
     # the interface's seeding without a `search:` (None -> no interface: load_info leaves the branch off)
     DEFAULT_SEARCH: ClassVar[SearchSpec | None] = None
+    # True -> the block may scatter its seeds with, and propose from, the information matrix of its waveform
+    # (source blocks with a Settings.signal_gen and an add-one-remove-one PE move)
+    SUPPORTS_INFO_MATRIX: ClassVar[bool] = False
 
     type: str  # block type == file stem == branch name (source_info / priors / recipe key)
     priors: PriorRef
@@ -346,6 +389,23 @@ class BlockBase(_Spec):
             raise ValueError(
                 f"search_type {self.search.search_type!r} is not available for the {self.type!r} block; "
                 f"use one of {list(self.SEARCH_TYPES)}."
+            )
+        return self
+
+    @property
+    def uses_info_matrix(self) -> bool:
+        """The block scatters its seeds with the information matrix or proposes from it (``InfoMatrixMove``)."""
+        scatter = self.search is not None and self.search.spread == "info_matrix"
+        moves = getattr(self, "inner_moves", None) or []
+        return scatter or any(move.class_name == "InfoMatrixMove" for move in moves)
+
+    @model_validator(mode="after")
+    def _info_matrix_is_available(self):
+        given = getattr(self, "info_matrix", None) is not None  # by value: a snapshot writes the key out as null
+        if (self.uses_info_matrix or given) and not self.SUPPORTS_INFO_MATRIX:
+            raise ValueError(
+                f"the {self.type!r} block has no information matrix: leave out spread 'info_matrix', "
+                "InfoMatrixMove and info_matrix."
             )
         return self
 
@@ -456,6 +516,8 @@ class SourceBlock(MoveBlock):
     SETTINGS_NAME: ClassVar[str]      # Settings / Setup classes in lisatools.globalfit.stock.erebor
     SETUP_NAME: ClassVar[str]
     NEEDS_REFERENCE_TIME: ClassVar[bool] = True
+    SUPPORTS_INFO_MATRIX: ClassVar[bool] = True
+    PROPOSAL_BASES: ClassVar[tuple[str, ...]] = ()  # the block's info_matrix.proposal_basis choices
     # waveform methods the special PE move must be told about (TDMBHSpecialMove sets its own)
     WAVEFORM_METHODS: ClassVar[dict[str, str]] = {}
     LIKE_KWARGS_FROM_WAVEFORM_KWARGS: ClassVar[bool] = False  # the likelihood call takes the waveform kwargs too
@@ -481,6 +543,36 @@ class SourceBlock(MoveBlock):
     adaptive_repeats: AdaptiveRepeatsSpec | None = None
     # per-leaf priors for the PE move (the branch prior `priors` stays for the transform, seeding and sampler)
     proposal_priors: ProposalPriorsSpec | None = None
+    # the information matrix behind search.spread 'info_matrix' and InfoMatrixMove; None -> the spec's defaults
+    info_matrix: InfoMatrixSpec | None = None
+
+    @model_validator(mode="after")
+    def _info_matrix_fits_the_block(self):
+        if not self.SUPPORTS_INFO_MATRIX:  # refused in _info_matrix_is_available
+            return self
+        if self.info_matrix is not None and not self.uses_info_matrix:
+            raise ValueError(
+                "info_matrix: the block uses no information matrix; give search.spread 'info_matrix' or an "
+                "InfoMatrixMove among the inner_moves, or leave info_matrix out."
+            )
+        if self.uses_info_matrix and self.proposal_priors is not None:
+            raise ValueError(
+                "the information matrix needs one prior for all the leaves (it bounds the covariance with the "
+                "prior's variance); leave out proposal_priors, or spread 'info_matrix' and InfoMatrixMove."
+            )
+        basis = None if self.info_matrix is None else self.info_matrix.proposal_basis
+        if basis is not None:
+            if basis not in self.PROPOSAL_BASES:
+                raise ValueError(
+                    f"info_matrix.proposal_basis {basis!r} is not available for the {self.type!r} block; "
+                    f"its bases are {list(self.PROPOSAL_BASES)} (leave the key out for the sampling basis)."
+                )
+            if not any(move.class_name == "InfoMatrixMove" for move in self.inner_moves or []):
+                raise ValueError(
+                    "info_matrix.proposal_basis is the basis of the InfoMatrixMove's proposal: give an "
+                    "InfoMatrixMove among the inner_moves, or leave proposal_basis out."
+                )
+        return self
 
     @model_validator(mode="after")
     def _proposal_priors_fit_the_leaves(self):
@@ -635,7 +727,11 @@ class SourceBlock(MoveBlock):
 
     def filled_move_kwargs(self, ctx: BuildContext, info: dict[str, Any]) -> dict[str, dict]:
         """Builder-filled kwargs of the inner moves, by move class name (e.g. ``SkyMove``)."""
-        return {}
+        filled = dict(branch_name=self.type)
+        basis = info.get("proposal_basis")  # put there by build_source: the generator's own
+        if basis is not None:
+            filled.update(transform=basis.transform, log_jacobian_fn=basis.log_jacobian)
+        return {"InfoMatrixMove": filled}
 
     def build_source(self, ctx: BuildContext) -> BlockBuild:
         """Build this branch's Setup and metadata (the waveform class is resolved, not constructed)."""
@@ -655,6 +751,18 @@ class SourceBlock(MoveBlock):
                 info["transform_fn"], self.waveform.runtime_kwargs,
             )
         search_interface = make_search_interface(self, info)
+        # one generator for the search interface (which reads it from the Settings when it seeds) and the PE move
+        # (build_recipe.source_moves): it holds the Settings' branch prior, so the engine's deep copy keeps them together
+        info_matrix_gen = None
+        if self.uses_info_matrix:
+            from lisatools.globalfit.infomatrix import PROPOSAL_BASES, InfoMatrixGenerator
+
+            spec = (self.info_matrix or InfoMatrixSpec()).model_dump()
+            basis = spec.pop("proposal_basis")
+            if basis is not None:
+                # one object for the generator (covariance in that basis) and the move (filled_move_kwargs)
+                basis = info["proposal_basis"] = PROPOSAL_BASES[basis](info["basis"])
+            info_matrix_gen = InfoMatrixGenerator(info["priors"][self.type], proposal_basis=basis, **spec)
         injection = info["injection"]  # the YAML's, if given
         if injection is None and search_interface is not None and search_interface.search_type == "catalog":
             # the diagnostic plots' truths: here, so a restart (which does not seed) keeps them
@@ -678,6 +786,7 @@ class SourceBlock(MoveBlock):
             injection=injection,
             search_interface=search_interface,
             signal_gen=signal_gen,
+            info_matrix_gen=info_matrix_gen,
         )
         setup = getattr(erebor, self.SETUP_NAME)(settings)
         if self.flow is not None:
@@ -752,7 +861,8 @@ def make_search_interface(block: BlockBase, info: dict[str, Any], defaults: dict
         transform=info["transform_fn"],
         parameters_searched=parameters,
         search_path=None if spec.search_path is None else str(spec.search_path),
-        spread=None if spec.spread is None else np.asarray(spec.spread, dtype=float),
+        # "info_matrix" as it is: the interface computes the covariances when it seeds
+        spread=spec.spread if spec.spread is None or isinstance(spec.spread, str) else np.asarray(spec.spread, dtype=float),
         is_eryn_backend=spec.is_eryn_backend,
         periodic=info["periodic"],
         max_resample_tries=spec.max_resample_tries,

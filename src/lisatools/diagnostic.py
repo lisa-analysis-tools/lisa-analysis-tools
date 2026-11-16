@@ -1,4 +1,4 @@
-"""Inner products, likelihood terms, and Fisher / covariance diagnostics."""
+"""Inner products, likelihood terms, and information matrix / covariance diagnostics."""
 
 from __future__ import annotations
 
@@ -699,7 +699,9 @@ def estimate_eps(
         inner_product_kwargs: Keyword arguments for the inner product function, as for :func:`info_matrix`.
         steps: Ladder of absolute steps, in increasing order. A 1D array is used for every parameter; a
             sequence of 1D arrays gives one ladder per parameter in ``deriv_inds``. If ``None``, each
-            parameter gets ``np.logspace(-11, -1, 11) * max(abs(value), 1)``.
+            parameter gets ``np.logspace(-11, -2, 10) * max(abs(value), 1)``. A ladder is cut at the first
+            step where the waveform raises (a step that large leaves the waveform's domain, e.g. a mass
+            with no inspiral in band), with a warning.
         return_changes: If ``True``, also return the ladders and the changes :math:`c_k`.
         **kwargs: Keyword arguments passed to :func:`dh_dlambda`.
 
@@ -710,7 +712,8 @@ def estimate_eps(
 
     Raises:
         ValueError: If a ladder has fewer than two steps, or no pair of neighbouring steps of a parameter
-            gives a finite change (e.g. every step leaves the waveform's domain).
+            gives a finite change (e.g. every step leaves the waveform's domain). A waveform error at the
+            smallest step is raised as it is.
 
     """
     params = np.asarray(params, dtype=float)
@@ -718,7 +721,7 @@ def estimate_eps(
         deriv_inds = np.arange(len(params))
 
     if steps is None:
-        ladders = [np.logspace(-11, -1, 11) * max(abs(params[i]), 1.0) for i in deriv_inds]
+        ladders = [np.logspace(-11, -2, 10) * max(abs(params[i]), 1.0) for i in deriv_inds]
     elif np.ndim(steps[0]) == 0:
         ladders = [np.asarray(steps, dtype=float)] * len(deriv_inds)
     else:
@@ -739,7 +742,15 @@ def estimate_eps(
         change = np.full(len(ladder) - 1, np.nan)
         previous = dh_dlambda(ladder[0], waveform_model, params, i, **kwargs)
         for k in range(1, len(ladder)):
-            current = dh_dlambda(ladder[k], waveform_model, params, i, **kwargs)
+            try:
+                current = dh_dlambda(ladder[k], waveform_model, params, i, **kwargs)
+            except Exception as error:
+                # larger steps only go further out: keep the steps below this one
+                warnings.warn(
+                    f"estimate_eps: parameter {i}, step {ladder[k]:.3g}: the waveform failed "
+                    f"({type(error).__name__}: {error}); using the smaller steps only."
+                )
+                break
             diff = difference(previous, current)
             with np.errstate(invalid="ignore", divide="ignore"):
                 change[k - 1] = inner_product(diff, diff, **inner_product_kwargs) / inner_product(
@@ -849,6 +860,7 @@ def covariance(
     diagonalize: Optional[bool] = False,
     return_info_mat: Optional[bool] = False,
     precision: Optional[bool] = False,
+    prior_precision: Optional[np.ndarray] = None,
     **info_mat_kwargs: dict,
 ) -> np.ndarray | list:
     """Calculate covariance matrix for a set of source parameters, computing the information matrix if not supplied.
@@ -859,12 +871,21 @@ def covariance(
         diagonalize: If ``True``, diagonalizes the covariance matrix.
         return_info_mat: If ``True``, also returns the computed information matrix.
         precision: If ``True``, uses 500-dps precision to compute the information matrix inverse (requires `mpmath <https://mpmath.org>`_). This is typically a good idea as the information matrix can be highly ill-conditioned.
+        prior_precision: 1D array with one precision (``1 / variance``) per parameter of the information matrix
+            :math:`M`, e.g. of the prior. If given, :math:`M + \\mathrm{diag}(P)` is inverted instead of :math:`M`
+            (scaled to unit diagonal for the inversion). The inverse is then finite also for a singular
+            :math:`M` (as long as every direction it leaves open has ``P > 0``) and no parameter gets a variance
+            larger than ``1 / P``; the result is symmetrised. If ``None``, :math:`M` is inverted as it is.
+            The information matrix returned with ``return_info_mat`` is always :math:`M` itself.
         **info_mat_kwargs: Keyword arguments to pass to :func:`info_matrix`.
 
     Returns:
         Covariance matrix. If ``return_info_mat is True``. A list will be returned with the covariance as the first
         entry and the information matrix as the second entry. If ``return_derivs is True`` (keyword argument to :func:`info_matrix`),
         then another entry will be added to the list for the derivatives.
+
+    Raises:
+        ValueError: If ``prior_precision`` is not a 1D array with one finite, non-negative entry per parameter.
 
     """
 
@@ -879,6 +900,17 @@ def covariance(
     else:
         return_derivs = False
 
+    if prior_precision is not None:
+        prior_precision = np.asarray(prior_precision, dtype=float)
+        num_info_params = np.shape(info_mat)[0]
+        if prior_precision.shape != (num_info_params,):
+            raise ValueError(
+                f"prior_precision has shape {prior_precision.shape}; the information matrix needs "
+                f"one entry per parameter, ({num_info_params},)."
+            )
+        if not np.all(np.isfinite(prior_precision)) or np.any(prior_precision < 0.0):
+            raise ValueError(f"prior_precision must be finite and non-negative; got {prior_precision}.")
+
     # attempt to import and setup mpmath if precision required
     if precision:
         try:
@@ -891,12 +923,39 @@ def covariance(
 
     if precision:
         hp_info_mat = mp.matrix(info_mat.tolist())
+        if prior_precision is not None:
+            # M + diag(P), scaled to unit diagonal
+            num = hp_info_mat.rows
+            for i in range(num):
+                hp_info_mat[i, i] += mp.mpf(float(prior_precision[i]))
+            scale = [mp.sqrt(hp_info_mat[i, i]) for i in range(num)]
+            scale = [val if val != 0 else mp.mpf(1) for val in scale]  # no information and no prior
+            for i in range(num):
+                for j in range(num):
+                    hp_info_mat[i, j] /= scale[i] * scale[j]
         U, S, V = mp.svd_r(hp_info_mat)  # singular value decomposition
-        temp = mp.diag([val ** (-1) for val in S])  # get S**-1
+        if prior_precision is None:
+            temp = mp.diag([val ** (-1) for val in S])  # get S**-1
+        else:
+            # a direction without information and without prior stays at zero, as pinv leaves it
+            temp = mp.diag([val ** (-1) if val > mp.mpf(10) ** (-mp.mp.dps // 2) else mp.mpf(0) for val in S])
         temp2 = V.T * temp * U.T  # construct pseudo-inverse
+        if prior_precision is not None:
+            for i in range(num):
+                for j in range(num):
+                    temp2[i, j] /= scale[i] * scale[j]
+            temp2 = (temp2 + temp2.T) / 2
         cov = np.array(temp2.tolist(), dtype=np.float64)
-    else:
+    elif prior_precision is None:
         cov = np.linalg.pinv(info_mat)
+    else:
+        # M + diag(P), scaled to unit diagonal for the inversion
+        regularised = np.asarray(info_mat, dtype=float) + np.diag(prior_precision)
+        scale = np.sqrt(np.diag(regularised))
+        scale[scale == 0.0] = 1.0  # no information and no prior: pinv leaves that direction at zero
+        scale = np.outer(scale, scale)
+        cov = np.linalg.pinv(regularised / scale) / scale
+        cov = 0.5 * (cov + cov.T)
 
     if diagonalize:
         # get eigeninformation
@@ -1019,7 +1078,7 @@ def plot_covariance_contour(
 def get_eigeninfo(
     arr: np.ndarray, high_precision: Optional[bool] = False
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Performs eigenvalue decomposition and returns the eigenvalues and right-eigenvectors for the supplied fisher/covariance matrix.
+    """Performs eigenvalue decomposition and returns the eigenvalues and right-eigenvectors for the supplied information/covariance matrix.
 
     Args:
         arr: Input matrix for which to perform eigenvalue decomposition.

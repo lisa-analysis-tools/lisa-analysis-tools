@@ -89,3 +89,28 @@ library call does needs that call read (or run) first, also when the rule is "de
 Planned a new `sampling/act.py` estimator; user: "use the utilities already in eryn as much as possible to prevent
 code duplication". **Pattern**: for sampler diagnostics (ACF, ACT, stopping rules) start from `eryn.utils`; add only
 what it measurably cannot do, and show the measurement.
+
+## 2026-11-14 — information matrix naming; check what exists before adding
+Planning the Eryn proposal work, three corrections from the user in one review:
+1. I wrote "Fisher" throughout (function names, YAML value, docs). User: never use that name in the code
+   base, only "information matrix" / `info_matrix`. **Pattern**: names, docstrings, comments, logs, YAML and
+   tests all say information matrix. (Existing GB code still has the old name; leave it, don't add to it.)
+2. I proposed a new `InfoMatrixGaussianMove`; `GaussianMove(mode="am")` already has `update_covariance`. Then a
+   new free function that bypassed `diagnostic.covariance`. **Pattern**: before proposing a class or function,
+   read the neighbouring ones for a refresh hook or an argument that already does it; extend those first.
+3. I stated "inner moves don't have `self.temperature_control`" without checking (the attribute exists and is
+   `None` there). **Pattern**: a claim about an attribute or a call path goes in a plan only after a grep.
+
+## 2026-11-14 — validate on more than the worst-case source
+Planned the chirp-basis benchmark (offline estimate and end-to-end run) on MBH source 0 only, the source where
+the information matrix disagrees with the chain. User: don't limit testing and validation to source 0, the
+matrix agrees very well with the chain for source 19. **Pattern**: a benchmark of a proposal or of the matrix
+runs on several sources, always including one where the matrix is known to be good (19) next to the one where
+it is not (0); a change must be shown not to hurt the good case, and each source needs its own baseline.
+
+## 2026-11-16 — open the folder before asking about it
+Planning the seed study I asked the user which MBH starting points to use, saying the search output had only 9 of
+11 parameters (`point_estimates.npy`). I had already listed `search_results/mbh/candidates_with_psd/` and not opened
+it; the user: "there should be a folder containing one file per source" (11 parameters each, already wired in
+`mojito_input/mbh_with_search`). **Pattern**: before a question about what data exists, open every entry of the
+directory listing and grep the run configs for the path; ask only what the files cannot answer.

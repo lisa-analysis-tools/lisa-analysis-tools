@@ -507,6 +507,9 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     if block.proposal_priors is not None:
         # this branch's move proposes under per-leaf priors; the sampler and the other branches keep the shared dict
         priors = {**priors, name: make_proposal_priors(block, ctx.cfg, priors[name])}
+    if info.info_matrix_gen is not None:
+        # the engine's copy of the block's generator, the one the search interface read from curr.source_info
+        kwargs["info_matrix_gen"] = info.info_matrix_gen
 
     if is_generic(block):
         # the builder reads the rest from curr.source_info

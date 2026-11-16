@@ -143,6 +143,11 @@ class Settings:
     # loops or ``subtract_initial_signal`` calls needed in the settings
     # file's recipe.
     signal_gen: Optional[Callable] = None
+    # Per-branch information-matrix covariance generator
+    # (``lisatools.globalfit.infomatrix.InfoMatrixGenerator``), shared by the
+    # branch's search interface (starting scatter) and its PE move
+    # (``InfoMatrixMove`` proposals). ``None``: the branch uses neither.
+    info_matrix_gen: Optional[Any] = None
 
 
 # Type alias: a user-supplied domain spec is either a fully constructed

@@ -271,6 +271,30 @@ class DomainInfoMatrixTest(unittest.TestCase):
         full = info_matrix(self.eps, self.full_grid_waveform, self.params, inner_product_kwargs=self.ip_kwargs)
         np.testing.assert_allclose(sub, full[np.ix_(inds, inds)], rtol=1e-12, atol=1e-12 * np.abs(full).max())
 
+    def test_estimate_eps_stops_where_the_waveform_fails(self):
+        """A step that leaves the waveform's domain cuts the ladder; the estimate uses the steps below it."""
+        amp0 = self.params[0]
+
+        def waveform(amp, f0, phi, tc):
+            if abs(phi - self.params[2]) > 2e-2:
+                raise ValueError("no root")
+            return self.full_grid_waveform(amp, f0, phi, tc)
+
+        with self.assertWarnsRegex(UserWarning, "no root"):
+            eps, ladders, changes = estimate_eps(
+                waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs, return_changes=True
+            )
+        self.assertLess(2 * eps[0], 2e-2)
+        self.assertTrue(np.isnan(changes[0][-1]))
+        free = estimate_eps(self.full_grid_waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs)
+        np.testing.assert_allclose(eps, free)
+
+        def always_fails(*params):
+            raise ValueError("no root")
+
+        with self.assertRaisesRegex(ValueError, "no root"):
+            estimate_eps(always_fails, self.params, deriv_inds=[0], inner_product_kwargs=self.ip_kwargs)
+
     def test_estimate_eps_without_a_finite_step_raises(self):
         def waveform(*params):
             return domains.FDSignal(np.full((NCHANNELS, N_FREQ), np.nan + 0j), self.settings)
@@ -293,6 +317,127 @@ class DomainInfoMatrixTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             dh_dlambda(1e-3, waveform, self.params, 0, basis_settings=self.settings)
+
+
+class CovariancePriorPrecisionTest(unittest.TestCase):
+    """``covariance(..., prior_precision=P)`` inverts ``M + diag(P)``."""
+
+    def setUp(self):
+        rng = np.random.default_rng(3)
+        a = rng.normal(size=(4, 4))
+        self.info = a @ a.T + 4 * np.eye(4)
+        self.prior_precision = np.array([0.5, 2.0, 1e-3, 10.0])
+
+    def test_matches_the_direct_inverse(self):
+        cov = covariance(info_mat=self.info, prior_precision=self.prior_precision)
+        expected = np.linalg.inv(self.info + np.diag(self.prior_precision))
+        np.testing.assert_allclose(cov, expected, rtol=1e-10)
+
+    def test_none_leaves_the_result_unchanged(self):
+        np.testing.assert_array_equal(covariance(info_mat=self.info), np.linalg.pinv(self.info))
+        np.testing.assert_array_equal(
+            covariance(info_mat=self.info, prior_precision=None), np.linalg.pinv(self.info)
+        )
+
+    def test_open_direction_gets_the_prior_variance(self):
+        info = self.info.copy()
+        info[2, :] = 0.0
+        info[:, 2] = 0.0  # no information on parameter 2
+        cov = covariance(info_mat=info, prior_precision=self.prior_precision)
+        self.assertTrue(np.all(np.isfinite(cov)))
+        np.testing.assert_allclose(cov[2, 2], 1.0 / self.prior_precision[2], rtol=1e-12)
+        np.testing.assert_allclose(cov, cov.T, rtol=1e-12, atol=0.0)
+        self.assertGreater(np.linalg.eigvalsh(cov).min(), 0.0)
+
+    def test_rank_one_matrix_is_finite_and_positive_definite(self):
+        v = np.array([1.0, -2.0, 0.5, 3.0])
+        info = np.outer(v, v)
+        cov = covariance(info_mat=info, prior_precision=self.prior_precision)
+        self.assertTrue(np.all(np.isfinite(cov)))
+        np.testing.assert_allclose(cov, cov.T, rtol=1e-12, atol=0.0)
+        self.assertGreater(np.linalg.eigvalsh(cov).min(), 0.0)
+        # no direction is wider than the prior
+        self.assertTrue(np.all(np.diag(cov) <= (1.0 / self.prior_precision) * (1 + 1e-12)))
+        np.testing.assert_allclose(cov @ (info + np.diag(self.prior_precision)), np.eye(4), atol=1e-9)
+
+    def _badly_scaled(self):
+        scales = np.sqrt(np.array([1e-10, 1e-3, 1e4, 1e10]))  # diagonal entries span ~1e20
+        info = self.info * np.outer(scales, scales)
+        prior_precision = self.prior_precision * scales**2 * 1e-2
+        return info, prior_precision
+
+    def test_badly_scaled_matrix_matches_high_precision_reference(self):
+        import mpmath as mp
+
+        info, prior_precision = self._badly_scaled()
+        self.assertGreater(np.diag(info).max() / np.diag(info).min(), 1e19)
+        old_dps = mp.mp.dps
+        try:
+            mp.mp.dps = 100
+            reference = (mp.matrix(info.tolist()) + mp.diag(prior_precision.tolist())) ** -1
+            reference = np.array(reference.tolist(), dtype=np.float64)
+        finally:
+            mp.mp.dps = old_dps
+        cov = covariance(info_mat=info, prior_precision=prior_precision)
+        np.testing.assert_allclose(cov, reference, rtol=1e-9)
+
+    def test_high_precision_path(self):
+        import mpmath as mp
+
+        old_dps = mp.mp.dps
+        try:
+            for info, prior_precision in [(self.info, self.prior_precision), self._badly_scaled()]:
+                cov = covariance(info_mat=info, prior_precision=prior_precision, precision=True)
+                expected = covariance(info_mat=info, prior_precision=prior_precision)
+                np.testing.assert_allclose(cov, expected, rtol=1e-9)
+        finally:
+            mp.mp.dps = old_dps
+
+    def test_zero_precision_on_an_open_direction_does_not_divide_by_zero(self):
+        info = np.diag([2.0, 0.0])
+        with np.errstate(all="raise"):
+            cov = covariance(info_mat=info, prior_precision=np.array([1.0, 0.0]))
+        np.testing.assert_allclose(cov, np.diag([1.0 / 3.0, 0.0]))
+
+    def test_invalid_prior_precision_raises(self):
+        with self.assertRaisesRegex(ValueError, "prior_precision"):
+            covariance(info_mat=self.info, prior_precision=np.ones(3))
+        with self.assertRaisesRegex(ValueError, "prior_precision"):
+            covariance(info_mat=self.info, prior_precision=np.ones((4, 4)))
+        with self.assertRaisesRegex(ValueError, "prior_precision"):
+            covariance(info_mat=self.info, prior_precision=np.array([1.0, -1.0, 1.0, 1.0]))
+        with self.assertRaisesRegex(ValueError, "prior_precision"):
+            covariance(info_mat=self.info, prior_precision=np.array([1.0, np.nan, 1.0, 1.0]))
+        with self.assertRaisesRegex(ValueError, "prior_precision"):
+            covariance(info_mat=self.info, prior_precision=np.array([1.0, np.inf, 1.0, 1.0]))
+
+    def test_returned_information_matrix_is_not_regularised(self):
+        cov, info = covariance(info_mat=self.info, prior_precision=self.prior_precision, return_info_mat=True)
+        np.testing.assert_array_equal(info, self.info)
+        np.testing.assert_allclose(cov, np.linalg.inv(self.info + np.diag(self.prior_precision)), rtol=1e-10)
+
+    def test_matrix_computed_inside_the_call(self):
+        settings, psd, _ = make_setup()
+        freqs = np.arange(N_FREQ) * DF
+        params = np.array([1.5, 0.03, 0.4, 20.0])
+        eps = np.array([1e-3, 1e-6, 1e-3, 1e-2])
+
+        def waveform(*p):
+            packet = wave_packet(*p, freqs)
+            return domains.FDSignal(np.stack([packet, 0.5j * packet]), settings)
+
+        prior_precision = np.array([1.0, 1e4, 0.3, 1e-2])
+        cov, info = covariance(
+            eps,
+            waveform,
+            params,
+            inner_product_kwargs=dict(psd=psd),
+            prior_precision=prior_precision,
+            return_info_mat=True,
+        )
+        np.testing.assert_array_equal(info, info_matrix(eps, waveform, params, inner_product_kwargs=dict(psd=psd)))
+        # the (amp, f0) and (phi, tc) blocks decouple: those entries are round-off
+        np.testing.assert_allclose(cov, np.linalg.inv(info + np.diag(prior_precision)), rtol=1e-8, atol=1e-12)
 
 
 if __name__ == "__main__":

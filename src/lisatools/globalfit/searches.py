@@ -55,14 +55,29 @@ def seed_from_search_interfaces(curr: CurrentInfoGlobalFit, state: GFState, inte
 class BaseSearchInterface(ABC):
     """
     Base class for search interfaces.
+
+    The ``point_estimate`` and ``catalog`` searches scatter the walkers around one point per source with a
+    covariance given by ``spread``: numbers (a covariance for all sources or one per source, divided by beta per
+    temperature), or the string ``"info_matrix"``. With the string, the covariance of a source is the inverse of its information
+    matrix at the starting point plus the prior precision, one matrix per temperature from ``beta`` times the
+    information matrix (:meth:`info_matrix_covariances`), so that no temperature is wider than the prior. This needs,
+    on the branch's settings (``curr.source_info[branch_name]``), a ``signal_gen`` (the waveform of the sampling
+    parameters) and an ``info_matrix_gen`` (:class:`~lisatools.globalfit.infomatrix.InfoMatrixGenerator`), and a
+    search over every parameter of the sampling basis. The noise is the fixed one of the run
+    (``general_info.fixed_psd_kwargs``, which must be set, also in a run that samples the noise). The cost is the estimation of the
+    derivative steps, once per source: of order 44 waveforms per parameter.
     """
 
-    def __init__(self, 
-                 search_type: str, 
+    # The value of ``spread`` that asks for the information-matrix covariance, and the search types that take it
+    INFO_MATRIX_SPREAD = "info_matrix"
+    INFO_MATRIX_SEARCH_TYPES = ("point_estimate", "catalog")
+
+    def __init__(self,
+                 search_type: str,
                  transform: typing.Optional[TransformContainer] = None,
                  parameters_searched: typing.Optional[list[str]] = None,
                  search_path: typing.Optional[str] = None,
-                 spread: typing.Optional[float | np.ndarray] = None,
+                 spread: typing.Optional[float | np.ndarray | str] = None,
                  is_eryn_backend: bool = False,
                  periodic: typing.Optional[dict[str, dict[str, float]]] = None,
                  max_resample_tries: int = 50):
@@ -78,8 +93,14 @@ class BaseSearchInterface(ABC):
         search_path : str, optional
             Path to the file or directory containing the search results. Required for ``search_type`` in ``["distribution", "samples", "point_estimate"]``.
             For ``catalog``, an optional HDF5 file whose root holds one dataset per catalogue column, read in place of the loaded catalogue.
-        spread : float or np.ndarray, optional
+        spread : float or np.ndarray or str, optional
             Spread to use for scattering walkers around the starting points. Can be a scalar, 1-D array (diagonal covariance), 2-D array (full covariance), or 3-D array (one covariance per leaf). Required for ``search_type`` in ``["point_estimate", "catalog"]``.
+            The string ``"info_matrix"`` (those two search types only) takes the information-matrix covariance at each
+            source's starting point, regularised by the prior, one matrix per temperature. It needs ``signal_gen``
+            and ``info_matrix_gen`` on the branch's settings and every sampling parameter searched
+            (``parameters_searched`` left out, or the whole sampling basis in its order); the noise is
+            ``general_info.fixed_psd_kwargs``. Cost: the derivative steps are estimated once per source, of order
+            44 waveforms per parameter. No other string is accepted.
         is_eryn_backend : bool, optional
             Whether the search results are from an Eryn backend. If True, the search results are assumed to be in the sampling basis and no inverse transform is applied.
         periodic : dict, optional
@@ -197,6 +218,24 @@ class BaseSearchInterface(ABC):
 
         if self.search_type in ["catalog", "point_estimate"] and self.spread is None:
             raise ValueError(f"Spread must be provided for search type {self.search_type}")
+
+        if isinstance(self.spread, str):
+            if self.spread != self.INFO_MATRIX_SPREAD:
+                raise ValueError(
+                    f"spread must be numbers or the string '{self.INFO_MATRIX_SPREAD}'; got the string {self.spread!r}"
+                )
+            if self.search_type not in self.INFO_MATRIX_SEARCH_TYPES:
+                raise ValueError(
+                    f"spread '{self.INFO_MATRIX_SPREAD}' scatters walkers around one point per source: it is only "
+                    f"allowed for search types {list(self.INFO_MATRIX_SEARCH_TYPES)}, not {self.search_type}"
+                )
+            # the waveform takes the whole sampling basis in its order, and so does the information matrix
+            if not np.array_equal(self.parameters_searched, np.arange(len(self.sampling_basis))):
+                raise ValueError(
+                    f"spread '{self.INFO_MATRIX_SPREAD}' needs every parameter of the {self.branch_name} sampling "
+                    f"basis {list(self.sampling_basis)} searched, in that order; parameters_searched selects "
+                    f"{[self.sampling_basis[index] for index in self.parameters_searched]}"
+                )
 
         # catalog values are in the physical basis: without a transform they would be used as sampling-basis values
         if self.search_type == "catalog" and self.transform is None:
@@ -400,6 +439,10 @@ class BaseSearchInterface(ABC):
         """
         Returns the covariance matrix computed from the spread for the given number of leaves.
         """
+        if isinstance(self.spread, str):
+            raise ValueError(
+                f"spread {self.spread!r} is not a numeric spread: its covariances come from info_matrix_covariances"
+            )
 
         spread = np.asarray(self.spread, dtype=float)
         if spread.ndim == 0:
@@ -417,6 +460,111 @@ class BaseSearchInterface(ABC):
             raise ValueError(f"spread must be scalar, 1-D, 2-D, or 3-D; got shape {spread.shape}")
 
         return covs
+
+    def info_matrix_covariances(self,
+                                curr: CurrentInfoGlobalFit,
+                                starting_points: np.ndarray,
+                                betas: typing.Optional[typing.Union[np.ndarray, list[float]]] = None,
+                                ) -> np.ndarray:
+        """
+        The information-matrix covariance of every source at its starting point, one per temperature.
+
+        Each matrix is the inverse of ``beta`` times the information matrix plus the prior precision (see
+        :class:`~lisatools.globalfit.infomatrix.InfoMatrixGenerator`), so the temperature is already inside and no
+        temperature is wider than the prior (``beta = 0`` gives the prior's own variances).
+
+        Read from ``curr``: ``source_info[branch_name].signal_gen`` (called with the sampling-basis parameters as
+        positional scalars, returning a ``DomainBase``), ``source_info[branch_name].info_matrix_gen``, and from
+        ``general_info`` the grid ``input_data_residual_array.settings``, the noise
+        ``sensitivity_backend("info_matrix", **fixed_psd_kwargs)`` (built once per call of this method) and ``gpus``.
+
+        Parameters
+        ----------
+        curr : CurrentInfoGlobalFit
+            The current information holder for the global fit.
+        starting_points : np.ndarray
+            Array of shape (num_leaves, num_dim), in the sampling basis.
+        betas : np.ndarray, optional
+            Inverse temperatures, shape (num_temps,). ``None``: one temperature at beta 1.
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape (num_temps, num_leaves, num_dim, num_dim).
+
+        Raises
+        ------
+        ValueError
+            If the branch has no ``signal_gen`` or no ``info_matrix_gen``, or the run has no ``fixed_psd_kwargs``.
+        ValueError or RuntimeError
+            If the covariance of a source fails (a ``ValueError`` of the generator stays a ``ValueError``); the
+            message names the branch, the source and its starting point.
+        """
+        info = curr.source_info[self.branch_name]
+        for attribute, what in (("signal_gen", "the waveform of the sampling parameters"),
+                                ("info_matrix_gen", "an InfoMatrixGenerator")):
+            if getattr(info, attribute, None) is None:
+                raise ValueError(
+                    f"spread '{self.INFO_MATRIX_SPREAD}' needs {attribute} ({what}) on the settings of branch "
+                    f"{self.branch_name}, which has none"
+                )
+        signal_gen, info_matrix_gen = info.signal_gen, info.info_matrix_gen
+
+        general_info = curr.general_info
+        if getattr(general_info, "fixed_psd_kwargs", None) is None:
+            raise ValueError(
+                f"spread '{self.INFO_MATRIX_SPREAD}' of branch {self.branch_name} takes its noise from "
+                "general_info.fixed_psd_kwargs, which is not set"
+            )
+
+        # * Seeding runs before build_acs: select the first device as it does, before the noise and the waveform
+        # * (built on its first call) allocate anything.
+        if general_info.gpus is not None:
+            try:
+                import cupy
+            except (ImportError, ModuleNotFoundError):
+                cupy = None
+            if cupy is not None:
+                cupy.cuda.runtime.setDevice(general_info.gpus[0])
+
+        grid = general_info.input_data_residual_array.settings
+        # * Used as returned, without a deep copy: the backend hands out a matrix of its own arrays per call
+        # * (a new object, or a shallow copy whose sens_mat / invC / detC are rebound), the inner products only
+        # * read it, and it is dropped at the end of this method.
+        psd = general_info.sensitivity_backend("info_matrix", **general_info.fixed_psd_kwargs)
+
+        starting_points = np.asarray(starting_points, dtype=float)
+        num_leaves, num_dim = starting_points.shape
+        betas = np.ones(1) if betas is None else np.asarray(betas, dtype=float)
+
+        covs = np.empty((len(betas), num_leaves, num_dim, num_dim), dtype=float)
+        for leaf in range(num_leaves):
+            try:
+                covs[:, leaf] = info_matrix_gen(starting_points[leaf], signal_gen, psd, grid, leaf=leaf, betas=betas)
+            except Exception as error:
+                error_class = ValueError if isinstance(error, ValueError) else RuntimeError
+                raise error_class(
+                    f"The information-matrix covariance of branch {self.branch_name}, source {leaf} failed at the "
+                    f"starting point {starting_points[leaf].tolist()} (sampling basis {list(self.sampling_basis)}): "
+                    f"{error}"
+                ) from error
+            last = getattr(info_matrix_gen, "last", None) or {}
+            logger.info(
+                f"Information-matrix covariance of {self.branch_name} source {leaf}: "
+                f"{last.get('time', float('nan')):.2f} s, steps {np.asarray(last.get('eps', [])).tolist()}, "
+                f"condition number {last.get('condition', float('nan')):.3e}"
+            )
+
+        return covs
+
+    def covariances_from_spread(self, curr: CurrentInfoGlobalFit, starting_points: np.ndarray,
+                                betas: typing.Optional[typing.Union[np.ndarray, list[float]]]) -> np.ndarray:
+        """The covariances of ``spread`` around the starting points: per leaf for numbers, and per temperature and
+        leaf (:meth:`info_matrix_covariances`) for the string ``"info_matrix"``."""
+        # isinstance, not ==: comparing an array spread with a string is not a single truth value
+        if isinstance(self.spread, str):
+            return self.info_matrix_covariances(curr, starting_points, betas)
+        return self.get_covariance_matrices_from_spread(*starting_points.shape)
 
     def get_covariance_matrices_from_samples(self, samples: np.ndarray) -> np.ndarray:
         """
@@ -443,10 +591,15 @@ class BaseSearchInterface(ABC):
         ----------
         starting_points : np.ndarray
             Array of shape (num_leaves, num_dim) representing the starting points for each leaf. These must already be in the sampling basis.
+        covariances : np.ndarray
+            Either one covariance per leaf, shape (num_leaves, num_dim, num_dim), divided by beta for each temperature
+            (``cov / max(beta, 1e-10)``); or one per temperature and leaf, shape (num_temps, num_leaves, num_dim,
+            num_dim), used as it is: the temperature is already inside (see :meth:`info_matrix_covariances`) and
+            nothing is divided by beta. ``num_temps`` is ``len(betas)``, or 1 without ``betas``.
         num_walkers : int
             Number of walkers to scatter around each starting point.
         betas : np.ndarray, optional
-            Array of shape (num_temps,) representing the inverse temperatures for each temperature. If provided, the covariance will be scaled by 1/beta for each temperature.
+            Array of shape (num_temps,) representing the inverse temperatures for each temperature. If provided, per-leaf covariances (3-D) will be scaled by 1/beta for each temperature; covariances with a temperature axis (4-D) are not scaled.
         priors : ProbDistContainer, optional
             A container of prior distributions for each branch. If provided, walkers will be resampled until they fall within the support of the prior.
         max_resample_tries : int, optional
@@ -459,12 +612,26 @@ class BaseSearchInterface(ABC):
         """
         num_leaves, num_dim = starting_points.shape
 
-        if betas is not None:
+        num_temps = len(betas) if betas is not None else 1
+
+        covariances = np.asarray(covariances)
+        per_temperature = covariances.ndim == 4
+        if covariances.shape[-3:] != (num_leaves, num_dim, num_dim) or covariances.ndim not in (3, 4):
+            raise ValueError(
+                f"covariances must have shape (num_leaves, num_dim, num_dim) = {(num_leaves, num_dim, num_dim)}, "
+                f"with an optional leading temperature axis; got {covariances.shape}"
+            )
+        if per_temperature and covariances.shape[0] != num_temps:
+            raise ValueError(
+                f"covariances hold {covariances.shape[0]} temperatures (shape {covariances.shape}), but the walkers "
+                f"are drawn at {num_temps}"
+            )
+
+        if per_temperature:
+            logger.info(f"Initial covariances given per temperature (betas: {betas}): not scaled by beta")
+        elif betas is not None:
             logger.info(f"Scaling initial covariance by betas: {betas}")
-            num_temps = len(betas)
-        else:
-            num_temps = 1
-    
+
         leaf_prior = priors[self.branch_name]
 
         coords = leaf_prior.rvs(size=(num_temps, num_walkers, num_leaves)) # np.empty((num_temps, num_walkers, num_leaves, num_dim), dtype=float)
@@ -472,9 +639,11 @@ class BaseSearchInterface(ABC):
     
         for leaf in range(num_leaves):
             center = starting_points[leaf]
-            leaf_cov = covariances[leaf]
+            leaf_cov = None if per_temperature else covariances[leaf]
             for t in range(num_temps):
-                if betas is not None:
+                if per_temperature:
+                    scaled_cov = covariances[t, leaf]  # the temperature is already inside
+                elif betas is not None:
                     scaled_cov = leaf_cov / max(betas[t], 1e-10)
                 else:
                     scaled_cov = leaf_cov
@@ -623,11 +792,11 @@ class BaseSearchInterface(ABC):
                         raise ValueError(f"point_estimate expects one point per source; got shape {starting_points.shape}")
                     starting_points = starting_points[:, 0, :]  # shape: (num_leaves, num_dim)
                 starting_points = self.wrap_periodic(starting_points)
-                covariances = self.get_covariance_matrices_from_spread(*starting_points.shape)
+                covariances = self.covariances_from_spread(curr, starting_points, betas)
 
             else:
                 starting_points = self.get_catalog_values(curr)
-                covariances = self.get_covariance_matrices_from_spread(*starting_points.shape)
+                covariances = self.covariances_from_spread(curr, starting_points, betas)
 
             return self.search_methods_map[self.search_type](
                 starting_points=starting_points,
