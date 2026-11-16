@@ -42,6 +42,7 @@ class Alternative(NamedTuple):
     move: Any
     weight: float  # the share of the iterations of every stage not in stage_weights
     stage_weights: dict[str, float] = {}  # stage name -> the share of that stage's iterations
+    key: str | None = None  # its name in the block (the gb ``extra_moves`` key): the move is "<block>.<key>"
 
     def share(self, stage: str) -> float:
         return self.stage_weights.get(stage, self.weight)
@@ -75,6 +76,10 @@ class RecipeContext:
     def adaptive_repeats(self) -> dict[str, tuple[dict, set[str]]]:
         """``{branch: (RepeatController kwargs, stages with their own num_prop_repeats)}`` (``adaptive_repeats``)."""
         return adaptive_repeats(self.cfg)
+
+    def attribute_targets(self) -> dict[str, list]:
+        """``{target: its moves}`` of the built moves, for a step's ``attribute_targets`` (after ``block_moves``)."""
+        return attribute_targets(self.built or {})
 
     def block_moves(self, engine_info, curr, acs, priors, state) -> dict[str, BranchMoves]:
         self.built = build_block_moves(self, engine_info, curr, acs, priors, state)
@@ -188,8 +193,9 @@ class StockRecipe:
     ) -> None:
         """Add the steps; ``move_settings(stage name) -> {branch: settings}`` gives each stage's move settings.
 
-        ``move_attributes(stage name) -> {branch: {attribute path: value}}``: what else is set on the branches'
-        moves when the stage starts (``stage_move_attributes``); every stage's paths are checked on the moves here.
+        ``move_attributes(stage name) -> {target: {attribute path: value}}``: what else is set on the moves when
+        the stage starts (``stage_move_attributes``; a target is a block or ``<block>.<extra move>``, see
+        ``attribute_targets``); every stage's paths are checked on the moves here.
 
         ``adaptive``: ``{branch: (RepeatController kwargs, stages with their own num_prop_repeats)}`` for the
         branches whose repeats follow their inner ACT (``adaptive_repeats``): tuned in every stage but the last,
@@ -221,7 +227,7 @@ class StockRecipe:
             free = [branch for branch, (_kwargs, fixed) in adaptive.items() if name not in fixed]
             common = dict(moves=combined, weights=weights, move_settings=settings)
             if move_attributes is not None:
-                common["move_attributes"] = move_attributes(name)
+                common.update(move_attributes=move_attributes(name), attribute_targets=attribute_targets(moves))
             if iterations is not None:
                 step = IterationCountRecipeStep(
                     num_iters=iterations, repeat_controllers={b: controllers[b] for b in free}, **common
@@ -283,7 +289,7 @@ def stage_move_settings(cfg: RunConfig, curr, stage: str) -> dict[str, dict]:
     for name, block in enabled_blocks(cfg).items():
         if not getattr(block, "stages", None) or block.search is None:  # no stages, or no moves (unseeded)
             continue
-        if not any(spec.needs_apply_settings for spec in block.stages.values()):  # attributes only
+        if not any(getattr(spec, "needs_apply_settings", False) for spec in block.stages.values()):  # attributes only
             continue
         stage_spec = block.stages.get(stage)
         info = curr.source_info[name]
@@ -299,29 +305,64 @@ def stage_move_settings(cfg: RunConfig, curr, stage: str) -> dict[str, dict]:
     return out
 
 
-def stage_move_attributes(cfg: RunConfig, stage: str, order: list[str] | None = None) -> dict[str, dict]:
-    """``{branch: {attribute path: value}}`` in force in ``stage``: the ``attributes`` of the blocks' ``stages``
-    up to and including it, a later stage's value going over an earlier one's.
+def attribute_targets(moves: dict[str, BranchMoves]) -> dict[str, list]:
+    """``{target: its moves}`` for a recipe step's ``move_attributes``: ``<block>`` is every PE move of the block
+    (its ``pe`` moves and the moves that take turns with them), ``<block>.<key>`` the one move of that name (a gb
+    ``extra_moves`` key). By the builders' record of which moves are whose, not by an attribute of the move."""
+    out: dict[str, list] = {}
+    for name, branch in moves.items():
+        out[name] = [*branch.pe, *(alternative.move for alternative in branch.alternatives)]
+        for alternative in branch.alternatives:
+            if alternative.key is not None:
+                out[f"{name}.{alternative.key}"] = [alternative.move]
+    return out
 
-    All of them and not this stage's alone, so that a restart into a later stage leaves the moves as a run
-    through the earlier stages does. ``order``: the stages' order (the stock recipe's stages); without it, the
-    order in which the block lists its ``stages``.
-    """
-    out = {}
-    for name, block in enabled_blocks(cfg).items():
-        stages = getattr(block, "stages", None)
-        if not stages or block.search is None:  # no stages, or no moves (unseeded)
-            continue
-        names = list(order) if order is not None else list(stages)
-        if stage not in names:
-            continue
-        merged = {}
+
+def _attributes_up_to(stages: dict, stage: str, order: list[str] | None) -> dict:
+    """The ``attributes`` of ``stages`` (stage name -> spec) in force in ``stage``: those of the stages up to and
+    including it, in ``order`` (None: as ``stages`` lists them), a later stage's value going over an earlier one's."""
+    names = list(order) if order is not None else list(stages)
+    merged: dict = {}
+    if stage in names:
         for earlier in names[: names.index(stage) + 1]:
             if earlier in stages:
                 merged.update(deepcopy(stages[earlier].attributes))
+    return merged
+
+
+def stage_move_attributes(cfg: RunConfig, stage: str, order: list[str] | None = None) -> dict[str, dict]:
+    """``{target: {attribute path: value}}`` in force in ``stage``, for a recipe step's ``move_attributes``:
+    under ``<block>`` the ``attributes`` of the block's ``stages`` (every move of the block), then under
+    ``<block>.<key>`` those of each ``extra_moves`` entry's ``stages`` (that move alone, going over the block's).
+
+    Each holds the stages up to and including ``stage``, a later stage's value going over an earlier one's, so
+    that a restart into a later stage leaves the moves as a run through the earlier stages does. ``order``: the
+    stages' order (the stock recipe's stages); without it, the order in which the block lists them.
+    """
+    out = {}
+    for name, block in enabled_blocks(cfg).items():
+        if not has_moves(block):
+            continue
+        merged = _attributes_up_to(getattr(block, "stages", None) or {}, stage, order)
         if merged:
             out[name] = merged
+        for key, spec in (getattr(block, "extra_moves", None) or {}).items():
+            merged = _attributes_up_to(getattr(spec, "stages", None) or {}, stage, order)
+            if merged:
+                out[f"{name}.{key}"] = merged
     return out
+
+
+def fixes_search_part(cfg: RunConfig, name: str, stage: str, order: list[str]) -> bool:
+    """Whether the block's stage attributes in force in ``stage`` call ``apply_settings(fix_search_part=True)`` on
+    its moves (the block's ``stages``, or those of an ``extra_moves`` entry)."""
+    for target, attributes in stage_move_attributes(cfg, stage, order).items():
+        if target != name and not target.startswith(name + "."):
+            continue
+        value = attributes.get("apply_settings")
+        if isinstance(value, dict) and value.get("fix_search_part") is True:
+            return True
+    return False
 
 
 def make_stock_recipe(name: str, kwargs: dict[str, Any]):
@@ -355,6 +396,11 @@ def load_recipe_function(path: Path, name: str):
 
 
 # --- branches and generators (the state is seeded by load_info, the residuals built by setup_acs) --- #
+
+def has_moves(block) -> bool:
+    """Whether the block gets PE moves: a source block only with a search (unseeded, it has none)."""
+    return isinstance(block, MoveBlock) and (not isinstance(block, SourceBlock) or block.search is not None)
+
 
 def enabled_blocks(cfg: RunConfig) -> dict[str, Any]:
     return {name: block for name, block in cfg.blocks.items() if block.enabled}
@@ -561,12 +607,17 @@ def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, sta
     ]
     if any(reads_search_memory(class_name, move_kwargs) for class_name, move_kwargs in moves_kwargs):
         if not hasattr(ctx.cfg.recipe, "file"):
-            raise ValueError(
-                f"the {block.type} block holds the F-statistic split and merge without record files, whose search "
-                "part must be fixed when the kept iterations start, and the stock recipe "
-                f"{ctx.cfg.recipe.class_name} does not fix it: use a recipe file whose step of the kept iterations "
-                "calls apply_settings(fix_search_part=True) on every GB move that has the method."
-            )
+            # * the stock recipe fixes it only if a stage says so; the last stage is the kept iterations
+            order = make_stock_recipe(ctx.cfg.recipe.class_name, ctx.cfg.recipe.kwargs).stage_names
+            if not fixes_search_part(ctx.cfg, block.type, order[-1], order):
+                raise ValueError(
+                    f"the {block.type} block holds the F-statistic split and merge without record files, whose "
+                    "search part must be fixed when the kept iterations start. Set it in the block's stages, by the "
+                    f"last stage ({order[-1]!r}): stages: {{{order[-1]}: {{attributes: {{apply_settings: "
+                    "{fix_search_part: true}}}}} (on the block, or on the extra move), or use a recipe file whose "
+                    "step of the kept iterations calls apply_settings(fix_search_part=True) on the GB moves that "
+                    "have the method."
+                )
         memory = make_fstat_search_memory(curr)
         for class_name, move_kwargs in moves_kwargs:
             if class_name == "GBFStatRJMove" or reads_search_memory(class_name, move_kwargs):
@@ -609,7 +660,7 @@ def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, sta
             **extra_kwargs,
         )
         extra.accepted = np.zeros((parts.ntemps, parts.nwalkers))
-        extras.append(Alternative(extra, spec.weight, dict(spec.stage_weights)))
+        extras.append(Alternative(extra, spec.weight, dict(spec.stage_weights), key))
         logger.info(
             f"Built {block.type} extra move {key} ({spec.class_name}), run in a share {spec.weight} of the "
             f"iterations" + (f" (by stage: {spec.stage_weights})" if spec.stage_weights else "")
@@ -721,22 +772,32 @@ def check_recipe_uses_the_blocks(recipe, cfg: RunConfig, built: dict[str, Branch
         named = {"stages": set(getattr(block, "stages", None) or ())}
         for key, spec in (getattr(block, "extra_moves", None) or {}).items():
             named[f"extra_moves {key} stage_weights"] = set(spec.stage_weights)
+            named[f"extra_moves {key} stages"] = set(getattr(spec, "stages", None) or ())
         for where, stages in named.items():
             unknown = sorted(stages - set(steps))
             if unknown:
                 raise ValueError(f"block {name!r}: {where} {unknown} name no recipe step {steps}.")
 
+    def sets_attributes(block) -> bool:
+        specs = list((getattr(block, "stages", None) or {}).values())
+        for spec in (getattr(block, "extra_moves", None) or {}).values():
+            specs += list((getattr(spec, "stages", None) or {}).values())
+        return any(getattr(spec, "attributes", None) for spec in specs)
+
     with_attributes = sorted(
         name for name, block in enabled_blocks(cfg).items()
-        if getattr(block, "search", None) is not None
-        and any(getattr(spec, "attributes", None) for spec in (getattr(block, "stages", None) or {}).values())
+        if has_moves(block) and sets_attributes(block)
     )
-    set_somewhere = {branch for step in recipe.recipe for branch in getattr(step["adjust"], "move_attributes", {})}
+    # a step's targets are "<block>" and "<block>.<extra move>"
+    set_somewhere = {
+        target.split(".")[0] for step in recipe.recipe for target in getattr(step["adjust"], "move_attributes", {})
+    }
     unset = sorted(set(with_attributes) - set_somewhere)
     if unset:
         raise ValueError(
             f"blocks {unset} set stage attributes, but no recipe step has move_attributes for them "
-            "(recipe.BaseRecipeStep(move_attributes=l2d.move_attributes(stage)))."
+            "(recipe.BaseRecipeStep(move_attributes=l2d.move_attributes(stage), "
+            "attribute_targets=l2d.attribute_targets()))."
         )
 
     controlled = {branch for step in recipe.recipe for branch in getattr(step["adjust"], "repeat_controllers", {})}

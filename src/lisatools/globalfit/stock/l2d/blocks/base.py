@@ -127,6 +127,21 @@ class StageSpec(_Spec):
         return any(v is not None for v in (self.num_prop_repeats, self.inner_move_weights, self.flow_weight))
 
 
+class MoveStageSpec(_Spec):
+    """What a recipe stage sets on ONE move of a block with several (a gb ``extra_moves`` entry): attribute
+    path -> value, as ``StageSpec.attributes``, set after the block's own ``stages`` and going over them."""
+
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _paths_read(self):
+        from lisatools.utils.utility import attribute_path
+
+        for path in self.attributes:
+            attribute_path(path)
+        return self
+
+
 class AdaptiveRepeatsSpec(_Spec):
     """A source block's proposal repeats follow its inner autocorrelation time (``recipe.RepeatController``).
 

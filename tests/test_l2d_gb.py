@@ -144,6 +144,44 @@ class GBSchemaTest(_GBConfig):
         kwargs = gb_move_kwargs(self.config({"pe_move": pe_move}).blocks["gb"])
         self.assertEqual(kwargs["debug_settings"], GBDebugSettings(mem_probe=True))
 
+    def test_stage_attributes_of_the_block_and_of_one_extra_move(self):
+        from lisatools.globalfit.stock.l2d.build_recipe import fixes_search_part, stage_move_attributes
+
+        extra = {"class": "GBFStatRJMove", "weight": 0.1}
+        fix = {"apply_settings": {"fix_search_part": True}}
+        write_candidates(self.run_dir / CANDIDATES_FILE)  # seeded: an unseeded block has no moves to set
+        seeded = {"search": gb_search()}
+        cfg = self.config({
+            **seeded,
+            "stages": {"burn-in": {"attributes": {"stretch_probability": 0.5}},
+                       "pe": {"attributes": {"stretch_probability": 0.0}}},
+            "extra_moves": {
+                "fstat": {**extra, "stages": {"burn-in": {"attributes": {"num_stationary_fim_steps": 1}}}},
+                "second": {**extra, "stages": {"pe": {"attributes": fix}}},
+            },
+        }, burn_in=True)
+        order = ["burn-in", "pe"]
+        self.assertEqual(stage_move_attributes(cfg, "burn-in", order),
+                         {"gb": {"stretch_probability": 0.5}, "gb.fstat": {"num_stationary_fim_steps": 1}})
+        self.assertEqual(
+            stage_move_attributes(cfg, "pe", order),
+            {"gb": {"stretch_probability": 0.0}, "gb.fstat": {"num_stationary_fim_steps": 1}, "gb.second": fix},
+        )
+        self.assertFalse(fixes_search_part(cfg, "gb", "burn-in", order))
+        self.assertTrue(fixes_search_part(cfg, "gb", "pe", order))
+        block_level = self.config({**seeded, "stages": {"pe": {"attributes": fix}}}, burn_in=True)
+        self.assertTrue(fixes_search_part(block_level, "gb", "pe", order))
+        self.assertFalse(fixes_search_part(self.config(seeded, burn_in=True), "gb", "pe", order))
+
+        for stages, message in (
+            ({"later": {"attributes": {"a": 1}}}, "extra_moves x stages ['later'] are not recipe"),
+            ({"pe": {"attributes": {"moves[last]": 1}}}, "cannot read"),
+            ({"pe": {"num_prop_repeats": 3}}, "Extra inputs are not permitted"),
+        ):
+            with self.subTest(stages=stages), self.assertRaises(Exception) as caught:
+                self.config({"extra_moves": {"x": {**extra, "stages": stages}}}, burn_in=True)
+            self.assertIn(message, str(caught.exception))
+
     def test_extra_moves(self):
         from lisatools.globalfit.moves.gbspecialmove import GBFStatSettings
 

@@ -23,7 +23,7 @@ from typing import Annotated, Any, ClassVar, Literal, NamedTuple
 from pydantic import Field, PositiveInt, model_validator
 
 from .base import (
-    SPECIAL_MOVES, BlockBuild, BuildContext, ClassSpec, PEMove, SourceBlock, TemperingSpec, WaveformSpec,
+    SPECIAL_MOVES, BlockBuild, BuildContext, ClassSpec, MoveStageSpec, PEMove, SourceBlock, TemperingSpec, WaveformSpec,
     make_betas, make_search_interface,
 )
 from .utility import check_kwargs, find_class
@@ -73,6 +73,8 @@ class ExtraMoveSpec(ClassSpec):
     weight: float = Field(ge=0.0, lt=1.0)
     # recipe stage name (recipe.kwargs.stages) -> the share in that stage; left-out stages take weight
     stage_weights: dict[str, Annotated[float, Field(ge=0.0, lt=1.0)]] = Field(default_factory=dict)
+    # recipe stage name -> what the stage sets on this move alone (the block's `stages` set every move of the block)
+    stages: dict[str, MoveStageSpec] = Field(default_factory=dict)
 
     def share(self, stage: str | None) -> float:
         return self.stage_weights.get(stage, self.weight)

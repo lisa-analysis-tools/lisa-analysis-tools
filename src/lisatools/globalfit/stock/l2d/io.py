@@ -534,6 +534,7 @@ class RunConfig(_Section):
             named = {"stages": set(getattr(block, "stages", None) or ())}
             for key, spec in (getattr(block, "extra_moves", None) or {}).items():
                 named[f"extra_moves {key} stage_weights"] = set(spec.stage_weights)
+                named[f"extra_moves {key} stages"] = set(spec.stages)
             for where, stages in named.items():
                 unknown = sorted(stages - set(names))
                 if unknown:

@@ -275,6 +275,7 @@ class BaseRecipeStep(RecipeStep):
     repeat_controllers: dict = {}
     kept_repeats: tuple = ()
     move_attributes: dict = {}
+    attribute_targets: dict = {}
     name: str | None = None
     backend = None
 
@@ -286,6 +287,7 @@ class BaseRecipeStep(RecipeStep):
         repeat_controllers: dict[str, "RepeatController"] | None = None,
         kept_repeats: typing.Iterable[str] = (),
         move_attributes: dict[str, dict] | None = None,
+        attribute_targets: dict[str, list] | None = None,
     ):
         super().__init__(moves=moves, weights=weights)
         self.move_settings = move_settings or {}
@@ -295,43 +297,66 @@ class BaseRecipeStep(RecipeStep):
         self.kept_repeats = tuple(kept_repeats)
         # branch -> {attribute path: value} set on the branch's moves when the step starts (set_attribute)
         self.move_attributes = move_attributes or {}
+        # target name -> its moves, for move_attributes (a block's moves, one of its moves); see apply_move_attributes
+        self.attribute_targets = attribute_targets or {}
         self.name: str | None = None  # the step's name in the Recipe (set by Recipe._start_current_step)
         self.backend = None  # the Recipe's backend (same)
 
-    def _branch_moves(self) -> dict[str, list]:
-        """The moves of each branch in this step (inside the combined moves too), each once."""
+    def _step_moves(self) -> list:
+        """The moves of this step (those inside the combined moves too), each once."""
         from eryn.moves import CombineMove
 
-        out: dict[str, list] = {}
+        out: list = []
         for move in self.moves:
             move = move[0] if isinstance(move, tuple) else move
             for sub in move.sub_moves if isinstance(move, CombineMove) else [move]:
-                listed = out.setdefault(getattr(sub, "branch_name", None), [])
-                if not any(sub is other for other in listed):
-                    listed.append(sub)
+                if not any(sub is other for other in out):
+                    out.append(sub)
+        return out
+
+    def _branch_moves(self) -> dict[str, list]:
+        """The moves of each branch in this step, by the moves' ``branch_name`` (None for a move without one)."""
+        out: dict[str, list] = {}
+        for move in self._step_moves():
+            out.setdefault(getattr(move, "branch_name", None), []).append(move)
         return out
 
     def apply_move_attributes(self, dry_run: bool = False) -> None:
-        """Set each branch's :attr:`move_attributes` on its moves in this step (:func:`set_attribute`).
+        """Set :attr:`move_attributes`, ``{target: {path: value}}``, on the targets' moves (:func:`set_attribute`).
 
-        A path is set on every move of the branch that has it, and must be there on one at least: an unknown
-        branch or a path that no move of the branch has is an error. ``dry_run`` only checks that.
+        A target's moves are those :attr:`attribute_targets` lists for it (a block, or one move of a block:
+        the move builders know which moves are whose); a target not listed there is a branch name, looked up on
+        the moves' ``branch_name``. Only the moves in this step are set. The targets are taken in order, so a
+        later one (one move) goes over an earlier one (its block).
+
+        A path is set on every move of the target that has it, and must be there on one at least. An unknown
+        target, or a path that no move of the target has, is an error; a target none of whose moves is in this
+        step (a move that takes no turn in this stage) is left. ``dry_run`` only checks.
         """
-        moves = self._branch_moves()
-        for branch, attributes in self.move_attributes.items():
-            if branch not in moves:
-                raise ValueError(f"move attributes for {branch!r}: this step has no move of that branch.")
+        in_step, by_branch = self._step_moves(), self._branch_moves()
+        for target, attributes in self.move_attributes.items():
+            if target in self.attribute_targets:
+                moves = [m for m in self.attribute_targets[target] if any(m is other for other in in_step)]
+                if not moves:
+                    continue
+            elif target in by_branch:
+                moves = by_branch[target]
+            else:
+                raise ValueError(
+                    f"move attributes for {target!r}: no move of that name or branch (known: "
+                    f"{sorted(self.attribute_targets) or sorted(str(b) for b in by_branch)})."
+                )
             for path, value in attributes.items():
                 done, errors = [], []
-                for move in moves[branch]:
+                for move in moves:
                     try:
                         done.append(set_attribute(move, path, value, dry_run=dry_run))
                     except (AttributeError, IndexError) as err:
                         errors.append(f"{type(move).__name__}: {err}")
                 if not done:
-                    raise ValueError(f"{branch} move attribute {path!r} fits no move of the branch: {errors}.")
+                    raise ValueError(f"{target} move attribute {path!r} fits no move of {target}: {errors}.")
                 if not dry_run:
-                    logger.info(f"{branch} move attribute: {done[0]}")
+                    logger.info(f"{target} move attribute ({len(done)} of {len(moves)} moves): {done[0]}")
 
     def _stored_repeats(self, branch: str) -> dict:
         if self.backend is None or not hasattr(self.backend, "recipe_repeats"):

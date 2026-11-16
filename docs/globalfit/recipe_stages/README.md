@@ -79,9 +79,38 @@ stages:
   earlier stages' attributes again, in the stages' order, so the move ends up as in a run through all of them.
 - The syntax is checked when the config loads. Whether the path exists is checked on the built moves when the
   recipe's steps are added, before the first iteration, for every stage.
-- It works for any source block's PE move, also one without `apply_settings` (gb), which cannot take
+- It works for any source block's PE moves, also those without `apply_settings` (gb), which cannot take
   `num_prop_repeats`, `inner_move_weights` or `flow_weight` per stage.
+- The psd block takes `stages` with `attributes` only, on its PE move (`MultiGPUPSDMove`), whose repeats are the
+  attribute `num_repeats`: `stages: {burn-in: {attributes: {num_repeats: 200}}}`. The galfor parameters are
+  sampled by that move, so galfor has no stages of its own.
 - The flow move is the last of the PE move's inner moves (`moves[-1]`), and its `executor` is the flow trainer.
+
+**A block with several moves** (gb: the `pe_move` and the `extra_moves`). The block's `stages` set every move of
+the block that has the path; an extra move's own `stages` set that move alone, after the block's and over them:
+
+```yaml
+stages:                                   # every gb move that has the attribute
+  burn-in: {attributes: {stretch_probability: 0.5, num_stationary_fim_steps: 1}}
+  pe:      {attributes: {stretch_probability: 0.0, num_stationary_fim_steps: 50}}
+extra_moves:
+  split_merge:
+    class: GBFStatSplitMergeRJMove
+    weight: 0.3
+    stage_weights: {burn-in: 0.4}
+    stages:                               # this move only
+      pe: {attributes: {apply_settings: {fix_search_part: true}}}
+```
+
+- A path on the block must be there on one of its moves at least; it is set on each that has it (a method that
+  only one move has is called on that one). A path on an extra move must be there on that move.
+- Only the moves that run in the stage are set. A move with no share of a stage is left, and gets the attributes
+  in force when a later stage brings it in (the earlier stages' are set again there).
+- Which moves are a block's comes from the move builders (`build_recipe.attribute_targets`: `<block>` and
+  `<block>.<extra move>`), not from an attribute of the move, so it also covers moves without a `branch_name`.
+- The F-statistic split and merge without record files needs its search part fixed when the kept iterations
+  start. The stock recipe accepts it when `apply_settings: {fix_search_part: true}` is in force in the last stage
+  (on the block or on the extra move, as above); before, it needed a recipe file.
 
 **The flow trainer in the stage that keeps its samples.** The trainer refits the flow on a buffer of the chain's
 recent samples (`flow.trainer.max_buffer_samples`, a few iterations' worth), so the proposal follows the chain
@@ -264,8 +293,9 @@ Two checks keep a recipe file from silently dropping what the blocks set:
   - every `stages` and `stage_weights` key must name one of its steps;
   - every extra move must sit in some step.
 
-A recipe file passes a stage's attributes as `move_attributes=l2d.move_attributes(stage)` to its step (in force
-in the order the block lists its `stages`); a block that sets stage attributes must have them in some step.
+A recipe file passes a stage's attributes as `move_attributes=l2d.move_attributes(stage)` and
+`attribute_targets=l2d.attribute_targets()` (after `l2d.block_moves`) to its step (in force in the order the block
+lists its `stages`); a block that sets stage attributes must have them in some step.
 
 A recipe file gets the same from `recipe.RepeatController` (`repeat_controllers=` of a step, with
 `l2d.adaptive_repeats()` for the blocks' settings; `kept_repeats=` on the step that keeps its samples) and
@@ -295,3 +325,5 @@ must have a controller in some step.
   `AdaptiveStagesTest` (tuning, freezing, restarts), `ConvergenceStepTest`, `AdaptiveRepeatsSchemaTest`.
 - `tests/test_l2d_stages.py`: `SetAttributeTest` (paths, methods, errors, dry run), `StageAttributesTest` (set at
   stage start, restart, paths checked when the steps are built), `StageAttributesSchemaTest`.
+- `tests/test_l2d_stages.py::SeveralMovesAttributesTest` (a block's moves and one of them, a move with no share of
+  a stage, a method only one move has), `tests/test_l2d_gb.py::GBSchemaTest::test_stage_attributes_of_the_block_and_of_one_extra_move`.
