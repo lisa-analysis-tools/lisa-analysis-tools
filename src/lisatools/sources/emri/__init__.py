@@ -5,7 +5,7 @@ from .domain import (  # noqa: F401
     emri_kerr_domain_mask,
     few_domain_guard,
 )
-from .waveform import EMRITDIWaveform
+from .waveform import EMRISparseSTFTWaveform, EMRITDIWaveform
 from .emritdionfly import EMRITDIonFly
 from .response import (  # noqa: F401
     EMRIWaveWrap,

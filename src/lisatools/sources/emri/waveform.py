@@ -352,3 +352,119 @@ class EMRITDIWaveform(TDPyResponseWaveformBase):
         merger_time = 0.0 if isinstance(merger_time, float) else get_array_module(merger_time).zeros_like(merger_time)
 
         return super()._apply_response(t_arr, h_plus, h_cross, ra, dec, merger_time, num_pad=num_pad)
+
+
+class EMRISparseSTFTWaveform(EMRITDIWaveform):
+    """:class:`EMRITDIWaveform` whose likelihood templates are built from sparse harmonic tracks.
+
+    ``__call__`` (the template of the STFT likelihood) no longer builds a dense time series:
+    FEW's sparse holder goes through the sparse TDI response
+    (:class:`~lisatools.sources.emri.sparse_tracks.EMRISparseResponse`) and each harmonic is
+    added to the STFT template as a linear chirp per segment
+    (:mod:`lisatools.stft_tracks`); segments where a harmonic chirps too fast, or where the
+    inspiral ends, are filled from the exact time series. Same call signature and output as
+    :class:`EMRITDIWaveform` in the STFT domain. Everything else (``get_signals_for_residuals``,
+    ``get_td_signals``) is inherited and stays on the dense path.
+
+    The sky convention is that of :class:`EMRITDIWaveform`: ``(ra, dec)`` in the orbits' frame
+    for the response, converted to the ecliptic for FEW.
+
+    Args:
+        *args: As :class:`EMRITDIWaveform`; ``stft_dt`` is required.
+        n_side: Bins kept beyond half a harmonic's sweep, each side.
+        cubic_tol: Largest phase [rad] the linear chirp may leave out at a segment edge before
+            the segment is filled from the exact time series.
+        max_half_width: Largest band half-width [bins] of a track segment (``None``: no cap).
+        sparse_dt: Largest spacing of the sparse response grid [s].
+        stop_taper: Taper [s] of the emission before the end of the inspiral.
+        **kwargs: As :class:`EMRITDIWaveform`.
+    """
+
+    def __init__(self, *args: Any, n_side: int = 30, cubic_tol: float = 0.03,
+                 max_half_width: Optional[int] = None, sparse_dt: float = 43200.0,
+                 stop_taper: float = 120.0, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        if self.analysis_domain != "STFT":
+            raise ValueError("EMRISparseSTFTWaveform needs an STFT analysis domain (stft_dt).")
+        self.n_side = int(n_side)
+        self.cubic_tol = float(cubic_tol)
+        self.max_half_width = max_half_width
+        self.sparse_dt = float(sparse_dt)
+        self.stop_taper = float(stop_taper)
+        self._sparse_response = None
+        self._accumulator = None
+        #: per-(row, segment) fill of the last call: 0 zero, 1 tracks, 2 exact time series
+        self.last_segment_mode = None
+
+    @property
+    def kwargs(self):
+        out = super().kwargs
+        out.update(n_side=self.n_side, cubic_tol=self.cubic_tol, max_half_width=self.max_half_width,
+                   sparse_dt=self.sparse_dt, stop_taper=self.stop_taper)
+        return out
+
+    def _sparse_setup(self):
+        """The sparse response and the track accumulator of this waveform's STFT grid."""
+        if self._sparse_response is None:
+            from ...stft_tracks import STFTTrackAccumulator
+            from .sparse_tracks import EMRISparseResponse
+
+            stft_dt = self.nperseg * self.dt
+            num_seg = self.domain_settings.N // self.nperseg
+            # the band of TDWaveformBase.fft on one segment
+            freqs = np.fft.rfftfreq(self.nperseg, d=self.dt)
+            lo = int(np.searchsorted(freqs, self.freq_min))
+            hi = int(np.searchsorted(freqs, self.freq_max, side="right"))
+            self._accumulator = STFTTrackAccumulator(
+                stft_dt, float(freqs[lo]), hi - lo, self.tukey_alpha, force_backend=self.force_backend)
+            t_lo = float(self.data_t0)
+            self._sparse_response = EMRISparseResponse(
+                self.waveform.waveform_generator, orbits=self.orbits, tdi_config=self.tdi_config,
+                t_start=float(self.waveform_t0), t_window=(t_lo, t_lo + num_seg * stft_dt),
+                data_dt=self.dt, sparse_dt=self.sparse_dt, force_backend=self.force_backend)
+        return self._sparse_response, self._accumulator
+
+    def __call__(self, *args, ra=None, dec=None, merger_time=None, **kwargs):
+        """STFT templates ``(template (B, 3, NT, NF), start_freqs (B,), start_times (B,))``.
+
+        The templates cover every segment of the data grid, so ``start_times`` is the data
+        start for every source. ``merger_time`` is ignored, as in :class:`EMRITDIWaveform`.
+        """
+        from ...stft_tracks import stft_templates_from_tracks
+        from ...utils.utility import tukey
+        from .sparse_tracks import EMRITrackSource
+
+        if ra is None or dec is None:
+            *args, ra, dec = args
+        xp = self.xp
+
+        def host(v):
+            v = v.get() if hasattr(v, "get") else v
+            return np.atleast_1d(np.asarray(v, dtype=float))
+
+        params = [host(v) for v in (*args, ra, dec)]
+        if len(params) != 14:
+            raise ValueError(f"expected 14 parameters (..., ra, dec), got {len(params)}.")
+        num = max(p.size for p in params)
+        params = [np.broadcast_to(p, (num,)) for p in params]
+
+        response, accumulator = self._sparse_setup()
+        items, holders = [], []
+        for i in range(num):
+            m1, m2, a, p0, e0, x0, dist, qK, phiK, Pp, Pt, Pr, ra_i, dec_i = (float(p[i]) for p in params)
+            qS, phiS = self.convert_sky_coords(ra_i, dec_i)
+            item, H = response.template_inputs(
+                (m1, m2, a, p0, e0, x0, dist, qS, phiS, qK, phiK, Pp, Pt, Pr), lam=ra_i, beta=dec_i, **kwargs)
+            items.append(item)
+            holders.append(H)
+        source = EMRITrackSource(response, items, holders, stop_taper=self.stop_taper)
+        window = tukey(self.nperseg, alpha=self.tukey_alpha, xp=xp) if self.tukey_alpha else None
+        num_seg = self.domain_settings.N // self.nperseg
+        segment_start = float(self.data_t0) + np.arange(num_seg) * (self.nperseg * self.dt)
+        template, info = stft_templates_from_tracks(
+            source, accumulator, segment_start, self.dt, n_side=self.n_side, cubic_tol=self.cubic_tol,
+            max_half_width=self.max_half_width, window=window, return_info=True)
+        self.last_segment_mode = info["mode"]
+        start_freqs = xp.full(num, accumulator.f_min)
+        start_times = xp.full(num, float(self.data_t0))
+        return template, start_freqs, start_times
