@@ -500,9 +500,25 @@ cmplx TDDenseTDIWaveform::strain_term(int s, int b, int seg, double t, double *P
     return cmplx(amp_factor * (cr * cph + ci * sph), amp_factor * (ci * cph - cr * sph));
 }
 
+// A source that stops abruptly has no net T-like area (every delay term of a channel is the same
+// truncated function), but SAMPLED, each term's cut falls at its own place between samples and the
+// sum keeps an area that aliases into the lowest frequencies. A weight on the EMISSION time is the
+// same for every term, so tapering there keeps the cancellation and makes each term smooth.
+CUDA_DEVICE
+double TDDenseTDIWaveform::stop_weight(int b, double s, double stop_taper)
+{
+    if (stop_taper <= 0.0) return 1.0;
+    double x = (t_knots[(size_t)b * K + n_knots[b] - 1] - s) / stop_taper;
+    if (x >= 1.0) return 1.0;
+    if (x <= 0.0) return 0.0;
+    double w = sin(0.5 * M_PI * x);
+    return w * w;
+}
+
 CUDA_DEVICE
 void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b, int sub_lo, int sub_hi,
-    cmplx *tdi_channels_arr, double *phi_ref, int N, int *link_Space_craft_rec, int *link_Space_craft_em)
+    cmplx *tdi_channels_arr, double *phi_ref, int N, int *link_Space_craft_rec, int *link_Space_craft_em,
+    int sum_subs, double stop_taper)
 {
     Vec k(0.0, 0.0, 0.0);
     Vec u(0.0, 0.0, 0.0);
@@ -542,9 +558,12 @@ void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b
             double t_end = (t_sc > t_knots[(size_t)b * K + nk - 1]) ? t_knots[(size_t)b * K + nk - 1] : t_knots[(size_t)b * K];
             phases(b, segment(b, t_end, true), t_end, P3);
         }
-        for (int s = sub_lo; s < sub_hi; s += 1)
+        if (phi_ref != nullptr)
         {
-            phi_ref[(size_t)s * N + i] = sub_mkn[3 * s] * P3[0] + sub_mkn[3 * s + 1] * P3[1] + sub_mkn[3 * s + 2] * P3[2];
+            for (int s = sub_lo; s < sub_hi; s += 1)
+            {
+                phi_ref[(size_t)s * N + i] = sub_mkn[3 * s] * P3[0] + sub_mkn[3 * s + 1] * P3[1] + sub_mkn[3 * s + 2] * P3[2];
+            }
         }
     }
 
@@ -600,20 +619,46 @@ void TDDenseTDIWaveform::channels_point(int b, int i, double t, double *params_b
         double P3e[3] = {0.0, 0.0, 0.0};
         if (seg_r >= 0) phases(b, seg_r, delay_rec, P3r);
         if (seg_e >= 0) phases(b, seg_e, delay_em, P3e);
-        for (int s = sub_lo; s < sub_hi; s += 1)
+        double w_r = stop_weight(b, delay_rec, stop_taper);
+        double w_e = stop_weight(b, delay_em, stop_taper);
+        if (sum_subs)
         {
-            cmplx zr = (seg_r >= 0) ? strain_term(s, b, seg_r, delay_rec, P3r) : cmplx(0.0, 0.0);
-            cmplx ze = (seg_e >= 0) ? strain_term(s, b, seg_e, delay_em, P3e) : cmplx(0.0, 0.0);
-            tdi_channels_arr[((size_t)s * nch + channel) * N + i] += G * (ze - zr);
+            cmplx acc(0.0, 0.0);
+            for (int s = sub_lo; s < sub_hi; s += 1)
+            {
+                cmplx zr = (seg_r >= 0) ? strain_term(s, b, seg_r, delay_rec, P3r) : cmplx(0.0, 0.0);
+                cmplx ze = (seg_e >= 0) ? strain_term(s, b, seg_e, delay_em, P3e) : cmplx(0.0, 0.0);
+                acc += w_e * ze - w_r * zr;
+            }
+            tdi_channels_arr[((size_t)b * nch + channel) * N + i] += G * acc;
+        }
+        else
+        {
+            for (int s = sub_lo; s < sub_hi; s += 1)
+            {
+                cmplx zr = (seg_r >= 0) ? strain_term(s, b, seg_r, delay_rec, P3r) : cmplx(0.0, 0.0);
+                cmplx ze = (seg_e >= 0) ? strain_term(s, b, seg_e, delay_em, P3e) : cmplx(0.0, 0.0);
+                tdi_channels_arr[((size_t)s * nch + channel) * N + i] += G * (w_e * ze - w_r * zr);
+            }
         }
     }
     if (!is_okay)
     {
-        for (int s = sub_lo; s < sub_hi; s += 1)
+        if (sum_subs)
         {
             for (int ch = 0; ch < nch; ch += 1)
             {
-                tdi_channels_arr[((size_t)s * nch + ch) * N + i] = cmplx(0.0, 0.0);
+                tdi_channels_arr[((size_t)b * nch + ch) * N + i] = cmplx(0.0, 0.0);
+            }
+        }
+        else
+        {
+            for (int s = sub_lo; s < sub_hi; s += 1)
+            {
+                for (int ch = 0; ch < nch; ch += 1)
+                {
+                    tdi_channels_arr[((size_t)s * nch + ch) * N + i] = cmplx(0.0, 0.0);
+                }
             }
         }
     }
@@ -642,7 +687,7 @@ void TDDenseTDIWaveform::postprocess_sub(void *buffer, cmplx *chan, double *amp,
 #ifdef __CUDACC__
 CUDA_KERNEL
 void td_dense_channels_kernel(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr, double *phi_ref,
-    double *params, double *t_arr, int *sub_offsets, int N, int n_params)
+    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs, double stop_taper)
 {
     CUDA_SHARED int link_rec[NLINKS];
     CUDA_SHARED int link_em[NLINKS];
@@ -653,7 +698,8 @@ void td_dense_channels_kernel(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr, do
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += gridDim.x * blockDim.x)
         {
             w->channels_point(b, i, t_arr[(size_t)b * N + i], &params[(size_t)b * n_params],
-                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em);
+                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em, sum_subs,
+                stop_taper);
         }
     }
 }
@@ -706,7 +752,8 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
 
     int n_temp_grid = (w->n_temp < 65535) ? w->n_temp : 65535;
     dim3 grid1((N + 127) / 128, n_temp_grid);
-    td_dense_channels_kernel<<<grid1, 128>>>(d_wave, tdi_channels_arr, phi_ref, params, t_arr, sub_offsets, N, n_params);
+    td_dense_channels_kernel<<<grid1, 128>>>(d_wave, tdi_channels_arr, phi_ref, params, t_arr, sub_offsets, N, n_params, 0,
+        0.0);
     cudaDeviceSynchronize();
     gpuErrchk(cudaGetLastError());
 
@@ -731,7 +778,7 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
         for (int i = 0; i < N; i += 1)
         {
             w->channels_point(b, i, t_arr[(size_t)b * N + i], &params[(size_t)b * n_params],
-                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em);
+                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, phi_ref, N, link_rec, link_em, 0, 0.0);
         }
     }
     int buffer_length = w->get_td_dense_buffer_size(N);
@@ -742,5 +789,210 @@ void td_dense_run_wave_tdi_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
             &tdi_phase[(size_t)s * nchannels * N], &phi_ref[(size_t)s * N], N);
     }
     delete[] buffer;
+#endif
+}
+
+void td_dense_run_channels_wrap(TDDenseTDIWaveform *w, cmplx *tdi_channels_arr,
+    double *params, double *t_arr, int *sub_offsets, int N, int n_params, int sum_subs, double stop_taper)
+{
+#ifdef __CUDACC__
+    Orbits *d_orbits;
+    gpuErrchk(cudaMalloc(&d_orbits, sizeof(Orbits)));
+    gpuErrchk(cudaMemcpy(d_orbits, w->orbits, sizeof(Orbits), cudaMemcpyHostToDevice));
+    TDIConfig *d_tdi_config;
+    gpuErrchk(cudaMalloc(&d_tdi_config, sizeof(TDIConfig)));
+    gpuErrchk(cudaMemcpy(d_tdi_config, w->tdi_config, sizeof(TDIConfig), cudaMemcpyHostToDevice));
+    TDDenseTDIWaveform *d_wave;
+    gpuErrchk(cudaMalloc(&d_wave, sizeof(TDDenseTDIWaveform)));
+    td_dense_construct_kernel<<<1, 1>>>(d_wave, d_orbits, d_tdi_config, w->n_temp, w->K, w->num_sub, w->amp_factor,
+        w->sub_temp, w->sub_mkn, w->n_knots, w->t_knots, w->phase_coeffs, w->amp_re, w->amp_im);
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+    int n_temp_grid = (w->n_temp < 65535) ? w->n_temp : 65535;
+    dim3 grid1((N + 127) / 128, n_temp_grid);
+    td_dense_channels_kernel<<<grid1, 128>>>(d_wave, tdi_channels_arr, nullptr, params, t_arr, sub_offsets, N,
+        n_params, sum_subs, stop_taper);
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+    gpuErrchk(cudaFree(d_orbits));
+    gpuErrchk(cudaFree(d_tdi_config));
+    gpuErrchk(cudaFree(d_wave));
+#else
+    int link_rec[NLINKS];
+    int link_em[NLINKS];
+    w->fill_link_arrays(link_rec, link_em);
+    for (int b = 0; b < w->n_temp; b += 1)
+    {
+        for (int i = 0; i < N; i += 1)
+        {
+            w->channels_point(b, i, t_arr[(size_t)b * N + i], &params[(size_t)b * n_params],
+                sub_offsets[b], sub_offsets[b + 1], tdi_channels_arr, nullptr, N, link_rec, link_em, sum_subs,
+                stop_taper);
+        }
+    }
+#endif
+}
+
+// ===========================================================================
+// wdm_lookup_sum: fused sparse-response -> WDM lookup (see lat_spline_tdi_waveform.hh)
+// ===========================================================================
+static CUDA_DEVICE inline void wdm_lookup_atomic_add(double *p, double v)
+{
+#ifdef __CUDA_ARCH__   // device pass only (atomicAdd is __device__)
+    atomicAdd(p, v);
+#else
+    *p += v;
+#endif
+}
+
+static CUDA_DEVICE void wdm_lookup_sum_point(const WDMLookupSumArgs &A, int s, int n,
+    unsigned long long *n_look, unsigned long long *n_drop)
+{
+    if (n >= A.n_stop[s]) return;
+    const double two_pi = 6.283185307179586476925286766559;
+    double t = A.t0 + (double)n * A.layer_dt;
+
+    // exact carrier (held -- derivatives zero -- outside the trajectory)
+    double car = 0.0;
+    double car1 = 0.0;
+    double car2 = 0.0;
+    if (A.carrier)
+    {
+        int b = A.sub_temp[s];
+        const double *tk = &A.t_knots[(size_t)b * A.K];
+        int nk = A.n_knots[b];
+        bool held = (t < tk[0]) || (t > tk[nk - 1]);
+        double tc = (t < tk[0]) ? tk[0] : ((t > tk[nk - 1]) ? tk[nk - 1] : t);
+        int seg = wdm_spline_segment(tk, nk, tc);
+        double h = tk[seg + 1] - tk[seg];
+        double sv = (tc - tk[seg]) / h;
+        const double *cb = &A.phase_coeffs[((size_t)b * (A.K - 1) + seg) * 24];
+        const int *mk = &A.sub_mkn[3 * s];
+        for (int p = 0; p < 3; p += 1)
+        {
+            double v, d1, d2;
+            wdm_dense_phase_derivs(&cb[8 * p], sv, &v, &d1, &d2);
+            car += mk[p] * v;
+            if (!held)
+            {
+                car1 += mk[p] * (d1 / h);
+                car2 += mk[p] * (d2 / (h * h));
+            }
+        }
+    }
+
+    const double *xs = &A.x[(size_t)s * A.nch * A.N];
+    int seg = wdm_spline_segment(xs, A.N, t);
+    double dx = t - xs[seg];
+    int n_m = A.m_hi - A.m_lo;
+    int row = A.sub_row[s];
+    for (int ch = 0; ch < A.nch; ch += 1)
+    {
+        size_t off = ((size_t)s * A.nch + ch) * A.N + seg;
+        double amp = A.amp_y[off] + dx * (A.amp_c1[off] + dx * (A.amp_c2[off] + dx * A.amp_c3[off]));
+        double r, r1, r2;
+        wdm_spline_derivs(&A.res_y[off - seg], &A.res_c1[off - seg], &A.res_c2[off - seg], &A.res_c3[off - seg],
+            seg, dx, &r, &r1, &r2);
+        double ph = r + car;
+        double f = (r1 + car1) / two_pi;
+        double fdot = (r2 + car2) / two_pi;
+        if (f < 0.0)            // a -m partner: cos is even
+        {
+            ph = -ph;
+            f = -f;
+            fdot = -fdot;
+        }
+        if (!(fabs(fdot) <= A.fdot_max) || !(f > A.f_min) || !isfinite(f))
+        {
+            *n_drop += 1;
+            continue;
+        }
+        *n_look += 1;
+        int td[4];
+        double wd[4];
+        if (!wdm_table_fdot_axis(A.tab, fdot, td, wd)) continue;   // off the fdot axis: every layer 0
+        double cph = cos(ph);
+        double sph = sin(ph);
+        int ms = (int)(f / A.layer_df);                  // truncation, as numpy .astype(int)
+        double *out_rc = &A.out[((size_t)row * A.nch + ch) * n_m * (size_t)A.Nt];
+        for (int dm = -A.num_m_layers; dm <= A.num_m_layers; dm += 1)
+        {
+            int m = ms + dm;
+            if ((m < 0) || (m >= A.Nf) || (m < A.m_lo) || (m >= A.m_hi)) continue;
+            double f_norm = f - (double)m * A.layer_df;
+            if ((f_norm < A.tab.f_lo) || (f_norm > A.tab.f_hi)) continue;   // out_of_support="zero"
+            double c, sn;
+            if (!wdm_table_cs_at(A.tab, td, wd, f_norm, &c, &sn)) continue;
+            double val = wdm_quarter_turn_value(c, sn, A.tab.ref_odd, (m + n) & 1, amp, cph, sph);
+            wdm_lookup_atomic_add(&out_rc[(size_t)(m - A.m_lo) * A.Nt + n], val);
+        }
+    }
+}
+
+#ifdef __CUDACC__
+CUDA_KERNEL
+void wdm_lookup_sum_kernel(WDMLookupSumArgs A)
+{
+    CUDA_SHARED unsigned long long blk[2];
+    if (threadIdx.x == 0)
+    {
+        blk[0] = 0;
+        blk[1] = 0;
+    }
+    CUDA_SYNC_THREADS;
+    unsigned long long n_look = 0;
+    unsigned long long n_drop = 0;
+    long long P = (long long)(A.n_hi - A.n_lo);
+    long long total = (long long)A.num_sub * P;
+    // adjacent threads = adjacent pixels of one harmonic: the same spline segment and
+    // neighbouring table cells
+    for (long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x; j < total;
+         j += (long long)gridDim.x * blockDim.x)
+    {
+        int s = (int)(j / P);
+        int n = A.n_lo + (int)(j - (long long)s * P);
+        wdm_lookup_sum_point(A, s, n, &n_look, &n_drop);
+    }
+    if (A.counts != nullptr)
+    {
+        if (n_look) atomicAdd(&blk[0], n_look);
+        if (n_drop) atomicAdd(&blk[1], n_drop);
+        CUDA_SYNC_THREADS;
+        if (threadIdx.x == 0)
+        {
+            atomicAdd(&A.counts[0], blk[0]);
+            atomicAdd(&A.counts[1], blk[1]);
+        }
+    }
+}
+#endif
+
+void wdm_lookup_sum_wrap(WDMLookupSumArgs args)
+{
+    long long P = (long long)(args.n_hi - args.n_lo);
+    if ((P <= 0) || (args.num_sub <= 0)) return;
+#ifdef __CUDACC__
+    long long total = (long long)args.num_sub * P;
+    int threads = 256;
+    long long blocks = (total + threads - 1) / threads;
+    if (blocks > (1LL << 20)) blocks = 1LL << 20;
+    wdm_lookup_sum_kernel<<<(int)blocks, threads>>>(args);
+    cudaDeviceSynchronize();
+    gpuErrchk(cudaGetLastError());
+#else
+    unsigned long long n_look = 0;
+    unsigned long long n_drop = 0;
+    for (int s = 0; s < args.num_sub; s += 1)
+    {
+        for (int n = args.n_lo; n < args.n_hi; n += 1)
+        {
+            wdm_lookup_sum_point(args, s, n, &n_look, &n_drop);
+        }
+    }
+    if (args.counts != nullptr)
+    {
+        args.counts[0] += n_look;
+        args.counts[1] += n_drop;
+    }
 #endif
 }

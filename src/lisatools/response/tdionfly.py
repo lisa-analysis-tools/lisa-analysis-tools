@@ -1019,8 +1019,10 @@ class SOBBHTDIonTheFly(TDIonTheFly):
         ), fill_splines=return_spline)
 
 class TDDenseTDIonTheFly(TDIonTheFly):
-    """Template-batched TD TDI-on-the-fly for multi-harmonic sources sharing one trajectory
-    (EMRIs), with EXACT phases from the integrator's 8th-order dense output.
+    """Template-batched TD TDI on the fly for multi-harmonic sources (EMRIs), exact phases.
+
+    For multi-harmonic sources sharing one trajectory (EMRIs), with EXACT
+    phases from the integrator's 8th-order dense output.
 
     Per template ``b``: the evaluation times ``t[b]`` (one common length ``N``), the
     integrator knots ``t_knots[b, :n_knots[b]]`` and DOPR853 phase coefficients
@@ -1033,6 +1035,33 @@ class TDDenseTDIonTheFly(TDIonTheFly):
     The kernel computes the link geometry once per (template, time) and reuses it for every
     harmonic; the output is a :class:`TDTDIOutput` over all harmonics (``phase_ref`` = the pure
     carrier ``Phi_s`` at spacecraft-1 time; the amplitude's phase lands in ``tdi_phase``).
+
+    Production: the ``EMRI_DIRECT_RESPONSE=dense`` path of
+    :class:`~lisatools.sources.emri.wdm_direct.EMRIDirectWDM` (both launchers), on a
+    sparse time grid. All arrays are held on the instance because the backend
+    ``TDDenseTDIWaveformWrap`` keeps raw pointers to them.
+
+    Args:
+        t (array-like): ``(n_temp, N)`` evaluation times [s].
+        sub_offsets (array-like): ``(n_temp + 1,)`` int harmonic offsets; template
+            ``b`` owns harmonics ``sub_offsets[b]:sub_offsets[b + 1]``, ``num_sub =
+            sub_offsets[-1]`` (numpy or cupy).
+        sub_mkn (array-like): ``(num_sub, 3)`` int ``(m, k, n)`` per harmonic.
+        t_knots (array-like): ``(n_temp, K)`` integrator knot times [s].
+        n_knots (array-like): ``(n_temp,)`` int valid knots per template.
+        phase_coeffs (array-like): ``(n_temp, K - 1, 3, 8)`` DOPR853 dense-output
+            coefficients of the three phases.
+        amp_re (array-like): ``(num_sub, K - 1, 4)`` monomial cubic coefficients of
+            the amplitude's real part.
+        amp_im (array-like): Same for the imaginary part.
+        amp_factor (float, optional): Overall amplitude factor. Default ``1.0``.
+        tdi_config (optional): As in :class:`TDIonTheFly`. Default ``None``.
+        orbits (optional): As in :class:`TDIonTheFly`. Default ``None``
+            (equal-arm; the global fit passes its unequal-arm orbits).
+        force_backend (str, optional): ``lisatools`` backend flavor.
+
+    Raises:
+        RuntimeError: The backend module has no ``TDDenseTDIWaveformWrap``.
     """
 
     def __init__(self, t, sub_offsets, sub_mkn, t_knots, n_knots, phase_coeffs, amp_re, amp_im,
@@ -1063,8 +1092,12 @@ class TDDenseTDIonTheFly(TDIonTheFly):
             self.sub_temp, self.sub_mkn.ravel(), self.n_knots, self.t_knots.ravel(),
             self.phase_coeffs.ravel(), self.amp_re.ravel(), self.amp_im.ravel())
 
-    def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":
-        """``params``: (n_temp, 4) = (inc, psi, lam, beta) per template."""
+    def _run(self, params):
+        """Run the full kernel; return flat ``(chans, amp, phase, phi_ref)`` buffers.
+
+        ``params`` is reshaped to ``(n_temp, 4)`` = ``(inc, psi, lam, beta)``. The buffers
+        are ``num_sub * nchannels * N`` long (``phi_ref``: ``num_sub * N``).
+        """
         xp = self.xp
         params = xp.ascontiguousarray(xp.asarray(params, dtype=xp.float64).reshape(self.n_temp, 4))
         nch = self.tdi_config.nchannels
@@ -1075,6 +1108,72 @@ class TDDenseTDIonTheFly(TDIonTheFly):
         phi_ref = xp.zeros(S * N, dtype=float)
         self.wave_gen.run_wave_tdi_wrap(chans, amp, phase, phi_ref, params.ravel(), self.t.ravel(),
                                         self.sub_offsets, N, 4, nch)
+        return chans, amp, phase, phi_ref
+
+    def channels(self, params, sum_subs=False, stop_taper=0.0):
+        """Return the raw complex TDI channels at the evaluation times.
+
+        The exact channel is the real part (no amplitude/phase representation, so a signal
+        that stops -- an in-window plunge -- keeps the TDI combination's own structure). Runs
+        the channel kernel only (no amplitude/phase extraction); a backend module without
+        ``run_channels_wrap`` falls back to the full kernel.
+
+        ``stop_taper`` [s] > 0 weights every delay term by a sin^2 window on its EMISSION time that
+        falls to 0 at the last knot over that span: the same window for every term, so the TDI
+        cancellation holds through the stop, and each term is smooth there. Without it, a sampled
+        channel keeps a net area from the terms' abrupt cuts falling between samples, which
+        aliases into the lowest frequencies (``tests/test_tdi_dense.py``).
+
+        Args:
+            params (array-like): ``(n_temp, 4)`` = ``(inc, psi, lam, beta)`` per template.
+            sum_subs (bool, optional): Sum each template's harmonics. Default ``False``.
+            stop_taper (float, optional): Taper span [s]; ``0`` (default) is off.
+
+        Returns:
+            xp.ndarray: Complex ``(num_sub, nch, N)``, or ``(n_temp, nch, N)`` with
+            ``sum_subs``.
+
+        Raises:
+            RuntimeError: ``stop_taper > 0`` on a module without ``run_channels_wrap``, or
+                a compiled ``run_channels_wrap`` that predates ``stop_taper``.
+        """
+        xp = self.xp
+        nch = self.tdi_config.nchannels
+        if not hasattr(self.wave_gen, "run_channels_wrap"):          # an older module
+            if stop_taper > 0:
+                raise RuntimeError("TDDenseTDIonTheFly.channels(stop_taper>0) needs the compiled "
+                                   "run_channels_wrap: rebuild lisatools (pip install -e . --no-build-isolation)")
+            chans = self._run(params)[0].reshape(self.num_sub, nch, self.N)
+            if not sum_subs:
+                return chans
+            return xp.stack([chans[int(a):int(b)].sum(axis=0) for a, b in
+                             zip(self.sub_offsets[:-1].tolist(), self.sub_offsets[1:].tolist())])
+        params = xp.ascontiguousarray(xp.asarray(params, dtype=xp.float64).reshape(self.n_temp, 4))
+        rows = self.n_temp if sum_subs else self.num_sub
+        chans = xp.zeros(rows * nch * self.N, dtype=complex)
+        try:
+            self.wave_gen.run_channels_wrap(chans, params.ravel(), self.t.ravel(), self.sub_offsets,
+                                            self.N, 4, nch, int(bool(sum_subs)), float(stop_taper))
+        except TypeError as exc:                                     # a module without stop_taper
+            raise RuntimeError("the compiled run_channels_wrap predates stop_taper: rebuild lisatools "
+                               f"(pip install -e . --no-build-isolation) ({exc})") from exc
+        return chans.reshape(rows, nch, self.N)
+
+    def __call__(self, params, return_spline: bool = True) -> "TDTDIOutput":
+        """Run the kernel and return the amplitude / phase output of every harmonic.
+
+        Args:
+            params (array-like): ``(n_temp, 4)`` = ``(inc, psi, lam, beta)`` per template
+                (sky in the orbits' frame).
+            return_spline: Build the output's splines. Default ``True``.
+
+        Returns:
+            TDTDIOutput: On the per-harmonic time grid ``t[sub_temp]`` ``(num_sub, N)``,
+            ``tdi_amp`` / ``tdi_phase`` ``(num_sub, nch, N)``, ``phase_ref`` ``(num_sub, N)``.
+        """
+        nch = self.tdi_config.nchannels
+        S, N = self.num_sub, self.N
+        chans, amp, phase, phi_ref = self._run(params)
         x = self.t[self.sub_temp]
         return TDTDIOutput(x, amp.reshape(S, nch, N), phase.reshape(S, nch, N), phi_ref.reshape(S, N),
                            fill_splines=return_spline, force_backend=self.backend.name.split("_")[-1])

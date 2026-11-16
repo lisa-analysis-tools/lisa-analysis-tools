@@ -340,10 +340,16 @@ void response_part(nb::module_ &m) {
          nb::arg("amp_factor"), nb::arg("sub_temp"), nb::arg("sub_mkn"), nb::arg("n_knots"), nb::arg("t_knots"),
          nb::arg("phase_coeffs"), nb::arg("amp_re"), nb::arg("amp_im"))
     .def("run_wave_tdi_wrap", &TDDenseTDIWaveformWrap::run_wave_tdi_wrap, "Template-batched TDI with dense-output phases.")
+    .def("run_channels_wrap", &TDDenseTDIWaveformWrap::run_channels_wrap,
+         "Raw complex channels only (optionally summed over each template's harmonics).")
     .def("get_buffer_size", &TDDenseTDIWaveformWrap::get_buffer_size, "Get needed buffer size.")
     .def_rw("orbits", &TDDenseTDIWaveformWrap::orbits)
     .def_rw("tdi_config", &TDDenseTDIWaveformWrap::tdi_config)
     ;
+
+    // fused sparse-response -> WDM lookup sum (EMRI direct-to-WDM)
+    m.def("wdm_lookup_sum", &wdm_lookup_sum_binding, nb::call_guard<nb::gil_scoped_release>(),
+          "Fused sparse-response -> WDM n_ref lookup sum (see lat_spline_tdi_waveform.hh).");
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
     nb::class_<TDSplineTDIWaveform>(m, "TDSplineTDIWaveformGPU")

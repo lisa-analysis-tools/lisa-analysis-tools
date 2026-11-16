@@ -85,6 +85,9 @@ class LISAToolsBackendMethods(BackendMethods):
     # Template-batched TD TDI-on-the-fly with exact dense-output phases (EMRI,
     # 2026-09-30). ``None`` on a module built before it landed.
     TDDenseTDIWaveformWrap: typing.Optional[object] = dataclasses.field(default=None, kw_only=True)
+    # Fused sparse-response -> WDM lookup sum (EMRI direct-to-WDM, 2026-10-02).
+    # ``None`` on a module built before it landed (the Python lookup path is used).
+    wdm_lookup_sum: typing.Optional[typing.Callable[(...), None]] = dataclasses.field(default=None, kw_only=True)
 
 
 class LISAToolsBackend:
@@ -117,6 +120,7 @@ class LISAToolsBackend:
     psd_likelihood: typing.Callable[(...), None]
     compute_logpdf: typing.Callable[(...), None]
     TDDenseTDIWaveformWrap: typing.Optional[object]
+    wdm_lookup_sum: typing.Optional[typing.Callable[(...), None]]
     # Phase 3L.7k LISA-response Wraps (see LISAToolsBackendMethods).
     TDSplineTDIWaveformWrap: object
     FDSplineTDIWaveformWrap: object
@@ -150,6 +154,7 @@ class LISAToolsBackend:
         self.psd_likelihood = lisatools_backend_methods.psd_likelihood
         self.compute_logpdf = lisatools_backend_methods.compute_logpdf
         self.TDDenseTDIWaveformWrap = lisatools_backend_methods.TDDenseTDIWaveformWrap
+        self.wdm_lookup_sum = lisatools_backend_methods.wdm_lookup_sum
         # Phase 3L.7k -- LISA-response wraps absorbed from
         # fastlisaresponse cutils backend (which is being retired).
         self.TDSplineTDIWaveformWrap = lisatools_backend_methods.TDSplineTDIWaveformWrap
@@ -209,6 +214,7 @@ class LISAToolsCpuBackend(CpuBackend, LISAToolsBackend):
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
             TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapCPU", None),
+            wdm_lookup_sum=getattr(_lat_pd, "wdm_lookup_sum", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapCPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapCPU,
@@ -280,6 +286,7 @@ class LISAToolsCuda11xBackend(Cuda11xBackend, LISAToolsBackend):
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
             TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
+            wdm_lookup_sum=getattr(_lat_pd, "wdm_lookup_sum", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
@@ -348,6 +355,7 @@ class LISAToolsCuda12xBackend(Cuda12xBackend, LISAToolsBackend):
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
             TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
+            wdm_lookup_sum=getattr(_lat_pd, "wdm_lookup_sum", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
@@ -417,6 +425,7 @@ class LISAToolsCuda13xBackend(Cuda13xBackend, LISAToolsBackend):
             psd_likelihood=_lat_pd.psd_likelihood,
             compute_logpdf=_lat_pd.compute_logpdf,
             TDDenseTDIWaveformWrap=getattr(_lat_pd, "TDDenseTDIWaveformWrapGPU", None),
+            wdm_lookup_sum=getattr(_lat_pd, "wdm_lookup_sum", None),
             # Phase 3L.7k LISA-response wraps absorbed from fastlisaresponse.
             TDSplineTDIWaveformWrap=_lat_pd.TDSplineTDIWaveformWrapGPU,
             FDSplineTDIWaveformWrap=_lat_pd.FDSplineTDIWaveformWrapGPU,
