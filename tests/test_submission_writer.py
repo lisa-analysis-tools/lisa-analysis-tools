@@ -103,6 +103,31 @@ class SubmissionWriterDecouplingTest(unittest.TestCase):
         for name in ["MBHB", "GB", "noise"]:
             self.assertNotIn("pending", self._metadata_json(writer, name)["comment"])
 
+    def test_a_class_among_the_waveform_kwargs_does_not_cost_the_metadata(self):
+        # few writes the trajectory class into inspiral_kwargs["func"] of the kwargs it is built with; whatever
+        # ends up in the config, the h5 attributes and the json file are written
+        import h5py
+
+        writer = _make_writer(self.parent)
+        writer._prepare_gb_samples = lambda acs, orig, samples, inds: (samples, inds)
+        config = {
+            "waveform_kwargs": {"inspiral_kwargs": {"func": SimpleNamespace, "err": np.float64(1e-8)}},
+            "grid": np.arange(3), "order": 25,
+        }
+        writer._curr.source_metadata["mbh"].waveform_model_config = config
+        writer.write_submission(acs=None)
+
+        expected = {
+            "waveform_kwargs": {"inspiral_kwargs": {"func": "types.SimpleNamespace", "err": 1e-8}},
+            "grid": [0, 1, 2], "order": 25,
+        }
+        self.assertEqual(self._metadata_json(writer, "MBHB")["waveform_model_config"], expected)
+        (h5_path,) = glob.glob(os.path.join(self._folder(writer), "*_MBHB_2026*.h5"))
+        with h5py.File(h5_path, "r") as f:
+            self.assertEqual(json.loads(f.attrs["waveform_model_config"]), expected)
+        self.assertEqual(len(self._posterior_files(writer, "MBHB")), 1)
+        self.assertIs(config["waveform_kwargs"]["inspiral_kwargs"]["func"], SimpleNamespace)  # the config is left
+
     def _found(self, writer):
         with open(os.path.join(self._folder(writer), "global_metadata.json")) as f:
             return json.load(f)["found_source_types_list"]

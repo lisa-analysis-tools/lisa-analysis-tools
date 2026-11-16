@@ -264,10 +264,10 @@ def _save_metadata_attributes(h5obj: h5py.File | h5py.Group, metadata: MetadataB
         value = getattr(metadata, field.name)
         if isinstance(value, (str, int, float)):
             h5obj.attrs[field.name] = value
-        elif isinstance(value, list):
-            h5obj.attrs[field.name] = json.dumps(value)
-        elif isinstance(value, dict):
-            h5obj.attrs[field.name] = json.dumps(value)
+        elif isinstance(value, (list, dict)):
+            # * sanitised as the JSON file is (to_json): a value json cannot write (a class a waveform put among
+            # * its kwargs, an array) must not cost the branch its metadata
+            h5obj.attrs[field.name] = json.dumps(metadata.json_sanitize(value))
         else:
             logger.warning(
                 f"Unsupported metadata field type for '{field.name}': {type(value)}. Skipping this field."
@@ -951,6 +951,10 @@ class MetadataBase:
             return obj.isoformat()
         elif isinstance(obj, (str, int, float, bool)) or obj is None:
             return obj
+        elif isinstance(obj, type):
+            return f"{obj.__module__}.{obj.__qualname__}"  # a class: its import path
+        elif isinstance(obj, np.generic):
+            return obj.item()
         else:
             logger.warning(f"Unsupported type {type(obj)} for JSON serialization. Converting to string.")
             return str(obj)

@@ -175,6 +175,17 @@ def with_waveform_kwargs(block, **extra):
     return {**block, "waveform": waveform}
 
 
+class WaveformMetadataTest(unittest.TestCase):
+    def test_config_is_a_copy_of_its_own(self):
+        # the waveform is built from init_kwargs after the metadata is made, and may write into its nested dicts
+        init_kwargs = {"waveform_kwargs": {"inspiral_kwargs": {"err": 1e-8}}, "order": 25, "orbits": object(),
+                       "settings": object(), "data_td_settings": object()}
+        config = blocks_base.waveform_metadata_config(init_kwargs, "mojito")
+        init_kwargs["waveform_kwargs"]["inspiral_kwargs"]["func"] = dict  # as few does with its trajectory class
+        self.assertEqual(config["waveform_kwargs"], {"inspiral_kwargs": {"err": 1e-8}})
+        self.assertEqual(sorted(config), ["force_backend", "order", "time_reference", "waveform_kwargs"])
+
+
 class SourceSchemaTest(_Sources):
     def test_blocks_load(self):
         cfg = self.config({"mbh": MBH_BLOCK, "emri": EMRI_BLOCK})

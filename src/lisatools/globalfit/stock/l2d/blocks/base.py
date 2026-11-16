@@ -796,7 +796,9 @@ TIME_REFERENCE_NAMES = {"mojito": "MOJITO_REFERENCE_TIME", "data_start": "data_s
 def waveform_metadata_config(init_kwargs: dict, time_reference: str) -> dict:
     """What SourceMetadata records: no live objects (data/STFT settings, orbits), CPU backend (as the settings
     files did), and what ``waveform_t0`` is (the sampled times and phases are referenced to it)."""
-    config = {k: v for k, v in init_kwargs.items() if k not in ("data_td_settings", "settings", "orbits")}
+    # * A copy of its own: the waveform is built from init_kwargs later and may write into its nested dicts
+    # * (few puts the trajectory class into inspiral_kwargs["func"]), which must not reach the metadata.
+    config = deepcopy({k: v for k, v in init_kwargs.items() if k not in ("data_td_settings", "settings", "orbits")})
     config["force_backend"] = "cpu"
     config["time_reference"] = TIME_REFERENCE_NAMES[time_reference]
     return config
