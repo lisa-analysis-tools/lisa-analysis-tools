@@ -17,6 +17,7 @@ from .response import (  # noqa: F401
 )
 from .sparse_tracks import (  # noqa: F401
     EMRISparseResponse,
+    EMRITrackSource,
     ExactPhaseTDIOutput,
     SplinedTDIOutput,
 )

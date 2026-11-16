@@ -15,7 +15,8 @@ import numpy as np
 from scipy.signal.windows import tukey
 
 import lisatools
-from lisatools.stft_tracks import STFTTrackAccumulator, cubic_phase_error, track_half_width
+from lisatools.stft_tracks import (SparseTrackSource, STFTTrackAccumulator, cubic_phase_error, periodic_tukey,
+                                   stft_templates_from_tracks, track_half_width)
 
 T_SEG = 21600.0
 DT = 5.0
@@ -159,6 +160,22 @@ class TrackSumTest(unittest.TestCase):
         np.testing.assert_allclose(cubic_phase_error(fdot, t, T_SEG),
                                    (np.pi / 3) * fddot * (T_SEG / 2) ** 3, rtol=1e-9)
 
+    def test_cubic_phase_error_validity(self):
+        t = (np.arange(5) + 0.5) * T_SEG
+        fdot = np.broadcast_to(np.array([0.0, 1.0, 3.0, 6.0, 10.0]) * 1e-12, (1, 3, 5))
+        unit = (np.pi / 3) * (T_SEG / 2) ** 3 * 1e-12 / T_SEG
+        # the larger of the two neighbouring differences
+        np.testing.assert_allclose(cubic_phase_error(fdot, t, T_SEG)[0] / unit, [1, 2, 3, 4, 4], rtol=1e-9)
+        valid = np.array([[True, True, False, True, False]])
+        got = cubic_phase_error(fdot, t, T_SEG, valid=valid)[0] / unit
+        np.testing.assert_allclose(got[:2], [1, 1], rtol=1e-9)
+        self.assertTrue(np.isinf(got[3]))            # no valid neighbour
+
+    def test_periodic_tukey(self):
+        for alpha in (0.0, 0.1, 0.5, 1.0):
+            ref = tukey(NPER, alpha, sym=False) if alpha > 0 else np.ones(NPER)
+            np.testing.assert_allclose(periodic_tukey(NPER, alpha), ref, atol=1e-13)
+
     def test_shape_errors(self):
         z = np.ones((2, 3, 4))
         acc = self.acc(0.1)
@@ -168,6 +185,134 @@ class TrackSumTest(unittest.TestCase):
             acc(z, z, z, z, component_row=np.array([0, 2]), num_rows=2)
         with self.assertRaises(ValueError):
             acc(z, z, z, z, half_width=np.ones((2, 3), dtype=np.int32))
+
+
+class ToySource:
+    """Two rows of chirps with cubic and quartic phase terms, no relation to any astrophysical source.
+
+    Row 0: two components that chirp faster and faster and stop at ``t_end`` (tapered over
+    ``TAPER``); their tracks are defined up to ``t_end - MARGIN``. Row 1: one slow component
+    that lasts forever. Channel ch scales the amplitude and shifts the phase.
+    """
+
+    TAPER = 600.0
+    MARGIN = 900.0
+
+    def __init__(self, t_end, xp=np):
+        self.xp = xp
+        self.num_rows = 2
+        self.component_row = np.array([0, 0, 1])
+        self.t_end = float(t_end)
+        #           amp   phi0  f0      fdot0   fddot0   amp drift [1/s]  fdddot
+        self.par = np.array([[1.0, 0.3, 3.0e-3, 2e-10, 1.5e-15, 2e-7, 1.2e-19],
+                             [0.6, 1.9, 4.5e-3, -1e-10, -2.5e-15, -1e-7, -0.8e-19],
+                             [0.8, -0.7, 6.0e-3, 3e-11, 0.0, 0.0, 0.0]])
+        self.ch_amp = np.array([1.0, -0.7, 0.4])     # a signed amplitude on channel 1
+        self.ch_phase = np.array([0.0, 0.9, -2.1])
+
+    def _parts(self, t):
+        xp = self.xp
+        t = xp.asarray(t, dtype=float)[None, None, :]
+        a0, p0, f0, fd, fdd, drift, f3 = (xp.asarray(self.par[:, i])[:, None, None] for i in range(7))
+        amp = a0 * (1.0 + drift * t) * xp.asarray(self.ch_amp)[None, :, None]
+        phase = p0 + xp.asarray(self.ch_phase)[None, :, None] + 2 * np.pi * (
+            f0 * t + fd * t**2 / 2 + fdd * t**3 / 6 + f3 * t**4 / 24)
+        f = f0 + fd * t + fdd * t**2 / 2 + f3 * t**3 / 6 + 0 * amp
+        fdot = fd + fdd * t + f3 * t**2 / 2 + 0 * amp
+        return amp, phase, f, fdot
+
+    def eval_tracks(self, t_anchor):
+        return self._parts(t_anchor)
+
+    def track_span(self):
+        return np.array([-np.inf] * 3), np.array([self.t_end - self.MARGIN] * 2 + [np.inf])
+
+    def signal_span(self):
+        return np.array([-np.inf, -np.inf]), np.array([self.t_end, np.inf])
+
+    def td_channels(self, row, t):
+        xp = self.xp
+        t = xp.asarray(t, dtype=float)
+        amp, phase, _, _ = self._parts(t)
+        x = (amp * xp.cos(phase))[xp.asarray(np.flatnonzero(self.component_row == row))].sum(axis=0)
+        if row == 0:
+            u = xp.clip((self.t_end - t) / self.TAPER, 0.0, 1.0)
+            x = x * 0.5 * (1.0 - xp.cos(np.pi * u))
+        return x
+
+
+class TemplateDriverTest(unittest.TestCase):
+    """stft_templates_from_tracks on a toy source: tracks, dense fallback and zero segments."""
+
+    backend = "cpu"
+    ALPHA = 0.3
+
+    def run_case(self, hop):
+        acc = STFTTrackAccumulator(T_SEG, 0.0, NF, self.ALPHA, force_backend=self.backend)
+        xp = acc.xp
+        src = ToySource(t_end=13.4 * T_SEG, xp=xp)
+        self.assertIsInstance(src, SparseTrackSource)
+        seg = np.arange(0.0, 16 * T_SEG - 1e-6, hop)
+        out, info = stft_templates_from_tracks(src, acc, seg, DT, n_side=40, cubic_tol=0.03, return_info=True)
+        out = out.get() if hasattr(out, "get") else out
+        w = tukey(NPER, self.ALPHA, sym=False)
+        t = seg[:, None] + np.arange(NPER) * DT
+        ref = np.stack([DT * np.fft.rfft(np.asarray(src.td_channels(r, xp.asarray(t.ravel())).get()
+                                                    if hasattr(xp, "asnumpy") else src.td_channels(r, t.ravel())
+                                                    ).reshape(3, seg.size, NPER) * w, axis=-1) for r in range(2)])
+        return seg, out, ref, info
+
+    def check(self, hop):
+        seg, out, ref, info = self.run_case(hop)
+        mode = info["mode"]
+        # row 1 is slow everywhere; row 0 goes tracks -> dense -> zero
+        self.assertTrue(np.all(mode[1] == 1))
+        m0 = mode[0]
+        self.assertTrue({0, 1, 2} <= set(m0.tolist()))
+        self.assertTrue(np.all(np.diff(np.where(m0 == 1, 0, np.where(m0 == 2, 1, 2))) >= 0))
+        self.assertTrue(np.all(m0[seg >= 13.4 * T_SEG] == 0))
+        self.assertTrue(np.all(m0[(seg < 13.4 * T_SEG) & (seg + T_SEG > 13.4 * T_SEG - ToySource.MARGIN)] == 2))
+        # dense segments are the reference itself; zero segments are zero
+        np.testing.assert_allclose(out[0][:, m0 == 2], ref[0][:, m0 == 2], rtol=1e-12, atol=1e-12 * np.abs(ref).max())
+        self.assertTrue(np.all(out[0][:, m0 == 0] == 0))
+        # track segments: every one within the tolerance's reach, and the whole template
+        for r in range(2):
+            tr = mode[r] == 1
+            a, b = out[r][:, tr], ref[r][:, tr]
+            worst = max(1 - np.vdot(a[:, j], b[:, j]).real / np.sqrt(np.vdot(a[:, j], a[:, j]).real * np.vdot(b[:, j], b[:, j]).real)
+                        for j in range(a.shape[1]))
+            self.assertLess(worst, 3e-5, f"row {r}")
+            self.assertLess(np.abs(a - b).max() / np.abs(b).max(), 5e-3)
+        mm = 1 - np.vdot(out, ref).real / np.sqrt(np.vdot(out, out).real * np.vdot(ref, ref).real)
+        self.assertLess(mm, 1e-5)
+        return info
+
+    def test_contiguous_segments(self):
+        info = self.check(T_SEG)
+        # the cubic criterion, not only the track end, sends segments to the dense path
+        self.assertGreater(int(np.sum(info["mode"][0] == 2)), 2)
+
+    def test_overlapping_segments(self):
+        self.check(0.5 * T_SEG)
+
+    def test_tolerance_controls_fallback(self):
+        acc = STFTTrackAccumulator(T_SEG, 0.0, NF, self.ALPHA, force_backend=self.backend)
+        src = ToySource(t_end=13.4 * T_SEG, xp=acc.xp)
+        seg = np.arange(16) * T_SEG
+        n_dense = [int(np.sum(stft_templates_from_tracks(src, acc, seg, DT, cubic_tol=tol, return_info=True)[1]["mode"] == 2))
+                   for tol in (1e-3, 0.03, 10.0)]
+        self.assertTrue(n_dense[0] > n_dense[1] > n_dense[2] >= 1)
+        capped = stft_templates_from_tracks(src, acc, seg, DT, cubic_tol=10.0, max_half_width=31, n_side=30,
+                                            return_info=True)[1]["mode"]
+        self.assertGreater(int(np.sum(capped == 2)), n_dense[2])
+
+    def test_grid_errors(self):
+        acc = STFTTrackAccumulator(T_SEG, 0.0, NF, self.ALPHA, force_backend=self.backend)
+        src = ToySource(t_end=5 * T_SEG, xp=acc.xp)
+        with self.assertRaises(ValueError):
+            stft_templates_from_tracks(src, acc, np.arange(3) * T_SEG, 7.0)
+        with self.assertRaises(ValueError):
+            stft_templates_from_tracks(src, acc, np.arange(3) * T_SEG, 4 * DT)   # band above Nyquist
 
 
 def _gpu_backend():
@@ -199,5 +344,11 @@ class TrackSumGPUTest(TrackSumTest):
         np.testing.assert_allclose(gpu, cpu, rtol=1e-9, atol=1e-9 * np.abs(cpu).max())
 
 
+@unittest.skipIf(_gpu_backend() is None, "no usable GPU backend")
+class TemplateDriverGPUTest(TemplateDriverTest):
+    backend = _gpu_backend()
+
+
 if __name__ == "__main__":
     unittest.main()
+

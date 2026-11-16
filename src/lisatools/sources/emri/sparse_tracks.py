@@ -965,3 +965,88 @@ class EMRISparseResponse:
             dense, par = self._dense_kernel([item], tb[None, :])[:2]
             out[:, :, b0:b0 + tb.size] = xp.real(dense.channels(par, sum_subs=sum_subs, stop_taper=stop_taper))
         return out[0] if sum_subs else out
+
+
+class EMRITrackSource:
+    """A batch of EMRI templates as a :class:`lisatools.stft_tracks.SparseTrackSource`.
+
+    The components are the harmonics (-m partners included) of every template; a row is a
+    template. This is the only EMRI-specific piece between the sparse response and a
+    track-accumulated template of any domain (``lisatools.stft_tracks``).
+
+    Args:
+        response (EMRISparseResponse): The sparse response.
+        items (list): Template items (:meth:`EMRISparseResponse.template_inputs`).
+        holders (list): Their host holders, in the same order.
+        stop_taper (float, optional): Emission-time taper [s] before the end of a trajectory,
+            applied to the exact time series (:meth:`td_channels`). Default 120.
+
+    A template whose inspiral ends before the window has no component and an empty signal
+    span (its row stays zero). One whose trajectory is too short for the response splines has
+    no component either, and its row is evaluated from the exact time series.
+    """
+
+    def __init__(self, response, items, holders, stop_taper=120.0):
+        if len(items) != len(holders):
+            raise ValueError("items and holders must have the same length")
+        self.response = response
+        self.items = list(items)
+        self.stop_taper = float(stop_taper)
+        self.num_rows = len(self.items)
+        xp = response.xp
+        t0 = response.t_start
+        sig_lo = np.full(self.num_rows, np.inf)
+        sig_hi = np.full(self.num_rows, -np.inf)
+        tracked, grids = [], []
+        for b, H in enumerate(holders):
+            if response.ends_before_window(H):
+                continue
+            t_arr = np.asarray(H.t_arr, dtype=float)
+            # the kernel zeroes a channel whose delayed times leave the trajectory
+            sig_lo[b], sig_hi[b] = t0 + t_arr[0], t0 + t_arr[-1] + response.DELAY_MARGIN
+            g = response.sparse_grid(H)
+            if np.size(g) >= MIN_RESPONSE_POINTS:
+                tracked.append(b)
+                grids.append(g)
+        self._signal_span = (sig_lo, sig_hi)
+        self._tracked = np.array(tracked, dtype=np.int64)
+        if tracked:
+            self._out = response.tracks([self.items[b] for b in tracked], grids)
+            temp = np.asarray(self._out._temp)
+            self.component_row = self._tracked[temp]
+            x = self._out.x
+            x = x.get() if hasattr(x, "get") else np.asarray(x)
+            self._track_span = (x.min(axis=1), x.max(axis=1))
+            self._temp = temp
+        else:
+            self._out = None
+            self.component_row = np.zeros(0, dtype=np.int64)
+            self._track_span = (np.zeros(0), np.zeros(0))
+            self._temp = np.zeros(0, dtype=np.int64)
+        self.xp = xp
+
+    def track_span(self):
+        return self._track_span
+
+    def signal_span(self):
+        return self._signal_span
+
+    def eval_tracks(self, t_anchor):
+        """``(amp, phase, f, fdot)``, each ``(num harmonics, nch, NT)``; anchors outside a
+        template's response grid are evaluated at its nearest end (ignored by the caller)."""
+        xp = self.xp
+        t = xp.asarray(t_anchor, dtype=float)
+        nch = self.response.tdi_config.nchannels
+        outs = [xp.zeros((self._temp.size, nch, int(t.size))) for _ in range(4)]
+        lo, hi = self._track_span
+        for b in np.unique(self._temp):
+            subs = np.flatnonzero(self._temp == b)
+            vals = self._out.eval_tracer(xp.clip(t, float(lo[subs[0]]), float(hi[subs[0]])), subs)
+            for o, v in zip(outs, vals):
+                o[xp.asarray(subs)] = v
+        return tuple(outs)
+
+    def td_channels(self, row, t):
+        """Exact summed channels ``(nch, len(t))`` of template ``row``, tapered at its end."""
+        return self.response.td_channels(self.items[int(row)], t, sum_subs=True, stop_taper=self.stop_taper)
+

@@ -133,6 +133,74 @@ class SparseDriverExactChannelsTest(unittest.TestCase):
         self.assertEqual(np.abs(tap[:, late]).max(), 0.0)
 
 
+def _mismatch(a, b):
+    return 1 - np.vdot(a, b).real / np.sqrt(np.vdot(a, a).real * np.vdot(b, b).real)
+
+
+def _stft_reference(d, item, seg, T_seg, dt, alpha, stop_taper=120.0):
+    from lisatools.stft_tracks import periodic_tukey
+
+    nper = int(round(T_seg / dt))
+    ts = (seg[:, None] + np.arange(nper) * dt).ravel()
+    x = np.asarray(d.td_channels(item, ts, sum_subs=True, stop_taper=stop_taper)).reshape(3, seg.size, nper)
+    return dt * np.fft.rfft(x * periodic_tukey(nper, alpha), axis=-1)
+
+
+class TrackSourceTest(unittest.TestCase):
+    """EMRITrackSource + the source-agnostic STFT driver on synthetic templates: one that
+    covers the window, one that stops inside it, one that ends before it."""
+
+    def test_batch_tracks_dense_and_zero_rows(self):
+        from lisatools.sources.emri.sparse_tracks import EMRITrackSource
+        from lisatools.stft_tracks import SparseTrackSource, STFTTrackAccumulator, stft_templates_from_tracks
+
+        T_seg, dt, alpha = 14400.0, 10.0, 0.3
+        w_lo = T_START + 1 * DAY
+        d = _driver(t_window=(w_lo, w_lo + 2 * DAY), data_dt=dt, sparse_dt=7200.0)
+        ends = (4 * DAY, 2.3 * DAY, 0.5 * DAY)
+        items = [_item(e) for e in ends]
+        holders = [SimpleNamespace(t_arr=it[0][0]) for it in items]
+        src = EMRITrackSource(d, items, holders)
+        self.assertIsInstance(src, SparseTrackSource)
+        self.assertEqual(src.num_rows, 3)
+        np.testing.assert_array_equal(np.unique(src.component_row), [0, 1])     # row 2 has no track
+        seg = w_lo + np.arange(12) * T_seg
+        nper = int(T_seg / dt)
+        acc = STFTTrackAccumulator(T_seg, 0.0, nper // 2 + 1, alpha)
+        out, info = stft_templates_from_tracks(src, acc, seg, dt, n_side=40, return_info=True)
+        mode = info["mode"]
+        self.assertTrue(np.all(mode[0] == 1))
+        self.assertTrue(np.all(mode[2] == 0) and np.all(out[2] == 0))
+        stop = T_START + ends[1]
+        self.assertTrue(np.all(mode[1][seg + T_seg <= stop - 2 * d.DELAY_MARGIN] == 1))
+        self.assertTrue(np.all(mode[1][(seg < stop) & (seg + T_seg > stop)] == 2))
+        self.assertTrue(np.all(mode[1][seg >= stop + d.DELAY_MARGIN] == 0))
+        for r in (0, 1):
+            ref = _stft_reference(d, items[r], seg, T_seg, dt, alpha)
+            self.assertLess(_mismatch(out[r], ref), 1e-6, f"row {r}")
+            dense = mode[r] == 2
+            np.testing.assert_allclose(out[r][:, dense], ref[:, dense], rtol=1e-12, atol=1e-12 * np.abs(ref).max())
+            # what the driver calls zero really is zero in the exact series
+            self.assertLess(np.abs(ref[:, mode[r] == 0]).max(initial=0.0), 1e-12 * np.abs(ref).max())
+
+    def test_too_short_a_trajectory_is_dense(self):
+        from lisatools.sources.emri.sparse_tracks import EMRITrackSource
+        from lisatools.stft_tracks import STFTTrackAccumulator, stft_templates_from_tracks
+
+        T_seg, dt = 2560.0, 10.0
+        d = _driver()                                              # window: 20480 s from T_START
+        item = _item(1300.0)                                       # shorter than two delay margins
+        src = EMRITrackSource(d, [item], [SimpleNamespace(t_arr=item[0][0])])
+        self.assertEqual(src.component_row.size, 0)
+        seg = T_START + np.arange(8) * T_seg
+        nper = int(T_seg / dt)
+        out, info = stft_templates_from_tracks(src, STFTTrackAccumulator(T_seg, 0.0, nper // 2 + 1, 0.3),
+                                               seg, dt, return_info=True)
+        np.testing.assert_array_equal(info["mode"][0], [2] + [0] * 7)
+        ref = _stft_reference(d, item, seg, T_seg, dt, 0.3)
+        np.testing.assert_allclose(out[0], ref, rtol=1e-12, atol=1e-12 * np.abs(ref).max())
+
+
 class SparseDriverRealFEWTest(unittest.TestCase):
     """End to end on a real FEW Kerr trajectory: FEW sparse holder -> dense inputs -> sparse
     response -> tracks; the tracks summed over harmonics reproduce the exact channels.
@@ -171,6 +239,32 @@ class SparseDriverRealFEWTest(unittest.TestCase):
         amp, phase, f, fdot = (np.asarray(v) for v in out.eval_tracer(T0 + (np.arange(40, 80) + 0.5) * 21600.0))
         self.assertEqual(amp.shape, (S, 3, 40))
         self.assertTrue(np.all(f > 0))                                      # -m partners mirrored
+
+    def test_stft_template_of_a_plunging_source(self):
+        """FEW -> sparse response -> EMRITrackSource -> STFT template, through the plunge: track
+        segments, dense segments and zero segments against the dense STFT of the exact channels."""
+        from lisatools.sources.emri.sparse_tracks import EMRITrackSource
+        from lisatools.stft_tracks import STFTTrackAccumulator, stft_templates_from_tracks
+
+        T0, T_seg, dt, alpha = 2.0e7, 21600.0, 10.0, 0.5
+        w_lo = T0 + 26 * DAY
+        d = _driver(t_start=T0 - 2 * DAY, t_window=(w_lo, w_lo + 8 * DAY), data_dt=dt)
+        d.few_gen = self.gen
+        few_args = (1e6, 100.0, 0.9, 7.0, 0.4, 1.0, 1.0, 0.8, 1.1, 0.5, 2.0, 0.3, 0.0, 1.2)   # ends ~day 32.4
+        item, H = d.template_inputs(few_args, lam=1.1, beta=np.pi / 2 - 0.8, mode_selection_threshold=1e-2)
+        src = EMRITrackSource(d, [item], [H])
+        seg = w_lo + np.arange(32) * T_seg
+        nper = int(T_seg / dt)
+        out, info = stft_templates_from_tracks(src, STFTTrackAccumulator(T_seg, 0.0, nper // 2 + 1, alpha),
+                                               seg, dt, cubic_tol=0.03, return_info=True)
+        mode = info["mode"][0]
+        self.assertTrue(set(mode.tolist()) == {0, 1, 2})
+        self.assertTrue(np.all(np.diff(np.where(mode == 1, 0, np.where(mode == 2, 1, 2))) >= 0))
+        ref = _stft_reference(d, item, seg, T_seg, dt, alpha)
+        self.assertLess(_mismatch(out[0], ref), 1e-5)
+        tr = mode == 1
+        self.assertLess(_mismatch(out[0][:, tr], ref[:, tr]), 5e-5)
+        self.assertLess(np.abs(ref[:, mode == 0]).max(), 1e-9 * np.abs(ref).max())
 
 
 if __name__ == "__main__":
