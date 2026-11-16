@@ -56,12 +56,12 @@ inner-product weight (`diff_comp`). Plan: `~/.claude/plans/nifty-weaving-storm.m
       cross terms); bare `df` only for bin geometry
 - [x] Scratch builds (LAT cpu+cuda12x, GBGPU) for base and new
 - [x] Contiguous bit-identity on CPU: base vs new, both responses (templates, ll, swap, grad, Fisher)
-- [ ] Same on GPU (GPU 5 was full on 2026-11-14)
+- [x] Same on GPU (GPU 5): 24 outputs bit-identical
 - [x] Oracle `scripts/dffr/stft_overlap_oracle.py` on CPU
-- [ ] Oracle on GPU
+- [x] Oracle on GPU: ALL OK (templates bit-exact, terms <= 8e-15, gradient = rounding)
 - [x] `tests/test_stft_overlap.py` + regression suite, CPU-only (failure sets vs baseline)
 - [x] GBGPU STFT/DFFR suites on the new build, CPU-only
-- [ ] LAT + GBGPU suites with the GPU visible
+- [x] LAT + GBGPU suites with the GPU visible: failure sets identical to base (LAT 9, GBGPU 7, all pre-existing)
 - [ ] Commit + push; hand over the venv reinstall commands (LAT + GBGPU together)
 
 ## Review (CPU, 2026-11-14)
