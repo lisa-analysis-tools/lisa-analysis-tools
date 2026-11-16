@@ -64,6 +64,30 @@ class TrackSumTest(unittest.TestCase):
             val = self.one(alpha, *par, n_side=NF)
             self.assertLess(rel(val, ref), bound, f"alpha {alpha}")
 
+    def test_symmetric_window_of_the_data(self):
+        """window_samples: the window is utility.tukey(N, alpha), the one applied to the data
+        (zero at the first and the last sample); without it, the periodic window."""
+        from lisatools.utils.utility import tukey as data_tukey
+
+        par = (1.3, 0.7, 3.0e-3 + 0.37 * DF, 4e-10)
+        x = chirp(*par)
+        z = np.array([[[1.0]]])
+        args = [p * z for p in par]
+        for alpha, bound in ((0.1, 2e-4), (0.2315, 5e-5), (0.5, 2e-5)):
+            sym = DT * np.fft.rfft(data_tukey(NPER, alpha) * x)
+            per = dense(x, alpha)
+            v_sym = self.get(self.acc(alpha, window_samples=NPER)(*args, n_side=NF))[0, 0, 0]
+            v_per = self.get(self.acc(alpha)(*args, n_side=NF))[0, 0, 0]
+            self.assertLess(rel(v_sym, sym), bound, f"alpha {alpha}")
+            self.assertLess(rel(v_per, per), bound, f"alpha {alpha}")
+            norm = lambda a, b: abs(np.sqrt(np.vdot(a, a).real / np.vdot(b, b).real) - 1)
+            self.assertLess(norm(v_sym, sym), 2e-5)
+            # the two windows differ by about half a sample in amplitude: each kernel matches its own
+            self.assertGreater(norm(v_per, sym), 0.2 / NPER)
+            self.assertGreater(rel(v_per, sym), 3 * rel(v_sym, sym))
+        with self.assertRaises(ValueError):
+            self.acc(0.1, window_samples=1)
+
     def test_sum_rows_channels_segments(self):
         rng = np.random.default_rng(3)
         C, nch, NT = 5, 3, 4
@@ -305,6 +329,28 @@ class TemplateDriverTest(unittest.TestCase):
         capped = stft_templates_from_tracks(src, acc, seg, DT, cubic_tol=10.0, max_half_width=31, n_side=30,
                                             return_info=True)[1]["mode"]
         self.assertGreater(int(np.sum(capped == 2)), n_dense[2])
+
+    def test_symmetric_window_through_the_driver(self):
+        from lisatools.utils.utility import tukey as data_tukey
+
+        acc = STFTTrackAccumulator(T_SEG, 0.0, NF, self.ALPHA, window_samples=NPER, force_backend=self.backend)
+        xp = acc.xp
+        src = ToySource(t_end=13.4 * T_SEG, xp=xp)
+        seg = np.arange(16) * T_SEG
+        out, info = stft_templates_from_tracks(src, acc, seg, DT, n_side=40, return_info=True)
+        out = out.get() if hasattr(out, "get") else out
+        t = (seg[:, None] + np.arange(NPER) * DT).ravel()
+        w = data_tukey(NPER, self.ALPHA)
+        for r in range(2):
+            x = src.td_channels(r, xp.asarray(t))
+            x = (x.get() if hasattr(x, "get") else x).reshape(3, seg.size, NPER)
+            ref = DT * np.fft.rfft(x * w, axis=-1)
+            self.assertLess(1 - np.vdot(out[r], ref).real / np.sqrt(np.vdot(out[r], out[r]).real * np.vdot(ref, ref).real), 1e-5)
+            self.assertLess(abs(np.sqrt(np.vdot(out[r], out[r]).real / np.vdot(ref, ref).real) - 1), 2e-5)
+            dense_seg = info["mode"][r] == 2      # the dense segments default to the same window
+            np.testing.assert_allclose(out[r][:, dense_seg], ref[:, dense_seg], rtol=1e-12, atol=1e-12 * np.abs(ref).max())
+        with self.assertRaises(ValueError):       # built for another number of samples
+            stft_templates_from_tracks(src, acc, seg, 2 * DT)
 
     def test_grid_errors(self):
         acc = STFTTrackAccumulator(T_SEG, 0.0, NF, self.ALPHA, force_backend=self.backend)

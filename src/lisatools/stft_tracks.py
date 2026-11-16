@@ -130,12 +130,18 @@ class STFTTrackAccumulator:
         f_min: Frequency of bin 0 of the templates [Hz].
         num_freqs: Number of bins of the templates.
         window_alpha: Taper fraction of the Tukey window (0 is a boxcar).
+        window_samples: N, the samples of the data in one segment (``STFTFresnel``'s
+            ``window_samples``; its ``sample_cadence`` is ``window_length / N``). Given, the window
+            is the symmetric Tukey window of N points (``lisatools.utils.utility.tukey``, the
+            window of the data), zero at the first and at the last sample. ``None``: the
+            periodic window, which ends at the first sample of the next segment.
         linear_envelope: Use the amplitude slope of each track (``slope`` in :meth:`__call__`).
         force_backend: Backend name (``"cpu"``, ``"cuda12x"``, ...).
     """
 
     def __init__(self, window_length: float, f_min: float, num_freqs: int, window_alpha: float = 0.0,
-                 *, linear_envelope: bool = False, force_backend: Optional[str] = None):
+                 *, window_samples: Optional[int] = None, linear_envelope: bool = False,
+                 force_backend: Optional[str] = None):
         self.backend = get_backend(force_backend or "cpu")
         self.xp = self.backend.xp
         self.window_length = float(window_length)
@@ -144,11 +150,16 @@ class STFTTrackAccumulator:
         self.num_freqs = int(num_freqs)
         self.window_alpha = float(window_alpha)
         self.linear_envelope = bool(linear_envelope)
+        self.window_samples = None if window_samples is None else int(window_samples)
+        if self.window_samples is not None and self.window_samples < 2:
+            raise ValueError("window_samples must be at least 2.")
         f_max = self.f_min + (self.num_freqs - 1) * self.df
         # num_times, num_channels and t0 of the settings are not read by the track kernel
+        # Symmetric window: N samples at h = window_length / N (the wrap checks N h = dt).
         self._fresnel = self.backend.STFTFresnelWrap(
             1, self.num_freqs, 3, 0.0, self.f_min, f_max, self.window_length, self.df,
-            self.window_alpha, True, self.linear_envelope)
+            self.window_alpha, True, self.linear_envelope, self.window_samples or 0,
+            self.window_length / self.window_samples if self.window_samples else 0.0)
 
     def __call__(self, amp, phase, f, fdot, *, component_row=None, num_rows: Optional[int] = None,
                  half_width=None, n_side: int = 30, slope=None, out=None, scale: float = 0.5):
@@ -242,8 +253,8 @@ def stft_templates_from_tracks(source: SparseTrackSource, accumulator: STFTTrack
         n_side: Bins kept beyond half the sweep on each side (track segments).
         cubic_tol: Largest edge phase error of the linear chirp [rad].
         max_half_width: Largest band half-width of a track segment [bins]; ``None``: no cap.
-        window: ``(samples per segment,)`` window of the dense segments; default the periodic
-            Tukey window of the accumulator.
+        window: ``(samples per segment,)`` window of the dense segments; default the window of
+            the accumulator (symmetric with ``window_samples``, periodic without).
         fallback_block: Largest number of (channel, sample) values of one dense evaluation.
         return_info: Also return a dict with ``mode`` ``(num_rows, NT)`` (0 zero, 1 tracks,
             2 dense), ``cubic`` and ``half_width`` ``(C, NT)``.
@@ -260,6 +271,9 @@ def stft_templates_from_tracks(source: SparseTrackSource, accumulator: STFTTrack
     bin_lo = int(round(accumulator.f_min / accumulator.df))
     if abs(bin_lo * accumulator.df - accumulator.f_min) > 1e-6 * accumulator.df:
         raise ValueError("f_min of the accumulator must be a multiple of 1 / window_length.")
+    if accumulator.window_samples not in (None, nper):
+        raise ValueError(f"the accumulator was built for {accumulator.window_samples} samples per "
+                         f"segment, data_dt gives {nper}.")
     if bin_lo + accumulator.num_freqs > nper // 2 + 1:
         raise ValueError("the accumulator's band exceeds the Nyquist frequency of data_dt.")
 
@@ -297,7 +311,17 @@ def stft_templates_from_tracks(source: SparseTrackSource, accumulator: STFTTrack
 
     # --- dense segments: window + FFT of the exact time series, per row
     if dense.any():
-        w = periodic_tukey(nper, accumulator.window_alpha, xp=xp) if window is None else xp.asarray(window)
+        if window is not None:
+            w = xp.asarray(window)
+        elif accumulator.window_samples is None:
+            w = periodic_tukey(nper, accumulator.window_alpha, xp=xp)
+        elif 0.0 < accumulator.window_alpha < 1.0:
+            from .utils.utility import tukey
+
+            w = tukey(nper, accumulator.window_alpha, xp=xp)
+        else:
+            w = periodic_tukey(nper - 1, accumulator.window_alpha, xp=xp)   # alpha 0 or 1: closed forms
+            w = xp.concatenate([w, w[:1]])
         if w.shape != (nper,):
             raise ValueError(f"window has shape {w.shape}, expected ({nper},).")
         offsets = xp.arange(nper) * data_dt

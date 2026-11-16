@@ -416,7 +416,8 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
             lo = int(np.searchsorted(freqs, self.freq_min))
             hi = int(np.searchsorted(freqs, self.freq_max, side="right"))
             self._accumulator = STFTTrackAccumulator(
-                stft_dt, float(freqs[lo]), hi - lo, self.tukey_alpha, force_backend=self.force_backend)
+                stft_dt, float(freqs[lo]), hi - lo, self.tukey_alpha, window_samples=self.nperseg,
+                force_backend=self.force_backend)
             t_lo = float(self.data_t0)
             self._sparse_response = EMRISparseResponse(
                 self.waveform.waveform_generator, orbits=self.orbits, tdi_config=self.tdi_config,
@@ -458,7 +459,7 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
             items.append(item)
             holders.append(H)
         source = EMRITrackSource(response, items, holders, stop_taper=self.stop_taper)
-        window = tukey(self.nperseg, alpha=self.tukey_alpha, xp=xp) if self.tukey_alpha else None
+        window = tukey(self.nperseg, alpha=self.tukey_alpha, xp=xp) if self.tukey_alpha else xp.ones(self.nperseg)
         num_seg = self.domain_settings.N // self.nperseg
         segment_start = float(self.data_t0) + np.arange(num_seg) * (self.nperseg * self.dt)
         template, info = stft_templates_from_tracks(

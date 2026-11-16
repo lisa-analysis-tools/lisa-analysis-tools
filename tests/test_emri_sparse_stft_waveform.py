@@ -53,9 +53,9 @@ class SparseSTFTWaveformTest(unittest.TestCase):
         self.assertLess(_mismatch(out, ref), 5e-6)
         worst = max(_mismatch(out[0][:, j], ref[0][:, j]) for j in range(ref.shape[2]))
         self.assertLess(worst, 1e-5)
-        # ? the dense path samples a symmetric Tukey window, the tracks model the periodic one:
-        # ? an amplitude difference of order 1 / samples per segment
-        self.assertLess(abs(np.sqrt(np.vdot(out, out).real / np.vdot(ref, ref).real) - 1), 2 / (STFT_DT / DT))
+        # the tracks model the symmetric Tukey window of the data (window_samples): no
+        # amplitude offset of order 1 / samples per segment (4.6e-4 here) is left
+        self.assertLess(abs(np.sqrt(np.vdot(out, out).real / np.vdot(ref, ref).real) - 1), 2e-5)
 
     def test_batch_and_keyword_sky(self):
         single = self.sparse(*PAR, **KW)[0]

@@ -19,7 +19,8 @@
 //
 // * Conventions, those of STFTFresnel and the STFT likelihood: the value of a pixel is
 // * dt * rfft(w * x) at f = f_min + k df, the positive-frequency half, Fourier origin at the
-// * segment start, w the periodic Tukey window of the STFTFresnel. The anchor is the segment
+// * segment start, w the Tukey window of the STFTFresnel: symmetric over N samples when it was
+// * built with window_samples = N and sample_cadence = h, periodic otherwise. The anchor is the segment
 // * midpoint when the STFTFresnel has use_midpoint, the segment start otherwise. Segment start
 // * times do not enter: the caller evaluates its tracks at the anchors of whatever segment grid
 // * it uses, so the hop between segments need not equal the window length.
