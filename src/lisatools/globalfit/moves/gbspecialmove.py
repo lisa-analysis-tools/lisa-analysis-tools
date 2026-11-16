@@ -5022,13 +5022,15 @@ class FStatSearchBase:
 
     @staticmethod
     def run_band_samplers(log_like_fn, start, prior_container, transform, gibbs_mask, periodic, burn, nsteps, betas,
-                          record_cold_coords=False, progress=True):
+                          record_cold_coords=False, progress=True, use_gpu=False):
         """One Eryn EnsembleSampler with one independent sampler per band; keeps the cold chain only.
 
         ``start`` is (n_bands, ntemps, nwalkers, 8) and ``betas`` the start ladder (coldest first, the same for every
         band), which Eryn adapts per sampler with its ends kept. The sampler stores nothing, since every temperature of
         a full-band search would be large and only the cold rows serve. ``progress`` shows Eryn's progress bar over the
-        burn + nsteps steps. Returns ``cold_ll`` (n_bands, nsteps,
+        burn + nsteps steps. ``use_gpu`` runs Eryn's stretch proposal on the card; its random draws then come from
+        CuPy's global generator, which the GB moves seed from the run seed when they are built, and not from the
+        sampler's own generator. The default keeps the proposal on the host. Returns ``cold_ll`` (n_bands, nsteps,
         nwalkers), ``last_cold`` (n_bands, nwalkers, 8), ``cold_coords`` (n_bands, nsteps, nwalkers, 8) when asked, the
         cold acceptance and the swap acceptance per band, the adapted ladders and the wall time.
         """
@@ -5037,11 +5039,14 @@ class FStatSearchBase:
         betas = np.asarray(betas, dtype=float)
         if betas.shape != (ntemps,):
             raise ValueError(f"the ladder has {betas.shape} betas, the start {ntemps} temperatures")
+        # the default keeps the original call, so that a caller that wraps StretchMove sees no new keyword
+        stretch_move = (StretchMove(gibbs_sampling_setup=("gb", gibbs_mask), use_gpu=True) if use_gpu
+                        else StretchMove(gibbs_sampling_setup=("gb", gibbs_mask)))
         sampler = EnsembleSampler(
             nwalkers, ndim, log_like_fn, {"gb": prior_container},
             tempering_kwargs=dict(betas=betas) if ntemps > 1 else {},
             branch_names=["gb"], nleaves_max=1,
-            moves=StretchMove(gibbs_sampling_setup=("gb", gibbs_mask)),
+            moves=stretch_move,
             vectorize=True, periodic=periodic, nsamplers=n_bands,
             prior_transform_fn={"gb": transform}, track_moves=False,
         )
@@ -5744,7 +5749,7 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
             start, seeding = self._seeded_start(holder, owners, bands, engine, start, seeds)
         output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
                                         periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
-                                        progress=bool(settings.progress))
+                                        progress=bool(settings.progress), use_gpu=self.backend.uses_cupy)
         if seeds is not None:
             output["seeding"] = seeding
         return output, likelihood
@@ -5828,7 +5833,7 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         output = self.run_band_samplers(
             likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
             self._band_mask(low, high), mask, periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
-            record_cold_coords=True, progress=bool(settings.progress))
+            record_cold_coords=True, progress=bool(settings.progress), use_gpu=self.backend.uses_cupy)
         return output, likelihood
 
     def _fit_mixtures(self, stage_2):
