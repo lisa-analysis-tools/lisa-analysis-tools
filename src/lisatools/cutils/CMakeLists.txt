@@ -138,6 +138,16 @@ if(LISATOOLS_WITH_CPU)
     VERBATIM
     )
 
+  # Multi-component STFT track accumulator (LAT only, not in the downstream source list).
+  add_custom_command(
+    OUTPUT "lat_stft_track_sum.cxx"
+    COMMENT "Copy lat_stft_track_sum.cu to lat_stft_track_sum.cxx"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/lat_stft_track_sum.cu"
+            "${CMAKE_CURRENT_BINARY_DIR}/lat_stft_track_sum.cxx"
+    DEPENDS "lat_stft_track_sum.cu"
+    VERBATIM
+    )
+
   # Phase 3E adds LISAResponse.cxx to the detector static library so all
   # LISA-side C++ symbols live in one .so per backend wheel.
   # Phase 3L.5+3L.6 add lat_tdi_on_the_fly.cxx + lat_spline_tdi_waveform.cxx
@@ -147,12 +157,12 @@ if(LISATOOLS_WITH_CPU)
   # files into their own .so under the per-backend alias).
   # stft_tof merge adds galactic_response.cxx + domains.cxx (XYZ sensitivity
   # matrix backend + STFT/FD domain likelihood kernels).
-  add_library(lisaanalysistools_cpu_detector_static STATIC Detector.cxx PSD.cxx LISAResponse.cxx lat_tdi_on_the_fly.cxx lat_spline_tdi_waveform.cxx galactic_response.cxx domains.cxx stft_cross_terms.cxx)
+  add_library(lisaanalysistools_cpu_detector_static STATIC Detector.cxx PSD.cxx LISAResponse.cxx lat_tdi_on_the_fly.cxx lat_spline_tdi_waveform.cxx galactic_response.cxx domains.cxx stft_cross_terms.cxx lat_stft_track_sum.cxx)
   apply_cpu_backend_common_options(detector lisatools lisaanalysistools true)
   target_include_directories(lisaanalysistools_cpu_detector_static PUBLIC ${GBT_CUTILS})
 
   target_sources(lisaanalysistools_cpu_detector_static PUBLIC FILE_SET HEADERS FILES
-                                        Detector.hpp  PSD.hpp  LISAResponse.hh domains.hpp galactic_response.hpp stft_cross_terms.hpp)
+                                        Detector.hpp  PSD.hpp  LISAResponse.hh domains.hpp galactic_response.hpp stft_cross_terms.hpp lat_stft_track_sum.hh)
 
   # Phase 3E adds binding_flr.cxx to the nanobind module so response_part(m)
   # is linked in alongside detector_part(m). (binding.cxx renamed to
@@ -174,13 +184,13 @@ if(LISATOOLS_WITH_GPU)
   # stft_tof merge adds galactic_response.cu + domains.cu (XYZ sensitivity
   # matrix backend + STFT/FD domain likelihood kernels).
   # GB block tempering: adds stft_cross_terms.cu (LAT only).
-  add_library(lisaanalysistools_gpu_detector_gpu_static STATIC Detector.cu PSD.cu LISAResponse.cu lat_tdi_on_the_fly.cu lat_spline_tdi_waveform.cu galactic_response.cu domains.cu stft_cross_terms.cu)
+  add_library(lisaanalysistools_gpu_detector_gpu_static STATIC Detector.cu PSD.cu LISAResponse.cu lat_tdi_on_the_fly.cu lat_spline_tdi_waveform.cu galactic_response.cu domains.cu stft_cross_terms.cu lat_stft_track_sum.cu)
   apply_gpu_backend_common_options(detector_gpu lisatools lisaanalysistools true)
   target_include_directories(lisaanalysistools_gpu_detector_gpu_static PUBLIC ${GBT_CUTILS})
   target_include_directories(lisaanalysistools_gpu_detector_gpu_static SYSTEM PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 
   target_sources(lisaanalysistools_gpu_detector_gpu_static PUBLIC FILE_SET HEADERS FILES
-                                        Detector.hpp PSD.hpp LISAResponse.hh domains.hpp galactic_response.hpp stft_cross_terms.hpp)
+                                        Detector.hpp PSD.hpp LISAResponse.hh domains.hpp galactic_response.hpp stft_cross_terms.hpp lat_stft_track_sum.hh)
 
   nanobind_add_module(lisaanalysistools_gpu_pycppdetector binding_detector.cxx binding_flr.cxx)
   apply_gpu_backend_common_options(pycppdetector lisatools lisaanalysistools false)

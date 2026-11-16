@@ -19,6 +19,7 @@
 #include "binding_detector.hpp"
 #include "binding_domains.hpp"       // STFTDomainWrap, FDDomainForStftWrap, STFTFresnelWrap
 #include "stft_cross_terms.hpp"      // stft_cross_terms_wrap (for tempering)
+#include "lat_stft_track_sum.hh"    // stft_track_sum_wrap (multi-component track templates)
 
 // Phase 3J: this binding TU is the SOLE registration site for the shared
 // wrapper classes (OrbitsWrap, LISAResponseWrap, TDIConfigWrap, ...).
@@ -881,6 +882,61 @@ static void stft_domain_compute_cross_terms(
         num_templates, max_window_width, run_async);
 }
 
+// STFTFresnelWrap.sum_tracks (lat_stft_track_sum.hh). A function here rather than a member of the
+// wrap class, because downstream packages compile binding_domains.hpp without
+// lat_stft_track_sum.cu.
+template<typename T>
+static T* track_sum_pointer(array_type<T> input, const char* name, size_t expected) {
+#if !(defined(__CUDA_COMPILATION__) || defined(__CUDACC__))
+    if (input.size() != expected)
+        throw std::invalid_argument(
+            std::string("sum_tracks: ") + name + " has length " + std::to_string(input.size()) +
+            ", expected " + std::to_string(expected) + ".");
+#else
+    (void)name; (void)expected;
+#endif
+    return input.data();
+}
+
+static void stft_fresnel_sum_tracks(
+    STFTFresnelWrap& self, array_type<std::complex<double>> out, int num_rows, int num_channels,
+    int num_segments, int num_freqs, double f_min, double scale, int num_components,
+    array_type<int> component_row, array_type<int> half_width, array_type<double> amp,
+    array_type<double> phase, array_type<double> f, array_type<double> fdot,
+    array_type<double> slope)
+{
+    if ((num_rows <= 0) || (num_channels <= 0) || (num_segments <= 0) || (num_freqs <= 0) ||
+        (num_components < 0))
+        throw std::invalid_argument("sum_tracks: inconsistent sizes.");
+    if (!(self.fresnel->dt > 0.0) || !(self.fresnel->df > 0.0))
+        throw std::invalid_argument("sum_tracks: the STFTFresnel needs dt > 0 and df > 0.");
+    size_t components = static_cast<size_t>(num_components);
+    size_t tracks = components * num_channels * num_segments;
+    STFTTrackSumArgs args;
+    args.out = reinterpret_cast<cmplx*>(track_sum_pointer(
+        out, "out", static_cast<size_t>(num_rows) * num_channels * num_segments * num_freqs));
+    args.num_rows = num_rows;
+    args.num_channels = num_channels;
+    args.num_segments = num_segments;
+    args.num_freqs = num_freqs;
+    args.f_min = f_min;
+    args.scale = scale;
+    args.num_components = num_components;
+    args.component_row = track_sum_pointer(component_row, "component_row", components);
+    args.half_width = track_sum_pointer(half_width, "half_width", components * num_segments);
+    args.amp = track_sum_pointer(amp, "amp", tracks);
+    args.phase = track_sum_pointer(phase, "phase", tracks);
+    args.f = track_sum_pointer(f, "f", tracks);
+    args.fdot = track_sum_pointer(fdot, "fdot", tracks);
+    args.slope = (slope.size() == 0) ? nullptr : track_sum_pointer(slope, "slope", tracks);
+#if !(defined(__CUDA_COMPILATION__) || defined(__CUDACC__))
+    for (size_t i = 0; i < components; i += 1)
+        if ((args.component_row[i] < 0) || (args.component_row[i] >= num_rows))
+            throw std::invalid_argument("sum_tracks: component_row outside [0, num_rows).");
+#endif
+    stft_track_sum_wrap(*self.fresnel, args);
+}
+
 void domains_part(nb::module_ &m) {
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
@@ -970,6 +1026,14 @@ void domains_part(nb::module_ &m) {
          "cosine_out and sine_out receive C(x) and S(x); aux_f_out and aux_g_out the auxiliary\n"
          "functions f and g at |x|, and slope_f_out and slope_g_out their derivatives in |x|.\n"
          "f, g and their derivatives come from the auxiliary branch and hold for |x| > 1.6.")
+    .def("sum_tracks", &stft_fresnel_sum_tracks,
+         nb::arg("out"), nb::arg("num_rows"), nb::arg("num_channels"), nb::arg("num_segments"),
+         nb::arg("num_freqs"), nb::arg("f_min"), nb::arg("scale"), nb::arg("num_components"),
+         nb::arg("component_row"), nb::arg("half_width"), nb::arg("amp"), nb::arg("phase"),
+         nb::arg("f"), nb::arg("fdot"), nb::arg("slope"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Add the windowed transforms of chirping tracks into dense STFT templates\n"
+         "(see lat_stft_track_sum.hh). slope may be an empty array (constant envelope).")
     .def("compute_fourier_values", &STFTFresnelWrap::compute_fourier_values,
          nb::arg("output"), nb::arg("amps"), nb::arg("phase0s"),
          nb::arg("f0s"), nb::arg("fdot0s"), nb::arg("t0s"),
