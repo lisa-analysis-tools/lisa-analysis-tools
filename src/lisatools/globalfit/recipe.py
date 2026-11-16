@@ -563,6 +563,37 @@ class RepeatController:
         return self.values()
 
 
+def gating_series(chain, inds, periods_branch: dict | None = None) -> tuple[np.ndarray | None, dict | None, str]:
+    """``(x[nsteps, nwalkers, nseries], periods, note)``: the series of a cold chain ``[nsteps, nwalkers, nleaves,
+    ndim]`` whose ACT counts, for the convergence stop and for the thinning in postprocessing alike. ``x`` is None
+    if there is none.
+
+    Left out: leaf slots not active through the whole stretch (``inds``), and parameters with no variance at all
+    (the same value in every walker and iteration: fixed by construction). A parameter where each walker sits at
+    its own value stays in, and its ACT is not defined. ``periods_branch``: ``{parameter index: period}``;
+    ``periods`` are those of the columns of ``x``.
+    """
+    chain, inds = np.asarray(chain), np.asarray(inds)
+    active = inds.all(axis=(0, 1))
+    ndim = chain.shape[-1]
+    x = chain[:, :, active].reshape(chain.shape[0], chain.shape[1], -1)
+    varies = np.ptp(x, axis=(0, 1)) > 0.0 if x.size else np.zeros(x.shape[-1], dtype=bool)
+    columns = np.flatnonzero(varies)
+    periods = {}
+    for new, old in enumerate(columns):
+        period = (periods_branch or {}).get(int(old % ndim))
+        if period is not None:
+            periods[new] = period
+    note = ""
+    if not active.all():
+        note += f" {int((~active).sum())} inactive leaves left out;"
+    if not varies.all():
+        note += f" {int((~varies).sum())} fixed parameters left out;"
+    if columns.size == 0:
+        return None, None, note + " nothing to monitor;"
+    return x[:, :, columns], periods, note
+
+
 class ChainMonitor:
     """The cold-chain series of one block that gate a :class:`ConvergenceRecipeStep`: its sampled parameters."""
 
@@ -570,36 +601,13 @@ class ChainMonitor:
         self.branch = branch
 
     def series(self, backend, start: int, stop: int, periodic) -> tuple[np.ndarray | None, dict | None, str]:
-        """``(x[nsteps, nwalkers, nseries], periods, note)`` since iteration ``start``; ``x`` None if nothing gates.
-
-        Left out: leaf slots not active through the whole stretch, and parameters with no variance at all (the
-        same value in every walker and iteration: fixed by construction). A parameter where each walker sits at
-        its own value stays in, and reads as not converged.
-        """
+        """:func:`gating_series` of the block's cold chain since iteration ``start``."""
         from lisatools.sampling.utility import branch_periods
 
         kwargs = dict(slice_vals=slice(start, stop), temp_index=0, branch_names=[self.branch])
-        chain = np.asarray(backend.get_chain(**kwargs)[self.branch])  # (nsteps, nwalkers, nleaves, ndim)
-        inds = np.asarray(backend.get_inds(**kwargs)[self.branch])
-        active = inds.all(axis=(0, 1))
-        ndim = chain.shape[-1]
-        x = chain[:, :, active].reshape(chain.shape[0], chain.shape[1], -1)
-        periods_branch = branch_periods(periodic, self.branch)
-        varies = np.ptp(x, axis=(0, 1)) > 0.0
-        columns = np.flatnonzero(varies)
-        periods = {}
-        for new, old in enumerate(columns):
-            period = periods_branch.get(int(old % ndim))
-            if period is not None:
-                periods[new] = period
-        note = ""
-        if not active.all():
-            note += f" {int((~active).sum())} inactive leaves left out;"
-        if not varies.all():
-            note += f" {int((~varies).sum())} fixed parameters left out;"
-        if columns.size == 0:
-            return None, None, note + " nothing to monitor;"
-        return x[:, :, columns], periods, note
+        chain = backend.get_chain(**kwargs)[self.branch]  # (nsteps, nwalkers, nleaves, ndim)
+        inds = backend.get_inds(**kwargs)[self.branch]
+        return gating_series(chain, inds, branch_periods(periodic, self.branch))
 
 
 class GBCountMonitor:

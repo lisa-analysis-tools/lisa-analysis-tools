@@ -218,6 +218,14 @@ never moves in some parameter (its ACT is not defined, and an undefined ACT is n
 
 Each check logs, per block, the ACT, the ESS, whether it is reliable, and the block's repeats.
 
+### Postprocessing keeps the last stage only
+
+The submission writer reads the chain from the iteration the last recipe stage started at (stored in the backend;
+`BackendConsumer.kept_stage_start`), so the posterior files hold no sample of the burn-in or tuning stages. Its
+thinning factor is the ACT of that stretch, with the series and the estimate of the convergence stop
+(`recipe.gating_series`, `cold_chain_act`), so the log of the stop and the thinning agree. A file with no recorded
+stage starts (written before they were stored) is read whole, as before.
+
 ### The estimates
 
 - Outer: eryn's `get_acf` per walker, averaged over the walkers, with Sokal's automatic window

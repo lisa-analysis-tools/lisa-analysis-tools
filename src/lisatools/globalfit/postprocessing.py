@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import h5py
 import numpy as np
 from eryn.backends import HDFBackend
-from eryn.utils import get_integrated_act
 from scipy.interpolate import CubicSpline
 from tqdm import tqdm
 
@@ -405,13 +404,17 @@ class BackendConsumer:
         curr: CurrentInfoGlobalFit = None,
         backend: HDFBackend | str = None,
     ):
+        # * A file is opened with the global fit's backend, which finds the run's group: "global_fit", or "mcmc"
+        # * in files written before the rename (eryn's own HDFBackend only looks under "mcmc").
+        from .hdfbackend import GFHDFBackend
+
         if backend is not None:
             if isinstance(backend, str):
-                self.backend = HDFBackend(filename=backend, read_only=True)
+                self.backend = GFHDFBackend(backend, read_only=True)
             else:
                 self.backend = backend
         elif curr is not None:
-            self.backend = HDFBackend(filename=curr.main_file_path, read_only=True)
+            self.backend = GFHDFBackend(curr.main_file_path, read_only=True)
         else:
             raise ValueError("Must provide either curr or backend.")
 
@@ -459,18 +462,54 @@ class BackendConsumer:
 
         return self._transforms
 
+    def kept_stage_start(self) -> int:
+        """The iteration the last step of the run's recipe started at: the samples from there on are the ones the
+        run keeps, the steps before it (burn-in, tuning, searches) are not posterior samples.
+
+        0, the whole chain, when the file records no recipe or no start of its steps (files written before the
+        recipe stored them). When the last step has not started (a run stopped before it), the whole chain too,
+        with a warning.
+        """
+        with self.backend.open() as f:
+            group = f[self.backend.name]
+            if "recipe" not in group:
+                return 0
+            steps = sorted(group["recipe"].values(), key=lambda step: step.attrs["order num"])
+            if not steps or not any("start iteration" in step.attrs for step in steps):
+                return 0
+            last = steps[-1]
+            if "start iteration" not in last.attrs:
+                logger.warning(
+                    f"The last recipe step ({last.name.rsplit('/', 1)[-1]!r}) has not started in this file: the "
+                    "whole chain is post-processed, the steps before it included."
+                )
+                return 0
+            return int(last.attrs["start iteration"])
+
     def store_cold_chains(self):
-        """Extract cold chains and inds for all branches and cache them."""
+        """Extract the cold chains and inds of all branches from the start of the kept stage, and cache them.
+
+        Only the iterations of the last recipe step are read (:meth:`kept_stage_start`), so the ACT, the thinning
+        and the posterior files hold no sample of the burn-in or tuning stages. ``discard`` of
+        :meth:`store_independent_samples` counts from there.
+        """
+        self.kept_start = start = self.kept_stage_start()
+        stop = int(self.backend.iteration)
+        if start >= stop:
+            raise ValueError(f"the kept stage starts at iteration {start}, and the file holds {stop}: nothing to keep.")
+        if start > 0:
+            logger.info(f"Post-processing the kept stage: iterations {start} to {stop} of the chain.")
+        kept = slice(start, stop)
         self._cold_chains = {}
         self._cold_inds = {}
-        all_chains = self.backend.get_chain()
-        all_inds = self.backend.get_inds()
+        all_chains = self.backend.get_chain(slice_vals=kept)
+        all_inds = self.backend.get_inds(slice_vals=kept)
         for branch in self.branches:
             self._cold_chains[branch] = all_chains[branch][:, :1]
             self._cold_inds[branch] = all_inds[branch][:, :1]
 
-        self._cold_log_prior = self.backend.get_log_prior()[:, :1]
-        self._cold_log_likelihood = self.backend.get_log_like()[:, :1]
+        self._cold_log_prior = self.backend.get_log_prior(slice_vals=kept)[:, :1]
+        self._cold_log_likelihood = self.backend.get_log_like(slice_vals=kept)[:, :1]
 
     @property
     def configured(self) -> bool:
@@ -504,27 +543,55 @@ class BackendConsumer:
             raise ValueError(f"Branch '{branch}' not found in cold chains.")
         return self._cold_inds[branch]
 
+    def _branch_periods(self, branch: str) -> dict:
+        """``{parameter index: period}`` of the branch's periodic parameters (``{}`` without a ``curr``)."""
+        try:
+            info = self._curr.source_info[branch]
+            periodic = info.get("periodic") if isinstance(info, dict) else getattr(info, "periodic", None)
+            if not periodic or branch not in periodic:
+                return {}
+            from .run import _periodic_names_to_indices
+
+            transform = info.get("transform") if isinstance(info, dict) else getattr(info, "transform", None)
+            return _periodic_names_to_indices(periodic[branch], transform)
+        except Exception:
+            return {}
+
     def compute_auto_correlation_time(
         self, branch: str = None, **act_kwargs
     ) -> Dict[str, np.ndarray] | np.ndarray:
-        """Compute the integrated ACT for the specified branch or all branches."""
+        """The integrated ACT, in iterations, of the kept cold chains: per branch, one value per series.
+
+        The estimate and the series are those of the recipe's convergence stop (``recipe.gating_series``,
+        ``sampling.utility.cold_chain_act``), so the two agree: the sampled parameters of the leaves that stay
+        active, periodic ones as sin and cos, with Sokal's automatic window. A branch with no such series (gb,
+        whose leaves come and go) gets 1, and so does a series whose ACT is not defined (a walker that never
+        moved), with a warning.
+        """
+        from lisatools.sampling.utility import cold_chain_act
+
+        from .recipe import gating_series
+
         if not self.configured:
             self.store_cold_chains()
-        if branch is not None:
-            if branch in self.branches:
-                return get_integrated_act(self._cold_chains[branch], **act_kwargs)
+        if branch is not None and branch not in self.branches:
             raise ValueError(f"Branch '{branch}' not found in cold chains.")
-        act: dict = get_integrated_act(self.cold_chains, **act_kwargs)
-
-        # now remove nans if present
-        for branch, value in act.items():
-            if not np.isfinite(value).all():
+        act = {}
+        for name in self.branches if branch is None else [branch]:
+            x, periods, _note = gating_series(
+                self._cold_chains[name][:, 0], self._cold_inds[name][:, 0], self._branch_periods(name)
+            )
+            if x is None:
+                act[name] = np.ones(1)
+                continue
+            tau, _reliable = cold_chain_act(x, periods, **act_kwargs)
+            if not np.isfinite(tau).all():
                 logger.warning(
-                    f"NaN values found in ACT for branch '{branch}'. These will be replaced with 1."
+                    f"NaN values found in ACT for branch '{name}'. These will be replaced with 1."
                 )
-                act[branch] = np.where(np.isfinite(value), value, 1.0)
-
-        return act
+                tau = np.where(np.isfinite(tau), tau, 1.0)
+            act[name] = tau
+        return act if branch is None else act[branch]
 
     def store_independent_samples(self, discard: int | float = 0.0, ess: int = 10000, **act_kwargs):
         """
