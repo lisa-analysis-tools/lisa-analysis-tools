@@ -71,6 +71,32 @@ filter_funcs = {
     "chebyshev2": _cheby2,
 }
 
+
+def kaiser_aafilter_response(
+    freqs: float | np.ndarray, attenuation: float, freq1: float, freq2: float, fs: float
+) -> np.ndarray:
+    """Power response of a Kaiser-window FIR anti-aliasing filter, LISA Instrument style.
+
+    The filter is designed as in LISA Instrument's ``aafilter=("kaiser", attenuation, freq1, freq2)``:
+    ``scipy.signal.kaiserord(attenuation, (freq2 - freq1) / (fs / 2))`` gives the number of taps and
+    the Kaiser beta, and ``firwin`` puts the cutoff at ``(freq1 + freq2) / 2``.
+
+    Args:
+        freqs: Frequencies [Hz] (the absolute value is used).
+        attenuation: Stop-band attenuation [dB].
+        freq1: Start of the transition band [Hz].
+        freq2: End of the transition band [Hz].
+        fs: Sampling rate at which the filter runs [Hz].
+
+    Returns:
+        ``|H(f)|^2`` with the shape of ``freqs``.
+    """
+    freqs = np.abs(np.asarray(freqs, dtype=np.float64))
+    numtaps, beta = signal.kaiserord(attenuation, (freq2 - freq1) / (fs / 2))
+    taps = signal.firwin(numtaps, (freq1 + freq2) / 2, window=("kaiser", beta), fs=fs)
+    _, h = signal.freqz(taps, worN=freqs.ravel(), fs=fs)
+    return (np.abs(h) ** 2).reshape(freqs.shape)
+
 def find_file(folder: str, source_type: str, source_id: int) -> str:
     """
     Find the Mojito L1 file for a given source type and ID in the specified folder.
@@ -876,6 +902,7 @@ class BaseProcessingStep(SignalProcessor):
         trim_kwargs: Optional[dict] = None,
         Tobs: Optional[float] = None,
         alias_correction: bool = True,
+        upstream_aafilter_kwargs: Optional[dict] = None,
         **kwargs,
     ) -> tuple:
         """
@@ -898,6 +925,12 @@ class BaseProcessingStep(SignalProcessor):
                 (about one extra covariance evaluation per alias). Set ``False`` only for runs
                 whose band stays well below the new Nyquist, where the effect is negligible.
                 Has no effect without downsampling.
+            upstream_aafilter_kwargs (dict, optional): Anti-aliasing filter applied to the data
+                *before* they were loaded, e.g. by the simulation when it decimated to the L1 rate
+                (Mojito: 4 Hz -> 0.4 Hz). Not applied to the data here; it only enters the modelled
+                response (:meth:`get_total_response`, hence also the alias terms, where it weights the
+                power folded from above the new Nyquist). Keys of :func:`kaiser_aafilter_response`:
+                ``attenuation`` [dB], ``freq1``, ``freq2``, ``fs`` [Hz].
             **kwargs: Additional keyword arguments for the eventual plots.
 
         Returns:
@@ -977,6 +1010,7 @@ class BaseProcessingStep(SignalProcessor):
                 self.fir_fs = up * fs_before
 
         self.alias_correction = alias_correction
+        self.upstream_aafilter_kwargs = upstream_aafilter_kwargs
 
         if trim_kwargs is not None:
             if self.verbose:
@@ -1180,9 +1214,18 @@ class BaseProcessingStep(SignalProcessor):
         )
         return alias_frequencies, alias_filters_response
 
+    def get_upstream_response(self, freqs: float | np.ndarray) -> np.ndarray:
+        """Power response of the upstream anti-aliasing filter (``upstream_aafilter_kwargs`` of
+        :meth:`process`), applied to the data before loading; 1 when none was given."""
+        freqs = np.asarray(freqs)
+        kw = getattr(self, "upstream_aafilter_kwargs", None)
+        if kw is None:
+            return np.ones_like(freqs, dtype=np.float64)
+        return kaiser_aafilter_response(freqs, **kw)
+
     def get_total_response(self, freqs: float | np.ndarray) -> np.ndarray:
         """
-        Compute the total power response of all applied filters (highpass, lowpass, bandpass, FIR) at given frequencies.
+        Compute the total power response of all filters (upstream anti-aliasing, highpass, lowpass, bandpass, FIR) at given frequencies.
 
         Args:
             freqs (np.ndarray): Frequencies at which to compute the total power response.
@@ -1192,7 +1235,7 @@ class BaseProcessingStep(SignalProcessor):
         """
         power_response = self.get_filter_response(freqs)
         fir_response = self.get_fir_response(freqs)
-        return power_response * fir_response
+        return power_response * fir_response * self.get_upstream_response(freqs)
 
 class L1ProcessingStep(L1DataLoader, BaseProcessingStep):
     """

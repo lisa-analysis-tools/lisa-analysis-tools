@@ -1,0 +1,88 @@
+schema_version: 1
+run:
+  name: test_run
+  output_dir: /Users/alessandrosantini/reps/globalift/erebor_org_setup/lisa-analysis-tools/gf_dev/interface/test/out
+  seed: null
+  num_iterations: 500
+  backup_iter: 5
+  submission_dir: /Users/alessandrosantini/reps/globalift/erebor_org_setup/lisa-analysis-tools/gf_dev/interface/test/out_sub
+sampler:
+  nwalkers: 4
+  ntemps: 10
+compute:
+  gpus: null
+  backend: cpu
+  head_rank: 1
+  main_rank: 0
+blocks:
+  psd:
+    priors:
+      class: mojitolight.NoisePrior
+      kwargs:
+        model_type: parametric-symmetric
+      output_file: /Users/alessandrosantini/reps/globalift/erebor_org_setup/lisa-analysis-tools/gf_dev/interface/test/psd_prior.yaml
+    enabled: true
+    tempering: null
+    nleaves: 1
+    num_prop_repeats: 200
+    inner_moves: null
+    links:
+      prior_model_code_link: TODO
+      prior_model_config_file: /Users/alessandrosantini/reps/globalift/erebor_org_setup/lisa-analysis-tools/gf_dev/interface/test/psd_prior.yaml
+    type: psd
+    injection:
+      S_oms: 1.5e-11
+      S_tm: 3.0e-15
+data:
+  loader: mojito_l1
+  path: /Volumes/as_storage/mojito/mojito_light_2p5s
+  source_types:
+  - NOISE
+  source_ids: {}
+  orbits:
+    type: l1
+    frame: icrs
+    armlength: 2500000000.0
+  Tobs: 31558149.763545595
+  dt: 5.0
+  highpass:
+    cutoff: 1.0e-05
+    order: 2
+    zero_phase: true
+  lowpass:
+    cutoff: 0.1
+    order: 2
+    zero_phase: true
+  downsample:
+    window:
+    - kaiser
+    - 5.0
+  trim:
+    duration: 720000.0
+    is_percent: false
+    trimming_type: from_each_end
+domain:
+  min_freq: 0.0001
+  max_freq: 0.1
+  type: stft
+  segment_duration: 86400.0
+metadata:
+  codename: erebor
+  version: null
+  contact: null
+  code_link: null
+  input_data_link: null
+  input_reference: null
+  noise_model: null
+  noise_model_code_link: null
+  comment: null
+window:
+  type: tukey
+  taper_duration: auto
+  normalize: true
+sensitivity:
+  class: XYZSensitivityBackend
+  kwargs:
+    tdi_generation: 2
+    mask_percentage: 0.02
+  fixed_psd_kwargs: null

@@ -272,8 +272,10 @@ class GFHDFBackend(eryn_HDFBackend):
 
         self.sub_backend = sub_backend
         if self.sub_backend is not None:
+            # Sub-backends read/write under f[self.name]["sub_backend"], so they
+            # must share the main group name (eryn's own default is "mcmc").
             self.sub_backend = {
-                key: self.sub_backend[key](*args, **kwargs)
+                key: self.sub_backend[key](*args, name=self.name, **kwargs)
                 for key in self.sub_backend
                 if self.sub_backend[key] is not None
             }
@@ -539,6 +541,26 @@ class GFHDFBackend(eryn_HDFBackend):
                     recipe_step_group.attrs["order num"] = i + 1
 
                 f[self.name].attrs["has_recipe"] = True
+
+    def recipe_step_start(self, step_name, iteration):
+        """The iteration ``step_name`` started at: recorded on its first start, read back afterwards (restarts)."""
+        with self.open("a") as f:
+            attrs = f[self.name]["recipe"][step_name].attrs
+            if "start iteration" not in attrs:
+                attrs["start iteration"] = int(iteration)
+            return int(attrs["start iteration"])
+
+    def recipe_repeats(self, branch, values=None):
+        """The proposal repeats the recipe tuned for ``branch`` (``{"tuning", "kept", "tau"}``): stored when
+        ``values`` is given, read back otherwise (``{}`` if none were stored), so a restart resumes the tuning and
+        the step that keeps its samples runs with the kept value."""
+        prefix = f"repeats {branch} "
+        with self.open("a" if values is not None else "r") as f:
+            attrs = f[self.name]["recipe"].attrs
+            if values is not None:
+                for key, value in values.items():
+                    attrs[prefix + key] = float(value)
+            return {key[len(prefix):]: float(value) for key, value in attrs.items() if key.startswith(prefix)}
 
     def completed_recipe_step(self, step_name):
         """Mark ``step_name`` as completed in the on-disk recipe metadata."""
@@ -842,6 +864,15 @@ class GBHDFBackend(eryn_HDFBackend):
 class MBHHDFBackend(eryn_HDFBackend):
     """Sub-backend that persists the per-leaf MBH temperature ladder."""
 
+    def __init__(
+                self,
+                *args,
+                name: str = "global_fit",
+                **kwargs,
+            ):
+        
+                super().__init__(*args, name=name, **kwargs)
+
     def reset(self, nwalkers, *args, ntemps=1, num_mbhs: int = None, **kwargs):
         """Create a ``betas_all`` dataset of shape ``(*, num_mbhs, ntemps)``."""
         if num_mbhs is None:
@@ -999,6 +1030,15 @@ class MBHHDFBackend(eryn_HDFBackend):
 
 class EMRIHDFBackend(eryn_HDFBackend):
     """Sub-backend that persists the per-leaf EMRI temperature ladder."""
+
+    def __init__(
+                self,
+                *args,
+                name: str = "global_fit",
+                **kwargs,
+            ):
+        
+                super().__init__(*args, name=name, **kwargs)
 
     def reset(self, nwalkers, *args, ntemps=1, num_emris: int = None, **kwargs):
         """Create a ``betas_all`` dataset of shape ``(*, num_emris, ntemps)``."""
@@ -1159,6 +1199,15 @@ class SOBBHHDFBackend(eryn_HDFBackend):
     Mirrors :class:`EMRIHDFBackend` — one ``betas_all`` row per leaf, sliced
     out at save time and restored from disk for warm-starts.
     """
+
+    def __init__(
+                self,
+                *args,
+                name: str = "global_fit",
+                **kwargs,
+            ):
+        
+                super().__init__(*args, name=name, **kwargs)
 
     def reset(self, nwalkers, *args, ntemps=1, num_sobbhs: int = None, **kwargs):
         """Create a ``betas_all`` dataset of shape ``(*, num_sobbhs, ntemps)``."""

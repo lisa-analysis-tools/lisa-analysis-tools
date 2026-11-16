@@ -1605,7 +1605,7 @@ def run_iterative_subtraction_mcmc(
                         )[fix]
 
                         tmp[:, :, 3] = tmp[:, :, 3] % (2 * np.pi)
-                        tmp[:, :, 5] = tmp[:, :, 5] % (np.pi)
+                        tmp[:, :, 5] = tmp[:, :, 5] % (2 * np.pi)
                         tmp[:, :, 6] = tmp[:, :, 6] % (2 * np.pi)
                         logp = priors_good.logpdf(tmp.reshape(-1, ndim)).reshape(tmp.shape[:-1])
 

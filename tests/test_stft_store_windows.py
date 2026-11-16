@@ -148,7 +148,7 @@ def build_case(backend: str = "cpu", seed: int = 7) -> dict:
         stft_comps=aca.cpp_splits[0], T=TOBS, t_ref=0.0, orbits=orbits,
         tdi_config=TDIConfig("1st generation", force_backend=backend),
         force_backend=backend, n_side_bins=N_SIDE_BINS, window_factor=1.0,
-        freq_from_tdi_phase=False,
+        freq_from_tdi_phase=False, response="tdi_on_the_fly",
     )
 
     band_edges = _band_edges()
@@ -571,6 +571,39 @@ class StoreWindowCPUTest(_StoreWindowCases, unittest.TestCase):
 @unittest.skipUnless(_have_gbgpu_stft() and _cuda_backend_name(), "requires a usable CUDA backend")
 class StoreWindowCudaTest(_StoreWindowCases, unittest.TestCase):
     BACKEND = _cuda_backend_name() or "cpu"
+
+
+class NoiseBinsTest(unittest.TestCase):
+    """``STFTStoreWindows.noise_bins`` on a two-year grid up to 0.1 Hz, the bands cut to 0.1 to 30 mHz."""
+
+    def test_noise_bins_hold_every_interior_cell(self):
+        import dataclasses
+
+        from lisatools.domains import STFTSettings
+        from lisatools.globalfit.moves.gbbandstructure import stft_band_structure, stft_store_window_layout
+
+        settings = STFTSettings(
+            t0=0.0, dt=86400.0, df=1.0 / 86400.0, NT=713, NF=86400 // 5 // 2 + 1,
+            min_freq=1.0e-4, max_freq=0.09999, force_backend="cpu",
+        )
+        structure = stft_band_structure(settings, 1.0e4 / 86400.0)
+        # * As GBSetup: the bands of the prior's f0 range and one guard band on each side.
+        first_band, last_band = (int(band) for band in structure.assign(np.array([1.0e-4, 30.0e-3])))
+        structure = dataclasses.replace(
+            structure, edges_hz=structure.edges_hz[max(first_band - 1, 0):last_band + 2]
+        )
+        windows = stft_store_window_layout(structure, settings, n_side_bins=16, epoch_offset_s=0.72e6)
+        noise_bins = windows.noise_bins
+        self.assertLess(noise_bins, int(settings.NF_active))
+
+        interior = np.arange(1, structure.n_bands - 1)
+        cell_ends = [
+            int(windows.window_starts(np.array([band]), width)[0]) + int(width)
+            for band in interior
+            for width in (int(windows.class_width[band]), windows.buffer_width)
+        ]
+        # * Every cell ends at or before noise_bins, and one ends there.
+        self.assertEqual(max(cell_ends), noise_bins)
 
 
 if __name__ == "__main__":

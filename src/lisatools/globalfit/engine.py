@@ -208,6 +208,9 @@ class GeneralSettings(Settings):
     global_fit_contact: Optional[str] = None
     global_fit_code_link: Optional[str] = None
     submission_parent_folder: Optional[str] = None
+    # branches whose posteriors are not written at the end of the run; produce them later with
+    # scripts/postprocess_submission.py (psd/galfor defer the whole stochastic component)
+    defer_posteriors: list[str] = dataclasses.field(default_factory=list)
     input_data_link: Optional[str] = None
     input_reference: Optional[str] = None
     noise_model: Optional[str] = None
@@ -290,6 +293,7 @@ class GeneralSetup(Setup, GeneralSettings):
         # CPU fallback: when gpus is None, force_backend resolves to "cpu" so
         # downstream consumers stay numpy-only. GPU path keeps cupy.
         self.force_backend = self.gpu_backend if self.gpus is not None else "cpu"
+        self.logger.debug(f"Using GPUs: {self.gpus}")
         self.logger.debug(f"Saving h5 backend to {self.main_file_path}")
         self.logger.debug(f"Saving artifacts to {self.artifacts_file_dir}")
         if not os.path.exists(self.artifacts_file_dir):
@@ -301,7 +305,9 @@ class GeneralSetup(Setup, GeneralSettings):
     def init_orbit_information(self):
         """Construct orbit objects, defaulting to :class:`EqualArmlengthOrbits`."""
         if self.orbits is None:
-            self.orbits = EqualArmlengthOrbits()
+            # * orbits is the host copy: without force_backend the default backend is the first GPU one when there is
+            # * a GPU, and a cpu run then pairs cupy orbits with a numpy sensitivity.
+            self.orbits = EqualArmlengthOrbits(force_backend="cpu")
             self.gpu_orbits = EqualArmlengthOrbits(force_backend=self.force_backend)
         else:
             if self.gpu_orbits is None and self.force_backend == self.gpu_backend:
@@ -362,9 +368,16 @@ class GeneralSetup(Setup, GeneralSettings):
 
         if self.fixed_psd_kwargs is None:
             self.fixed_psd_kwargs = dict(
-                psd_params=[15e-12, 3e-15],
+                psd_params=np.array([15e-12, 3e-15]),
                 galfor_params=None,
             )
+        else:
+            # the sensitivity backend slices these as arrays (psd_params[..., :n]); a YAML config gives lists
+            self.fixed_psd_kwargs = {
+                key: np.asarray(value, dtype=float) if key in ("psd_params", "galfor_params") and value is not None
+                else value
+                for key, value in self.fixed_psd_kwargs.items()
+            }
 
         self.logger.info(f"Using fixed PSD kwargs: {self.fixed_psd_kwargs}")
 
@@ -524,8 +537,9 @@ class GeneralSetup(Setup, GeneralSettings):
             )
         else:
             self.sensitivity_backend = backend_cls(
-                orbits=self.gpu_orbits,
+                orbits=self.gpu_orbits if self.force_backend == self.gpu_backend else self.orbits,
                 settings=domain_settings,
+                data_td_settings=self.data_td_settings,
                 force_backend=self.force_backend,
                 window_values=window if self.normalize_window else None,
                 filters_response=filters_response,
@@ -533,6 +547,8 @@ class GeneralSetup(Setup, GeneralSettings):
                 alias_filters_response=None if alias_response is None else alias_response[1],
                 **sensitivity_init_kwargs,
             )
+
+            self.logger.debug(f"Using sensitivity backend {type(self.sensitivity_backend).__name__} with kwargs: {self.sensitivity_backend.kwargs}")
 
     @property
     def stft_dt(self) -> Optional[float]:
@@ -576,6 +592,9 @@ class GlobalFitSettings:
     source_metadata: typing.Dict[str, dataclasses.dataclass] = dataclasses.field(
         default_factory=dict
     )
+    # build the residuals from the state through each branch's Settings.signal_gen when the analysis
+    # containers are assembled (run.py build_acs); off -> the recipe subtracts its own initial signals
+    rebuild_residuals: bool = False
 
 
 @dataclasses.dataclass

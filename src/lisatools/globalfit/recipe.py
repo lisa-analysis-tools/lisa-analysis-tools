@@ -31,7 +31,12 @@ except ModuleNotFoundError:
 from lisatools.domains import FDSettings, STFTSettings, WDMSettings
 from lisatools.response.tdiconfig import TDIConfig
 
-from bbhx.utils.transform import SSB_to_LISA
+# bbhx is optional (only MBH branches need it); a stub raises on first use.
+try:
+    from bbhx.utils.transform import SSB_to_LISA
+except ImportError as _bbhx_err:
+    def SSB_to_LISA(*args, _err=_bbhx_err, **kwargs):
+        raise ImportError("SSB_to_LISA requires bbhx, which is not installed.") from _err
 from gbgpu.gbgpu import GBGPU
 from eryn.moves.tempering import TemperatureControl, make_ladder
 from eryn.prior import ProbDistContainer
@@ -45,12 +50,13 @@ from .moves import (
     # GBSpecialRJSerialSearchMCMC,
     # GBSpecialRJRefitMove,
 )
-from .moves.gbbandstructure import stft_store_window_layout
+from .moves.gbbandstructure import plot_band_layout, stft_store_window_layout
 from .moves.gbspecialmove import (
-    GBSpecialRJPriorMove, 
-    GBSpecialRJSerialSearchMCMC,
+    GBFStatRJMove,
+    GBFStatSettings,
+    GBSpecialRJPriorMove,
     GBSpecialRJRefitMove,
-    GBSpecialBase   
+    GBSpecialBase
 )
 # from .moves.gbspecialstretch import GBSpecialBase
 
@@ -66,6 +72,8 @@ if typing.TYPE_CHECKING:
     from .state import GFState
     from .stock.erebor import GBSetup, GeneralSetup
     from ..analysiscontainer import AnalysisContainerArray
+
+from lisatools.utils.utility import set_attribute
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +153,24 @@ class Recipe:
         if self._current_iter >= len(self.recipe):
             raise ValueError("Recipe is already finished.")
 
-        self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+        self._start_current_step(iteration, last_sample, sampler)
         self._has_setup_first_step = True
+
+    def _start_current_step(self, iteration, last_sample, sampler):
+        """Set the current step's ``start_iteration`` (absolute) and run its ``setup_run``.
+
+        The start is recorded in the backend the first time the step starts, so a restart in the middle of a
+        step keeps counting from where it began (eryn's own ``iteration`` restarts at 0 with every run).
+        """
+        step = self._current_recipe_step
+        start = int(getattr(sampler, "iteration", iteration))
+        if self.backend_added and hasattr(self.backend, "recipe_step_start"):
+            start = self.backend.recipe_step_start(step["name"], start)
+        step["adjust"].start_iteration = start
+        step["adjust"].name = step["name"]
+        step["adjust"].backend = self.backend if self.backend_added else None
+        logger.info(f"Starting recipe step {step['name']!r} (from iteration {start}).")
+        step["adjust"].setup_run(iteration, last_sample, sampler)
 
     @property
     def current_recipe_step(self):
@@ -164,6 +188,9 @@ class Recipe:
         Returns:
             ``True`` if the entire recipe has finished, ``False`` otherwise.
         """
+        after_iteration = getattr(self._current_recipe_step["adjust"], "after_iteration", None)
+        if after_iteration is not None:
+            after_iteration(iteration, last_sample, sampler)
         stop_here = self._current_recipe_step["adjust"].stopping_function(
             iteration, last_sample, sampler
         )
@@ -174,7 +201,7 @@ class Recipe:
 
             if self._current_iter >= len(self.recipe):
                 return True
-            self._current_recipe_step["adjust"].setup_run(iteration, last_sample, sampler)
+            self._start_current_step(iteration, last_sample, sampler)
 
         return False
 
@@ -190,6 +217,8 @@ class RecipeStep:
         moves: List of MCMC moves to use during this recipe step.
         weights: List of weights matching ``moves``. Defaults to uniform.
     """
+
+    start_iteration: int | None = None  # absolute sampler iteration the step started at (set by Recipe)
 
     def __init__(self, moves=None, weights=None):
         if moves is not None:
@@ -231,22 +260,138 @@ class RecipeStep:
         raise NotImplementedError
 
 class BaseRecipeStep(RecipeStep):
-    """Default :class:`RecipeStep` that simply assigns moves to the sampler.
+    """Default :class:`RecipeStep` that assigns moves to the sampler.
 
     Args:
         moves: List of MCMC moves to use during this recipe step.
         weights: List of weights matching ``moves``.
+        move_settings: ``{branch_name: kwargs}`` for ``apply_settings`` of the moves of that branch (e.g.
+            ``{"mbh": {"num_repeats": 15, "weights": [...]}}``), applied whenever the step starts (also on a
+            restart). The moves may sit inside a ``CombineMove``.
     """
 
-    def __init__(self, moves=None, weights=None):
+    # defaults for subclasses that do not call this __init__
+    repeat_controllers: dict = {}
+    kept_repeats: tuple = ()
+    move_attributes: dict = {}
+    name: str | None = None
+    backend = None
+
+    def __init__(
+        self,
+        moves=None,
+        weights=None,
+        move_settings: dict[str, dict] | None = None,
+        repeat_controllers: dict[str, "RepeatController"] | None = None,
+        kept_repeats: typing.Iterable[str] = (),
+        move_attributes: dict[str, dict] | None = None,
+    ):
         super().__init__(moves=moves, weights=weights)
+        self.move_settings = move_settings or {}
+        # branch -> RepeatController: the branch's proposal repeats follow its inner ACT during this step
+        self.repeat_controllers = repeat_controllers or {}
+        # branches whose repeats earlier steps tuned: this step runs with the kept value, fixed
+        self.kept_repeats = tuple(kept_repeats)
+        # branch -> {attribute path: value} set on the branch's moves when the step starts (set_attribute)
+        self.move_attributes = move_attributes or {}
+        self.name: str | None = None  # the step's name in the Recipe (set by Recipe._start_current_step)
+        self.backend = None  # the Recipe's backend (same)
+
+    def _branch_moves(self) -> dict[str, list]:
+        """The moves of each branch in this step (inside the combined moves too), each once."""
+        from eryn.moves import CombineMove
+
+        out: dict[str, list] = {}
+        for move in self.moves:
+            move = move[0] if isinstance(move, tuple) else move
+            for sub in move.sub_moves if isinstance(move, CombineMove) else [move]:
+                listed = out.setdefault(getattr(sub, "branch_name", None), [])
+                if not any(sub is other for other in listed):
+                    listed.append(sub)
+        return out
+
+    def apply_move_attributes(self, dry_run: bool = False) -> None:
+        """Set each branch's :attr:`move_attributes` on its moves in this step (:func:`set_attribute`).
+
+        A path is set on every move of the branch that has it, and must be there on one at least: an unknown
+        branch or a path that no move of the branch has is an error. ``dry_run`` only checks that.
+        """
+        moves = self._branch_moves()
+        for branch, attributes in self.move_attributes.items():
+            if branch not in moves:
+                raise ValueError(f"move attributes for {branch!r}: this step has no move of that branch.")
+            for path, value in attributes.items():
+                done, errors = [], []
+                for move in moves[branch]:
+                    try:
+                        done.append(set_attribute(move, path, value, dry_run=dry_run))
+                    except (AttributeError, IndexError) as err:
+                        errors.append(f"{type(move).__name__}: {err}")
+                if not done:
+                    raise ValueError(f"{branch} move attribute {path!r} fits no move of the branch: {errors}.")
+                if not dry_run:
+                    logger.info(f"{branch} move attribute: {done[0]}")
+
+    def _stored_repeats(self, branch: str) -> dict:
+        if self.backend is None or not hasattr(self.backend, "recipe_repeats"):
+            return {}
+        return self.backend.recipe_repeats(branch)
+
+    def apply_repeat_control(self):
+        """After :meth:`apply_move_settings`: start this step's controllers, or fix the repeats a step tuned."""
+        moves = self._branch_moves()
+        for branch, controller in self.repeat_controllers.items():
+            (move,) = moves[branch]
+            controller.attach(move, self._stored_repeats(branch))
+        for branch, move_list in moves.items():
+            if branch in self.repeat_controllers:
+                continue
+            for move in move_list:  # a move shared with a tuning step: stop recording
+                if getattr(move, "record_inner_chain", False):
+                    move.record_inner_chain = False
+            if branch in self.kept_repeats:
+                kept = self._stored_repeats(branch).get("kept")
+                if kept is None:
+                    logger.warning(f"{branch}: no tuned repeats stored; step {self.name!r} keeps the configured value.")
+                    continue
+                for move in move_list:
+                    move.apply_settings(num_repeats=int(kept))
+                logger.info(f"{branch}: {int(kept)} proposal repeats in step {self.name!r}, as tuned.")
+
+    def after_iteration(self, iteration, last_sample, sampler):
+        """Called by the Recipe after every stored iteration, before :meth:`stopping_function`."""
+        for branch, controller in self.repeat_controllers.items():
+            values = controller.update()
+            if values is not None and self.backend is not None and hasattr(self.backend, "recipe_repeats"):
+                self.backend.recipe_repeats(branch, values)
+
+    def apply_move_settings(self):
+        """Hand each branch's ``move_settings`` to its moves' ``apply_settings``."""
+        from eryn.moves import CombineMove
+
+        settings = getattr(self, "move_settings", None) or {}
+        applied = set()
+        for move in self.moves:
+            move = move[0] if isinstance(move, tuple) else move
+            for sub in move.sub_moves if isinstance(move, CombineMove) else [move]:
+                branch = getattr(sub, "branch_name", None)
+                if branch in settings and hasattr(sub, "apply_settings"):
+                    sub.apply_settings(**settings[branch])
+                    applied.add(branch)
+                    logger.info(f"{branch} move settings: {settings[branch]}")
+        missing = sorted(set(settings) - applied)
+        if missing:
+            raise ValueError(f"move_settings for {missing}: no move of these branches takes settings in this step.")
 
     def setup_run(self, iteration, last_sample, sampler):
-        """Install :attr:`moves`/:attr:`weights` on the sampler.
+        """Apply :attr:`move_settings` and install :attr:`moves`/:attr:`weights` on the sampler.
 
         Each move that lacks an explicit periodicity setting inherits the
         sampler's periodicity.
         """
+        self.apply_move_settings()
+        self.apply_move_attributes()
+        self.apply_repeat_control()
         for move in self.moves:
             if sampler.periodic is not None and move.periodic is None:
                 logger.debug(f"Setting periodicity of move {move} to {sampler.periodic}")
@@ -285,21 +430,257 @@ class PERecipeStep(BaseRecipeStep):
 class IterationCountRecipeStep(BaseRecipeStep):
     """Recipe step that runs for N iterations before moving to the next step."""
 
-    def __init__(self, moves: list, weights: typing.Optional[list] = None, num_iters: int = 100):
-        super().__init__(moves, weights)
+    def __init__(
+        self,
+        moves: list,
+        weights: typing.Optional[list] = None,
+        num_iters: int = 100,
+        move_settings: dict[str, dict] | None = None,
+        **kwargs,
+    ):
+        super().__init__(moves, weights, move_settings=move_settings, **kwargs)
         self.num_iters = num_iters
 
     def setup_run(self, iteration, last_sample, sampler):
         super().setup_run(iteration, last_sample, sampler)
-
-        self.start_iteration = iteration
+        if self.start_iteration is None:  # outside a Recipe, which sets it (restart-aware)
+            self.start_iteration = int(sampler.iteration)
 
     def stopping_function(self, iteration, last_sample, sampler):
-        """Stop after num_iters iterations."""
-        stop = (iteration - self.start_iteration) >= self.num_iters
+        """Stop after num_iters stored iterations (absolute count: eryn's ``iteration`` restarts per run)."""
+        stop = (int(sampler.iteration) - self.start_iteration) >= self.num_iters
         if stop:
             logger.info(f"IterationCountRecipeStep stopping after {self.num_iters} iterations.")
 
+        return stop
+
+
+class RepeatController:
+    """Keeps a single-source move's proposal repeats at a multiple of its inner autocorrelation time.
+
+    The inner ACT is the move's own (``move.inner_act()``): that of the cold chain in units of proposal repeats,
+    over the move's last ``window`` calls put end to end. It is what more repeats per iteration buy; the ACT of
+    the stored chain, in iterations, is the same thing seen once per call.
+
+    Every ``every`` calls the repeats go to ``per_act`` inner ACTs, by at most a factor ``max_step``, within
+    ``[min, max]``. While the ACT is not resolved (the window is shorter than about five ACTs, or the chain is
+    still burning in) they grow by ``max_step``, which also lengthens the window. The repeats change between
+    iterations only, from past calls. :attr:`kept` is the value for the stage that keeps its samples.
+
+    Args:
+        branch: the branch of the move.
+        min, max: bounds of the repeats.
+        per_act: inner ACTs per call.
+        every: calls of the move between updates.
+        window: calls of the move the ACT is measured over (at least ``every``).
+        max_step: largest factor the repeats change by in one update.
+    """
+
+    def __init__(self, branch, min, max, per_act=2.0, every=10, window=20, max_step=2.0):
+        self.branch, self.min, self.max = branch, int(min), int(max)
+        self.per_act, self.every, self.window, self.max_step = float(per_act), int(every), int(window), float(max_step)
+        self.move = None
+        self.tau = np.nan  # the last resolved inner ACT
+        self._tuning = None  # the repeats this controller last set (carried from one tuning step to the next)
+
+    def _clip(self, value) -> int:
+        return int(np.clip(int(np.ceil(value)), self.min, self.max))
+
+    @property
+    def kept(self) -> int:
+        """The repeats for the stage that keeps its samples; ``max`` while the ACT is not resolved."""
+        return self.max if np.isnan(self.tau) else self._clip(self.per_act * self.tau)
+
+    def values(self) -> dict:
+        return {"tuning": int(self.move.num_repeats), "kept": self.kept, "tau": float(self.tau)}
+
+    def attach(self, move, stored: dict | None = None) -> None:
+        """Take over ``move`` at the start of a step; ``stored`` are the values tuned so far (an earlier step, or
+        this one before a restart)."""
+        self.move = move
+        stored = stored or {}
+        if stored.get("tuning") is not None:
+            move.apply_settings(num_repeats=self._clip(stored["tuning"]))
+            self.tau = float(stored.get("tau", np.nan))
+        else:  # nothing stored: carry on from an earlier step of this run, or start from the block's value
+            move.apply_settings(num_repeats=self._clip(self._tuning or move.num_repeats))
+        self._tuning = int(move.num_repeats)
+        move.record_inner_chain, move.inner_window = True, self.window
+        move.reset_inner_act()
+        logger.info(f"{self.branch}: adaptive proposal repeats, starting from {move.num_repeats}.")
+
+    def update(self) -> dict | None:
+        """Set the repeats from the last ``window`` calls; the new values, or None if it is not time yet."""
+        tau, ncalls = self.move.inner_act()
+        if ncalls < self.every:
+            return None
+        current = int(self.move.num_repeats)
+        if np.isnan(tau):  # not resolved: the ACT is above about a fifth of the window, or the chain is drifting
+            target = self.max_step * current
+            if current >= self.max:
+                logger.warning(
+                    f"{self.branch}: inner ACT not resolved over the last {self.window} calls at {current} repeats "
+                    f"(the maximum); the kept stage will run with {self.max}."
+                )
+            self.tau = np.nan
+        else:
+            target, self.tau = self.per_act * tau, tau
+        new = self._clip(np.clip(target, current / self.max_step, current * self.max_step))
+        if new != current:
+            self.move.apply_settings(num_repeats=new)
+        self._tuning = new
+        self.move.reset_inner_act(keep_chain=True)
+        logger.info(
+            f"{self.branch}: inner ACT {'not resolved' if np.isnan(tau) else f'{tau:.1f} repeats'}; "
+            f"repeats {current} -> {new} (kept stage: {self.kept})."
+        )
+        return self.values()
+
+
+class ChainMonitor:
+    """The cold-chain series of one block that gate a :class:`ConvergenceRecipeStep`: its sampled parameters."""
+
+    def __init__(self, branch: str):
+        self.branch = branch
+
+    def series(self, backend, start: int, stop: int, periodic) -> tuple[np.ndarray | None, dict | None, str]:
+        """``(x[nsteps, nwalkers, nseries], periods, note)`` since iteration ``start``; ``x`` None if nothing gates.
+
+        Left out: leaf slots not active through the whole stretch, and parameters with no variance at all (the
+        same value in every walker and iteration: fixed by construction). A parameter where each walker sits at
+        its own value stays in, and reads as not converged.
+        """
+        from lisatools.sampling.utility import branch_periods
+
+        kwargs = dict(slice_vals=slice(start, stop), temp_index=0, branch_names=[self.branch])
+        chain = np.asarray(backend.get_chain(**kwargs)[self.branch])  # (nsteps, nwalkers, nleaves, ndim)
+        inds = np.asarray(backend.get_inds(**kwargs)[self.branch])
+        active = inds.all(axis=(0, 1))
+        ndim = chain.shape[-1]
+        x = chain[:, :, active].reshape(chain.shape[0], chain.shape[1], -1)
+        periods_branch = branch_periods(periodic, self.branch)
+        varies = np.ptp(x, axis=(0, 1)) > 0.0
+        columns = np.flatnonzero(varies)
+        periods = {}
+        for new, old in enumerate(columns):
+            period = periods_branch.get(int(old % ndim))
+            if period is not None:
+                periods[new] = period
+        note = ""
+        if not active.all():
+            note += f" {int((~active).sum())} inactive leaves left out;"
+        if not varies.all():
+            note += f" {int((~varies).sum())} fixed parameters left out;"
+        if columns.size == 0:
+            return None, None, note + " nothing to monitor;"
+        return x[:, :, columns], periods, note
+
+
+class GBCountMonitor:
+    """The gb block's gating series: the cold-chain number of sources, from the per-band counts the gb
+    sub-backend stores every iteration (``band_num_binaries``). The per-band counts are reported, not gating."""
+
+    def __init__(self, branch: str = "gb"):
+        self.branch = branch
+
+    def band_counts(self, backend, start: int, stop: int) -> np.ndarray:
+        info = backend.sub_backend[self.branch].get_band_info(slice_vals=slice(start, stop))
+        return np.asarray(info["band_num_binaries"])[:, 0].astype(float)  # (nsteps, nwalkers, nbands)
+
+    def series(self, backend, start: int, stop: int, periodic) -> tuple[np.ndarray | None, dict | None, str]:
+        from lisatools.sampling.utility import cold_chain_act
+
+        bands = self.band_counts(backend, start, stop)
+        total = bands.sum(axis=-1, keepdims=True)
+        moving = np.ptp(bands, axis=(0, 1)) > 0.0
+        note = ""
+        if moving.any():
+            tau, reliable = cold_chain_act(bands[:, :, moving])
+            with np.errstate(invalid="ignore"):
+                slowest = "not defined" if np.isnan(tau).all() else f"{np.nanmax(tau):.1f}"
+            note = (
+                f" per-band counts: {int(moving.sum())} of {moving.size} bands change, slowest ACT {slowest}, "
+                f"{int(reliable.sum())} reliable;"
+            )
+        if np.ptp(total) == 0.0:
+            return None, None, note + " the number of sources never changes: not gating;"
+        return total, None, note
+
+
+class ConvergenceRecipeStep(BaseRecipeStep):
+    """Recipe step that stops once every monitored block has ``target_ess`` independent cold-chain samples.
+
+    Every ``check_every`` iterations the cold chain since the step started is read from the backend, and for each
+    monitor ``tau`` is the largest integrated ACT over its series (:func:`lisatools.sampling.utility.cold_chain_act`)
+    and ``ESS = nwalkers * nsteps / tau``, the count postprocessing gets by thinning by the ACT. The step stops
+    when the smallest ESS reaches ``target_ess`` and every ``tau`` is reliable (``nsteps > 50 tau``); an ACT that
+    is not defined (a walker that never moved) is not reliable. Without ``target_ess`` nothing stops the step
+    (a :class:`PERecipeStep` that reports its ACTs). The run's iteration count remains the hard limit.
+
+    Args:
+        monitors: objects with ``branch`` and ``series(backend, start, stop, periodic)`` (:class:`ChainMonitor`,
+            :class:`GBCountMonitor`).
+        target_ess: independent samples wanted of the slowest block.
+        check_every: iterations between checks.
+    """
+
+    def __init__(self, moves=None, weights=None, monitors=(), target_ess=None, check_every=50, **kwargs):
+        super().__init__(moves, weights, **kwargs)
+        self.monitors, self.target_ess, self.check_every = list(monitors), target_ess, int(check_every)
+        self.last_report: dict[str, dict] = {}
+
+    def setup_run(self, iteration, last_sample, sampler):
+        super().setup_run(iteration, last_sample, sampler)
+        if self.start_iteration is None:  # outside a Recipe, which sets it (restart-aware)
+            self.start_iteration = int(sampler.iteration)
+
+    def report(self, sampler) -> dict[str, dict]:
+        """``{branch: {tau, ess, reliable, note}}`` from the cold chain since the step started."""
+        from lisatools.sampling.utility import cold_chain_act
+
+        backend, stop = sampler.backend, int(sampler.backend.iteration)
+        out = {}
+        for monitor in self.monitors:
+            x, periods, note = monitor.series(backend, self.start_iteration, stop, getattr(sampler, "periodic", None))
+            if x is None:
+                out[monitor.branch] = {"gating": False, "note": note}
+                continue
+            tau, reliable = cold_chain_act(x, periods)
+            defined = not np.isnan(tau).any()
+            slowest = float(tau.max()) if defined else np.nan
+            out[monitor.branch] = {
+                "gating": True,
+                "tau": slowest,
+                "ess": x.shape[0] * x.shape[1] / slowest if defined else 0.0,
+                "reliable": bool(reliable.all()),
+                "note": note,
+            }
+        return out
+
+    def stopping_function(self, iteration, last_sample, sampler):
+        done = int(sampler.backend.iteration) - self.start_iteration
+        if done <= 0 or done % self.check_every != 0:
+            return False
+        self.last_report = report = self.report(sampler)
+        repeats = {branch: [m.num_repeats for m in moves if hasattr(m, "num_repeats")]
+                   for branch, moves in self._branch_moves().items()}
+        lines = [f"Convergence after {done} iterations of step {self.name!r} (target ESS: {self.target_ess}):"]
+        for branch, row in report.items():
+            if not row["gating"]:
+                lines.append(f"  {branch}: not gating;{row['note']}")
+                continue
+            lines.append(
+                f"  {branch}: ACT {row['tau']:.1f}, "
+                f"ESS {row['ess']:.0f}, {'reliable' if row['reliable'] else 'not reliable yet'}"
+                + (f", repeats {repeats[branch]}" if repeats.get(branch) else "") + f";{row['note']}"
+            )
+        logger.info("\n".join(lines))
+        gating = [row for row in report.values() if row["gating"]]
+        if self.target_ess is None or not gating:
+            return False
+        stop = all(row["reliable"] and row["ess"] >= self.target_ess for row in gating)
+        if stop:
+            logger.info(f"Step {self.name!r} reached {self.target_ess} independent samples in every block.")
         return stop
 
 
@@ -593,7 +974,7 @@ def mbh_catalogue_to_sampling_basis(
 
     s1z = float(catalogue_entry["PrimarySpinCompZ"])
     s2z = float(catalogue_entry["SecondarySpinCompZ"])
-    dist = float(catalogue_entry["LuminosityDistance"]) / 1e3  # Mpc -> Gpc
+    dist = float(catalogue_entry["LuminosityDistance"]) * 1e-3  # Mpc -> Gpc
     phi_ref = float(catalogue_entry["PhaseReferenceSourceFrame"]) % (2 * np.pi)
     cos_iota = np.cos(float(catalogue_entry["InclinationAngle"]))
 
@@ -629,6 +1010,42 @@ def mbh_catalogue_to_sampling_basis(
     # Erebor's stock MBH transform (MBHSetup.init_sampling_info /
     # make_mbh_transform_container) uses the same direct-ICRS basis.
     return np.array([logM, Q, s1z, s2z, dist, phi_ref, cos_iota, psi_icrs, ra, sin_dec, t_ssb])
+
+def sobhb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_plus_shift: float = 0.0) -> np.ndarray:
+    """Convert a single Mojito SOBHB catalogue entry to the SOBBH (gwtf) sampling basis.
+
+    The sampling basis is the input basis of erebor-priors ``SOBHBPrior`` (the default of
+    :class:`~lisatools.globalfit.stock.erebor.SOBBHTFSetup`):
+    ``[Mc, eta, s1, s2, d_L [Gpc], cos_iota, f0, phi_0, psi, alpha, sin_delta]``, with ``phi_0`` the
+    orbital phase at the data start (mojito / TD convention), as the waveforms take it with
+    ``phase_at_coalescence=False``.
+    Its transform gives the ``GWTF_generator`` basis, built here by
+    :func:`~lisatools.globalfit.searches.sobhb_catalogue_to_gwtf_basis`.
+
+    Parameters
+    ----------
+    catalogue_entry : dict
+        Dictionary of catalogue parameters for one SOBHB source, as
+        stored by ``L1DataLoader.catalogue['sobhb'][source_id]``.
+    trim_plus_shift : float
+        Time [s] from the catalogue reference epoch (``MOJITO_REFERENCE_TIME``)
+        to the start of the data (gwtf t=0). The catalogue GW22 frequency is
+        given at the reference epoch and is evolved forward by this amount.
+
+    Returns
+    -------
+    np.ndarray
+        Parameter vector of shape ``(11,)`` in the SOBBH sampling basis
+        (masses in Msun, SSB frame; sky / polarization in ICRS).
+    """
+    from .searches import sobhb_catalogue_to_gwtf_basis
+
+    m1, m2, s1, s2, dist, iota, f0, phi_0, psi, ra, dec = sobhb_catalogue_to_gwtf_basis(
+        catalogue_entry, trim_plus_shift
+    )
+    Mc = (m1 * m2) ** 0.6 / (m1 + m2) ** 0.2
+    eta = m1 * m2 / (m1 + m2) ** 2
+    return np.array([Mc, eta, s1, s2, dist, np.cos(iota), f0, phi_0, psi, ra, np.sin(dec)])
 
 
 def emri_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float = 0.0) -> np.ndarray:
@@ -708,7 +1125,7 @@ def gb_catalogue_to_sampling_basis(catalogue_entry: dict, trim_duration: float =
 
     ra = np.array(catalogue_entry["RightAscension"]) # alpha
     dec = np.array(catalogue_entry["Declination"]) # delta
-    psi_icrs = np.array(catalogue_entry["PolarisationAngle"]) % np.pi  # ensure polarization is within [0, pi]
+    psi_icrs = np.array(catalogue_entry["PolarisationAngle"]) % (2 * np.pi)  # psi is periodic in 2 pi (DDPC convention)
     # lam_ecl, beta_ecl, psi_ecl= icrs_to_ecliptic(ra, dec, psi_icrs)
 
     alpha = ra % (2 * np.pi)
@@ -836,7 +1253,12 @@ def select_gb_injection_subset_by_snr(
     # physical rows must come from the fdot-basis transform -- the RUN's
     # transform would read slot 2 as Mc on chirp-mass runs (fdot ~1e-15 as
     # Mc -> template fdot ~ 0; fdot < 0 -> (neg)^(5/3) = NaN template).
-    from .stock.erebor.transforms import make_gb_transform_container
+    try:
+        from .stock.erebor.transforms import make_gb_transform_container # type: ignore
+    except ImportError:
+        raise ImportError(
+            "GB SNR-cut injection requires the 'erebor' package (pip install erebor)."
+        )
 
     _tc_fdot = make_gb_transform_container(use_chirp_mass=False)
     _xp = gb_wdm_comp.xp
@@ -1010,7 +1432,12 @@ def subtract_gb_neighbors_from_data(
     # FDOT-basis physical rows (same contract note as in
     # select_gb_injection_subset_by_snr: the run transform would misread
     # slot 2 as Mc on chirp-mass runs and NaN the fdot < 0 sources).
-    from .stock.erebor.transforms import make_gb_transform_container
+    try:
+        from .stock.erebor.transforms import make_gb_transform_container # type: ignore
+    except ImportError:
+        raise ImportError(
+            "GB neighbor subtraction requires the 'erebor' package (pip install erebor)."
+        )
 
     _tc_fdot = make_gb_transform_container(use_chirp_mass=False)
     xp = gb_wdm_comp.xp
@@ -1105,6 +1532,7 @@ def build_psd_moves(
     num_repeats: int = 60,
     permute_every: int = 50,
     Tmax: float = 1e6,
+    betas: typing.Optional[np.ndarray] = None,
 ) -> tuple[PSDMove, PSDMove]:
     """Build PSD search and PE moves.
 
@@ -1126,6 +1554,8 @@ def build_psd_moves(
         Number of internal PSD move repeats. Default 60.
     Tmax : float, optional
         Maximum temperature for ``TemperatureControl``. Default 1e6.
+    betas : np.ndarray, optional
+        Explicit ladder for ``TemperatureControl``; overrides ``Tmax``.
 
     Returns
     -------
@@ -1140,7 +1570,7 @@ def build_psd_moves(
 
     effective_ndim = engine_info.ndims["psd"] if galfor_info is None else engine_info.ndims["galfor"] + engine_info.ndims["psd"] 
     temperature_control = TemperatureControl(
-        effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
+        effective_ndim, nwalkers, ntemps=ntemps, betas=betas, Tmax=Tmax, permute=False
     )
 
     psd_move_kwargs = dict(
@@ -1244,66 +1674,55 @@ class GBWaveformDict(typing.TypedDict):
     window_alpha: float
 
 
-def build_gb_moves(
+@dataclasses.dataclass
+class GBMoveParts:
+    """The engine-owned constructor arguments of every GB special move (``GBSpecialBase``)."""
+
+    args: tuple  # gb, priors, start_freq_ind, data_length, acs, band_edges, band_N_vals, gpu_priors
+    kwargs: dict  # waveform, transform, domain computations, temperature control, store windows
+    gpu_priors: dict  # the RJ prior move's proposal distribution
+    ntemps: int
+    nwalkers: int
+
+
+def default_gb_debug_settings(debug_settings, artifacts_file_dir: str):
+    """``debug_settings`` with its plot folder in the run's artifacts when it names none."""
+    if debug_settings is None or debug_settings.plot_dir is not None:
+        return debug_settings
+    return dataclasses.replace(
+        debug_settings, plot_dir=os.path.join(artifacts_file_dir, "gb_debug", "")
+    )
+
+
+def default_fstat_settings(fstat_settings, artifacts_file_dir: str):
+    """``fstat_settings`` (the defaults when None) with the search's output folder in the run's artifacts when it names
+    none."""
+    settings = GBFStatSettings() if fstat_settings is None else fstat_settings
+    if settings.output_dir is not None:
+        return settings
+    return dataclasses.replace(settings, output_dir=os.path.join(artifacts_file_dir, "fstat_search", ""))
+
+
+def prepare_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
     acs: AnalysisContainerArray,
     priors: dict,
     state: GFState,
     *,
-    Tmax: float = 1e6,
-    search_move_names: typing.Optional[typing.Sequence[str]] = None,
-    pe_move_names: typing.Optional[typing.Sequence[str]] = None,
-    include_search: typing.Optional[bool] = None,
-    include_refit: bool = True,
-    **kwargs,
-) -> typing.Tuple[typing.List[GBSpecialBase], typing.List[GBSpecialBase]]:
-    """Build GB search and PE moves.
+    Tmax: typing.Optional[float] = None,
+    waveform_class: typing.Optional[type] = None,
+) -> GBMoveParts:
+    """Set up what every GB move runs on, and return the moves' engine-owned constructor arguments.
 
-    Both moves share the same ``acs``, ``priors``, and
-    ``TemperatureControl`` instance, so updates to ``acs`` (e.g. signal
-    subtraction by another branch) are visible to both moves at runtime.
-
-    The GB move classes, per-move flags, and list ordering are the GB
-    *reference recipe* and stay here; a settings file steers which of them it
-    actually installs through the keyword-only design knobs below (this
-    replaces the post-hoc ``[m for m in gb_pe_moves if "prior" in m.name]``
-    filtering that GB settings files used to duplicate).
-
-    Parameters
-    ----------
-    engine_info :
-        Engine info object exposing ``ndims``.
-    curr : CurrentInfoGlobalFit
-        Current run info; reads ``source_info["gb"]`` and ``general_info``.
-    acs :
-        Shared analysis container (passed by reference).
-    priors : dict
-        Shared priors dict (passed by reference).
-    Tmax : float, optional
-        Maximum temperature for ``TemperatureControl``. Default 1e6.
-    search_move_names : sequence of str, optional
-        Explicit names of search moves to build (e.g. ``["rj_prior_search"]``).
-        If ``None`` and ``include_search`` is not ``False``, defaults to
-        ``["rj_fstat_mcmc_search", "rj_prior_search"]`` for FD, or ``[]`` for STFT/WDM.
-    pe_move_names : sequence of str, optional
-        Explicit names of PE moves to build (e.g. ``["rj_prior"]``). If ``None``,
-        defaults to ``["rj_prior", "rj_fstat_mcmc"]`` (plus refit if available) for FD,
-        or ``["rj_prior"]`` for STFT/WDM.
-    include_search : bool, optional
-        Deprecated in favor of ``search_move_names``. When ``False``, return an empty
-        search-move list. Default ``None``.
-    include_refit : bool, optional
-        When ``False``, never build the GMM-refit moves even if the refit
-        file is present. Default ``True`` (refit is still gated on the file
-        existing).
-
-    Returns
-    -------
-    gb_search_moves : List[GBSpecialBase]
-    gb_pe_moves : List[GBSpecialBase]
+    It builds the GB waveform (``waveform_class``, default ``GBGPU``) and the domain computations, sizes the
+    STFT store windows, subtracts the start sources from the residuals and sets the band temperatures.
+    ``Tmax`` tops the moves' ``TemperatureControl``; ``None`` takes ``gb_info.moves.Tmax``.
+    ``build_gb_moves`` and the l2d GB block add each move's own knobs.
     """
     gb_info: GBSetup = curr.source_info["gb"]
+    if Tmax is None:
+        Tmax = gb_info.moves.Tmax
     general_info: GeneralSetup = curr.general_info
     nwalkers: int = general_info.nwalkers
     ntemps: int = general_info.ntemps
@@ -1324,56 +1743,55 @@ def build_gb_moves(
     if gpus is not None:
         _gb_backend.set_cuda_device(gpus[0])
         
-    gb = GBGPU(**gb_info.initialize_kwargs)
+    gb = (GBGPU if waveform_class is None else waveform_class)(**gb_info.waveform.initialize_kwargs)
     if gpus is not None:
         cp.cuda.runtime.setDevice(gpus[0])
         gb.gpus = gpus
     else:
         gb.gpus = None
 
-    logger.debug(f"GBGPU initialized at t0 = {gb_info.initialize_kwargs['t0']}")
+    logger.debug(f"GBGPU initialized at t0 = {gb_info.waveform.t0}")
     logger.debug(f"GBGPU initialized with gpus: {gb.gpus} and backend: {gb.backend}")
     
     #* Ensure gb computations frames are initialized. (currently STFT only)
-    if isinstance(gb_info.gb_stft_comp, type) and issubclass(gb_info.gb_stft_comp, STFTGBComputations):
-        assert gb_info.gb_stft_kwargs is not None
-        
+    if isinstance(domain_settings, STFTSettings):
+        stft_settings = gb_info.stft
+
         if acs.domain_group_kwargs is None or acs.domain_group_kwargs == dict():
             domain_kwargs = dict(
                 tdi_type="XYZ",
                 window_alpha=general_info.window_alpha,
-                use_midpoint=gb_info.gb_stft_kwargs["use_midpoint"],
-                linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"]
+                use_midpoint=stft_settings.use_midpoint,
+                linear_envelope=stft_settings.linear_envelope,
             )
             acs.domain_group_kwargs = domain_kwargs
             acs._ensure_cpp_splits()
-        
+
         tdi_config = TDIConfig(
-            tdi='2nd generation', 
+            tdi='2nd generation',
             force_backend=general_info.force_backend
         )
 
-        gb_stft_comp = STFTGBComputations(
+        # * Kept on the setup: the store windows, the start subtraction and the moves read it.
+        gb_info.gb_stft_comp = STFTGBComputations(
             stft_comps=acs.cpp_splits[0],
             T=gb_info.Tobs,
             t_ref=MOJITO_REFERENCE_TIME,
             orbits=general_info.gpu_orbits,
             tdi_config=tdi_config,
             force_backend=general_info.force_backend,
-            n_side_bins=gb_info.gb_stft_kwargs["n_side_bins"],
-            freq_from_tdi_phase=gb_info.gb_stft_kwargs["freq_from_tdi_phase"],
             window_alpha=general_info.window_alpha,
-            use_midpoint=gb_info.gb_stft_kwargs["use_midpoint"],
-            linear_envelope=gb_info.gb_stft_kwargs["linear_envelope"]
+            **stft_settings.computation_kwargs,
         )
-        gb_info.gb_stft_comp = gb_stft_comp
 
     #* STFT store windows are sized here, where the comp's stencil, its t_ref and data_t0 are all known.
     gb_info.stft_store_windows = None
     band_structure = getattr(gb_info, "band_structure", None)
     if isinstance(acs.settings, STFTSettings) and band_structure is not None:
+        # ? The bands start at the grid's lowest frequency, or above it when the GB prior does.
+        first_edge_hz, grid_min_hz = float(asnumpy(band_structure.edges_hz)[0]), float(acs.settings.min_freq)
         if (float(band_structure.grid_df_hz) != float(acs.settings.df)
-                or not np.isclose(float(asnumpy(band_structure.edges_hz)[0]), float(acs.settings.min_freq))):
+                or (first_edge_hz < grid_min_hz and not np.isclose(first_edge_hz, grid_min_hz))):
             raise ValueError(
                 "the GB band structure was built on a different STFT grid than the analysis container; "
                 "its store windows would index the wrong bins."
@@ -1389,6 +1807,16 @@ def build_gb_moves(
             gb_info.stft_store_windows.tier_width,
             gb_info.stft_store_windows.buffer_width,
             int(acs.settings.NF_active),
+        )
+        # * The band layout the moves run on, with the sources of walker 0's cold chain per band.
+        gb_branch = state.branches["gb"]
+        walker_coords = gb_branch.coords[0, 0][gb_branch.inds[0, 0]]
+        source_f0_hz = (
+            gb_info.transform.both_transforms(walker_coords)[:, 1] if len(walker_coords) else np.zeros(0)
+        )
+        plot_band_layout(
+            band_structure, gb_info.stft_store_windows, source_f0_hz,
+            os.path.join(curr.general_info.artifacts_file_dir, "gb_band_layout.png"),
         )
 
     #* Make sure that priors are evaluated on gpus (when available).
@@ -1427,23 +1855,30 @@ def build_gb_moves(
         coords_out_gb = state.branches["gb"].coords[0,
             state.branches["gb"].inds[0]
         ]
-        coords_out_gb[:, 3] = coords_out_gb[:, 3] % (2 * np.pi)
-        coords_out_gb[:, 5] = coords_out_gb[:, 5] % (1 * np.pi)
-        coords_out_gb[:, 6] = coords_out_gb[:, 6] % (2 * np.pi)
+        # * Wrap the periodic columns into their prior range, with the GB prior's own periods.
+        input_basis = list(gb_info.transform.input_basis)
+        for name, period in gb_info.periodic["gb"].items():
+            column = input_basis.index(name)
+            coords_out_gb[:, column] = coords_out_gb[:, column] % period
 
         check = priors["gb"].logpdf(coords_out_gb)
         if np.any(np.isinf(check)):
-
-            # check which prior is inf
             inf_indices = np.where(np.isinf(check))[0]
-            inf_coords = coords_out_gb[inf_indices]
-            logger.error(f"Found {len(inf_indices)} coordinates with inf logpdf under GB priors. Example inf coordinates: {inf_coords[:5]}") 
-
+            logger.error(
+                f"Found {len(inf_indices)} GB start coordinates outside the GB prior. "
+                f"Examples: {coords_out_gb[inf_indices][:5]}"
+            )
             logger.info("Prior bounds for GB parameters:")
             for param_name, prior in priors["gb"].priors_in.items():
-                logger.info(f"  {param_name}: [{prior.min_val},{prior.max_val}]")
-            breakpoint()
-            raise ValueError("Starting priors are inf. If injecting, try reducing spread.")
+                # ? A one-column prior has minimum and maximum; the joint (f0, fdot) prior has the
+                # ? f0 range, and fdot's bounds follow from f0.
+                lower = getattr(prior, "minimum", getattr(prior, "f0_min", None))
+                upper = getattr(prior, "maximum", getattr(prior, "f0_max", None))
+                logger.info(f"  {param_name}: [{lower}, {upper}]")
+            raise ValueError(
+                f"{len(inf_indices)} GB start coordinates lie outside the GB prior (bounds in the "
+                "log). If injecting, try reducing the spread."
+            )
 
         coords_in_in = gb_info.transform.both_transforms(coords_out_gb)
 
@@ -1481,7 +1916,7 @@ def build_gb_moves(
                 data_splits=acs.gpu_map,
                 num_per_gpu=num_per_gpu_walker,
                 N=N_vals,
-                **gb_info.waveform_kwargs,
+                **gb_info.waveform.waveform_kwargs,
             )
         elif isinstance(domain_settings, WDMSettings):
             if gb_info.gb_wdm_comp is None:
@@ -1501,12 +1936,11 @@ def build_gb_moves(
                 factors=factors_arr,
             )
         elif isinstance(domain_settings, STFTSettings):
-            assert gb_info.gb_stft_comp is not None, (
-                "STFT-domain GB initialization requires "
-                "gb_info.gb_stft_comp; build an STFTGBComputations in the "
-                "settings file and pass it via GBSettings.gb_stft_comp."
+            assert getattr(gb_info, "gb_stft_comp", None) is not None, (
+                "STFT-domain GB initialization requires gb_info.gb_stft_comp, which "
+                "build_gb_moves builds above for an STFT domain."
             )
-            
+
             xp = gb_info.gb_stft_comp.xp
 
             from gbgpu.gb_likelihood import make_band_likelihood_engine
@@ -1515,14 +1949,14 @@ def build_gb_moves(
                 domain_settings,
                 gb_stft_comp=gb_info.gb_stft_comp,
                 nchannels=acs.nchannels,
-                tdi_channel_setup=gb_info.waveform_kwargs["tdi_channel_setup"],
+                tdi_channel_setup=gb_info.waveform.tdi_channel_setup,
             ).fill_template(
                 acs,
                 xp.asarray(coords_in_in),
                 xp.asarray(data_index).astype(xp.int32),
                 None,
                 factor=-1,
-                waveform_kwargs=gb_info.waveform_kwargs,
+                waveform_kwargs=gb_info.waveform.waveform_kwargs,
             )
         else:
             raise NotImplementedError(
@@ -1606,18 +2040,8 @@ def build_gb_moves(
         effective_ndim, nwalkers, ntemps=ntemps, Tmax=Tmax, permute=False
     )
     
-    # * GB move options come from the settings file through gb_info; None gives each class's defaults.
-    debug_settings = getattr(gb_info, "debug_settings", None)
-    if debug_settings is not None and debug_settings.plot_dir is None:
-        debug_settings = dataclasses.replace(
-            debug_settings,
-            plot_dir=os.path.join(curr.general_info.artifacts_file_dir, "gb_debug", ""),
-        )
-    leaf_cap_settings = getattr(gb_info, "leaf_cap_settings", None)
-    sighet_settings = getattr(gb_info, "sighet_settings", None)
-
-    gb_move_kwargs = dict(
-        waveform_kwargs=gb_info.waveform_kwargs,
+    engine_kwargs = dict(
+        waveform_kwargs=gb_info.waveform.waveform_kwargs,
         parameter_transforms=gb_info.transform,
         provide_betas=True,
         skip_supp_names_update=["group_move_points"],
@@ -1625,25 +2049,100 @@ def build_gb_moves(
         force_backend=general_info.force_backend,
         nfriends=nwalkers,
         temperature_control=temperature_control,
-        num_repeat_proposals=gb_info.num_repeat_proposals,
-        search_kwargs=gb_info.search_kwargs,
-        stretch_probability=gb_info.stretch_probability,
         gb_wdm_comp=getattr(gb_info, "gb_wdm_comp", None),
         gb_fd_comp=getattr(gb_info, "gb_fd_comp", None),
         gb_stft_comp=getattr(gb_info, "gb_stft_comp", None),
         orbits=getattr(gb_info, "orbits", None),
         tdi_config=getattr(gb_info, "tdi_config", None),
-        t_ref=float(getattr(gb_info, "t0", 0.0) or 0.0),
-        debug_settings=debug_settings,
-        leaf_cap_settings=leaf_cap_settings,
-        sighet_settings=sighet_settings,
-        num_band_preload=getattr(gb_info, "num_band_preload", None),
-        num_bands_preload_temp=getattr(gb_info, "num_bands_preload_temp", None),
+        # ? The moves use t_ref for the FD computation only.
+        t_ref=float(gb_info.waveform.t0 or 0.0),
         ntemps=ntemps,
         stft_store_windows=gb_info.stft_store_windows,
     )
+    return GBMoveParts(gb_move_args, engine_kwargs, gpu_priors, ntemps, nwalkers)
 
-    _rj_phase_max = bool(int(os.environ.get("GB_RJ_PHASE_MAXIMIZE", "0")))
+
+def build_gb_moves(
+    engine_info: Setup,
+    curr: CurrentInfoGlobalFit,
+    acs: AnalysisContainerArray,
+    priors: dict,
+    state: GFState,
+    *,
+    Tmax: typing.Optional[float] = None,
+    search_move_names: typing.Optional[typing.Sequence[str]] = None,
+    pe_move_names: typing.Optional[typing.Sequence[str]] = None,
+    include_search: typing.Optional[bool] = None,
+    include_refit: typing.Optional[bool] = None,
+    **kwargs,
+) -> typing.Tuple[typing.List[GBSpecialBase], typing.List[GBSpecialBase]]:
+    """Build GB search and PE moves.
+
+    Both moves share the same ``acs``, ``priors``, and
+    ``TemperatureControl`` instance, so updates to ``acs`` (e.g. signal
+    subtraction by another branch) are visible to both moves at runtime.
+
+    The GB move classes, per-move flags, and list ordering are the GB
+    *reference recipe* and stay here; a settings file steers which of them it
+    actually installs through the keyword-only design knobs below (this
+    replaces the post-hoc ``[m for m in gb_pe_moves if "prior" in m.name]``
+    filtering that GB settings files used to duplicate).
+
+    Parameters
+    ----------
+    engine_info :
+        Engine info object exposing ``ndims``.
+    curr : CurrentInfoGlobalFit
+        Current run info; reads ``source_info["gb"]`` and ``general_info``.
+    acs :
+        Shared analysis container (passed by reference).
+    priors : dict
+        Shared priors dict (passed by reference).
+    Tmax : float, optional
+        Maximum temperature for ``TemperatureControl``. ``None`` takes ``gb_info.moves.Tmax``.
+    search_move_names : sequence of str, optional
+        Explicit names of search moves to build (e.g. ``["rj_prior_search"]``).
+        ``None`` takes ``gb_info.moves.search_move_names``, unless ``include_search`` is set.
+    pe_move_names : sequence of str, optional
+        Explicit names of PE moves to build (e.g. ``["rj_prior"]``). ``None`` takes
+        ``gb_info.moves.pe_move_names``.
+    include_search : bool, optional
+        Deprecated in favor of ``search_move_names``. When ``False``, return an empty
+        search-move list. Default ``None``.
+    include_refit : bool, optional
+        When ``False``, never build the GMM-refit moves even if the refit file is present.
+        ``None`` takes ``gb_info.moves.include_refit`` (refit is still gated on the file existing).
+
+    Returns
+    -------
+    gb_search_moves : List[GBSpecialBase]
+    gb_pe_moves : List[GBSpecialBase]
+    """
+    gb_info: GBSetup = curr.source_info["gb"]
+    # * The move choices come from the setup's moves group; explicit arguments override them.
+    if include_refit is None:
+        include_refit = gb_info.moves.include_refit
+    general_info: GeneralSetup = curr.general_info
+    domain_settings = general_info.domain_settings
+    parts = prepare_gb_moves(engine_info, curr, acs, priors, state, Tmax=Tmax)
+    gb_move_args, gpu_priors = parts.args, parts.gpu_priors
+    ntemps, nwalkers = parts.ntemps, parts.nwalkers
+
+    # * GB move options come from the setup's moves group.
+    move_settings = gb_info.moves
+    gb_move_kwargs = dict(
+        parts.kwargs,
+        num_repeat_proposals=move_settings.num_repeat_proposals,
+        search_kwargs=move_settings.search_kwargs,
+        stretch_probability=move_settings.stretch_probability,
+        debug_settings=default_gb_debug_settings(
+            move_settings.debug_settings, general_info.artifacts_file_dir
+        ),
+        leaf_cap_settings=move_settings.leaf_cap_settings,
+        sighet_settings=move_settings.sighet_settings,
+        num_band_preload=move_settings.num_band_preload,
+        num_bands_preload_temp=move_settings.num_bands_preload_temp,
+    )
 
     # Check aliases in kwargs if any
     if "pe_search_names" in kwargs and pe_move_names is None:
@@ -1651,19 +2150,22 @@ def build_gb_moves(
     if "search_moves_names" in kwargs and search_move_names is None:
         search_move_names = kwargs.pop("search_moves_names")
 
+    # * Without explicit names, the moves group names the moves.
+    if search_move_names is None and include_search is None:
+        search_move_names = move_settings.search_move_names
+    if pe_move_names is None:
+        pe_move_names = move_settings.pe_move_names
+
     # Resolve search_move_names
     if search_move_names is None:
         if include_search is False:
             search_move_names = []
         elif include_search is True:
-            if isinstance(domain_settings, FDSettings):
-                search_move_names = ["rj_fstat_mcmc_search", "rj_prior_search"]
-            else:
-                search_move_names = ["rj_prior_search"]
+            search_move_names = ["rj_prior_search"]
         else:
             # search_move_names is None and include_search is None
             if isinstance(domain_settings, FDSettings):
-                search_move_names = ["rj_fstat_mcmc_search", "rj_prior_search"]
+                search_move_names = ["rj_prior_search"]
             else:
                 search_move_names = []
     else:
@@ -1676,23 +2178,27 @@ def build_gb_moves(
     # Resolve pe_move_names
     if pe_move_names is None:
         if isinstance(domain_settings, FDSettings):
-            pe_move_names = (
-                ["rj_prior", "rj_refit", "rj_fstat_mcmc"]
-                if _refit_available
-                else ["rj_prior", "rj_fstat_mcmc"]
-            )
+            pe_move_names = ["rj_prior", "rj_refit"] if _refit_available else ["rj_prior"]
         else:
             pe_move_names = ["rj_prior"]
     else:
         pe_move_names = list(pe_move_names)
 
     # Validate domain compatibility
-    fd_only_moves = {"rj_fstat_mcmc_search", "rj_fstat_mcmc", "rj_refit_search", "rj_refit"}
+    fd_only_moves = {"rj_refit_search", "rj_refit"}
     if not isinstance(domain_settings, FDSettings):
         for name in search_move_names + pe_move_names:
             if name in fd_only_moves:
                 raise NotImplementedError(
                     f"GB move '{name}' requires FD basis, but domain is {type(domain_settings).__name__}."
+                )
+    # * The F-statistic search runs on the STFT/DFFR response only; a run gets it only when it names it.
+    stft_only_moves = {"rj_fstat_mcmc_search", "rj_fstat_mcmc"}
+    if not isinstance(domain_settings, STFTSettings):
+        for name in search_move_names + pe_move_names:
+            if name in stft_only_moves:
+                raise NotImplementedError(
+                    f"GB move '{name}' requires the STFT basis, but domain is {type(domain_settings).__name__}."
                 )
 
     # Validate refit availability if explicitly requested
@@ -1704,26 +2210,36 @@ def build_gb_moves(
             )
 
     def _create_move(name: str) -> GBSpecialBase:
+        # * the search moves recompute each source's Fisher matrix at every block, since a source
+        # * climbing onto its signal needs one at its current position
+        fim_interval = (
+            1 if name.endswith("_search") else int(move_settings.num_stationary_fim_steps)
+        )
         if name == "rj_prior_search":
             move = GBSpecialRJPriorMove(
                 *gb_move_args,
                 rj_proposal_distribution=gpu_priors,
                 name="rj_prior_search",
                 use_prior_removal=True,
-                phase_maximize=_rj_phase_max,
+                phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc_search":
-            move = GBSpecialRJSerialSearchMCMC(
+            move = GBFStatRJMove(
                 *gb_move_args,
                 rj_proposal_distribution=None,
                 is_rj_prop=True,
                 run_swaps=False,
                 name="rj_fstat_mcmc_search",
-                phase_maximize=True,
+                phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
+                fstat_settings=default_fstat_settings(
+                    move_settings.fstat_settings, general_info.artifacts_file_dir
+                ),
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit_search":
@@ -1734,8 +2250,9 @@ def build_gb_moves(
                 run_swaps=False,
                 name="rj_refit_search",
                 fp=_refit_fp,
-                phase_maximize=True,
+                phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_prior":
@@ -1744,19 +2261,24 @@ def build_gb_moves(
                 rj_proposal_distribution=gpu_priors,
                 name="rj_prior",
                 use_prior_removal=False,
-                phase_maximize=_rj_phase_max,
+                phase_maximize=False,
                 ranks_needed=0,
                 run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
                 **gb_move_kwargs,
             )
         elif name == "rj_fstat_mcmc":
-            move = GBSpecialRJSerialSearchMCMC(
+            move = GBFStatRJMove(
                 *gb_move_args,
                 rj_proposal_distribution=None,
                 run_swaps=True,
                 name="rj_fstat_mcmc",
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
+                fstat_settings=default_fstat_settings(
+                    move_settings.fstat_settings, general_info.artifacts_file_dir
+                ),
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         elif name == "rj_refit":
@@ -1768,6 +2290,7 @@ def build_gb_moves(
                 fp=_refit_fp,
                 phase_maximize=False,
                 ranks_needed=0,
+                num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
             )
         else:
@@ -1873,10 +2396,13 @@ class SingleSourcePEBuilder(SourceMoveBuilder):
         # ladder on the source info and the tiled ladder on the sub-state.
         info.betas = betas
         betas_all = np.tile(betas, (info.nleaves_max, 1))
-        state.sub_states[self.branch_name].betas_all = betas_all
+        # the state (and its backend) keeps every temperature: pad a subset ladder with its last rung
+        padded = np.concatenate([betas, np.full(ntemps - len(betas), betas[-1])])
+        state.sub_states[self.branch_name].betas_all = np.tile(padded, (info.nleaves_max, 1))
         logger.debug(f"{self.branch_name} betas: {betas}")
 
-        coords_shape = (ntemps, nwalkers, info.nleaves_max, info.ndim)
+        # the move may run on a subset ladder (the first len(betas) temperatures)
+        coords_shape = (len(betas), nwalkers, info.nleaves_max, info.ndim)
 
         wf_gen_kw = (
             self.waveform_gen_kwargs
@@ -1940,7 +2466,8 @@ class GBMoveBuilder(SourceMoveBuilder):
 
     Wraps :func:`build_gb_moves` (which owns the GB machinery + the GB reference
     move recipe) in the :class:`SourceMoveBuilder` interface. Design knobs are
-    forwarded so a settings file can steer which moves it installs.
+    forwarded so a settings file can steer which moves it installs; ``None``
+    takes the value of the setup's moves group.
     """
 
     branch_name = "gb"
@@ -1948,11 +2475,11 @@ class GBMoveBuilder(SourceMoveBuilder):
     def __init__(
         self,
         *,
-        Tmax: float = 1e6,
+        Tmax: typing.Optional[float] = None,
         search_move_names: typing.Optional[typing.Sequence[str]] = None,
         pe_move_names: typing.Optional[typing.Sequence[str]] = None,
         include_search: typing.Optional[bool] = None,
-        include_refit: bool = True,
+        include_refit: typing.Optional[bool] = None,
         **kwargs,
     ):
         super().__init__(branch_name="gb")
@@ -1984,11 +2511,15 @@ class PSDMoveBuilder(SourceMoveBuilder):
 
     branch_name = "psd"
 
-    def __init__(self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6):
+    def __init__(
+        self, *, num_repeats: int = 60, permute_every: int = 50, Tmax: float = 1e6,
+        betas: typing.Optional[np.ndarray] = None,
+    ):
         super().__init__(branch_name="psd")
         self.num_repeats = num_repeats
         self.permute_every = permute_every
         self.Tmax = Tmax
+        self.betas = betas
 
     def build(self, engine_info, curr, acs, priors, state):
         search_move, pe_move = build_psd_moves(
@@ -1999,5 +2530,6 @@ class PSDMoveBuilder(SourceMoveBuilder):
             num_repeats=self.num_repeats,
             permute_every=self.permute_every,
             Tmax=self.Tmax,
+            betas=self.betas,
         )
         return [search_move], [pe_move]

@@ -57,6 +57,8 @@ cover/
 
 # Django stuff:
 *.log
+# the log of build_recipe.py's init_logger(__name__), written into the working directory
+lisatools.globalfit.stock.l2d.build_recipe
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

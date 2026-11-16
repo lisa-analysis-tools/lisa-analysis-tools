@@ -91,6 +91,7 @@ optional-dependencies.doc = [
 
 optional-dependencies.sampling = [
   "eryn",
+  "ereborpriors",                          # The GB prior of the global-fit setup; from git, see tool.uv.sources
   "fastlisaresponse",
   "corner",
   "chainconsumer",
@@ -251,3 +252,5 @@ dev = [
 mojito = { index = "pypi" }
 lisaconstants = { index = "pypi" }
 mojito-processor = { index = "testpypi" }  # TODO: switch to pypi once published there
+# * Not on PyPI; aab7e93 is the first commit whose unit conversions take CuPy arrays.
+ereborpriors = { git = "https://github.com/Erebor-L2D/erebor-priors", rev = "aab7e9323bb5c6f388af8d3716619a8f851d5c64" }

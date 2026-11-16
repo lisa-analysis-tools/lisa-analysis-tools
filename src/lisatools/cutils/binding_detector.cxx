@@ -18,6 +18,7 @@
 #include <nanobind/stl/string.h>
 #include "binding_detector.hpp"
 #include "binding_domains.hpp"       // STFTDomainWrap, FDDomainForStftWrap, STFTFresnelWrap
+#include "stft_cross_terms.hpp"      // stft_cross_terms_wrap (for tempering)
 
 // Phase 3J: this binding TU is the SOLE registration site for the shared
 // wrapper classes (OrbitsWrap, LISAResponseWrap, TDIConfigWrap, ...).
@@ -171,10 +172,11 @@ void XYZSensitivityMatrixWrap::spline_pointers(
     *spline_tm = nullptr;
     if (!sensitivity_matrix->noise_levels.use_splines)
         return;
-    int n_spline = num_psds * sensitivity_matrix->n_noise_par
-                   * (1 + sensitivity_matrix->n_alias) * num_freqs;
-    *spline_oms = return_pointer_and_check_length(spline_oms_all, "spline_oms_all", n_spline, 1);
-    *spline_tm  = return_pointer_and_check_length(spline_tm_all,  "spline_tm_all",  n_spline, 1);
+    // (N, multiplier) split, as for the per-PSD arrays: the helper forms the product as size_t
+    int n_grid = (1 + sensitivity_matrix->n_alias) * num_freqs;
+    int n_curves = num_psds * sensitivity_matrix->n_noise_par;
+    *spline_oms = return_pointer_and_check_length(spline_oms_all, "spline_oms_all", n_grid, n_curves);
+    *spline_tm  = return_pointer_and_check_length(spline_tm_all,  "spline_tm_all",  n_grid, n_curves);
 }
 
 void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
@@ -207,19 +209,20 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
     }
     else
     {
-        int total_size = num_psds * total_tf_pairs;
-        _c00 = return_pointer_and_check_length(c00_all, "c00_all", total_size, 1);
-        _c11 = return_pointer_and_check_length(c11_all, "c11_all", total_size, 1);
-        _c22 = return_pointer_and_check_length(c22_all, "c22_all", total_size, 1);
-        _c01 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_all, "c01_all", total_size, 1));
-        _c02 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_all, "c02_all", total_size, 1));
-        _c12 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_all, "c12_all", total_size, 1));
+        // (N, multiplier) split: the product is formed as size_t (num_psds * total_tf_pairs
+        // overflows int at 2 yr)
+        _c00 = return_pointer_and_check_length(c00_all, "c00_all", total_tf_pairs, num_psds);
+        _c11 = return_pointer_and_check_length(c11_all, "c11_all", total_tf_pairs, num_psds);
+        _c22 = return_pointer_and_check_length(c22_all, "c22_all", total_tf_pairs, num_psds);
+        _c01 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_all, "c01_all", total_tf_pairs, num_psds));
+        _c02 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_all, "c02_all", total_tf_pairs, num_psds));
+        _c12 = reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_all, "c12_all", total_tf_pairs, num_psds));
     }
 
     sensitivity_matrix->psd_likelihood_wrap(
         return_pointer_and_check_length(like_contrib_final, "like_contrib_final", num_psds,                  1),
         return_pointer_and_check_length(f_arr,              "f_arr",              num_freqs,                 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(data, "data", num_psds * 3 * total_tf_pairs, 1)),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(data, "data", total_tf_pairs, num_psds * 3)),
         return_pointer_and_check_length(data_index_all,     "data_index_all",     num_psds,                  1),
         return_pointer_and_check_length(time_index_all,     "time_index_all",     num_times,                 1),
         return_pointer_and_check_length(Soms_d_in_all,      "Soms_d_in_all",      num_psds * sensitivity_matrix->n_noise_par, 1),
@@ -242,6 +245,72 @@ void XYZSensitivityMatrixWrap::psd_likelihood_wrap(
     );
 }
 
+void XYZSensitivityMatrixWrap::psd_likelihood_basis_wrap(
+    array_type<double> like_contrib_final, array_type<std::complex<double>> data,
+    array_type<int> data_index_all, array_type<double> coeffs,
+    array_type<double> B00, array_type<double> B11, array_type<double> B22,
+    array_type<std::complex<double>> B01, array_type<std::complex<double>> B02,
+    array_type<std::complex<double>> B12,
+    bool use_galaxy, array_type<double> gal_conv, array_type<double> gal_ratios,
+    int n_gal, long long gal_psd_stride, long long gal_t_stride,
+    bool use_spline_weights, array_type<double> spline_weights,
+    long long spl_psd_stride, long long spl_noise_stride, long long spl_f_stride,
+    array_type<bool> dips_mask, double differential_component,
+    int num_freqs, int num_times, int num_psds, int num_data, int n_basis,
+    bool run_async)
+{
+    int total_tf_pairs = num_times * num_freqs;  // one block of bins; products below are size_t
+
+    // Optional inputs are only read when their flag is set; otherwise they may be empty.
+    // gal_conv is addressed through the explicit element strides (gal_t_stride = 0
+    // broadcasts one row over time), so its buffer length is not checked here.
+    double *_gal_conv = nullptr, *_gal_ratios = nullptr, *_spl = nullptr;
+    if (use_galaxy && n_gal > 0)
+    {
+        if (n_gal > num_freqs)
+            throw std::invalid_argument("psd_likelihood_basis_wrap: n_gal > num_freqs");
+        _gal_conv = return_pointer_no_check(gal_conv);
+        _gal_ratios = return_pointer_and_check_length(gal_ratios, "gal_ratios", num_times, 6);
+    }
+    if (use_spline_weights)
+        _spl = return_pointer_and_check_length(spline_weights, "spline_weights", num_freqs, 2 * num_psds);
+
+    typedef gcmplx::complex<double> gc;
+    sensitivity_matrix->psd_likelihood_basis_wrap(
+        return_pointer_and_check_length(like_contrib_final, "like_contrib_final", num_psds, 1),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(data, "data", total_tf_pairs, 3 * num_data)),
+        return_pointer_and_check_length(data_index_all, "data_index_all", num_psds, 1),
+        return_pointer_and_check_length(coeffs, "coeffs", num_psds, n_basis),
+        n_basis,
+        return_pointer_and_check_length(B00, "B00", total_tf_pairs, n_basis),
+        return_pointer_and_check_length(B11, "B11", total_tf_pairs, n_basis),
+        return_pointer_and_check_length(B22, "B22", total_tf_pairs, n_basis),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(B01, "B01", total_tf_pairs, n_basis)),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(B02, "B02", total_tf_pairs, n_basis)),
+        reinterpret_cast<gc*>(return_pointer_and_check_length(B12, "B12", total_tf_pairs, n_basis)),
+        _gal_conv, (_gal_conv == nullptr) ? 0 : n_gal, gal_psd_stride, gal_t_stride, _gal_ratios,
+        _spl, spl_psd_stride, spl_noise_stride, spl_f_stride,
+        return_pointer_and_check_length(dips_mask, "dips_mask", total_tf_pairs, 1),
+        differential_component, num_freqs, num_times, num_psds, run_async);
+}
+
+void XYZSensitivityMatrixWrap::get_galactic_row_wrap(
+    array_type<double> out, array_type<double> freqs,
+    array_type<double> Amp_all, array_type<double> alpha_all,
+    array_type<double> f_1_all, array_type<double> f_knee_all, array_type<double> f_2_all,
+    int num_freqs, int num_psds, int time_index, bool run_async)
+{
+    sensitivity_matrix->get_galactic_row_arr(
+        return_pointer_and_check_length(out,        "out",        num_freqs, num_psds),
+        return_pointer_and_check_length(freqs,      "freqs",      num_freqs, 1),
+        return_pointer_and_check_length(Amp_all,    "Amp_all",    num_psds, 1),
+        return_pointer_and_check_length(alpha_all,  "alpha_all",  num_psds, 1),
+        return_pointer_and_check_length(f_1_all,    "f_1_all",    num_psds, 1),
+        return_pointer_and_check_length(f_knee_all, "f_knee_all", num_psds, 1),
+        return_pointer_and_check_length(f_2_all,    "f_2_all",    num_psds, 1),
+        num_freqs, num_psds, time_index, run_async);
+}
+
 void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
     array_type<double> freqs, array_type<int> time_indices,
     array_type<double> Soms_d_in_all, array_type<double> Sa_a_in_all,
@@ -252,7 +321,9 @@ void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
     array_type<double> c11_arr, array_type<std::complex<double>> c12_arr, array_type<double> c22_arr,
     int num_freqs, int num_times, int num_psds, bool run_async)
 {
-    int total_size = num_psds * num_freqs * num_times;
+    // (N, multiplier) split: num_psds * num_freqs * num_times exceeds INT_MAX at 2 yr,
+    // the helper forms the product as size_t
+    int total_tf_pairs = num_freqs * num_times;
     double *_spline_oms = nullptr, *_spline_tm = nullptr;
     spline_pointers(spline_in_isi_oms_all, spline_in_testmass_all, num_psds, num_freqs, &_spline_oms, &_spline_tm);
     sensitivity_matrix->get_noise_covariance_arr(
@@ -267,12 +338,12 @@ void XYZSensitivityMatrixWrap::get_noise_covariance_wrap(
         return_pointer_and_check_length(f_2_all,       "f_2_all",       num_psds, 1),
         _spline_oms,
         _spline_tm,
-        return_pointer_and_check_length(c00_arr, "c00_arr", total_size, 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_arr, "c01_arr", total_size, 1)),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_arr, "c02_arr", total_size, 1)),
-        return_pointer_and_check_length(c11_arr, "c11_arr", total_size, 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_arr, "c12_arr", total_size, 1)),
-        return_pointer_and_check_length(c22_arr, "c22_arr", total_size, 1),
+        return_pointer_and_check_length(c00_arr, "c00_arr", total_tf_pairs, num_psds),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c01_arr, "c01_arr", total_tf_pairs, num_psds)),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c02_arr, "c02_arr", total_tf_pairs, num_psds)),
+        return_pointer_and_check_length(c11_arr, "c11_arr", total_tf_pairs, num_psds),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(c12_arr, "c12_arr", total_tf_pairs, num_psds)),
+        return_pointer_and_check_length(c22_arr, "c22_arr", total_tf_pairs, num_psds),
         num_freqs, num_times, num_psds, run_async
     );
 }
@@ -308,8 +379,8 @@ void XYZSensitivityMatrixWrap::get_noise_tfs_mosa_wrap(
 {
     sensitivity_matrix->get_noise_tfs_mosa_arr(
         return_pointer_and_check_length(freqs, "freqs", num_freqs, 1),
-        return_pointer_and_check_length(mosa_auto, "mosa_auto", 24 * num_freqs * num_times, 1),
-        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross", 12 * num_freqs * num_times, 1)),
+        return_pointer_and_check_length(mosa_auto, "mosa_auto", num_freqs * num_times, 24),
+        reinterpret_cast<gcmplx::complex<double>*>(return_pointer_and_check_length(mosa_cross, "mosa_cross", num_freqs * num_times, 12)),
         num_freqs, num_times,
         return_pointer_and_check_length(time_indices, "time_indices", num_times, 1));
 }
@@ -531,6 +602,35 @@ void detector_part(nb::module_ &m) {
 
     ;
 
+    // ---- KinematicsTableWrap ----
+    // ! noconvert: the wrap keeps raw pointers, so a converted temporary would leave them dangling.
+#if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
+    nb::class_<KinematicsTableWrap>(m, "KinematicsTableWrapGPU")
+#else
+    nb::class_<KinematicsTableWrap>(m, "KinematicsTableWrapCPU")
+#endif
+    .def(nb::init<double, double, int,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type, kinematics_array_type,
+                  kinematics_array_type, kinematics_array_type>(),
+         nb::arg("first_segment_midpoint"), nb::arg("segment_time"), nb::arg("num_time_segments"),
+         nb::arg("position_receiver").noconvert(), nb::arg("velocity_receiver").noconvert(),
+         nb::arg("acceleration_receiver").noconvert(), nb::arg("position_sender").noconvert(),
+         nb::arg("velocity_sender").noconvert(), nb::arg("acceleration_sender").noconvert(),
+         nb::arg("light_travel_time").noconvert(), nb::arg("light_travel_time_rate").noconvert(),
+         nb::arg("light_travel_time_acceleration").noconvert(),
+         nb::arg("unit_direction").noconvert(), nb::arg("unit_direction_rate").noconvert())
+    .def("build", &KinematicsTableWrap::build, nb::arg("orbits"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Fill the table at the segment midpoints from an OrbitsWrap on the same device.")
+    .def_prop_ro("first_segment_midpoint",
+                 [](const KinematicsTableWrap &self) { return self.table.first_segment_midpoint; })
+    .def_prop_ro("segment_time",
+                 [](const KinematicsTableWrap &self) { return self.table.segment_time; })
+    .def_prop_ro("num_time_segments",
+                 [](const KinematicsTableWrap &self) { return self.table.num_time_segments; });
+
     // ---- GalacticGridSetup (host-side quadrature/sky-grid builder) ----
     // The C++ type is per-backend aliased (GalacticGridSetupGPU/CPU) so the
     // CPU and GPU plugin .so's register distinct typeids; the Python-facing
@@ -538,7 +638,10 @@ void detector_part(nb::module_ &m) {
     nb::class_<GalacticGridSetup>(m, "GalacticGridSetup")
     .def(nb::init<>())
     .def("compute", &GalacticGridSetup::compute,
-         nb::arg("N_lambda") = 90, nb::arg("N_beta") = 60)
+         nb::arg("N_lambda") = 90, nb::arg("N_beta") = 60,
+         nb::arg("los_center_half_width") = 0.0, nb::arg("los_center_sub") = 1,
+         "Build the sky grid and line-of-sight quadrature. With los_center_half_width > 0\n"
+         "the line of sight is split around R_sun (finer sampling, needed for the bulge).")
     .def("print_summary", &GalacticGridSetup::print_summary)
     .def_ro("N_lambda", &GalacticGridSetup::N_lambda)
     .def_ro("N_beta",   &GalacticGridSetup::N_beta)
@@ -586,8 +689,13 @@ void detector_part(nb::module_ &m) {
          "Call initialize_wrap() once before inference starts.")
     .def("initialize_wrap", &GalacticGridWrap::initialize_wrap,
          nb::arg("times"), nb::arg("R_d"), nb::arg("z_d"), nb::arg("N_times"),
-         "Compute fixed sky weights and R_avg from disk parameters and orbit times.\n"
+         nb::arg("f_b") = 0.0, nb::arg("r_b") = 0.5,
+         "Compute fixed sky weights and R_avg from disk (+ bulge) parameters and orbit times.\n"
          "Must be called once before passing this object to set_galactic_grid().")
+    .def("set_detector_arms_wrap", &GalacticGridWrap::set_detector_arms_wrap,
+         nb::arg("arms"), nb::arg("N_times"),
+         "Use the detector-tensor response from the orbit arms (N_times, 3, 3: u12, u13, u23,\n"
+         "ecliptic) instead of the analytic formulas. Call before initialize_wrap().")
     .def("compute_gal_covariance_wrap", &GalacticGridWrap::compute_gal_covariance_wrap,
          nb::arg("freqs"),
          nb::arg("Amp"), nb::arg("alpha"),
@@ -629,6 +737,36 @@ void detector_part(nb::module_ &m) {
          "Compute PSD likelihood. With use_external_matrix, the covariance entries are read from "
          "c*_all (num_psds * num_times * num_freqs each) instead of being computed in-kernel, and "
          "the spline weights may be empty; otherwise c*_all may be empty.")
+    .def("psd_likelihood_basis_wrap", &XYZSensitivityMatrixWrap::psd_likelihood_basis_wrap,
+         nb::arg("like_contrib_final"), nb::arg("data"), nb::arg("data_index_all"), nb::arg("coeffs"),
+         nb::arg("B00"), nb::arg("B11"), nb::arg("B22"), nb::arg("B01"), nb::arg("B02"), nb::arg("B12"),
+         nb::arg("use_galaxy"), nb::arg("gal_conv"), nb::arg("gal_ratios"),
+         nb::arg("n_gal"), nb::arg("gal_psd_stride"), nb::arg("gal_t_stride"),
+         nb::arg("use_spline_weights"), nb::arg("spline_weights"),
+         nb::arg("spl_psd_stride"), nb::arg("spl_noise_stride"), nb::arg("spl_f_stride"),
+         nb::arg("dips_mask"), nb::arg("differential_component"),
+         nb::arg("num_freqs"), nb::arg("num_times"), nb::arg("num_psds"), nb::arg("num_data"),
+         nb::arg("n_basis"),
+         nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Log-likelihood per PSD with the covariance assembled from precomputed bases:\n"
+         "c_k = sum_b coeffs[p, b] w_b(p, f) B_k[b, t * nf + f] + gal_ratios[t, k'] gal_conv[p, t, f]\n"
+         "(f < n_gal), then the psd_likelihood_wrap algebra. B* (n_basis, num_times * num_freqs)\n"
+         "contiguous, coeffs (num_psds, n_basis), data (num_data, 3, num_times * num_freqs).\n"
+         "gal_conv: element strides (psd, time; 0 = same row for all times), unit stride in f;\n"
+         "gal_ratios (num_times, 6) in the gal_R_avg order [00, 01, 02, 11, 12, 22].\n"
+         "spline_weights: (num_psds, 2, num_freqs) multiplicative weights (row b / n_noise_par)\n"
+         "addressed through the given element strides. Unused optional arrays may be empty.")
+    .def("get_galactic_row_wrap", &XYZSensitivityMatrixWrap::get_galactic_row_wrap,
+         nb::arg("out"), nb::arg("freqs"),
+         nb::arg("Amp_all"), nb::arg("alpha_all"), nb::arg("f_1_all"), nb::arg("f_knee_all"), nb::arg("f_2_all"),
+         nb::arg("num_freqs"), nb::arg("num_psds"), nb::arg("time_index"),
+         nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "XX galactic entry rows out (num_psds, num_freqs): gal_R_avg[time_index * 6] * S_gal *\n"
+         "common_tdi * noise_normalization + the alias copies, bitwise the XX entry of a\n"
+         "galaxy-only get_noise_covariance_wrap call. freqs must be a prefix of the active grid.\n"
+         "time_index < 0: unit R00 (galactic shape only). f = 0 gives NaN.")
     .def("get_noise_covariance_wrap", &XYZSensitivityMatrixWrap::get_noise_covariance_wrap,
          nb::arg("freqs"), nb::arg("time_indices"),
          nb::arg("Soms_d_in_all"), nb::arg("Sa_a_in_all"),
@@ -705,6 +843,63 @@ void detector_part(nb::module_ &m) {
 // 1/2/3 values).
 // ============================================================================
 
+// The lengths are checked in both builds: they are host metadata, and a short array would be read
+// past its end on the device.
+template <typename T>
+static T* cross_terms_pointer(array_type<T> input, const char* name, size_t expected) {
+    if (input.size() != expected)
+        throw std::invalid_argument(
+            std::string("compute_cross_terms: ") + name + " has length " +
+            std::to_string(input.size()) + ", expected " + std::to_string(expected) + ".");
+    return input.data();
+}
+
+// STFTDomainWrap.compute_cross_terms. A function here rather than a member of the wrap class,
+// because downstream packages compile binding_domains.hpp without stft_cross_terms.cu.
+static void stft_domain_compute_cross_terms(
+    STFTDomainWrap& self, array_type<double> cross_out, array_type<double> template_out,
+    array_type<double> residual_out, array_type<std::complex<double>> template_vals,
+    int num_freqs_template, array_type<int> residual_index, array_type<int> noise_index,
+    array_type<int> residual_start, array_type<int> template_index,
+    array_type<int> template_start, array_type<int> window_lo, array_type<int> window_hi,
+    int num_tables, int num_residuals, int num_templates, int max_window_width,
+    bool run_async)
+{
+    if ((num_tables < 0) || (num_residuals <= 0) || (num_templates <= 0) ||
+        (num_freqs_template <= 0))
+        throw std::invalid_argument(
+            "compute_cross_terms: needs num_tables >= 0 and at least one residual, one template "
+            "and one template bin.");
+    size_t tables = static_cast<size_t>(num_tables);
+    size_t residual_entries = tables * num_residuals;
+    size_t template_entries = tables * num_templates;
+    size_t template_row = static_cast<size_t>(self.domain->num_channels) *
+                          self.domain->num_times * num_freqs_template;
+    if (template_vals.size() % template_row != 0)
+        throw std::invalid_argument(
+            "compute_cross_terms: template_vals is not a whole number of template rows.");
+    int num_template_rows = static_cast<int>(template_vals.size() / template_row);
+
+    double* cross_ptr = cross_terms_pointer(cross_out, "cross_out", residual_entries * num_templates);
+    double* template_ptr =
+        cross_terms_pointer(template_out, "template_out", residual_entries * num_templates);
+    double* residual_ptr = cross_terms_pointer(residual_out, "residual_out", residual_entries);
+    int* residual_index_ptr = cross_terms_pointer(residual_index, "residual_index", residual_entries);
+    int* noise_index_ptr = cross_terms_pointer(noise_index, "noise_index", residual_entries);
+    int* residual_start_ptr = cross_terms_pointer(residual_start, "residual_start", residual_entries);
+    int* template_index_ptr = cross_terms_pointer(template_index, "template_index", template_entries);
+    int* template_start_ptr = cross_terms_pointer(template_start, "template_start", template_entries);
+    int* window_lo_ptr = cross_terms_pointer(window_lo, "window_lo", tables);
+    int* window_hi_ptr = cross_terms_pointer(window_hi, "window_hi", tables);
+
+    stft_cross_terms_wrap(
+        *self.domain, cross_ptr, template_ptr, residual_ptr,
+        reinterpret_cast<cmplx*>(template_vals.data()), num_template_rows, num_freqs_template,
+        residual_index_ptr, noise_index_ptr, residual_start_ptr, template_index_ptr,
+        template_start_ptr, window_lo_ptr, window_hi_ptr, num_tables, num_residuals,
+        num_templates, max_window_width, run_async);
+}
+
 void domains_part(nb::module_ &m) {
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
@@ -714,12 +909,13 @@ void domains_part(nb::module_ &m) {
 #endif
     .def(nb::init<int, int, int, double, double, double, double, double,
                   array_type<std::complex<double>>, array_type<std::complex<double>>,
-                  int, int, int>(),
+                  int, int, int, int, bool>(),
          nb::arg("num_times"), nb::arg("num_freqs"), nb::arg("num_channels"),
          nb::arg("t0"), nb::arg("f_min"), nb::arg("f_max"),
          nb::arg("dt"), nb::arg("df"),
          nb::arg("data"), nb::arg("invC"),
-         nb::arg("num_data"), nb::arg("num_noise"), nb::arg("tdi_type"))
+         nb::arg("num_data"), nb::arg("num_noise"), nb::arg("tdi_type"),
+         nb::arg("num_freqs_noise") = -1, nb::arg("noise_full_grid") = false)
     .def("compute_likelihood_terms", &STFTDomainWrap::compute_likelihood_terms,
          nb::arg("d_h_out"), nb::arg("h_h_out"), nb::arg("template_vals"),
          nb::arg("start_times"), nb::arg("start_freqs"), nb::arg("num_binaries"),
@@ -727,7 +923,18 @@ void domains_part(nb::module_ &m) {
          nb::arg("n_t_template"), nb::arg("n_f_template"),
          nb::arg("run_async") = false,
          nb::call_guard<nb::gil_scoped_release>(),
-         "Compute (d|h) and (h|h) likelihood terms for a batch of binaries.");
+         "Compute (d|h) and (h|h) likelihood terms for a batch of binaries.")
+    .def("compute_cross_terms", &stft_domain_compute_cross_terms,
+         nb::arg("cross_out"), nb::arg("template_out"), nb::arg("residual_out"),
+         nb::arg("template_vals"), nb::arg("num_freqs_template"),
+         nb::arg("residual_index"), nb::arg("noise_index"), nb::arg("residual_start"),
+         nb::arg("template_index"), nb::arg("template_start"),
+         nb::arg("window_lo"), nb::arg("window_hi"),
+         nb::arg("num_tables"), nb::arg("num_residuals"), nb::arg("num_templates"),
+         nb::arg("max_window_width"), nb::arg("run_async") = false,
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Cross terms per table: (r_i|t_j), (t_j|t_j) and (r_i|r_i), each under the noise row\n"
+         "of residual i, summed over the table's bin window (see stft_cross_terms.hpp).");
 
 #if defined(__CUDA_COMPILATION__) || defined(__CUDACC__)
     nb::class_<FDDomainForStftWrap>(m, "FDDomainForStftWrapGPU")
@@ -771,6 +978,15 @@ void domains_part(nb::module_ &m) {
          "  moment = the same integral with an extra tau in the integrand.\n"
          "Both are the quantities the windowed evaluator sums over its seven Tukey terms, so they\n"
          "can be compared directly with the integrals rather than with another implementation.")
+    .def("compute_fresnel_functions", &STFTFresnelWrap::compute_fresnel_functions,
+         nb::arg("cosine_out"), nb::arg("sine_out"), nb::arg("aux_f_out"),
+         nb::arg("aux_g_out"), nb::arg("slope_f_out"), nb::arg("slope_g_out"),
+         nb::arg("arguments"), nb::arg("num"),
+         nb::call_guard<nb::gil_scoped_release>(),
+         "Diagnostic: the shared Fresnel functions of lat_fresnel.hh at each argument x.\n\n"
+         "cosine_out and sine_out receive C(x) and S(x); aux_f_out and aux_g_out the auxiliary\n"
+         "functions f and g at |x|, and slope_f_out and slope_g_out their derivatives in |x|.\n"
+         "f, g and their derivatives come from the auxiliary branch and hold for |x| > 1.6.")
     .def("compute_fourier_values", &STFTFresnelWrap::compute_fourier_values,
          nb::arg("output"), nb::arg("amps"), nb::arg("phase0s"),
          nb::arg("f0s"), nb::arg("fdot0s"), nb::arg("t0s"),
