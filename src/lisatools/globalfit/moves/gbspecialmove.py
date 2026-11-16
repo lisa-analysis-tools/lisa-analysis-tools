@@ -5529,33 +5529,98 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         f0 node less than ``SEED_MIN_F0_BINS`` away, or ``SEED_NEIGHBOURHOOD_CAP`` kept rows already lie within
         ``reach_bins`` of its node. ``scores`` are the F values (n_chirp, n_sky). Returns the rows (count, 8) and a dict
         with the chirp index, the sky index and F of each seed; fewer than ``nwalkers`` rows when the ranking runs out
-        or the cap blocks the rest.
+        or the cap blocks the rest. This is :meth:`select_seeds_of_windows` for one window on numpy.
         """
-        flat = scores.ravel()
-        kept = np.zeros((nwalkers, 3), dtype=np.int64)
-        count = 0
-        if flat.size:
-            pool = min(cls.SEED_RANKING_POOL, flat.size)
-            top = np.argpartition(flat, -pool)[-pool:]
-            top = top[np.argsort(flat[top])[::-1]]
-            for index in top:
-                if flat[index] <= cls.REJECTED_LL or count == nwalkers:
+        return cls.select_seeds_of_windows([grid], [scores], nwalkers, [reach_bins])[0]
+
+    @classmethod
+    def select_seeds_of_windows(cls, grids, scores, nwalkers, reach_bins, xp=np):
+        """The best rows of the seed grids of several windows, at most ``nwalkers`` of each, ranked in one call.
+
+        ``grids`` is a list of :class:`SeedGrid`, ``scores`` the list of their F arrays (n_chirp, n_sky) on the host,
+        ``reach_bins`` one value for each window and ``xp`` numpy or cupy. Returns a list with the ``(rows, info)`` that
+        :meth:`select_seeds` returns for each window.
+
+        A round takes, in every window, the best entry that no kept seed blocks. A kept seed blocks the entries at its
+        sky point less than ``SEED_MIN_F0_BINS`` away in f0 node, and every chirp row that has
+        ``SEED_NEIGHBOURHOOD_CAP`` kept seeds within ``reach_bins`` of its node. Only entries with F above
+        ``REJECTED_LL`` and among the ``SEED_RANKING_POOL`` largest of their window can become seeds. Both rules only
+        block more entries as seeds are kept, so a round gives the seed that a walk down the ranked rows keeps next.
+
+        The windows are padded with -inf into one array (windows, most chirp rows, most sky points) that is built on
+        ``xp``, so that only the real entries cross to the card and the host builds no padded copy. The rounds of all
+        windows run together and end after the first round that keeps no seed in any window, which costs one small host
+        check per round; the kept indices come back in one copy. The call holds the array and one copy of it for the
+        pool's thresholds: 16 bytes per padded entry on ``xp``. On numpy the windows are ranked one at a time, so that
+        no window is padded to the largest.
+
+        Equal F values: the pool keeps every entry equal to its threshold and a round takes the first best entry in
+        chirp-major order. A ranking that sorts a pool cut at exactly ``SEED_RANKING_POOL`` entries leaves the order of
+        equal values undefined, so the seeds differ from such a ranking only where F values that it reaches are equal.
+        """
+        if xp is np and len(grids) > 1:
+            # one window at a time: no window is padded to the largest, and the rounds read only its own entries
+            ranked = []
+            for grid, window_scores, window_reach in zip(grids, scores, reach_bins):
+                ranked += cls.select_seeds_of_windows([grid], [window_scores], nwalkers, [window_reach])
+            return ranked
+        num_windows = len(grids)
+        host_scores = [np.asarray(window_scores) for window_scores in scores]
+        max_chirp = max((grid.n_chirp for grid in grids), default=0)
+        max_sky = max((grid.n_sky for grid in grids), default=0)
+        num_rounds = int(nwalkers) if max_chirp * max_sky > 0 else 0
+        # rows: chirp index, sky index and 1 for a round that kept a seed; columns: the windows
+        kept = np.zeros((3, num_rounds, num_windows), dtype=np.int64)
+        if num_rounds:
+            # the padding is built on xp, so that only the real entries cross to the card
+            open_scores = xp.full((num_windows, max_chirp, max_sky), -xp.inf)
+            chirp_nodes = xp.zeros((num_windows, max_chirp), dtype=xp.int64)
+            for window, (grid, window_scores) in enumerate(zip(grids, host_scores)):
+                open_scores[window, :grid.n_chirp, :grid.n_sky] = xp.asarray(window_scores)
+                chirp_nodes[window, :grid.n_chirp] = xp.asarray(grid.chirp_node)
+            reach = xp.asarray(np.asarray(reach_bins, dtype=float))
+            # rows the ranking never reaches: not scored, or below the pool of the best rows of their window
+            xp.copyto(open_scores, -xp.inf, where=open_scores <= cls.REJECTED_LL)
+            if max_chirp * max_sky > cls.SEED_RANKING_POOL:
+                cut = max_chirp * max_sky - cls.SEED_RANKING_POOL
+                thresholds = xp.partition(open_scores.reshape(num_windows, -1), cut, axis=1)[:, cut]
+                xp.copyto(open_scores, -xp.inf, where=open_scores < thresholds[:, None, None])
+            window_index = xp.arange(num_windows)
+            # the same entries with the sky point first, so that one sky point of every window is one indexed read
+            open_by_sky = open_scores.swapaxes(1, 2)
+            seeds_in_reach = xp.zeros((num_windows, max_chirp), dtype=xp.int64)
+            open_rows = xp.ones((num_windows, max_chirp), dtype=bool)
+            chosen_chirp, chosen_sky, chosen_valid = [], [], []
+            for _ in range(num_rounds):
+                # the best open entry of each window: the best chirp row first, then the best sky point of that row
+                row_best = xp.where(open_rows, open_scores.max(axis=2), -xp.inf)
+                chirp = row_best.argmax(axis=1)
+                valid = row_best[window_index, chirp] > -xp.inf
+                sky = open_scores[window_index, chirp].argmax(axis=1)
+                chosen_chirp.append(chirp)
+                chosen_sky.append(sky)
+                chosen_valid.append(valid)
+                # the one host check of a round: no window has a seed left
+                if not bool(valid.any()):
                     break
-                chirp, sky = divmod(int(index), grid.n_sky)
-                node = grid.chirp_node[chirp]
-                node_distance = np.abs(kept[:count, 1] - node)
-                same_sky = kept[:count, 2] == sky
-                if np.any(same_sky & (node_distance < cls.SEED_MIN_F0_BINS)):
-                    continue
-                if np.count_nonzero(node_distance <= reach_bins) >= cls.SEED_NEIGHBOURHOOD_CAP:
-                    continue
-                kept[count] = (chirp, node, sky)
-                count += 1
-        chirp_index, sky_index = kept[:count, 0], kept[:count, 2]
-        rows = (np.concatenate([grid.rows(chirp, sky) for chirp, sky in zip(chirp_index, sky_index)]) if count
-                else np.zeros((0, cls.NDIM)))
-        return rows, {"chirp_index": chirp_index, "sky_index": sky_index,
-                      "fstat": scores[chirp_index, sky_index] if count else np.zeros(0)}
+                # the kept entry closes itself, so that the result does not depend on SEED_MIN_F0_BINS being above 0
+                open_scores[window_index, chirp, sky] = xp.where(valid, -xp.inf, open_scores[window_index, chirp, sky])
+                node_distance = xp.abs(chirp_nodes - chirp_nodes[window_index, chirp][:, None])
+                too_close = valid[:, None] & (node_distance < cls.SEED_MIN_F0_BINS)
+                open_by_sky[window_index, sky] = xp.where(too_close, -xp.inf, open_by_sky[window_index, sky])
+                seeds_in_reach += valid[:, None] & (node_distance <= reach[:, None])
+                open_rows &= seeds_in_reach < cls.SEED_NEIGHBOURHOOD_CAP
+            kept = asnumpy(xp.stack([xp.stack(chosen_chirp), xp.stack(chosen_sky),
+                                     xp.stack(chosen_valid).astype(xp.int64)]))
+        results = []
+        for window, (grid, window_scores) in enumerate(zip(grids, host_scores)):
+            count = int(kept[2, :, window].sum())
+            chirp_index, sky_index = kept[0, :count, window].copy(), kept[1, :count, window].copy()
+            rows = (np.concatenate([grid.rows(chirp, sky) for chirp, sky in zip(chirp_index, sky_index)]) if count
+                    else np.zeros((0, cls.NDIM)))
+            results.append((rows, {"chirp_index": chirp_index, "sky_index": sky_index,
+                                   "fstat": window_scores[chirp_index, sky_index] if count else np.zeros(0)}))
+        return results
 
     # ==================================================================================================================
     # The search, in its steps
@@ -5813,6 +5878,10 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         ntemps, nwalkers, 8) and ``seeds`` a :class:`SeedStartInputs` with one entry for each searched window. Returns
         the start and a dict of facts: ``grid_rows`` scored, their ``seconds``, and ``seed_counts`` and ``best_fstat``
         of each window.
+
+        All windows are scored first and ranked in one call of :meth:`select_seeds_of_windows` on the search's array
+        module, so the host holds the scores of all windows of the call at once: about 2 MB per window on average and
+        10 MB for the largest windows seen.
         """
         searched = np.flatnonzero(bands["active"])
         if len(seeds.source_rows) != len(searched) or len(seeds.reach_bins) != len(searched):
@@ -5822,12 +5891,15 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms, fstat=True)
         time_start = time.perf_counter()
         grid_rows, seed_counts, best_fstat = 0, np.zeros(len(searched), dtype=int), np.full(len(searched), np.nan)
+        grids, window_scores = [], []
         for window, band in enumerate(searched):
-            grid = self.seed_grid(seeds.source_rows[window], bands["low_mhz"][band], bands["high_mhz"][band],
-                                  seeds.reach_bins[window], seeds.epoch_fraction, seeds.observation_seconds,
-                                  self.priors["gb"])
-            scores = self._score_seed_grid(likelihood, grid)
-            rows, _ = self.select_seeds(grid, scores, nwalkers, seeds.reach_bins[window])
+            grids.append(self.seed_grid(seeds.source_rows[window], bands["low_mhz"][band], bands["high_mhz"][band],
+                                        seeds.reach_bins[window], seeds.epoch_fraction, seeds.observation_seconds,
+                                        self.priors["gb"]))
+            window_scores.append(self._score_seed_grid(likelihood, grids[-1]))
+        # one ranking for all windows of the call
+        chosen = self.select_seeds_of_windows(grids, window_scores, nwalkers, seeds.reach_bins, xp=self.xp)
+        for window, ((rows, _), scores) in enumerate(zip(chosen, window_scores)):
             for column in self.SAMPLED_COLUMNS:
                 start[window, :, :len(rows), column] = rows[None, :, column]
             grid_rows += scores.size
