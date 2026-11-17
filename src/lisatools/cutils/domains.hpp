@@ -453,7 +453,7 @@ class STFTFresnel : public STFTSettings {
  public:
   double window_alpha;  ///< Window function parameter (e.g. for a Tukey window)
   double taper_duration;  ///< Duration of the window taper (e.g. for a Tukey
-                          ///< window) [s] alpha * dt / 2
+                          ///< window) [s] alpha * window_span / 2
   double f_taper;  /// 1.0 / (2.0 * taper_duration);  ///< Frequency scale
                    /// associated with the window taper [Hz]
   bool use_midpoint;  ///< If true, anchor the linear-chirp expansion at the bin
@@ -468,18 +468,31 @@ class STFTFresnel : public STFTSettings {
                          ///< amplitude slope supplied by the caller as `slope`).
                          ///< Default false -> reproduces the const-envelope
                          ///< path BYTE-IDENTICALLY (correction fully gated).
+  int window_samples;      ///< N, or 0 for the periodic window
+  double sample_cadence;   ///< h [s], or 0 for the periodic window
+  double window_span;      ///< (N - 1) h for the symmetric window, dt for the periodic one [s]
   CUDA_CALLABLE_MEMBER
   STFTFresnel(int num_times_, int num_freqs_, int num_channels_, double t0_,
               double f_min_, double f_max_, double dt_, double df_,
               double window_alpha_, bool use_midpoint_ = false,
-              bool linear_envelope_ = false)
+              bool linear_envelope_ = false, int window_samples_ = 0,
+              double sample_cadence_ = 0.0)
       : STFTSettings(num_times_, num_freqs_, num_channels_, t0_, f_min_, f_max_,
                      dt_, df_),
         window_alpha(window_alpha_),
         taper_duration(window_alpha_ > 0.0 ? window_alpha_ * dt_ / 2.0 : 0.0),
         f_taper(window_alpha_ > 0.0 ? 1.0 / (2.0 * taper_duration) : 0.0),
         use_midpoint(use_midpoint_),
-        linear_envelope(linear_envelope_){};
+        linear_envelope(linear_envelope_),
+        window_samples(window_samples_),
+        sample_cadence(sample_cadence_),
+        window_span(dt_) {
+    if (window_samples_ > 0 && window_alpha_ > 0.0) {
+      window_span = (window_samples_ - 1) * sample_cadence_;
+      taper_duration = window_alpha_ * window_span / 2.0;
+      f_taper = 1.0 / (2.0 * taper_duration);
+    }
+  };
 
   CUDA_DEVICE
   void get_amp_phase(double* amp, double* phase, cmplx z);

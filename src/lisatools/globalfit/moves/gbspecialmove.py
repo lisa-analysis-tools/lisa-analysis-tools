@@ -5702,7 +5702,8 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
         return AnalysisContainerArray(
             containers, gpus=cards, complex_psd=True, gpu_assignment=cards,
             domain_group_kwargs=dict(tdi_type=group.tdi_type, window_alpha=group.window_alpha,
-                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope))
+                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope,
+                                     use_sym_window=getattr(group, "use_sym_window", True)))
 
     def _fill_search_holder(self, holder, walker):
         """The search holder, built at the first call, with ``walker``'s data and noise rows of ``holder`` copied card

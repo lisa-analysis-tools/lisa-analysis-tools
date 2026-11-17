@@ -15,6 +15,11 @@ which call the series and the auxiliary functions of the header directly.
   the standalone DFFR package's ``tests/test_fresnel.py``.
 * The same tests on the CUDA backend, and the CUDA backend against the CPU backend (skipped
   without a usable GPU).
+* The windowed transform of STFTFresnel with the periodic Tukey window (scipy's ``sym=False``) and
+  the symmetric one of LAT's ``tukey()`` (``sym=True``), each against the direct sum over the
+  samples of its own window, the argument checks of the symmetric window, and the window an
+  ``STFTComputationGroup`` hands to its Fresnel objects: the symmetric one by default, with the
+  sample spacing ``sample_cadence`` of its settings.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import scipy.integrate
 import scipy.special
 
 import lisatools
+from lisatools.utils.utility import tukey
 
 #: Seams of lat_fresnel.hh: the series below the first, the rational fits up to the second.
 SERIES_SEAM = 1.6
@@ -90,6 +96,21 @@ GPU_FUNCTION_BOUNDS = {
     "slope_g": (8 * EPS, "absolute"),
 }
 GPU_PHASE_KERNEL_BOUND = 1e-14
+
+#: A one-day segment of 5 s samples with the global fit's taper of 1e4 s.
+WINDOW_SAMPLES = 17280
+SAMPLE_CADENCE = 5.0
+WINDOW_SEGMENT = WINDOW_SAMPLES * SAMPLE_CADENCE
+WINDOW_TAPER = 1.0e4 / WINDOW_SEGMENT
+#: Chirp rates of the phase-kernel cases, a carrier 0.37 bins above bin 363 (4.2 mHz), and the
+#: frequencies of the transform from 19 bins below it to 18 above.
+WINDOW_CHIRP_RATES = (4.0e-13, -4.0e-13, 1.0e-20)
+WINDOW_CARRIER = (363 + 0.37) / WINDOW_SEGMENT
+WINDOW_BIN_OFFSETS = np.array([-19, -7, -1, 0, 1, 2, 7, 18])
+# ? Each window's transform against the direct sum over its own samples: bounded by the Fresnel
+# ? fits, 2e-10 of the integral; against the other window's samples, the window difference.
+OWN_WINDOW_BOUND = 1e-9
+OTHER_WINDOW_FLOOR = 1e-5
 
 
 def _cuda_backend_name():
@@ -162,6 +183,52 @@ def phase_kernel_moments(backend, cases=PHASE_KERNEL_CASES):
         num,
     )
     return _to_host(kernel), _to_host(moment)
+
+
+def window_wrap(backend, use_sym_window, window_taper=WINDOW_TAPER):
+    """A one-day STFTFresnelWrap with the expansion at the segment midpoint, either window."""
+    window = (
+        dict(window_samples=WINDOW_SAMPLES, sample_cadence=SAMPLE_CADENCE) if use_sym_window else {}
+    )
+    return backend.STFTFresnelWrap(
+        1, 1, 3, 0.0, 0.0, 1.0, WINDOW_SEGMENT, 1.0 / WINDOW_SEGMENT, window_alpha=window_taper,
+        use_midpoint=True, **window
+    )
+
+
+def window_frequencies():
+    return (np.floor(WINDOW_CARRIER * WINDOW_SEGMENT) + WINDOW_BIN_OFFSETS) / WINDOW_SEGMENT
+
+
+def windowed_values(backend, wrap, chirp_rate):
+    """The windowed transform of exp(i [0.3 + 2 pi f0 tau + pi alpha tau^2]), tau from the segment
+    midpoint, at window_frequencies(), as a host array."""
+    xp = backend.xp
+    frequencies = window_frequencies()
+    output = xp.zeros(frequencies.size, dtype=np.complex128)
+    wrap.compute_fourier_values(
+        output, xp.ones(1), xp.full(1, 0.3), xp.full(1, WINDOW_CARRIER), xp.full(1, chirp_rate),
+        xp.zeros(1), xp.asarray(frequencies), 1.0, 1, frequencies.size,
+    )
+    return _to_host(output)
+
+
+def window_direct_sum(chirp_rate, window):
+    """h sum_n w_n s(t_n) exp(-2 pi i f t_n) over the segment's samples t_n = n h."""
+    times = np.arange(WINDOW_SAMPLES) * SAMPLE_CADENCE
+    tau = times - 0.5 * WINDOW_SEGMENT
+    signal = window * np.exp(
+        1j * (0.3 + 2.0 * np.pi * WINDOW_CARRIER * tau + np.pi * chirp_rate * tau * tau)
+    )
+    return SAMPLE_CADENCE * (np.exp(-2j * np.pi * np.outer(window_frequencies(), times)) @ signal)
+
+
+def window_samples():
+    """{use_sym_window: samples}: the periodic window over N h, and LAT's symmetric tukey()."""
+    return {
+        False: tukey(WINDOW_SAMPLES + 1, WINDOW_TAPER)[:-1],
+        True: tukey(WINDOW_SAMPLES, WINDOW_TAPER),
+    }
 
 
 # ---------------------------------------------------------------------------------------------
@@ -414,6 +481,115 @@ class FresnelFunctionsGPUTest(FresnelFunctionsTest):
         for name in ("phase_kernel", "phase_moment"):
             with self.subTest(function=name):
                 self.assertLessEqual(differences[name], GPU_PHASE_KERNEL_BOUND)
+
+
+class FresnelWindowTest(unittest.TestCase):
+    """STFTFresnel's windowed transform of a linear chirp with the periodic and the symmetric
+    Tukey window, CPU backend."""
+
+    backend_name = "cpu"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.backend = lisatools.get_backend(cls.backend_name)
+        cls.samples = window_samples()
+
+    def test_each_window_matches_its_samples(self):
+        """Within OWN_WINDOW_BOUND of the peak against the sum over its own window's samples, and
+        apart from the other window's by more than OTHER_WINDOW_FLOOR."""
+        for use_sym_window in (False, True):
+            wrap = window_wrap(self.backend, use_sym_window)
+            for chirp_rate in WINDOW_CHIRP_RATES:
+                with self.subTest(use_sym_window=use_sym_window, chirp_rate=chirp_rate):
+                    values = windowed_values(self.backend, wrap, chirp_rate)
+                    own = window_direct_sum(chirp_rate, self.samples[use_sym_window])
+                    other = window_direct_sum(chirp_rate, self.samples[not use_sym_window])
+                    peak = np.abs(own).max()
+                    own_error = np.abs(values - own).max() / peak
+                    other_error = np.abs(values - other).max() / peak
+                    self.assertLess(own_error, OWN_WINDOW_BOUND, msg=f"own: {own_error:.3e}")
+                    self.assertGreater(
+                        other_error, OTHER_WINDOW_FLOOR, msg=f"other: {other_error:.3e}"
+                    )
+
+    def test_symmetric_window_arguments(self):
+        """N and h must fill the segment; without a taper both windows are the same boxcar."""
+        for samples, cadence in (
+            (WINDOW_SAMPLES + 1, SAMPLE_CADENCE),
+            (1, WINDOW_SEGMENT),
+            (WINDOW_SAMPLES, 0.0),
+        ):
+            with self.subTest(samples=samples, cadence=cadence):
+                with self.assertRaises(ValueError):
+                    self.backend.STFTFresnelWrap(
+                        1, 1, 3, 0.0, 0.0, 1.0, WINDOW_SEGMENT, 1.0 / WINDOW_SEGMENT,
+                        window_alpha=WINDOW_TAPER, window_samples=samples, sample_cadence=cadence,
+                    )
+        boxcars = [
+            windowed_values(self.backend, window_wrap(self.backend, use, window_taper=0.0), 4.0e-13)
+            for use in (False, True)
+        ]
+        np.testing.assert_array_equal(boxcars[0], boxcars[1])
+
+
+@unittest.skipUnless(_cuda_backend_name(), "requires a usable CUDA backend")
+class FresnelWindowGPUTest(FresnelWindowTest):
+    """The window tests on the CUDA backend."""
+
+    backend_name = _cuda_backend_name() or "cpu"
+
+
+class STFTComputationGroupWindowTest(unittest.TestCase):
+    """STFTComputationGroup takes the symmetric window by default, with N and h from its settings'
+    sample_cadence, for its Fresnel object and that of envelope_override."""
+
+    def _group(self, sample_cadence=SAMPLE_CADENCE, **window):
+        from lisatools.analysiscontainer import AnalysisContainer, AnalysisContainerArray
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.domains import STFTSettings
+        from lisatools.sensitivity import XYZSensitivityBackend
+
+        num_times = 2
+        settings = STFTSettings(
+            t0=0.0,
+            dt=WINDOW_SEGMENT,
+            df=1.0 / WINDOW_SEGMENT,
+            NT=num_times,
+            NF=512,
+            min_freq=340.0 / WINDOW_SEGMENT,
+            max_freq=390.0 / WINDOW_SEGMENT,
+            sample_cadence=sample_cadence,
+            force_backend="cpu",
+        )
+        shape = (3, num_times, settings.NF_active)
+        sensitivity = XYZSensitivityBackend(
+            orbits=EqualArmlengthOrbits(force_backend="cpu"), settings=settings, force_backend="cpu"
+        )
+        sensitivity.sens_mat = np.zeros((3,) + shape, dtype=np.complex128)
+        sensitivity.invC = np.ones((3,) + shape, dtype=np.complex128)
+        sensitivity.detC = np.ones(shape[1:])
+        sensitivity.channel_shape = (3, 3)
+        container = AnalysisContainer(
+            settings.associated_class(np.zeros(shape, dtype=np.complex128), settings), sensitivity
+        )
+        group_kwargs = dict(tdi_type="XYZ", window_alpha=WINDOW_TAPER, use_midpoint=True, **window)
+        return AnalysisContainerArray([container], domain_group_kwargs=group_kwargs).cpp_splits[0]
+
+    def test_group_window(self):
+        backend = lisatools.get_backend("cpu")
+        symmetric = windowed_values(backend, window_wrap(backend, True), 4.0e-13)
+        periodic = windowed_values(backend, window_wrap(backend, False), 4.0e-13)
+        group = self._group()
+        np.testing.assert_array_equal(windowed_values(backend, group.cpp_fresnel, 4.0e-13), symmetric)
+        with group.envelope_override(not group.linear_envelope):
+            np.testing.assert_array_equal(
+                windowed_values(backend, group.cpp_fresnel, 4.0e-13), symmetric
+            )
+        chosen = self._group(use_sym_window=False)
+        np.testing.assert_array_equal(windowed_values(backend, chosen.cpp_fresnel, 4.0e-13), periodic)
+        # * Without the sample spacing a tapered group cannot form the symmetric window.
+        with self.assertRaises(ValueError):
+            self._group(sample_cadence=None)
 
 
 if __name__ == "__main__":

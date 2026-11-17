@@ -162,11 +162,24 @@ public:
     STFTFresnelWrap(int num_times, int num_freqs, int num_channels,
                     double t0, double f_min, double f_max,
                     double dt, double df, double window_alpha = 0.0,
-                    bool use_midpoint = false, bool linear_envelope = false)
+                    bool use_midpoint = false, bool linear_envelope = false,
+                    int window_samples = 0, double sample_cadence = 0.0)
     {
+        // ! The symmetric window spans (N - 1) h only if its N samples fill the segment exactly.
+        if (window_samples != 0) {
+            if (window_samples < 2)
+                throw std::invalid_argument(
+                    "STFTFresnel: window_samples must be zero or at least two.");
+            if (!(sample_cadence > 0.0))
+                throw std::invalid_argument("STFTFresnel: sample_cadence must be positive.");
+            if (!(std::fabs(window_samples * sample_cadence - dt) <= 1.0e-12 * dt))
+                throw std::invalid_argument(
+                    "STFTFresnel: window_samples * sample_cadence must equal dt to within 1e-12.");
+        }
         fresnel = new STFTFresnel(num_times, num_freqs, num_channels,
                                   t0, f_min, f_max, dt, df, window_alpha,
-                                  use_midpoint, linear_envelope);
+                                  use_midpoint, linear_envelope, window_samples,
+                                  sample_cadence);
     }
 
     ~STFTFresnelWrap() { delete fresnel; }
