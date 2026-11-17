@@ -189,7 +189,6 @@ class SOBBHProposalPriorsTest(_Sources):
             "unknown factory": {"proposal_priors": {**PROPOSAL_PRIORS, "factory": "no_such_factory"}},
             "unknown kwarg": {"proposal_priors": {**PROPOSAL_PRIORS, "kwargs": {"f0_min": 1e-3}}},
             "chirp-mass order": {"proposal_priors": {**PROPOSAL_PRIORS, "kwargs": {"sort_with_chirp_mass": True}}},
-            "fixed nleaves": {"nleaves": 3},
             "prior search": {"search": {"search_type": "prior"}},
         }
         for name, changes in cases.items():
@@ -206,6 +205,17 @@ class SOBBHProposalPriorsTest(_Sources):
             f0 = prior.rvs(200)[:, prior.get_input_basis().index("f0")]
             lo, hi = sobhb.TILES_F0_MIN[source_id], sobhb.TILES_F0_MAX[source_id]
             self.assertTrue(np.all((f0 >= lo) & (f0 <= hi)), source_id)
+
+    def test_fewer_leaves_than_source_ids_take_the_first_tiles(self):
+        # more sources injected than fitted: a fixed nleaves, one prior per leaf
+        from ereborpriors.stock.mojitolight import SOBHBPrior, sobhb
+
+        cfg = self.config({"nleaves": 2})  # source ids [0, 3, 4]
+        leaf_priors = make_proposal_priors(cfg.blocks["sobbh"], cfg, SOBHBPrior.prior_factory())
+        self.assertEqual(len(leaf_priors), 2)
+        for source_id, prior in zip((0, 3), leaf_priors):
+            f0 = prior.rvs(200)[:, prior.get_input_basis().index("f0")]
+            self.assertTrue(np.all((f0 >= sobhb.TILES_F0_MIN[source_id]) & (f0 <= sobhb.TILES_F0_MAX[source_id])))
 
     def test_rejects_missing_tiles_and_other_bases(self):
         from ereborpriors.stock.mojitolight import SOBHBPrior

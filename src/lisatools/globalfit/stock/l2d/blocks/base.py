@@ -1023,10 +1023,11 @@ def make_priors(block: BlockBase, general) -> GFBasePrior:
 
 def make_proposal_priors(block: SourceBlock, cfg, branch_prior) -> list:
     """The PE move's per-leaf priors (``block.proposal_priors``): leaf j gets the factory's prior for the j-th
-    sorted source id, the order the catalogue seeds the leaves in."""
+    sorted source id, the order the catalogue seeds the leaves in. A block with fewer leaves than source ids (a
+    fixed ``nleaves``: more sources injected than fitted) takes the first ``nleaves`` of them."""
     spec = block.proposal_priors
     tiles = getattr(prior_class(spec.class_name), spec.factory)(**deepcopy(spec.kwargs))
-    ids = sorted(cfg.data.source_ids[block.SOURCE_IDS_KEY])
+    ids = sorted(cfg.data.source_ids[block.SOURCE_IDS_KEY])[: block.resolve_nleaves(cfg)]
     missing = [i for i in ids if i >= len(tiles)]
     if missing:
         raise ValueError(f"proposal_priors: {spec.factory} gives {len(tiles)} priors, none for source ids {missing}.")
