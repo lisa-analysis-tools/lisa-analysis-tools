@@ -521,6 +521,14 @@ class SourceSearchBuildTest(_Built):
         self.assertIs(gen.source.init_kwargs, built["mbh"].setup.initialize_kwargs)  # copied together by the engine
         self.assertFalse(gen.source.built)  # built on the first call, after the engine's deep copy
         self.assertIsNone(built["emri"].setup.signal_gen)  # no search: the branch starts empty
+        self.assertTrue(gen.supports_batch)  # one call per leaf over the walkers
+
+    def test_emri_signal_gen_is_called_per_walker(self):
+        point = self.run_dir / "emri_point.npy"
+        np.save(point, np.zeros(1))  # read only when the run seeds
+        search = {"search_type": "point_estimate", "search_path": str(point), "spread": 1e-3}
+        _, built = self.build({"emri": {**EMRI_BLOCK, "search": search}})
+        self.assertFalse(built["emri"].setup.signal_gen.supports_batch)
 
     def test_mbh_interface(self):
         from lisatools.globalfit.searches import MBHBSearchInterface
