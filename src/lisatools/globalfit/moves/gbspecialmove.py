@@ -3386,6 +3386,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         if self.backend.uses_cupy:
             self.xp.cuda.runtime.setDevice(model.analysis_container_arr.gpus[0])
+            # * The level every propose should start from: a fall over the run shows that a move
+            # * kept arrays on a card after its propose.
+            logger.info(
+                "[GB_MEMORY %s] device memory free at the start of the propose: %.2f GiB",
+                self.name,
+                free_device_bytes(self.xp, model.analysis_container_arr.gpus) / 2**30,
+            )
         # Run-time source of truth is the ACA that arrives with the model:
         # refresh the domain quantities and re-bind the parent engine (FD
         # prototype comp + move-level engine) if this ACA differs from the
@@ -3703,6 +3710,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.mempool.free_all_blocks()
         with tm.span("ll_inject_final"):
             new_state.log_like[:] = self.check_ll_inject(model, new_band_sorter)
+        # * The rebuild above is the last reader of the data copy; kept, it would take a card's
+        # * share of the walkers' data from every other GB move until this move's next propose.
+        self.reset_non_gb_linear_data_arr = None
 
         # Per-band progressive leaf caps advance AFTER the final residual
         # rebuild so the convergence metric sees the accepted state. Only
@@ -3773,6 +3783,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self._mem_probe.finish()
 
         self._release_stft_comp_groups()
+        # * Nothing reads the incoming state after the propose; kept, it pins a whole sampler state
+        # * on the host.
+        self.current_state = None
 
         return new_state, accepted
 
@@ -5357,9 +5370,9 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
     the passes before left it.
 
     The search chooses neither the bands nor the walker and changes nothing of the run: the caller turns the fit into a
-    proposal. It keeps no sampler and no data between calls, except the containers of those copies, which it builds
-    once. :meth:`finish` writes one line to the run log and a block to ``fstat_search.log``, and saves the search's
-    record when ``save_search_records`` asks for one.
+    proposal. It keeps no sampler and no data between calls, except the containers of those copies, which stay until
+    its owner calls :meth:`release_search_holder`. :meth:`finish` writes one line to the run log and a block to
+    ``fstat_search.log``, and saves the search's record when ``save_search_records`` asks for one.
 
     Args:
         fstat_settings: The search's settings, kept as given (the owner of the search holds the copy); None takes the
@@ -5731,6 +5744,11 @@ class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
                     destination.data.copy_from_device_async(source.data, source.nbytes)
         search_holder.compute_d_d_terms()
         return search_holder
+
+    def release_search_holder(self):
+        """Drop the search holder. Its containers leave the cards once the search dicts that refer to them are gone,
+        and the next search on several cards builds it again. On one card there is none."""
+        self._search_holder = None
 
     def _run_stage_1(self, holder, owners, bands, engine, periodic, seeds=None):
         """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
@@ -6302,6 +6320,9 @@ class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
         self.residual_search.finish(search, time_start, outcome, warn=status == "no_usable_fit")
         if self.fstat_search_memory is not None:
             self._write_fit_to_memory(search)
+        # * The search of this propose is over; kept, its holder would take memory on every card from the proposals of
+        # * all GB moves. The containers leave with ``search`` when this method ends.
+        self.residual_search.release_search_holder()
 
     def _search_bands(self):
         """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
@@ -7638,6 +7659,9 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
                     len(windows["ids"]))
                 searched = True
         if searched:
+            # * The searches of this propose are over; kept, their holder would take memory on
+            # * every card from the proposals of all GB moves.
+            self.residual_search.release_search_holder()
             # the search dicts went out of scope with the calls; this returns their device memory
             free_bytes = free_device_bytes(self.xp, holder.gpus)
             logger.info("[%s %s] device memory free after the searches: %.2f GiB",
