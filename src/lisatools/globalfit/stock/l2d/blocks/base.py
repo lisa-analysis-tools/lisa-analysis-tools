@@ -278,6 +278,9 @@ class SearchSpec(_Spec):
     spread: (
         Literal["info_matrix"] | float | list[float] | list[list[float]] | list[list[list[float]]] | None
     ) = None
+    # with spread "info_matrix": the numeric spread (same forms as spread) of a source whose information matrix
+    # cannot be computed (e.g. a search point on the edge of the prior); None -> such a source stops the run
+    fallback_spread: float | list[float] | list[list[float]] | list[list[list[float]]] | None = None
     is_eryn_backend: bool = False  # search results are an eryn backend, already in the sampling basis
     max_resample_tries: PositiveInt = 50  # redraws of walkers that land outside the prior around a point value
     kwargs: dict[str, Any] = Field(default_factory=dict)  # the interface class's own arguments
@@ -304,6 +307,11 @@ class SearchSpec(_Spec):
                     "spread 'info_matrix' is the covariance of every parameter at the point: it needs "
                     "parameters_searched: all."
                 )
+        if self.fallback_spread is not None and self.spread != "info_matrix":
+            raise ValueError(
+                "fallback_spread is the numeric spread of the sources whose information matrix cannot be computed: "
+                "it needs spread 'info_matrix'; a numeric spread goes in spread."
+            )
         if self.search_path is not None and not self.search_path.exists():
             raise ValueError(f"search_path {self.search_path} does not exist.")
         return self
@@ -560,10 +568,15 @@ class SourceBlock(MoveBlock):
                 "info_matrix: the block uses no information matrix; give search.spread 'info_matrix' or an "
                 "InfoMatrixMove among the inner_moves, or leave info_matrix out."
             )
-        if self.uses_info_matrix and self.proposal_priors is not None:
+        # the starting scatter takes each leaf's own prior (build_source); the proposal has one Gaussian basis
+        # for all the leaves and is not built for per-leaf priors
+        if self.proposal_priors is not None and any(
+            move.class_name == "InfoMatrixMove" for move in self.inner_moves or []
+        ):
             raise ValueError(
-                "the information matrix needs one prior for all the leaves (it bounds the covariance with the "
-                "prior's variance); leave out proposal_priors, or spread 'info_matrix' and InfoMatrixMove."
+                "InfoMatrixMove needs one prior for all the leaves (it bounds the covariance with the prior's "
+                "variance); leave out proposal_priors or InfoMatrixMove. (search.spread 'info_matrix' works with "
+                "proposal_priors: each source is scattered within its own prior.)"
             )
         basis = None if self.info_matrix is None else self.info_matrix.proposal_basis
         if basis is not None:
@@ -762,6 +775,12 @@ class SourceBlock(MoveBlock):
                 info["transform_fn"], self.waveform.runtime_kwargs,
             )
         search_interface = make_search_interface(self, info)
+        # the leaves' own priors (proposal_priors): the seeds of a leaf are drawn inside its prior, and the
+        # information matrix of its starting scatter is bounded by it; the same list the PE move gets
+        leaf_priors = None
+        if self.proposal_priors is not None and search_interface is not None:
+            leaf_priors = make_proposal_priors(self, ctx.cfg, info["priors"][self.type])
+            search_interface.leaf_priors = leaf_priors
         # one generator for the search interface (which reads it from the Settings when it seeds) and the PE move
         # (build_recipe.source_moves): it holds the Settings' branch prior, so the engine's deep copy keeps them together
         info_matrix_gen = None
@@ -773,7 +792,8 @@ class SourceBlock(MoveBlock):
             if basis is not None:
                 # one object for the generator (covariance in that basis) and the move (filled_move_kwargs)
                 basis = info["proposal_basis"] = PROPOSAL_BASES[basis](info["basis"])
-            info_matrix_gen = InfoMatrixGenerator(info["priors"][self.type], proposal_basis=basis, **spec)
+            prior = info["priors"][self.type] if leaf_priors is None else leaf_priors
+            info_matrix_gen = InfoMatrixGenerator(prior, proposal_basis=basis, **spec)
         injection = info["injection"]  # the YAML's, if given
         if injection is None and search_interface is not None and search_interface.search_type == "catalog":
             # the diagnostic plots' truths: here, so a restart (which does not seed) keeps them
@@ -874,6 +894,7 @@ def make_search_interface(block: BlockBase, info: dict[str, Any], defaults: dict
         search_path=None if spec.search_path is None else str(spec.search_path),
         # "info_matrix" as it is: the interface computes the covariances when it seeds
         spread=spec.spread if spec.spread is None or isinstance(spec.spread, str) else np.asarray(spec.spread, dtype=float),
+        fallback_spread=None if spec.fallback_spread is None else np.asarray(spec.fallback_spread, dtype=float),
         is_eryn_backend=spec.is_eryn_backend,
         periodic=info["periodic"],
         max_resample_tries=spec.max_resample_tries,
