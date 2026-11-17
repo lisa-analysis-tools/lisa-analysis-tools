@@ -250,7 +250,8 @@ class InfoMatrixSpec(_Spec):
 
     One generator per block serves both uses: the starting scatter of ``search.spread: info_matrix`` and the
     proposal of an ``InfoMatrixMove`` among the ``inner_moves``. The builder gives it the branch prior; the
-    waveform, the PSD and the grid reach it at each call.
+    waveform, the PSD and the grid reach it at each call. ``distance_cap`` shortens the starting scatter where the
+    waveform is not linear over one sigma; the proposal is not capped.
     """
 
     more_accurate: bool = True  # five-point stencil for the derivatives (three-point without)
@@ -262,6 +263,10 @@ class InfoMatrixSpec(_Spec):
     # basis of the InfoMatrixMove's Gaussian (lisatools.globalfit.infomatrix.PROPOSAL_BASES), among those of the
     # block (PROPOSAL_BASES); None -> the sampling basis. The starting scatter is always in the sampling basis.
     proposal_basis: str | None = None
+    # cap of the starting scatter (search.spread: info_matrix): each principal axis of the scatter is shortened
+    # until one sigma along it changes the waveform by at most this <dh|dh>; None -> no cap. It does not apply to
+    # the InfoMatrixMove's proposal.
+    distance_cap: PositiveFloat | None = None
 
 
 class SearchSpec(_Spec):
@@ -587,6 +592,12 @@ class SourceBlock(MoveBlock):
                     "info_matrix.proposal_basis is the basis of the InfoMatrixMove's proposal: give an "
                     "InfoMatrixMove among the inner_moves, or leave proposal_basis out."
                 )
+        cap = None if self.info_matrix is None else self.info_matrix.distance_cap
+        if cap is not None and (self.search is None or self.search.spread != "info_matrix"):
+            raise ValueError(
+                "info_matrix.distance_cap is the cap of the starting scatter (the InfoMatrixMove's proposal is not "
+                "capped): give search.spread 'info_matrix', or leave distance_cap out."
+            )
         return self
 
     @model_validator(mode="after")

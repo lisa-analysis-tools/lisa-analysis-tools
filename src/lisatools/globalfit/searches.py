@@ -473,6 +473,9 @@ class BaseSearchInterface(ABC):
         :class:`~lisatools.globalfit.infomatrix.InfoMatrixGenerator`), so the temperature is already inside and no
         temperature is wider than the prior (``beta = 0`` gives the prior's own variances).
 
+        These covariances are for the starting scatter, so each call asks the generator for its waveform-distance
+        cap (``cap=True``); the cap runs only if the generator has a ``distance_cap``, and is otherwise a no-op.
+
         Read from ``curr``: ``source_info[branch_name].signal_gen`` (called with the sampling-basis parameters as
         positional scalars, returning a ``DomainBase``), ``source_info[branch_name].info_matrix_gen``, and from
         ``general_info`` the grid ``input_data_residual_array.settings``, the noise
@@ -540,7 +543,10 @@ class BaseSearchInterface(ABC):
         covs = np.empty((len(betas), num_leaves, num_dim, num_dim), dtype=float)
         for leaf in range(num_leaves):
             try:
-                covs[:, leaf] = info_matrix_gen(starting_points[leaf], signal_gen, psd, grid, leaf=leaf, betas=betas)
+                # * cap=True: the starting scatter only (the generator caps if it has a distance_cap)
+                covs[:, leaf] = info_matrix_gen(
+                    starting_points[leaf], signal_gen, psd, grid, leaf=leaf, betas=betas, cap=True
+                )
             except Exception as error:
                 error_class = ValueError if isinstance(error, ValueError) else RuntimeError
                 raise error_class(
@@ -549,10 +555,17 @@ class BaseSearchInterface(ABC):
                     f"{error}"
                 ) from error
             last = getattr(info_matrix_gen, "last", None) or {}
+            # * Only what the generator reports about its cap: nothing is added when it did not run.
+            cap_report = ""
+            if last.get("capped") is not None:
+                cap_report += f", {int(last['capped'])} directions capped"
+            extents = last.get("extents")
+            if extents is not None and np.size(extents) > 0:
+                cap_report += f", smallest extent {float(np.min(np.asarray(extents, dtype=float))):.3g}"
             logger.info(
                 f"Information-matrix covariance of {self.branch_name} source {leaf}: "
                 f"{last.get('time', float('nan')):.2f} s, steps {np.asarray(last.get('eps', [])).tolist()}, "
-                f"condition number {last.get('condition', float('nan')):.3e}"
+                f"condition number {last.get('condition', float('nan')):.3e}{cap_report}"
             )
 
         return covs
