@@ -537,3 +537,132 @@ def get_psd_transform_container(
     """
     # TODO/DOCS: function body is currently empty; this docstring describes
     # the intended interface but no transforms are actually constructed yet.
+
+
+# --- autocorrelation times at runtime (recipe stages: convergence stop and adaptive inner repeats) --- #
+
+def _windowed_act(acf: np.ndarray, c: float = 5.0) -> np.ndarray:
+    """Integrated ACT of each column of ``acf`` (lags along axis 0) with Sokal's automatic window.
+
+    The window is the smallest ``M`` with ``M >= c * tau(M)``, ``tau(M) = 1 + 2 sum_{k<M} acf[k]``; NaN where no
+    such window fits in the series (the ACT is not resolved by it).
+    """
+    taus = 2.0 * np.cumsum(acf, axis=0) - 1.0
+    windows = np.arange(1, taus.shape[0] + 1)[:, None]
+    fits = windows >= c * taus  # False where taus is NaN
+    first = np.argmax(fits, axis=0)
+    out = np.take_along_axis(taus, first[None, :], axis=0)[0]
+    return np.where(fits.any(axis=0), out, np.nan)
+
+
+def branch_periods(periodic, branch: str) -> dict[int, float]:
+    """``{parameter index: period}`` of ``branch`` from eryn's ``PeriodicContainer`` (``{}`` for None or a branch
+    without periodic parameters). The container's resolved indices, so name keys are fine."""
+    indices = getattr(periodic, "inds_periodic", None) or {}
+    if branch not in indices:
+        return {}
+    return {int(index): float(period) for index, period in zip(indices[branch], periodic.periods[branch])}
+
+
+def _periodic_as_sin_cos(x: np.ndarray, periods: dict | None) -> tuple[np.ndarray, np.ndarray]:
+    """``x[..., nseries]`` with each periodic column as a sin and a cos column; and the column each one came from."""
+    owner = np.arange(x.shape[-1])
+    if not periods:
+        return x, owner
+    x, extra = x.copy(), []
+    for index, period in periods.items():
+        phase = 2.0 * np.pi * x[..., int(index)] / period
+        x[..., int(index)] = np.sin(phase)
+        extra.append(np.cos(phase))
+        owner = np.append(owner, int(index))
+    return np.concatenate([x, np.stack(extra, axis=-1)], axis=-1), owner
+
+
+def _max_per_owner(tau: np.ndarray, owner: np.ndarray, nseries: int) -> np.ndarray:
+    """The largest ``tau`` of each original column (NaN if any of its columns is NaN)."""
+    out = np.full(nseries, -np.inf)
+    for value, index in zip(tau, owner):
+        out[index] = np.nan if np.isnan(value) or np.isnan(out[index]) else max(out[index], value)
+    return out
+
+
+def cold_chain_act(x, periods: dict | None = None, multiplier: float = 50.0, c: float = 5.0):
+    """Integrated ACT of a stored chain ``x[nsteps, nwalkers, nseries]`` and whether each estimate is reliable.
+
+    eryn's ``get_acf`` (per walker, averaged over the walkers) with Sokal's automatic window in place of the
+    fixed 50 lags of ``eryn.utils.get_integrated_act``, which cannot return more than about 100. ``reliable`` is
+    eryn's ``AutoCorrelationStop`` rule, ``nsteps > multiplier * tau``. A walker that never moves gives NaN, and
+    NaN is never reliable. ``periods``: ``{column: period}`` of the periodic columns (taken as sin and cos).
+
+    Returns:
+        ``(tau[nseries], reliable[nseries])``.
+    """
+    from eryn.utils import get_acf
+
+    x = np.asarray(x, dtype=float)
+    nsteps, _nwalkers, nseries = x.shape
+    x, owner = _periodic_as_sin_cos(x, periods)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        acf = get_acf(x, axis=0).mean(axis=1)  # (nsteps, columns)
+    tau = _windowed_act(acf, c)
+    # a walker that never moved has no ACF (0 / 0, or rounding noise in its place): not defined
+    tau[(np.ptp(x, axis=0) == 0.0).any(axis=0)] = np.nan
+    tau = _max_per_owner(tau, owner, nseries)
+    with np.errstate(invalid="ignore"):
+        reliable = nsteps > multiplier * tau
+    return tau, reliable
+
+
+def variogram(x, periods: dict | None = None) -> np.ndarray:
+    """Half the mean squared difference at each lag, ``[nsteps, columns]``, of an ensemble chain
+    ``x[nsteps, nwalkers, nseries]``, over the walkers and the steps.
+
+    For the cold chain across a move's proposal repeats. It equals ``variance * (1 - acf)`` and needs no mean:
+    each walker samples its own conditional distribution (it carries its own state of the other blocks), so a
+    mean pooled over the walkers leaves a plateau in the ACF, and each walker's own mean over a series of ten
+    ACTs (eryn's ``get_acf``) halves the ACT.
+    """
+    x, _owner = _periodic_as_sin_cos(np.asarray(x, dtype=float), periods)
+    nsteps = x.shape[0]
+    x = x - x.mean(axis=0)  # differences do not see a constant; this only keeps the sums below well conditioned
+    # sum_t (x[t+k] - x[t])^2 = sum_{t<n-k} x[t]^2 + sum_{t>=k} x[t]^2 - 2 sum_t x[t] x[t+k]
+    f = np.fft.rfft(x, n=2 * nsteps, axis=0)
+    cross = np.fft.irfft(f * np.conjugate(f), n=2 * nsteps, axis=0)[:nsteps]
+    squares = np.concatenate([np.zeros((1,) + x.shape[1:]), np.cumsum(x * x, axis=0)], axis=0)
+    lags = np.arange(nsteps)
+    head = squares[nsteps - lags]  # sum of x[t]^2 for t < n - k
+    tail = squares[nsteps] - squares[lags]  # ... for t >= k
+    pairs = (nsteps - lags)[:, None, None]
+    return (0.5 * (head + tail - 2.0 * cross) / pairs).mean(axis=1)
+
+
+def variogram_act(vario: np.ndarray, level: float = 1.0 - np.exp(-1.0), flat: float = 0.75, min_steps: int = 8) -> float:
+    """The largest integrated ACT over the columns of a :func:`variogram`; NaN if it is not resolved.
+
+    The variance is the variogram's plateau, between a half and three quarters of the series. The ACT is twice
+    the lag at which the variogram reaches ``level`` of the plateau (the ACF falls to ``1 - level``, 1/e by
+    default): exact for an exponential ACF, and, unlike the sum of the ACF, not sensitive to the plateau (an
+    error of 5% in it doubles the sum, and moves this by 10%).
+
+    Not resolved (NaN) when the series is shorter than ``min_steps`` or than five ACTs, or when the variogram is
+    still rising: its mean between a quarter and a half of the series is below ``flat`` of the plateau (0.6 for
+    a chain that drifts or diffuses, as during burn-in; 1 for a stationary chain several ACTs long).
+    Calibration (AR(1), and a stretch move on a 12-dimensional Gaussian with 14 and 48 walkers): resolved from
+    about ten ACTs, within 10% for AR(1) and 10 to 30% high for the stretch move.
+    """
+    nsteps = vario.shape[0]
+    if nsteps < min_steps:
+        return float("nan")
+    plateau = vario[nsteps // 2 : (3 * nsteps) // 4].mean(axis=0)
+    rising = vario[nsteps // 4 : nsteps // 2].mean(axis=0)
+    moving = plateau > 0.0  # a column that never changes (a parameter held fixed) says nothing
+    if not moving.any() or (rising[moving] < flat * plateau[moving]).any():
+        return float("nan")
+    tau = 1.0
+    for column, top in zip(vario[:, moving].T, level * plateau[moving]):
+        k = int(np.argmax(column >= top))  # column[0] = 0 < top, and the plateau itself is above top
+        if k == 0:
+            return float("nan")
+        crossing = k - 1 + (top - column[k - 1]) / (column[k] - column[k - 1])
+        tau = max(tau, 2.0 * crossing)
+    return float(tau) if tau <= nsteps / 5.0 else float("nan")

@@ -77,10 +77,16 @@ class DomainKernelStrategy(LISAToolsParallelModule):
         self.split_index = split_index
         self.data_arr = acs.linear_data_arr[split_index]
         self.invC_arr = acs.linear_psd_arr[split_index]
+        self.settings = acs.settings
         self.num_channels = acs.nchannels
         self.num_data = len(acs.gpu_splits[split_index])
         self.num_noise = len(acs.gpu_splits[split_index])
-        self.settings = acs.settings
+        # Shape of one row of an external noise array; None while every AC holds its own row.
+        self.noise_row_shape = None
+        if getattr(acs, "external_noise_rows", False):
+            # The ACs read the rows of an external noise array, so the row count is its own.
+            self.num_noise = acs.num_noise_rows(split_index)
+            self.noise_row_shape = tuple(acs.noise_row_shape)
 
         all_acs = acs.acs.flatten()
         split_container_ids = acs.gpu_splits[split_index]
@@ -392,6 +398,7 @@ class STFTComputationGroup(DomainKernelStrategy):
         window_alpha: float = 0.0,
         use_midpoint: bool = False,
         linear_envelope: bool = True,
+        use_sym_window: bool = True,
     ):
         """
         Args:
@@ -411,6 +418,12 @@ class STFTComputationGroup(DomainKernelStrategy):
                 Defaults ``True``; ``False`` gives the const-envelope path, byte for
                 byte the kernel of before. ``STFTGBComputations`` defaults to ``True``
                 as well and checks that the two agree.
+            use_sym_window: If ``True`` (the default), the Fresnel transform models the
+                symmetric Tukey window of LAT's ``tukey()`` (scipy's ``sym=True``), zero on the
+                first and the last of a segment's samples, as ``windowfun`` windows the data; a
+                tapered window then needs the sample spacing ``sample_cadence`` of the STFT
+                settings.
+                ``False`` models the periodic window (scipy's ``sym=False``).
         """
         from .domains import STFTSettings
 
@@ -423,6 +436,7 @@ class STFTComputationGroup(DomainKernelStrategy):
         self.window_alpha = window_alpha
         self.use_midpoint = use_midpoint
         self.linear_envelope = linear_envelope
+        self.use_sym_window = use_sym_window
 
         with self.group_device_context():
             self._create_cpp_domain()
@@ -449,7 +463,32 @@ class STFTComputationGroup(DomainKernelStrategy):
             self.num_data,
             self.num_noise,
             self.backend.TDITypeDict[self.tdi_type],
+            *self._noise_layout_args(),
         ]
+
+    def _noise_layout_args(self) -> list:
+        """Trailing wrapper arguments for external noise rows; none while every AC holds its own row."""
+        if getattr(self, "noise_row_shape", None) is None:
+            return []
+        # The rows hold the full active grid, so the kernels read them at a pixel's active bin.
+        return [int(self.noise_row_shape[-1]), True]
+
+    def _fresnel_window_kwargs(self) -> dict:
+        """N and h of the symmetric window for the STFTFresnelWrap; none for the periodic window
+        and the boxcar."""
+        if not getattr(self, "use_sym_window", True) or not self.window_alpha > 0.0:
+            return {}
+        sample_cadence = getattr(self.settings, "sample_cadence", None)
+        if sample_cadence is None:
+            raise ValueError(
+                "The symmetric window needs the sample spacing sample_cadence of the STFT settings "
+                "(get_stft_settings sets it); use use_sym_window=False for the periodic window."
+            )
+        # * get_nperseg checks that the samples fill a segment; the wrap checks N h = dt to 1e-12.
+        return dict(
+            window_samples=self.settings.get_nperseg(sample_cadence),
+            sample_cadence=float(sample_cadence),
+        )
 
     def _create_cpp_domain(self):
         self._cpp_domain = self.backend.STFTDomainWrap(*self.domain_args)
@@ -458,6 +497,7 @@ class STFTComputationGroup(DomainKernelStrategy):
             window_alpha=self.window_alpha,
             use_midpoint=self.use_midpoint,
             linear_envelope=self.linear_envelope,
+            **self._fresnel_window_kwargs(),
         )
 
     @property
@@ -497,6 +537,7 @@ class STFTComputationGroup(DomainKernelStrategy):
                     window_alpha=self.window_alpha,
                     use_midpoint=self.use_midpoint,
                     linear_envelope=wanted,
+                    **self._fresnel_window_kwargs(),
                 )
         saved = self._cpp_fresnel
         self._cpp_fresnel = cache[wanted]
@@ -607,6 +648,104 @@ class STFTComputationGroup(DomainKernelStrategy):
         )
 
         return d_h_out, h_h_out
+
+    def compute_cross_terms(
+        self,
+        residual_index: NDArrayLike,
+        noise_index: NDArrayLike,
+        residual_starts: NDArrayLike,
+        templates: NDArrayLike,
+        template_index: NDArrayLike,
+        template_starts: NDArrayLike,
+        window_lo: NDArrayLike,
+        window_hi: NDArrayLike,
+        run_async: bool = False,
+    ) -> tuple[NDArrayLike, NDArrayLike, NDArrayLike]:
+        """Inner products of this group's data rows with template rows, per table.
+
+        Table ``b`` holds residuals ``i`` and templates ``j``. Residual ``i`` is data row
+        ``residual_index[b, i]``, read with noise row ``noise_index[b, i]``, and its window starts at
+        active bin ``residual_starts[b, i]``. Template ``j`` is row ``template_index[b, j]`` of
+        ``templates``, and its window starts at ``template_starts[b, j]``. The sums run over every
+        segment and the active bins ``[window_lo[b], window_hi[b])``: a pixel outside a residual's
+        window adds nothing to that residual's terms, and a template is zero outside its window.
+        With ``(a|c) = 4 df Re sum a^H C^-1 c`` under the noise row of residual ``i``::
+
+            cross[b, i, j] = (r_i|t_j),  template[b, i, j] = (t_j|t_j),  residual[b, i] = (r_i|r_i).
+
+        Each value is summed in one fixed order that does not depend on the other tables of the
+        call or on the device, so tables split over calls or devices give identical results.
+
+        Args:
+            residual_index, noise_index, residual_starts: ints of shape
+                ``(num_tables, num_residuals)``.
+            templates: complex128 rows of shape ``(num_rows, num_channels, NT, width)``,
+                C-contiguous.
+            template_index, template_starts: ints of shape ``(num_tables, num_templates)``.
+            window_lo, window_hi: ints of shape ``(num_tables,)``. Host arrays size the launch
+                without waiting for the device.
+            run_async: free the kernel's partial sums asynchronously and return without waiting.
+
+        Returns:
+            ``(cross, template, residual)``, float64 arrays of shapes
+            ``(num_tables, num_residuals, num_templates)``, the same, and
+            ``(num_tables, num_residuals)``.
+        """
+        xp = self.xp
+        num_tables, num_residuals = np.shape(residual_index)
+        num_templates = np.shape(template_index)[1]
+        if np.shape(noise_index) != (num_tables, num_residuals) or np.shape(residual_starts) != (
+            num_tables, num_residuals
+        ):
+            raise ValueError("noise_index and residual_starts must have the shape of residual_index.")
+        if np.shape(template_index) != (num_tables, num_templates) or np.shape(
+            template_starts
+        ) != (num_tables, num_templates):
+            raise ValueError("template_index and template_starts must have the same shape.")
+        if np.shape(window_lo) != (num_tables,) or np.shape(window_hi) != (num_tables,):
+            raise ValueError("window_lo and window_hi need one entry per table.")
+        if templates.ndim != 4 or tuple(templates.shape[1:3]) != (
+            self.num_channels, int(self.settings.NT)
+        ):
+            raise ValueError(
+                f"templates must have shape (rows, {self.num_channels}, {int(self.settings.NT)}, "
+                f"width); got {templates.shape}."
+            )
+        # ! The binding reads raw pointers, so a strided or converted array would be read wrongly.
+        if templates.dtype != xp.complex128 or not templates.flags.c_contiguous:
+            raise ValueError("templates must be a C-contiguous complex128 array.")
+        max_window_width = int((window_hi - window_lo).max()) if num_tables else 0
+
+        with self.group_device_context():
+            cross = xp.empty((num_tables, num_residuals, num_templates), dtype=xp.float64)
+            template = xp.empty((num_tables, num_residuals, num_templates), dtype=xp.float64)
+            residual = xp.empty((num_tables, num_residuals), dtype=xp.float64)
+            if num_tables == 0:
+                return cross, template, residual
+
+            def flat_ints(values):
+                return xp.ascontiguousarray(xp.asarray(values), dtype=xp.int32).reshape(-1)
+
+            self.cpp_domain.compute_cross_terms(
+                cross.reshape(-1),
+                template.reshape(-1),
+                residual.reshape(-1),
+                templates.reshape(-1),
+                int(templates.shape[-1]),
+                flat_ints(residual_index),
+                flat_ints(noise_index),
+                flat_ints(residual_starts),
+                flat_ints(template_index),
+                flat_ints(template_starts),
+                flat_ints(window_lo),
+                flat_ints(window_hi),
+                num_tables,
+                num_residuals,
+                num_templates,
+                max_window_width,
+                run_async,
+            )
+        return cross, template, residual
 
 
 class FDComputationGroup(DomainKernelStrategy):

@@ -27,6 +27,7 @@ __all__ = [
     "current_device",
     "jax_device_context",
     "assert_peer_access",
+    "gpu_memory_report",
 ]
 
 
@@ -159,3 +160,49 @@ def jax_device_context(device: Optional[int], *, kind: str = "gpu"):
     except (RuntimeError, IndexError):
         # JAX on CPU while cupy on GPU, or fewer JAX devices than cupy sees.
         return nullcontext()
+
+
+def _gib(nbytes) -> str:
+    return f"{nbytes / 2**30:.2f} GiB"
+
+
+def gpu_memory_report(xp, gpus: Union[int, Sequence[int], None], walkers_per_gpu: Optional[dict] = None) -> list[str]:
+    """One line per GPU on its memory occupation, for sizing the ensemble (empty on the CPU path).
+
+    Per device: used / total over all processes (``cudaMemGetInfo``, so other jobs on the card count too),
+    this process's cupy pool (in use / held; held is what the pool keeps after a free), JAX's in-use, peak and
+    limit (``memory_stats`` of the JAX device with that id; JAX keeps the CUDA ids under
+    ``jax_cuda_visible_devices``) and, with
+    ``walkers_per_gpu`` (``{gpu: count}``), the cupy bytes per walker on that card (sensitivity included, so
+    an upper bound of the per-walker cost).
+    """
+    if gpus is None or not hasattr(xp, "cuda"):
+        return []
+    gpus = [gpus] if isinstance(gpus, int) else [int(g) for g in gpus]
+    try:
+        import jax
+
+        jax_devices = {d.id: d for d in jax.devices("gpu")} if jax.default_backend() == "gpu" else {}
+    except Exception:  # noqa: BLE001 -- no jax, or no jax gpu backend
+        jax_devices = {}
+    pool = xp.get_default_memory_pool()  # per-device numbers: the pool reports the current device
+    lines = []
+    for gpu in gpus:
+        with device_context(xp, gpu):
+            free, total = xp.cuda.runtime.memGetInfo()
+            in_use, held = pool.used_bytes(), pool.total_bytes()
+        line = (
+            f"GPU {gpu}: device {_gib(total - free)} / {_gib(total)} used (all processes); "
+            f"cupy pool {_gib(in_use)} in use, {_gib(held)} held"
+        )
+        stats = jax_devices[gpu].memory_stats() if gpu in jax_devices else None
+        if stats:
+            line += (
+                f"; JAX {_gib(stats.get('bytes_in_use', 0))} in use, peak {_gib(stats.get('peak_bytes_in_use', 0))}"
+                f", limit {_gib(stats.get('bytes_limit', 0))}"
+            )
+        count = (walkers_per_gpu or {}).get(gpu)
+        if count:
+            line += f"; {count} walkers, <= {_gib(in_use / count)} cupy per walker"
+        lines.append(line)
+    return lines

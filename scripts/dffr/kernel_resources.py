@@ -28,7 +28,8 @@ dynamic part of the tile's templates and 1 kB the system keeps per block. The SM
 the A100 (sm_80) and 228 kB on the H100 (sm_90). The dynamic part of the DFFR tile is the size of
 its template arena. A small host program built with the flags of gb_dffr.cu prints it, and a
 second one the dynamic shared memory of the DFFR Fisher matrix, which depends on the parameters
-it differences: the kernel table shows the 8 of the global fit, a list both 8 and 9.
+it differences: the kernel table shows the 8 of the global fit, a list both 8 and 9. A third
+prints that of the two-template F-statistic, which holds the tables of its two variants.
 
 Two properties of the sm_90 code: its static shared memory already holds the 1 kB the system
 keeps (cuobjdump reports ptxas's figure plus 1024 bytes), and it reports registers for kernels
@@ -95,6 +96,17 @@ int main() {
 FISHER_KERNEL = "dffr_information_matrix_kernel"
 #: Parameters of the Fisher figure in the kernel table: the 8 of the global fit.
 FISHER_TABLE_PARAMETERS = 8
+# * The two-template F-statistic holds the tables of its two variants, not those of a tile.
+DFFR_FSTAT_PROBE = """#include <cstdio>
+#include "gb_dffr.hh"
+#include "lat_dffr_kernels.hh"
+int main() {
+  std::printf("16 %zu\\n", dffr_information_bytes<GBDFFRSource, 16>(dffr_fstat_layout()));
+  std::printf("32 %zu\\n", dffr_information_bytes<GBDFFRSource, 32>(dffr_fstat_layout()));
+  return 0;
+}
+"""
+FSTAT_KERNEL = "dffr_get_fstat_kernel"
 
 
 def recorded_command(build_dir, ninja, target, toolkit=None):
@@ -229,6 +241,24 @@ def dffr_template_bytes(build_dir, ninja, arch, work_dir, objects, toolkit=None)
     return {int(rows): int(size) for rows, size in (line.split() for line in printed.splitlines())}
 
 
+def dffr_fstat_bytes(build_dir, ninja, arch, work_dir, objects, toolkit=None):
+    """{rows: dynamic shared bytes of the two-template F-statistic}, or {} without it."""
+    printed = run_probe(
+        build_dir,
+        ninja,
+        arch,
+        work_dir,
+        objects,
+        toolkit,
+        "dffr_fstat_bytes",
+        DFFR_FSTAT_PROBE,
+        required=False,
+    )
+    if printed is None:
+        return {}
+    return {int(rows): int(size) for rows, size in (line.split() for line in printed.splitlines())}
+
+
 def dffr_fisher_bytes(build_dir, ninja, arch, work_dir, objects, toolkit=None):
     """{(parameters, rows): dynamic shared bytes of the DFFR Fisher}, or {} without it."""
     printed = run_probe(
@@ -324,6 +354,7 @@ def module_report(
     own = own_resources(ptxas_log, arch)
     template_bytes = dffr_template_bytes(build_dir, ninja, arch, work_dir, objects, toolkit)
     fisher_bytes = dffr_fisher_bytes(build_dir, ninja, arch, work_dir, objects, toolkit)
+    fstat_bytes = dffr_fstat_bytes(build_dir, ninja, arch, work_dir, objects, toolkit)
 
     kernels, callees = {}, {}
     names = list(resources)
@@ -339,6 +370,8 @@ def module_report(
                     if rows
                     else 0
                 )
+            elif base == FSTAT_KERNEL:
+                stats["dynamic_shared"] = fstat_bytes.get(int(rows.group(1)), 0) if rows else 0
             else:
                 per_template = template_bytes.get(int(rows.group(1)), 0) if rows else 0
                 stats["dynamic_shared"] = TEMPLATES_PER_KERNEL.get(base, 1) * per_template

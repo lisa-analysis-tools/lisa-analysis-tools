@@ -3,7 +3,8 @@
     python stft_accuracy.py --write-sources DIR/sources.json [--days 365]
     DFFR_REPOSITORY/.venv/bin/python td_truth.py --sources DIR/sources.json --output DIR/truth
     python stft_accuracy.py --device gpu --output DIR [--truth DIR/truth] [--days 365]
-        [--n-side-bins 60] [--sources NAME ...] [--check-only] [--no-figures]
+        [--n-side-bins 60] [--model-window periodic] [--sources NAME ...] [--check-only]
+        [--no-figures]
 
 Injection: X, Y and Z of TDI 2nd generation every 5 s from 10 days after the start of the ESA
 orbit file that LAT ships. With ``--truth``, the LISA Consortium chain of ``td_truth.py``
@@ -11,8 +12,9 @@ orbit file that LAT ships. With ``--truth``, the LISA Consortium chain of ``td_t
 and the grid from ``--write-sources``; without it, LAT's full time-domain response
 (``td_injection.TimeDomainTDI``, ``pyResponseTDI``). Data: ``TDSignal.stft`` of the injection per
 one-day segment, twice: with LAT's Tukey window (``windowfun``, symmetric), as
-``globalfit/engine.py`` builds the data, and with the periodic Tukey window that both responses
-integrate. Templates: ``STFTGBComputations`` with each response and the production settings (XYZ,
+``globalfit/engine.py`` builds the data, and with the periodic Tukey window. The templates
+integrate the symmetric window, the default of ``STFTComputationGroup``, or the periodic one with
+``--model-window periodic``. Templates: ``STFTGBComputations`` with each response and the production settings (XYZ,
 taper 0.1157, segment midpoints, linear envelope, ``freq_from_tdi_phase``) but 60 side bins
 (``--n-side-bins``; production takes 10), on one domain per source that spans its frequency
 track over the data with the side bins and 20 more bins to spare on each side, cut where the
@@ -90,7 +92,7 @@ FDOT_BOUNDS = {"fdotmax": "+", "fdotmin": "-"}
 SKY_POSITIONS = ((2.1, -0.35), (5.0, 0.9))
 AMPLITUDE, INITIAL_PHASE, INCLINATION, POLARIZATION = 1.0e-22, 1.2, 0.9, 0.7
 #: Data windows: LAT's Tukey (symmetric), as the global fit builds the data, and the periodic
-#: Tukey that both responses integrate.
+#: Tukey window.
 WINDOWS = ("lat", "periodic")
 #: The eight cases of the step 0 truth (dffr's scripts/compare_time_domain.py): carrier and fdot,
 #: each at the two sky positions above, carriers moved to the nearest bin as there.
@@ -350,12 +352,14 @@ def source_settings(params, data_start, num_segments, t_ref, n_side_bins, device
         NF=samples_per_segment // 2 + 1,
         min_freq=(first_bin - 0.5) * df,
         max_freq=(last_bin + 0.5) * df,
+        sample_cadence=SAMPLING_INTERVAL,
         force_backend=device,
     )
 
 
-def build_group(settings, data, orbits, window_alpha, device):
-    """Computation group over the two data transforms, both with the XYZ instrument noise."""
+def build_group(settings, data, orbits, window_alpha, device, use_sym_window=True):
+    """Computation group over the two data transforms, both with the XYZ instrument noise; the
+    templates take the symmetric or the periodic window."""
     from lisatools.analysiscontainer import AnalysisContainer, AnalysisContainerArray
     from lisatools.sensitivity import XYZSensitivityBackend
 
@@ -374,6 +378,7 @@ def build_group(settings, data, orbits, window_alpha, device):
             window_alpha=window_alpha,
             use_midpoint=True,
             linear_envelope=True,
+            use_sym_window=use_sym_window,
         ),
     )
     group = container_array.cpp_splits[0]
@@ -454,7 +459,16 @@ def noise_metrics(model, reference, inverse_covariance, df):
 
 
 def evaluate_source(
-    name, params, injection, orbits, t_ref, num_segments, n_side_bins, source_set, device
+    name,
+    params,
+    injection,
+    orbits,
+    t_ref,
+    num_segments,
+    n_side_bins,
+    source_set,
+    device,
+    use_sym_window=True,
 ):
     """Data, templates and every metric of one source; returns (record, arrays)."""
     from lisatools.domains import TDSettings, TDSignal
@@ -480,7 +494,7 @@ def evaluate_source(
         for window in WINDOWS
     }
     container_array, group, inverse_covariance = build_group(
-        settings, data, orbits, source_set.window_alpha, device
+        settings, data, orbits, source_set.window_alpha, device, use_sym_window
     )
     data_host = {window: to_host(data[window].arr) for window in WINDOWS}
     group_d_d = to_host(group.d_d)
@@ -495,6 +509,7 @@ def evaluate_source(
         num_segments=num_segments,
         n_side_bins=n_side_bins,
         window_alpha=source_set.window_alpha,
+        model_window="symmetric" if use_sym_window else "periodic",
         responses={},
     )
     band = None
@@ -835,6 +850,12 @@ def main():
     parser.add_argument("--truth", type=Path, default=None, metavar="DIR")
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS)
     parser.add_argument("--n-side-bins", type=int, default=DEFAULT_N_SIDE_BINS)
+    parser.add_argument(
+        "--model-window",
+        choices=("symmetric", "periodic"),
+        default="symmetric",
+        help="Tukey window of the templates: the data's symmetric one, or the periodic one",
+    )
     parser.add_argument("--sources", nargs="*", default=None)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--no-figures", action="store_true")
@@ -878,7 +899,7 @@ def main():
         injection = ResponseInjection(orbits, data_start, num_samples, arguments.device)
     log(
         f"device {arguments.device}, source set {arguments.source_set}, {arguments.days} days, "
-        f"{arguments.n_side_bins} side bins, sources {names}"
+        f"{arguments.n_side_bins} side bins, {arguments.model_window} model window, sources {names}"
     )
 
     checks = check_conventions(
@@ -887,6 +908,7 @@ def main():
     summary = dict(
         metadata=run_metadata(arguments.device),
         source_set=arguments.source_set,
+        model_window=arguments.model_window,
         convention_check=checks,
         sources=[],
     )
@@ -902,6 +924,7 @@ def main():
                 arguments.n_side_bins,
                 chosen,
                 arguments.device,
+                arguments.model_window == "symmetric",
             )
             summary["sources"].append(record)
             np.savez_compressed(arguments.output / f"{name}.npz", **arrays)
@@ -922,7 +945,7 @@ def main():
     (arguments.output / "summary.json").write_text(json.dumps(summary, indent=1))
     lines = [
         f"Source set: {arguments.source_set}, Tukey taper {chosen.window_alpha}, side bins of the "
-        f"templates: {arguments.n_side_bins}"
+        f"templates: {arguments.n_side_bins}, {arguments.model_window} window of the templates"
     ] + report_lines(summary["sources"], checks, injection.label)
     (arguments.output / "report.txt").write_text("\n".join(lines) + "\n")
     print("\n".join(lines), flush=True)

@@ -4,7 +4,8 @@
 // lat_dffr_kernels.hh -- the Direct Fast Fresnel Response (DFFR) of the STFT likelihood: settings,
 // source contract, windowed chirp transform, TDI weights, segment table, the tile that hands the
 // pixels to the consumers of lat_stft_kernels.hh (get_ll, fill_global, swap_ll, the F-statistic and
-// both gradients), and two diagnostics of a batch of sources (compact template, segment table).
+// both gradients), the F-statistic of a galactic binary from two templates, and two diagnostics of
+// a batch of sources (compact template, segment table).
 // Ported from the standalone package direct-fast-fresnel-response at commit 01530a5
 // (src/dffr/cutils/dffr.cu). A source package (GBGPU for galactic binaries) instantiates the tile
 // and the diagnostics with its source model. docs/response/dffr/README.md describes the response
@@ -20,21 +21,26 @@
 // * transform of its own. The moment carries the antenna and amplitude slopes (linear_envelope) and
 // * the first-order change of every delay across the segment (first_order_delays).
 // *
-// * Conventions, those of GBTDIonTheFly and STFTFresnel: a value is dt * rfft(w * x) of the real
-// * TDI x at f = f_min + j df, with the Fourier origin at the segment start and w the periodic
-// * Tukey window of taper fraction window_alpha; it is the positive-frequency half, so it compares
-// * with the transform of a real time series directly. Strain of LAT, -2 times the strain of the
-// * derivation (DFFR_LAT_STRAIN_FACTOR). Links in the order 12, 23, 31, 13, 32, 21 of Orbits, link
-// * ij received by spacecraft i and sent by spacecraft j.
+// * Conventions, those of GBTDIonTheFly and STFTFresnel: a value is h * rfft(w * x) of the real
+// * TDI x sampled at the spacing h, at f = f_min + j df, with the Fourier origin at the segment
+// * start and w the Tukey window of taper fraction window_alpha: the periodic window (scipy's
+// * sym=False), or, when STFTFresnel holds the N samples and the spacing h of a segment, the
+// * symmetric window of LAT's tukey() (scipy's sym=True), zero on the first and the last sample
+// * and (N - 1) h long. A value is the positive-frequency half, so it compares with the transform
+// * of a real time series directly. Strain of LAT, -2 times the strain of the derivation
+// * (DFFR_LAT_STRAIN_FACTOR). Links in the order 12, 23, 31, 13, 32, 21 of Orbits, link ij
+// * received by spacecraft i and sent by spacecraft j.
 // *
 // * Accuracy of the standalone package against a time-domain TDI 2.0 truth (lisagwresponse,
 // * lisainstrument without noise, pytdi; 30 one-day segments on the ESA orbits, Tukey 0.116,
 // * sources from 3 to 40 mHz): median error per segment 3.2e-5 to 4.7e-5 of the segment's peak,
 // * largest 4.8e-4, template mismatch 6.5e-10 to 1.2e-9. The Fresnel functions of lat_fresnel.hh
-// * contribute at most 1.6e-10.
+// * contribute at most 1.6e-10. Each window reaches this on data windowed the same way; on data
+// * with the other window the mismatch grows to 3.5e-8 to 3.9e-8.
 // ! Assumptions, checked on the host by dffr_make_settings and dffr_check_table:
 // !   df * dt = 1 to within 1e-12 (contiguous segments); otherwise the band-bin phases of the
 // !   window endpoints are wrong without any sign of it.
+// !   N h = dt to within 1e-12 for the symmetric window, so that its samples fill the segment.
 // !   The kinematics table holds the midpoints of the grid's segments, in the time frame of the
 // !   orbits, the frame of t_ref.
 // !   XYZ channels, with the combinations of TDIConfig("1st generation") or ("2nd generation").
@@ -135,8 +141,8 @@ struct DFFRSettings {
   int num_bins;  // active bins of the grid
 
   double window_taper;        // Tukey taper fraction rho, STFTFresnel::window_alpha; 0 is a boxcar
-  double plateau_half_width;  // tau_0 = (Delta T / 2) (1 - rho)
-  double taper_frequency;     // 1 / (rho Delta T), the shift of the taper sidebands
+  double plateau_half_width;  // tau_0 = (W / 2) (1 - rho), W the window span
+  double taper_frequency;     // 1 / (rho W), the shift of the taper sidebands
   double taper_phase_offset;  // theta_rho = pi (1 / rho - 1)
   cmplx taper_phasor;         // exp(i theta_rho)
   cmplx origin_phasor_base;   // exp(-i pi f_min Delta T), the Fourier origin at the segment start
@@ -145,6 +151,21 @@ struct DFFRSettings {
   bool first_order_delays;  // carry every delay to first order across the segment
   int tdi_generation;       // 1 or 2
   int num_side_bins;        // half-width of a row's band around its carrier bin
+
+  // * The window edges about the segment midpoint. The periodic window spans the segment,
+  // * W = Delta T; the symmetric one is zero on the first and the last of N samples spaced by h,
+  // * so W = (N - 1) h, centred at c = -h / 2.
+  bool sampled_window;         // the symmetric window; never set without a taper
+  int window_samples;          // N; zero for the periodic window
+  double sample_cadence;       // h [s]; zero for the periodic window
+  double outer_lower;          // window start, -Delta T / 2
+  double outer_upper;          // window end, Delta T / 2, or Delta T / 2 - h when symmetric
+  double inner_lower;          // plateau start, c - tau_0
+  double inner_upper;          // plateau end, c + tau_0
+  cmplx taper_phasor_left;     // exp(i (theta_rho + chi)), chi = pi h / (rho W)
+  cmplx taper_phasor_right;    // exp(i (theta_rho - chi))
+  double end_bin_phase;        // 2 pi h df: band-bin phase of the window end beyond (-1)^j
+  double plateau_bin_phase;    // pi rho h df: band-bin phase of the plateau start beyond h = 0
 };
 
 // Settings of a launch: the grid and window of an STFTFresnel and the DFFR settings. Host only.
@@ -170,6 +191,16 @@ inline DFFRSettings dffr_make_settings(const STFTFresnel &fresnel, bool linear_e
                                 std::to_string(tdi_generation) + ".");
   if (num_side_bins < 0)
     throw std::invalid_argument("dffr: n_side_bins must not be negative.");
+  // ! The symmetric window spans (N - 1) h only if its N samples fill the segment exactly.
+  const int window_samples = fresnel.window_samples;
+  const double sample_cadence = fresnel.sample_cadence;
+  if (window_samples != 0 &&
+      (window_samples < 2 || !(sample_cadence > 0.0) ||
+       !(std::fabs(window_samples * sample_cadence - segment_duration) <=
+         1.0e-12 * segment_duration)))
+    throw std::invalid_argument("dffr: the N = " + std::to_string(window_samples) +
+                                " samples of the window do not fill the segment of " +
+                                std::to_string(segment_duration) + " s.");
 
   DFFRSettings settings;
   settings.num_time_segments = fresnel.num_times;
@@ -195,6 +226,35 @@ inline DFFRSettings dffr_make_settings(const STFTFresnel &fresnel, bool linear_e
   settings.first_order_delays = first_order_delays;
   settings.tdi_generation = tdi_generation;
   settings.num_side_bins = num_side_bins;
+
+  // * The periodic window: edges symmetric about the midpoint, both tapers share one phasor.
+  // * Without a taper both windows are the same boxcar, so only a tapered window is symmetric.
+  settings.sampled_window = (window_samples != 0) && (window_taper > 0.0);
+  settings.window_samples = window_samples;
+  settings.sample_cadence = sample_cadence;
+  settings.outer_lower = -settings.half_duration;
+  settings.outer_upper = settings.half_duration;
+  settings.inner_lower = -settings.plateau_half_width;
+  settings.inner_upper = settings.plateau_half_width;
+  settings.taper_phasor_left = settings.taper_phasor;
+  settings.taper_phasor_right = settings.taper_phasor;
+  settings.end_bin_phase = 0.0;
+  settings.plateau_bin_phase = 0.0;
+  if (settings.sampled_window) {
+    const double window_span = fresnel.window_span;
+    const double window_centre = -0.5 * sample_cadence;
+    settings.plateau_half_width = 0.5 * window_span * (1.0 - window_taper);
+    settings.taper_frequency = 1.0 / (window_taper * window_span);
+    settings.outer_upper = settings.half_duration - sample_cadence;
+    settings.inner_lower = window_centre - settings.plateau_half_width;
+    settings.inner_upper = window_centre + settings.plateau_half_width;
+    // * chi = -2 pi f_rho c turns the sidebands of each taper about the window centre.
+    const double taper_turn = M_PI * sample_cadence * settings.taper_frequency;
+    settings.taper_phasor_left = dffr_polar_unit(settings.taper_phase_offset + taper_turn);
+    settings.taper_phasor_right = dffr_polar_unit(settings.taper_phase_offset - taper_turn);
+    settings.end_bin_phase = DFFR_TWO_PI * sample_cadence * settings.df;
+    settings.plateau_bin_phase = M_PI * window_taper * sample_cadence * settings.df;
+  }
   return settings;
 }
 
@@ -382,7 +442,13 @@ inline void dffr_accumulate_sub_interval(const DFFRQuadPhaseScalars &scalars, do
 // * sidebands of one taper share endpoint phasors.
 
 // * The six integrals before the overall phasor: the sums that the stencil variants of the Fisher
-// * matrix share when their reception states agree.
+// * matrix share when their reception states agree. SymmetricWindow selects the window at compile
+// * time, so the periodic window's kernels compile from the lines they had before.
+// * The symmetric window ends one sample early and is centred half a sample before the midpoint:
+// * its edges come from the settings, and the sidebands of its left and right taper turn by +chi
+// * and -chi. The pairing of weights and endpoint phasors holds as for the periodic window, with
+// * f_taper = 1 / (rho W) and the plateau edges c -+ (W / 2)(1 - rho).
+template <bool SymmetricWindow>
 CUDA_DEVICE
 inline void dffr_windowed_sums(const DFFRSettings &settings, const DFFRQuadPhaseScalars &scalars,
                                double effective_frequency, double frequency,
@@ -398,7 +464,46 @@ inline void dffr_windowed_sums(const DFFRSettings &settings, const DFFRQuadPhase
   cmplx total(0.0, 0.0);
   cmplx total_moment(0.0, 0.0);
 
-  if (settings.window_taper <= 0.0) {
+  if constexpr (SymmetricWindow) {
+    const double window_start = settings.outer_lower;
+    const double window_end = settings.outer_upper;
+    const double plateau_start = settings.inner_lower;
+    const double plateau_end = settings.inner_upper;
+    const cmplx half_weight(0.5, 0.0);
+    dffr_accumulate_sub_interval(scalars, window_start, window_end, detuning_base, offset_base,
+                                 0.5 * outer_minus, 0.5 * outer_plus, half_weight, with_moment,
+                                 &total, &total_moment);
+    dffr_accumulate_sub_interval(scalars, plateau_start, plateau_end, detuning_base, offset_base,
+                                 0.5 * inner_minus, 0.5 * inner_plus, half_weight, with_moment,
+                                 &total, &total_moment);
+
+    const double detuning_plus = detuning_base + settings.taper_frequency;
+    const double detuning_minus = detuning_base - settings.taper_frequency;
+    const double offset_plus = detuning_plus * scalars.reciprocal_chirp;
+    const double offset_minus = detuning_minus * scalars.reciprocal_chirp;
+    const cmplx left_weight_plus = 0.25 * settings.taper_phasor_left;
+    const cmplx left_weight_minus = 0.25 * gcmplx::conj(settings.taper_phasor_left);
+    const cmplx right_weight_plus = 0.25 * gcmplx::conj(settings.taper_phasor_right);
+    const cmplx right_weight_minus = 0.25 * settings.taper_phasor_right;
+
+    const cmplx left_lower = -0.25 * outer_minus;
+    const cmplx left_upper = 0.25 * inner_minus;
+    dffr_accumulate_sub_interval(scalars, window_start, plateau_start, detuning_plus, offset_plus,
+                                 left_lower, left_upper, left_weight_plus, with_moment, &total,
+                                 &total_moment);
+    dffr_accumulate_sub_interval(scalars, window_start, plateau_start, detuning_minus,
+                                 offset_minus, left_lower, left_upper, left_weight_minus,
+                                 with_moment, &total, &total_moment);
+
+    const cmplx right_lower = 0.25 * inner_plus;
+    const cmplx right_upper = -0.25 * outer_plus;
+    dffr_accumulate_sub_interval(scalars, plateau_end, window_end, detuning_plus, offset_plus,
+                                 right_lower, right_upper, right_weight_plus, with_moment, &total,
+                                 &total_moment);
+    dffr_accumulate_sub_interval(scalars, plateau_end, window_end, detuning_minus, offset_minus,
+                                 right_lower, right_upper, right_weight_minus, with_moment, &total,
+                                 &total_moment);
+  } else if (settings.window_taper <= 0.0) {
     // * A boxcar keeps only the full span.
     dffr_accumulate_sub_interval(scalars, -half_duration, half_duration, detuning_base,
                                  offset_base, outer_minus, outer_plus, unit_weight, with_moment,
@@ -444,6 +549,7 @@ inline void dffr_windowed_sums(const DFFRSettings &settings, const DFFRQuadPhase
 }
 
 // The windowed transform of one reception state: its windowed sums times the overall phasor.
+template <bool SymmetricWindow>
 CUDA_DEVICE
 inline void dffr_evaluate_windowed_kernel(const DFFRSettings &settings,
                                           const DFFRQuadPhaseScalars &scalars,
@@ -453,8 +559,9 @@ inline void dffr_evaluate_windowed_kernel(const DFFRSettings &settings,
                                           const cmplx &overall, bool with_moment,
                                           cmplx *kernel_out, cmplx *moment_out) {
   cmplx total, total_moment;
-  dffr_windowed_sums(settings, scalars, effective_frequency, frequency, outer_plus, outer_minus,
-                     inner_plus, inner_minus, with_moment, &total, &total_moment);
+  dffr_windowed_sums<SymmetricWindow>(settings, scalars, effective_frequency, frequency,
+                                      outer_plus, outer_minus, inner_plus, inner_minus,
+                                      with_moment, &total, &total_moment);
   *kernel_out = dffr_mul(overall, total);
   *moment_out = with_moment ? dffr_mul(overall, total_moment) : cmplx(0.0, 0.0);
 }
@@ -530,10 +637,10 @@ template <int Rows>
 struct DFFRSegmentTable {
   static_assert(Rows >= 1, "a segment table holds at least one row");
   cmplx reference_phasor[Rows * DFFR_NUM_SPACECRAFT];    // amplitude ratio times exp(i phase)
-  cmplx anchor_outer_plus[Rows * DFFR_NUM_SPACECRAFT];   // endpoint phasor at +Delta T / 2
-  cmplx anchor_outer_minus[Rows * DFFR_NUM_SPACECRAFT];  // at -Delta T / 2
-  cmplx anchor_inner_plus[Rows * DFFR_NUM_SPACECRAFT];   // at +tau_0
-  cmplx anchor_inner_minus[Rows * DFFR_NUM_SPACECRAFT];  // at -tau_0
+  cmplx anchor_outer_plus[Rows * DFFR_NUM_SPACECRAFT];   // endpoint phasor at the window end
+  cmplx anchor_outer_minus[Rows * DFFR_NUM_SPACECRAFT];  // at the window start
+  cmplx anchor_inner_plus[Rows * DFFR_NUM_SPACECRAFT];   // at the plateau end
+  cmplx anchor_inner_minus[Rows * DFFR_NUM_SPACECRAFT];  // at the plateau start
   cmplx link_amplitude[Rows * DFFR_NUM_LINKS];
   cmplx envelope_slope[Rows * DFFR_NUM_LINKS];
   cmplx emission_phasor[Rows * DFFR_NUM_LINKS];
@@ -1172,12 +1279,31 @@ CUDA_DEVICE inline void dffr_build_rows(const StorageT &storage, const DFFRSetti
 // The four endpoint anchors of the reception state at slot, in a row whose band starts at
 // start_freq_ind. AnchorsT holds them under the names of DFFRSegmentTable.
 // * Anchored on the row's band start, so that both phases of the later split stay near 1e2 rad.
-template <class AnchorsT>
+template <bool SymmetricWindow, class AnchorsT>
 CUDA_DEVICE inline void dffr_store_anchors(AnchorsT &anchors, const DFFRSettings &settings,
                                            int slot, int start_freq_ind,
                                            double effective_frequency, double chirp_rate) {
   const double band_anchor = settings.f_min + (double)start_freq_ind * settings.df;
   const double delta_anchor = effective_frequency - band_anchor;
+
+  if constexpr (SymmetricWindow) {
+    // * One phase per edge: the symmetric window's edges are not symmetric about the midpoint.
+    const double window_end = settings.outer_upper;
+    const double window_start = settings.outer_lower;
+    const double plateau_end = settings.inner_upper;
+    const double plateau_start = settings.inner_lower;
+    anchors.anchor_outer_plus[slot] = dffr_polar_unit(
+        M_PI * chirp_rate * window_end * window_end + DFFR_TWO_PI * delta_anchor * window_end);
+    anchors.anchor_outer_minus[slot] =
+        dffr_polar_unit(M_PI * chirp_rate * window_start * window_start +
+                        DFFR_TWO_PI * delta_anchor * window_start);
+    anchors.anchor_inner_plus[slot] = dffr_polar_unit(
+        M_PI * chirp_rate * plateau_end * plateau_end + DFFR_TWO_PI * delta_anchor * plateau_end);
+    anchors.anchor_inner_minus[slot] =
+        dffr_polar_unit(M_PI * chirp_rate * plateau_start * plateau_start +
+                        DFFR_TWO_PI * delta_anchor * plateau_start);
+    return;
+  }
 
   const double outer = settings.half_duration;
   const double quadratic_outer = M_PI * chirp_rate * outer * outer;
@@ -1203,7 +1329,7 @@ CUDA_DEVICE inline void dffr_store_anchors(AnchorsT &anchors, const DFFRSettings
 // Fill the tile's table for rows_here segments from row_base on: the rows of its one variant, then
 // the anchors. Every thread of the block must enter; the caller separates it from earlier readers
 // of the table and from later readers by barriers of its own.
-template <class SourceT, int Rows>
+template <bool SymmetricWindow, class SourceT, int Rows>
 CUDA_DEVICE inline void dffr_build_segment_table(DFFRSegmentTable<Rows> &table,
                                                  const DFFRSettings &settings,
                                                  const KinematicsTable &kinematics,
@@ -1218,8 +1344,8 @@ CUDA_DEVICE inline void dffr_build_segment_table(DFFRSegmentTable<Rows> &table,
     const int spacecraft_index = item / rows_here;
     const int row = item - spacecraft_index * rows_here;
     const int slot = row * DFFR_NUM_SPACECRAFT + spacecraft_index;
-    dffr_store_anchors(table, settings, slot, table.start_freq_ind[row],
-                       table.effective_frequency[slot], table.chirp_rate[slot]);
+    dffr_store_anchors<SymmetricWindow>(table, settings, slot, table.start_freq_ind[row],
+                                        table.effective_frequency[slot], table.chirp_rate[slot]);
   }
 }
 
@@ -1231,13 +1357,17 @@ CUDA_DEVICE inline void dffr_build_segment_table(DFFRSegmentTable<Rows> &table,
 struct DFFRBandBinPhasors {
   double outer_sign;  // (-1)^band_bin for the outer endpoints
   cmplx inner;        // exp(-i pi (1 - rho) band_bin) for the plateau endpoints
-  cmplx inner_conj;
+  cmplx inner_conj;   // its conjugate; for the symmetric window, the plateau start's own phasor
+  cmplx end_shift = cmplx(1.0, 0.0);  // exp(2 pi i band_bin h df), the symmetric window's end
 };
 
 // * The outer endpoints sit at +-Delta T / 2 and df Delta T = 1, so their band-bin phase is
 // * pi band_bin: a sign. The plateau phase pi (1 - rho) band_bin is split into that sign and
 // * -pi rho band_bin, folded to its nearest even multiple so the argument stays bounded. Negative
 // * band bins, below the band start, come out right as well.
+// * The symmetric window moves its end by -h and its plateau edges by -rho h / 2 and
+// * -(2 - rho) h / 2, which adds the phases 2 pi j h df, pi j rho h df and their difference.
+template <bool SymmetricWindow>
 CUDA_DEVICE
 inline DFFRBandBinPhasors dffr_make_band_bin_phasors(const DFFRSettings &settings, int band_bin) {
   DFFRBandBinPhasors band_bin_phasors;
@@ -1252,6 +1382,14 @@ inline DFFRBandBinPhasors dffr_make_band_bin_phasors(const DFFRSettings &setting
     band_bin_phasors.inner = cmplx(band_bin_phasors.outer_sign, 0.0);
   }
   band_bin_phasors.inner_conj = gcmplx::conj(band_bin_phasors.inner);
+  if constexpr (SymmetricWindow) {
+    const cmplx end_shift = dffr_polar_unit((double)band_bin * settings.end_bin_phase);
+    const cmplx plateau_shift = dffr_polar_unit((double)band_bin * settings.plateau_bin_phase);
+    band_bin_phasors.end_shift = end_shift;
+    band_bin_phasors.inner_conj = dffr_mul(band_bin_phasors.inner_conj, plateau_shift);
+    band_bin_phasors.inner =
+        dffr_mul(band_bin_phasors.inner, dffr_mul(end_shift, gcmplx::conj(plateau_shift)));
+  }
   return band_bin_phasors;
 }
 
@@ -1259,7 +1397,7 @@ inline DFFRBandBinPhasors dffr_make_band_bin_phasors(const DFFRSettings &setting
 // origin phasor. StatesT holds the bin-independent scalars of the states at slot
 // row * 3 + spacecraft and AnchorsT their endpoint anchors: both a DFFRSegmentTable, or those of a
 // Fisher variant (DFFRFisherReception, DFFRFisherAnchors).
-template <class StatesT, class AnchorsT>
+template <bool SymmetricWindow, class StatesT, class AnchorsT>
 CUDA_DEVICE inline void dffr_reception_sums(const StatesT &states, const AnchorsT &anchors,
                                             const DFFRSettings &settings, int slot,
                                             double frequency,
@@ -1273,16 +1411,18 @@ CUDA_DEVICE inline void dffr_reception_sums(const StatesT &states, const Anchors
   scalars.moment_prefactor = states.moment_prefactor[slot];
   scalars.chirp_sign = (scalars.chirp_rate > 0.0) ? 1.0 : -1.0;
 
-  const cmplx outer_plus = band_bin_phasors.outer_sign * anchors.anchor_outer_plus[slot];
+  cmplx outer_plus = band_bin_phasors.outer_sign * anchors.anchor_outer_plus[slot];
+  if constexpr (SymmetricWindow) outer_plus = dffr_mul(outer_plus, band_bin_phasors.end_shift);
   const cmplx outer_minus = band_bin_phasors.outer_sign * anchors.anchor_outer_minus[slot];
   const cmplx inner_plus = dffr_mul(anchors.anchor_inner_plus[slot], band_bin_phasors.inner);
   const cmplx inner_minus = dffr_mul(anchors.anchor_inner_minus[slot], band_bin_phasors.inner_conj);
 
-  dffr_windowed_sums(settings, scalars, states.effective_frequency[slot], frequency, outer_plus,
-                     outer_minus, inner_plus, inner_minus, true, total_out, moment_out);
+  dffr_windowed_sums<SymmetricWindow>(settings, scalars, states.effective_frequency[slot],
+                                      frequency, outer_plus, outer_minus, inner_plus, inner_minus,
+                                      true, total_out, moment_out);
 }
 
-template <int Rows>
+template <bool SymmetricWindow, int Rows>
 CUDA_DEVICE inline void dffr_evaluate_reception_state(const DFFRSegmentTable<Rows> &table,
                                                       const DFFRSettings &settings, int row,
                                                       int spacecraft_index, double frequency,
@@ -1291,8 +1431,8 @@ CUDA_DEVICE inline void dffr_evaluate_reception_state(const DFFRSegmentTable<Row
                                                       cmplx *moment_out) {
   const int slot = row * DFFR_NUM_SPACECRAFT + spacecraft_index;
   cmplx total, total_moment;
-  dffr_reception_sums(table, table, settings, slot, frequency, band_bin_phasors, &total,
-                      &total_moment);
+  dffr_reception_sums<SymmetricWindow>(table, table, settings, slot, frequency, band_bin_phasors,
+                                       &total, &total_moment);
   const cmplx overall = dffr_mul(table.reference_phasor[slot], origin_phasor);
   *kernel_out = dffr_mul(overall, total);
   *moment_out = dffr_mul(overall, total_moment);
@@ -1314,11 +1454,12 @@ CUDA_DEVICE inline void dffr_add_reception_state(const cmplx *weights, int space
 // The three channels of one pixel: band_bin counts from the row's band start, bin_index from the
 // grid's f_min, and frequency = f_min + bin_index df. The row's eighteen weights carry the six
 // links and the whole TDI combination, so each reception state feeds the channels directly.
-template <int Rows>
+template <bool SymmetricWindow, int Rows>
 CUDA_DEVICE inline void dffr_evaluate_pixel(const DFFRSegmentTable<Rows> &table,
                                             const DFFRSettings &settings, int row, int band_bin,
                                             int bin_index, double frequency, cmplx *channels) {
-  const DFFRBandBinPhasors band_bin_phasors = dffr_make_band_bin_phasors(settings, band_bin);
+  const DFFRBandBinPhasors band_bin_phasors =
+      dffr_make_band_bin_phasors<SymmetricWindow>(settings, band_bin);
 
   // ? exp(-i pi f Delta T) moves the origin to the segment start; with df Delta T = 1 it is a
   // ? launch constant times (-1)^j.
@@ -1333,9 +1474,9 @@ CUDA_DEVICE inline void dffr_evaluate_pixel(const DFFRSegmentTable<Rows> &table,
   // ! Not unrolled: each iteration inlines a whole reception state, and copies of it cost more.
   for (int spacecraft_index = 0; spacecraft_index < DFFR_NUM_SPACECRAFT; spacecraft_index += 1) {
     cmplx expansion_kernel, expansion_moment;
-    dffr_evaluate_reception_state(table, settings, row, spacecraft_index, frequency,
-                                  band_bin_phasors, origin_phasor, &expansion_kernel,
-                                  &expansion_moment);
+    dffr_evaluate_reception_state<SymmetricWindow>(table, settings, row, spacecraft_index,
+                                                   frequency, band_bin_phasors, origin_phasor,
+                                                   &expansion_kernel, &expansion_moment);
     dffr_add_reception_state(weights, spacecraft_index, expansion_kernel, expansion_moment,
                              channels);
   }
@@ -1347,14 +1488,16 @@ CUDA_DEVICE inline void dffr_evaluate_pixel(const DFFRSegmentTable<Rows> &table,
 // * The tile builds the segment table of Rows segments per pass in its template's dynamic shared
 // * memory, with all threads of the block, and maps the pixels band bin first (StftBandBinMap).
 // * On the GPU Rows is the warp size, 32, so that a warp takes one band bin of 32 segments. One
-// * template, 32 rows of 1012 bytes plus the source constants and the settings, takes 32 672
+// * template, 32 rows of 1012 bytes plus the source constants and the settings, takes 32 768
 // * bytes, within the 49 152 a launch gets. The consumers that hold two templates (swap_ll, its
-// * gradient and the F-statistic) take 65 344 bytes through the opt-in launch path, or 32 960 at
+// * gradient and the F-statistic) take 65 536 bytes through the opt-in launch path, or 33 152 at
 // * Rows = 16 (DFFR_ROWS_PER_PASS_HALF); both are instantiated, and the A100 benchmarks of the
 // * integration choose. On the CPU a block is one thread and Rows is 1, which evaluates the pixels
 // * in the order of the standalone package's CPU backend.
 // * values() doubles DFFR's pixel: the consumers halve every value, the positive-frequency half of
 // * a real signal, and a DFFR pixel is that half already. Doubling and halving are exact.
+// * SymmetricWindow is the window of the tile's kernels; DFFR_WINDOW_DISPATCH takes the one of
+// * the launch's settings.
 
 #ifdef __CUDACC__
 #define DFFR_ROWS_PER_PASS 32
@@ -1363,6 +1506,21 @@ CUDA_DEVICE inline void dffr_evaluate_pixel(const DFFRSegmentTable<Rows> &table,
 #define DFFR_ROWS_PER_PASS 1
 #define DFFR_ROWS_PER_PASS_HALF 1
 #endif
+
+// * The two windows run separate instantiations of every DFFR kernel, so that the periodic
+// * window's kernels compile from the lines they had before the symmetric window existed. The
+// * statements, launches of a DFFRTile or of a kernel of this header, see the window of the
+// * settings as the compile-time constant symmetric_window.
+#define DFFR_WINDOW_DISPATCH(sampled_window, ...) \
+  do {                                            \
+    if (sampled_window) {                         \
+      constexpr bool symmetric_window = true;     \
+      __VA_ARGS__;                                \
+    } else {                                      \
+      constexpr bool symmetric_window = false;    \
+      __VA_ARGS__;                                \
+    }                                             \
+  } while (0)
 
 // Launch inputs of the DFFR tile, passed by value to the kernels: the settings, the kinematics
 // table of the grid (its arrays on the device of the launch) and the source model's own inputs.
@@ -1373,7 +1531,7 @@ struct DFFRTileInputs {
   typename SourceT::Model model;
 };
 
-template <class SourceT, int Rows>
+template <class SourceT, int Rows, bool SymmetricWindow>
 struct DFFRTile {
   static_assert(SourceT::num_components == 1,
                 "the DFFR tile evaluates component 0 only; see the source-model contract");
@@ -1427,8 +1585,8 @@ struct DFFRTile {
       (void)context;
       CUDA_SYNC_THREADS;
       if (THREAD_START_X == 0) arena->settings = inputs.settings;
-      dffr_build_segment_table<SourceT, Rows>(arena->table, inputs.settings, inputs.kinematics,
-                                              arena->source, row_base, rows_here);
+      dffr_build_segment_table<SymmetricWindow, SourceT, Rows>(
+          arena->table, inputs.settings, inputs.kinematics, arena->source, row_base, rows_here);
       CUDA_SYNC_THREADS;
     }
 
@@ -1438,9 +1596,9 @@ struct DFFRTile {
 
     CUDA_DEVICE STFT_TILE_PIXEL_INLINE void values(int row, int freq_j_here, double freq_here,
                                                    cmplx *out) const {
-      dffr_evaluate_pixel(arena->table, arena->settings, row,
-                          freq_j_here - arena->table.start_freq_ind[row], freq_j_here, freq_here,
-                          out);
+      dffr_evaluate_pixel<SymmetricWindow>(arena->table, arena->settings, row,
+                                           freq_j_here - arena->table.start_freq_ind[row],
+                                           freq_j_here, freq_here, out);
       for (int channel = 0; channel < DFFR_NUM_CHANNELS; channel += 1)
         out[channel] = 2.0 * out[channel];
     }
@@ -1768,7 +1926,7 @@ struct DFFRFisherWaveStorage {
 // shifted sources are loaded, then dffr_build_rows fills their rows straight into the tables,
 // with the wave's intermediates in the anchor space. The anchors of every set of states follow
 // the last wave. Every thread of the block enters; the caller's next barrier publishes the anchors.
-template <class SourceT, int Rows>
+template <bool SymmetricWindow, class SourceT, int Rows>
 CUDA_DEVICE inline void dffr_information_build(DFFRFisherReception<Rows> *states,
                                                DFFRFisherAmplitude<Rows> *amplitudes,
                                                DFFRFisherAnchors<Rows> *anchors,
@@ -1808,15 +1966,17 @@ CUDA_DEVICE inline void dffr_information_build(DFFRFisherReception<Rows> *states
     const int row = set_item - spacecraft_index * rows_here;
     const int slot = row * DFFR_NUM_SPACECRAFT + spacecraft_index;
     const DFFRFisherReception<Rows> &reception = states[state_set];
-    dffr_store_anchors(anchors[state_set], inputs.settings, slot, reception.start_freq_ind[row],
-                       reception.effective_frequency[slot], reception.chirp_rate[slot]);
+    dffr_store_anchors<SymmetricWindow>(anchors[state_set], inputs.settings, slot,
+                                        reception.start_freq_ind[row],
+                                        reception.effective_frequency[slot],
+                                        reception.chirp_rate[slot]);
   }
 }
 
 // The derivatives dh[d][c] of the three channels at one pixel of row `row`, on the common support
 // of each derivative's variants and zero outside it. freq_j_here counts from the grid's f_min and
 // frequency = f_min + freq_j_here df, as in the consumers.
-template <int Rows>
+template <bool SymmetricWindow, int Rows>
 CUDA_DEVICE inline void dffr_information_derivatives(
     const DFFRFisherReception<Rows> *states, const DFFRFisherAnchors<Rows> *anchors,
     const DFFRFisherAmplitude<Rows> *amplitudes, const int *carrier_lo, const int *carrier_hi,
@@ -1861,17 +2021,19 @@ CUDA_DEVICE inline void dffr_information_derivatives(
         const DFFRFisherReception<Rows> &reception = states[set];
         const int band_start = reception.start_freq_ind[row];
         if (!phasor_ready || band_start != phasor_band_start) {
-          band_bin_phasors = dffr_make_band_bin_phasors(settings, freq_j_here - band_start);
+          band_bin_phasors =
+              dffr_make_band_bin_phasors<SymmetricWindow>(settings, freq_j_here - band_start);
           phasor_band_start = band_start;
           phasor_ready = true;
         }
         // ! Not unrolled, as in dffr_evaluate_pixel: each iteration inlines a reception state.
         for (int spacecraft_index = 0; spacecraft_index < DFFR_NUM_SPACECRAFT;
              spacecraft_index += 1)
-          dffr_reception_sums(reception, anchors[set], settings,
-                              row * DFFR_NUM_SPACECRAFT + spacecraft_index, frequency,
-                              band_bin_phasors, &total[spacecraft_index],
-                              &moment[spacecraft_index]);
+          dffr_reception_sums<SymmetricWindow>(reception, anchors[set], settings,
+                                               row * DFFR_NUM_SPACECRAFT + spacecraft_index,
+                                               frequency, band_bin_phasors,
+                                               &total[spacecraft_index],
+                                               &moment[spacecraft_index]);
         if (shared) {
           for (int spacecraft_index = 0; spacecraft_index < DFFR_NUM_SPACECRAFT;
                spacecraft_index += 1) {
@@ -1915,7 +2077,7 @@ struct DFFRFisherBands {
 };
 
 // One block per source. Writes info_out[(bin * num_derivs + i) * num_derivs + j].
-template <class SourceT, int Rows>
+template <class SourceT, int Rows, bool SymmetricWindow>
 CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs<SourceT> inputs,
                                                 STFTDomain *stft, const double *params_all,
                                                 const int *noise_index_all,
@@ -1947,7 +2109,8 @@ CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs
 
   const int num_derivs = layout.num_derivs;
   const int num_times = inputs.settings.num_time_segments;
-  const int num_freqs = stft->num_freqs;
+  // The Fisher matrix contracts with the inverse CSD only, so its bins are those of the noise row.
+  const int num_freqs_noise = stft->num_freqs_noise;
   const double df = stft->df;
   const double f_min = stft->f_min;
 
@@ -1956,8 +2119,10 @@ CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs
 
   for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X) {
     const int noise_index = noise_index_all[bin_i];
-    // The window start belongs to the invC row this source is contracted against.
-    const int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[noise_index];
+    // The window start belongs to the invC row this source is contracted against;
+    // a full-grid noise row starts at bin 0.
+    const int start_j = (start_freq_inds == nullptr || stft->noise_full_grid)
+                            ? 0 : start_freq_inds[noise_index];
     CUDA_SYNC_THREADS;
     for (int index = THREAD_START_X; index < nparams; index += BLOCK_INCR_X)
       params[index] = params_all[(size_t)bin_i * nparams + index];
@@ -1971,8 +2136,9 @@ CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs
 
     for (int row_base = 0; row_base < num_times; row_base += Rows) {
       const int rows_here = (num_times - row_base < Rows) ? (num_times - row_base) : Rows;
-      dffr_information_build<SourceT, Rows>(states, amplitudes, anchors, inputs, layout,
-                                            wave_variants, params, nparams, row_base, rows_here);
+      dffr_information_build<SymmetricWindow, SourceT, Rows>(states, amplitudes, anchors, inputs,
+                                                             layout, wave_variants, params,
+                                                             nparams, row_base, rows_here);
 
       // * A row's band is the union of its derivatives' common supports, each spanned by the
       // * carriers of the derivative's variants.
@@ -2007,12 +2173,14 @@ CUDA_KERNEL void dffr_information_matrix_kernel(double *info_out, DFFRTileInputs
         if (!map.locate(pixel, &row, &freq_j_here)) continue;
         const int time_i = row_base + row;
         const int freq_j_local = freq_j_here - start_j;
-        if ((freq_j_local < 0) || (freq_j_local > num_freqs - 1)) continue;
+        if ((freq_j_local < 0) || (freq_j_local > num_freqs_noise - 1)) continue;
         const double freq_here = f_min + freq_j_here * df;
 
         cmplx dh[STFT_FISHER_NDERIV_MAX][DFFR_NUM_CHANNELS];  // derivative templates, per channel
-        dffr_information_derivatives<Rows>(states, anchors, amplitudes, carrier_lo, carrier_hi,
-                                           settings, layout, row, freq_j_here, freq_here, dh);
+        dffr_information_derivatives<SymmetricWindow, Rows>(states, anchors, amplitudes,
+                                                            carrier_lo, carrier_hi, settings,
+                                                            layout, row, freq_j_here, freq_here,
+                                                            dh);
 
         // * The contraction of stft_eval_block_information on the cross-channel inverse CSD.
         cmplx invc[DFFR_NUM_CHANNELS][DFFR_NUM_CHANNELS];  // inverse CSD of the pixel
@@ -2113,16 +2281,320 @@ inline void dffr_information_matrix(double *info_out, const DFFRTileInputs<Sourc
   if (num_bin < 1) return;
   const size_t shared_bytes = dffr_information_bytes<SourceT, Rows>(layout);
 #ifdef __CUDACC__
-  stft_prepare_dynamic_shared(dffr_information_matrix_kernel<SourceT, Rows>, shared_bytes);
-  dffr_information_matrix_kernel<SourceT, Rows><<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
-      info_out, inputs, stft_launch, params_all, noise_index_all, layout, num_bin, nparams,
-      start_freq_inds, nullptr);
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      stft_prepare_dynamic_shared(dffr_information_matrix_kernel<SourceT, Rows, symmetric_window>,
+                                  shared_bytes);
+      dffr_information_matrix_kernel<SourceT, Rows, symmetric_window>
+          <<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(info_out, inputs, stft_launch, params_all,
+                                                        noise_index_all, layout, num_bin, nparams,
+                                                        start_freq_inds, nullptr));
   gpuErrchk(cudaGetLastError());
 #else
   std::vector<unsigned char> host_arena(shared_bytes);
-  dffr_information_matrix_kernel<SourceT, Rows>(info_out, inputs, stft_launch, params_all,
-                                                noise_index_all, layout, num_bin, nparams,
-                                                start_freq_inds, host_arena.data());
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      dffr_information_matrix_kernel<SourceT, Rows, symmetric_window>(
+          info_out, inputs, stft_launch, params_all, noise_index_all, layout, num_bin, nparams,
+          start_freq_inds, host_arena.data()));
+#endif
+}
+
+// ===========================================================================
+// The F-statistic of a galactic binary from two templates
+// ===========================================================================
+// F is the log-likelihood maximised over the four extrinsic amplitudes: 2F = N^T M^-1 N, with
+// N_i = Re(d|A_i) and M_ij = Re(A_i|A_j) for the four filters A_i of stft_get_fstat_ll_kernel, the
+// template at A = 2, iota = pi/2 and (psi, phi0) = (0, 0), (pi/4, pi), (0, 3 pi/2), (pi/4, pi/2).
+// d is the data row of the source's cell and (x|y) = 4 df sum conj(x) C^-1 y the consumers' inner
+// product over pixels and channels. Since phi0 enters a template only as exp(-i phi0), the filters
+// are T+, -Tx, i T+ and -i Tx, with T+ and Tx the templates at phi0 = 0 and psi = 0 or pi/4. From
+// D+ = (d|T+), Dx = (d|Tx), P+ = (T+|T+), Px = (Tx|Tx) and Q = (T+|Tx):
+//   N  = (Re D+, -Re Dx, -Im D+, Im Dx),
+//   M  = (Re P+, -Re Q, 0, Im Q, Re Px, -Im Q, 0, Re P+, -Re Q, Re Px), the upper triangle row by
+//        row; M13 and M24 are zero because P+ and Px are real,
+//   2F = (Px |D+|^2 + P+ |Dx|^2 - 2 Re(Q D+ conj(Dx))) / (P+ Px - |Q|^2).
+// * psi changes no reception state, so Tx is a variant of the Fisher matrix's build that reads the
+// * states of T+, and a pixel evaluates its windowed sums once for both templates.
+// ! The GB parameter slots and the filter values are fixed, as in stft_get_fstat_ll_kernel.
+// ! A row whose two templates are parallel on the support gets a non-finite 2F.
+
+constexpr int DFFR_FSTAT_NUM_PARAMS = 9;
+// Parameter slots of a galactic binary (amp, f0, fdot, fddot, phi0, iota, psi, lam, beta).
+constexpr int DFFR_FSTAT_SLOT_AMPLITUDE = 0;
+constexpr int DFFR_FSTAT_SLOT_PHASE = 4;
+constexpr int DFFR_FSTAT_SLOT_INCLINATION = 5;
+constexpr int DFFR_FSTAT_SLOT_POLARIZATION = 6;
+// Entries of the projections N and of the overlap upper triangle M, per row.
+constexpr int DFFR_FSTAT_NUM_PROJECTIONS = 4;
+constexpr int DFFR_FSTAT_NUM_OVERLAPS = 10;
+
+// The variant table of the Fisher matrix's build for T+ (variant 0, which writes the reception
+// states) and Tx (variant 1, psi shifted by pi/4, which reads them). Host and device alike.
+CUDA_CALLABLE_MEMBER inline DFFRFisherLayout dffr_fstat_layout() {
+  DFFRFisherLayout layout = {};
+  layout.num_variants = 2;
+  layout.num_states = 1;
+  layout.shared_states = 0;
+  for (int variant = 0; variant < 2; variant += 1) {
+    layout.variant_param[variant] = DFFR_FSTAT_SLOT_POLARIZATION;
+    layout.variant_states[variant] = 0;
+    layout.variant_writes_states[variant] = (variant == 0);
+  }
+  layout.variant_shift[0] = 0.0;
+  layout.variant_shift[1] = M_PI / 4.0;
+  return layout;
+}
+
+// The three channels of T+ and Tx at one pixel: the windowed sums once, then each template's
+// reference phasors and weights in the order of dffr_evaluate_pixel.
+template <bool SymmetricWindow, int Rows>
+CUDA_DEVICE inline void dffr_fstat_pixel_values(const DFFRFisherReception<Rows> &states,
+                                                const DFFRFisherAnchors<Rows> &anchors,
+                                                const DFFRFisherAmplitude<Rows> *amplitudes,
+                                                const DFFRSettings &settings, int row,
+                                                int freq_j_here, double frequency,
+                                                cmplx *plus_values, cmplx *cross_values) {
+  const DFFRBandBinPhasors band_bin_phasors = dffr_make_band_bin_phasors<SymmetricWindow>(
+      settings, freq_j_here - states.start_freq_ind[row]);
+  const double bin_sign = (freq_j_here & 1) ? -1.0 : 1.0;
+  const cmplx origin_phasor = bin_sign * settings.origin_phasor_base;
+  const DFFRFisherAmplitude<Rows> &plus = amplitudes[0];
+  const DFFRFisherAmplitude<Rows> &cross = amplitudes[1];
+  const cmplx *plus_weights = plus.tdi_weights + row * DFFR_TDI_WEIGHTS;
+  const cmplx *cross_weights = cross.tdi_weights + row * DFFR_TDI_WEIGHTS;
+  for (int channel = 0; channel < DFFR_NUM_CHANNELS; channel += 1) {
+    plus_values[channel] = cmplx(0.0, 0.0);
+    cross_values[channel] = cmplx(0.0, 0.0);
+  }
+
+  // ! Not unrolled, as in dffr_evaluate_pixel: each iteration inlines a reception state.
+  for (int spacecraft_index = 0; spacecraft_index < DFFR_NUM_SPACECRAFT; spacecraft_index += 1) {
+    const int slot = row * DFFR_NUM_SPACECRAFT + spacecraft_index;
+    cmplx total, total_moment;
+    dffr_reception_sums<SymmetricWindow>(states, anchors, settings, slot, frequency,
+                                         band_bin_phasors, &total, &total_moment);
+    const cmplx plus_overall = dffr_mul(plus.reference_phasor[slot], origin_phasor);
+    dffr_add_reception_state(plus_weights, spacecraft_index, dffr_mul(plus_overall, total),
+                             dffr_mul(plus_overall, total_moment), plus_values);
+    const cmplx cross_overall = dffr_mul(cross.reference_phasor[slot], origin_phasor);
+    dffr_add_reception_state(cross_weights, spacecraft_index, dffr_mul(cross_overall, total),
+                             dffr_mul(cross_overall, total_moment), cross_values);
+  }
+}
+
+// One block per row: N, the upper triangle of M and 2F into projections_out[row * 4 + i],
+// overlaps_out[row * 10 + k] and two_f_out[row]. Pixels, window and reduction as in
+// stft_eval_block_swap; the tile's doubling and the consumer's halving cancel exactly, so both are
+// left out.
+template <class SourceT, int Rows, bool SymmetricWindow>
+CUDA_KERNEL void dffr_get_fstat_kernel(double *projections_out, double *overlaps_out,
+                                       double *two_f_out, DFFRTileInputs<SourceT> inputs,
+                                       STFTDomain *stft, const double *params_all,
+                                       const int *data_index_all, const int *noise_index_all,
+                                       DFFRFisherLayout layout, int num_bin, int nparams,
+                                       const int *start_freq_inds, unsigned char *host_arena) {
+  static_assert(SourceT::num_params == DFFR_FSTAT_NUM_PARAMS,
+                "the F-statistic kernel takes the nine parameters of a galactic binary");
+  static_assert(((SourceT::reception_invariant_params >> DFFR_FSTAT_SLOT_POLARIZATION) & 1u) != 0u,
+                "T+ and Tx share their reception states only if psi changes none of them");
+  using Map = StftBandBinMap<Rows>;
+
+  // Per-thread shares of the five products.
+  CUDA_SHARED cmplx d_plus_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx d_cross_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx plus_plus_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx cross_cross_sums[NUM_THREADS_HERE];
+  CUDA_SHARED cmplx plus_cross_sums[NUM_THREADS_HERE];
+  CUDA_SHARED double params[N_PARAMS_MAX];
+  CUDA_SHARED typename Map::Shared bands;
+#ifdef __CUDACC__
+  const int thread_index = threadIdx.x;
+#else
+  const int thread_index = 0;
+#endif
+
+  unsigned char *arena = stft_tile_arena(host_arena);
+  DFFRSettings *shared_settings = reinterpret_cast<DFFRSettings *>(arena);
+  DFFRFisherReception<Rows> *states =
+      reinterpret_cast<DFFRFisherReception<Rows> *>(arena + dffr_information_states_offset());
+  DFFRFisherAmplitude<Rows> *amplitudes = reinterpret_cast<DFFRFisherAmplitude<Rows> *>(
+      arena + dffr_information_amplitudes_offset<Rows>(layout));
+  DFFRFisherAnchors<Rows> *anchors = reinterpret_cast<DFFRFisherAnchors<Rows> *>(
+      arena + dffr_information_anchors_offset<Rows>(layout));
+  const DFFRSettings &settings = *shared_settings;
+  const DFFRFisherBands<Rows> band_context{&bands};
+  const int wave_variants = dffr_information_wave_variants<SourceT, Rows>(layout);
+
+  const int num_times = inputs.settings.num_time_segments;
+  const int num_freqs = stft->num_freqs;
+  const double df = stft->df;
+  const double f_min = stft->f_min;
+
+  // * The pixels read the settings from shared memory, as the tile does, to keep one pointer.
+  if (THREAD_START_X == 0) *shared_settings = inputs.settings;
+
+  for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X) {
+    const int data_index = data_index_all[bin_i];
+    const int noise_index = noise_index_all[bin_i];
+    // * Window start of the cell this row is evaluated against; 0 is the full grid.
+    const int start_j = (start_freq_inds == nullptr) ? 0 : start_freq_inds[data_index];
+    CUDA_SYNC_THREADS;
+    for (int index = THREAD_START_X; index < nparams; index += BLOCK_INCR_X)
+      params[index] = params_all[(size_t)bin_i * nparams + index];
+    CUDA_SYNC_THREADS;
+    // T+; the layout shifts psi by pi/4 for Tx.
+    if (THREAD_START_X == 0) {
+      params[DFFR_FSTAT_SLOT_AMPLITUDE] = 2.0;
+      params[DFFR_FSTAT_SLOT_PHASE] = 0.0;
+      params[DFFR_FSTAT_SLOT_INCLINATION] = M_PI / 2.0;
+      params[DFFR_FSTAT_SLOT_POLARIZATION] = 0.0;
+    }
+    d_plus_sums[thread_index] = cmplx(0.0, 0.0);
+    d_cross_sums[thread_index] = cmplx(0.0, 0.0);
+    plus_plus_sums[thread_index] = cmplx(0.0, 0.0);
+    cross_cross_sums[thread_index] = cmplx(0.0, 0.0);
+    plus_cross_sums[thread_index] = cmplx(0.0, 0.0);
+    CUDA_SYNC_THREADS;
+
+    for (int row_base = 0; row_base < num_times; row_base += Rows) {
+      const int rows_here = (num_times - row_base < Rows) ? (num_times - row_base) : Rows;
+      dffr_information_build<SymmetricWindow, SourceT, Rows>(states, amplitudes, anchors, inputs,
+                                                             layout, wave_variants, params,
+                                                             nparams, row_base, rows_here);
+
+      // * Both templates have the carrier of T+, so a row's band is that of T+.
+      Map map(band_context, rows_here);
+      for (int row = map.first_row(); row < rows_here; row += map.row_stride()) {
+        const int band_start = states[0].start_freq_ind[row];
+        map.set_band(row, band_start, band_start + 2 * settings.num_side_bins);
+      }
+      map.finish_bands();
+
+      for (int pixel = map.first_pixel(); pixel < map.end_pixel(); pixel += map.pixel_stride()) {
+        int row, freq_j_here;
+        if (!map.locate(pixel, &row, &freq_j_here)) continue;
+        const int time_i = row_base + row;
+        const int freq_j_local = freq_j_here - start_j;
+        if ((freq_j_local < 0) || (freq_j_local > num_freqs - 1)) continue;
+        const double freq_here = f_min + freq_j_here * df;
+
+        cmplx plus_values[DFFR_NUM_CHANNELS];
+        cmplx cross_values[DFFR_NUM_CHANNELS];
+        dffr_fstat_pixel_values<SymmetricWindow, Rows>(states[0], anchors[0], amplitudes,
+                                                       settings, row, freq_j_here, freq_here,
+                                                       plus_values, cross_values);
+        const int noise_bin = stft->noise_bin(freq_j_here, freq_j_local);
+        // * The terms of add_ip_swap_contrib in its order, each inverse-CSD entry and data value
+        // * read once.
+        cmplx data_values[DFFR_NUM_CHANNELS];
+        for (int channel = 0; channel < DFFR_NUM_CHANNELS; channel += 1)
+          data_values[channel] = stft->get_data_value(time_i, freq_j_local, channel, data_index);
+        cmplx d_plus_value(0.0, 0.0);
+        cmplx d_cross_value(0.0, 0.0);
+        cmplx plus_plus_value(0.0, 0.0);
+        cmplx cross_cross_value(0.0, 0.0);
+        cmplx plus_cross_value(0.0, 0.0);
+        for (int channel = 0; channel < DFFR_NUM_CHANNELS; channel += 1) {
+          for (int other_channel = 0; other_channel < DFFR_NUM_CHANNELS; other_channel += 1) {
+            const cmplx inverse_csd = stft->get_invC_cross_value(time_i, noise_bin, channel,
+                                                                 other_channel, noise_index);
+            const cmplx weighted_plus = inverse_csd * plus_values[other_channel];
+            d_plus_value += gcmplx::conj(data_values[channel]) * weighted_plus;
+            plus_plus_value += gcmplx::conj(plus_values[channel]) * weighted_plus;
+            const cmplx weighted_cross = inverse_csd * cross_values[other_channel];
+            d_cross_value += gcmplx::conj(data_values[channel]) * weighted_cross;
+            cross_cross_value += gcmplx::conj(cross_values[channel]) * weighted_cross;
+            plus_cross_value += gcmplx::conj(plus_values[channel]) * weighted_cross;
+          }
+        }
+        d_plus_sums[thread_index] += d_plus_value;
+        plus_plus_sums[thread_index] += plus_plus_value;
+        d_cross_sums[thread_index] += d_cross_value;
+        cross_cross_sums[thread_index] += cross_cross_value;
+        plus_cross_sums[thread_index] += plus_cross_value;
+      }
+      map.finish_pass();
+    }
+    CUDA_SYNC_THREADS;
+
+#ifdef __CUDACC__
+    const cmplx d_plus = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(d_plus_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx d_cross = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(d_cross_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx plus_plus = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(plus_plus_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx cross_cross = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(cross_cross_sums);
+    CUDA_SYNC_THREADS;
+    const cmplx plus_cross = 4.0 * stft->diff_comp * stft_block_reduce_cmplx(plus_cross_sums);
+#else
+    const cmplx d_plus = 4.0 * stft->diff_comp * d_plus_sums[0];
+    const cmplx d_cross = 4.0 * stft->diff_comp * d_cross_sums[0];
+    const cmplx plus_plus = 4.0 * stft->diff_comp * plus_plus_sums[0];
+    const cmplx cross_cross = 4.0 * stft->diff_comp * cross_cross_sums[0];
+    const cmplx plus_cross = 4.0 * stft->diff_comp * plus_cross_sums[0];
+#endif
+
+    if (thread_index == 0) {
+      double *projections = projections_out + (size_t)bin_i * DFFR_FSTAT_NUM_PROJECTIONS;
+      projections[0] = d_plus.real();
+      projections[1] = -d_cross.real();
+      projections[2] = -d_plus.imag();
+      projections[3] = d_cross.imag();
+      double *overlaps = overlaps_out + (size_t)bin_i * DFFR_FSTAT_NUM_OVERLAPS;
+      overlaps[0] = plus_plus.real();
+      overlaps[1] = -plus_cross.real();
+      overlaps[2] = 0.0;
+      overlaps[3] = plus_cross.imag();
+      overlaps[4] = cross_cross.real();
+      overlaps[5] = -plus_cross.imag();
+      overlaps[6] = 0.0;
+      overlaps[7] = plus_plus.real();
+      overlaps[8] = -plus_cross.real();
+      overlaps[9] = cross_cross.real();
+
+      const double plus_norm = plus_plus.real();
+      const double cross_norm = cross_cross.real();
+      const double d_plus_squared = d_plus.real() * d_plus.real() + d_plus.imag() * d_plus.imag();
+      const double d_cross_squared =
+          d_cross.real() * d_cross.real() + d_cross.imag() * d_cross.imag();
+      const double plus_cross_squared =
+          plus_cross.real() * plus_cross.real() + plus_cross.imag() * plus_cross.imag();
+      const double mixed = dffr_mul(dffr_mul(plus_cross, d_plus), gcmplx::conj(d_cross)).real();
+      two_f_out[bin_i] = (cross_norm * d_plus_squared + plus_norm * d_cross_squared - 2.0 * mixed) /
+                         (plus_norm * cross_norm - plus_cross_squared);
+    }
+    CUDA_SYNC_THREADS;
+  }
+}
+
+// Host launcher of the F-statistic kernel.
+// ! Raises std::runtime_error when the device cannot hold the launch.
+template <class SourceT, int Rows>
+inline void dffr_get_fstat(double *projections_out, double *overlaps_out, double *two_f_out,
+                           const DFFRTileInputs<SourceT> &inputs, STFTDomain *stft_launch,
+                           const double *params_all, const int *data_index_all,
+                           const int *noise_index_all, int num_bin, int nparams,
+                           const int *start_freq_inds) {
+  if (num_bin < 1) return;
+  const DFFRFisherLayout layout = dffr_fstat_layout();
+  const size_t shared_bytes = dffr_information_bytes<SourceT, Rows>(layout);
+#ifdef __CUDACC__
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      stft_prepare_dynamic_shared(dffr_get_fstat_kernel<SourceT, Rows, symmetric_window>,
+                                  shared_bytes);
+      dffr_get_fstat_kernel<SourceT, Rows, symmetric_window>
+          <<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
+              projections_out, overlaps_out, two_f_out, inputs, stft_launch, params_all,
+              data_index_all, noise_index_all, layout, num_bin, nparams, start_freq_inds,
+              nullptr));
+  gpuErrchk(cudaGetLastError());
+#else
+  std::vector<unsigned char> host_arena(shared_bytes);
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      dffr_get_fstat_kernel<SourceT, Rows, symmetric_window>(
+          projections_out, overlaps_out, two_f_out, inputs, stft_launch, params_all,
+          data_index_all, noise_index_all, layout, num_bin, nparams, start_freq_inds,
+          host_arena.data()));
 #endif
 }
 
@@ -2145,10 +2617,11 @@ struct DFFRSegmentTableOutput {
 
 // * The constants of one source, from its parameters; the table build that follows starts with a
 // * barrier. Every thread of the block calls it.
-template <class SourceT, int Rows>
-CUDA_DEVICE inline void dffr_load_source(typename DFFRTile<SourceT, Rows>::Arena *arena,
-                                         const DFFRTileInputs<SourceT> &inputs, double *params,
-                                         const double *params_all, int bin_i, int nparams) {
+template <class SourceT, int Rows, bool SymmetricWindow>
+CUDA_DEVICE inline void dffr_load_source(
+    typename DFFRTile<SourceT, Rows, SymmetricWindow>::Arena *arena,
+    const DFFRTileInputs<SourceT> &inputs, double *params, const double *params_all, int bin_i,
+    int nparams) {
   CUDA_SYNC_THREADS;
   for (int index = THREAD_START_X; index < nparams; index += BLOCK_INCR_X)
     params[index] = params_all[(size_t)bin_i * nparams + index];
@@ -2160,11 +2633,11 @@ CUDA_DEVICE inline void dffr_load_source(typename DFFRTile<SourceT, Rows>::Arena
 // segment's band start, template_out[((source * 3 + channel) * NT + segment) * band + band_bin],
 // and the band starts, start_out[source * NT + segment]. Bins outside the grid hold zero. These
 // are DFFR's pixel values, the amounts fill_global adds with a factor of one.
-template <class SourceT, int Rows>
+template <class SourceT, int Rows, bool SymmetricWindow>
 CUDA_KERNEL void dffr_fill_template_kernel(cmplx *template_out, int *start_out,
                                            DFFRTileInputs<SourceT> inputs, const double *params_all,
                                            int num_bin, int nparams, unsigned char *host_arena) {
-  using Arena = typename DFFRTile<SourceT, Rows>::Arena;
+  using Arena = typename DFFRTile<SourceT, Rows, SymmetricWindow>::Arena;
   CUDA_SHARED double params[N_PARAMS_MAX];
   Arena *arena = reinterpret_cast<Arena *>(stft_tile_arena(host_arena));
   const DFFRSettings &settings = inputs.settings;
@@ -2172,12 +2645,13 @@ CUDA_KERNEL void dffr_fill_template_kernel(cmplx *template_out, int *start_out,
   const int band_width = 2 * settings.num_side_bins + 1;
 
   for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X) {
-    dffr_load_source<SourceT, Rows>(arena, inputs, params, params_all, bin_i, nparams);
+    dffr_load_source<SourceT, Rows, SymmetricWindow>(arena, inputs, params, params_all, bin_i,
+                                                     nparams);
     for (int row_base = 0; row_base < num_times; row_base += Rows) {
       const int rows_here = (num_times - row_base < Rows) ? (num_times - row_base) : Rows;
       CUDA_SYNC_THREADS;
-      dffr_build_segment_table<SourceT, Rows>(arena->table, settings, inputs.kinematics,
-                                              arena->source, row_base, rows_here);
+      dffr_build_segment_table<SymmetricWindow, SourceT, Rows>(
+          arena->table, settings, inputs.kinematics, arena->source, row_base, rows_here);
       CUDA_SYNC_THREADS;
 
       for (int pixel = THREAD_START_X; pixel < rows_here * band_width; pixel += BLOCK_INCR_X) {
@@ -2191,8 +2665,8 @@ CUDA_KERNEL void dffr_fill_template_kernel(cmplx *template_out, int *start_out,
         cmplx channels[DFFR_NUM_CHANNELS] = {cmplx(0.0, 0.0), cmplx(0.0, 0.0), cmplx(0.0, 0.0)};
         if (bin_index >= 0 && bin_index < settings.num_bins) {
           const double frequency = settings.f_min + ((double)bin_index) * settings.df;
-          dffr_evaluate_pixel(arena->table, settings, row, band_bin, bin_index, frequency,
-                              channels);
+          dffr_evaluate_pixel<SymmetricWindow>(arena->table, settings, row, band_bin, bin_index,
+                                               frequency, channels);
         }
         const size_t stride = (size_t)num_times * band_width;
         const size_t base = (size_t)bin_i * DFFR_NUM_CHANNELS * stride;
@@ -2205,22 +2679,23 @@ CUDA_KERNEL void dffr_fill_template_kernel(cmplx *template_out, int *start_out,
 }
 
 // Copies of every bin-independent quantity of the segment table, for the stage checks.
-template <class SourceT, int Rows>
+template <class SourceT, int Rows, bool SymmetricWindow>
 CUDA_KERNEL void dffr_segment_table_kernel(DFFRSegmentTableOutput output,
                                            DFFRTileInputs<SourceT> inputs, const double *params_all,
                                            int num_bin, int nparams, unsigned char *host_arena) {
-  using Arena = typename DFFRTile<SourceT, Rows>::Arena;
+  using Arena = typename DFFRTile<SourceT, Rows, SymmetricWindow>::Arena;
   CUDA_SHARED double params[N_PARAMS_MAX];
   Arena *arena = reinterpret_cast<Arena *>(stft_tile_arena(host_arena));
   const int num_times = inputs.settings.num_time_segments;
 
   for (int bin_i = BLOCK_START_X; bin_i < num_bin; bin_i += GRID_INCR_X) {
-    dffr_load_source<SourceT, Rows>(arena, inputs, params, params_all, bin_i, nparams);
+    dffr_load_source<SourceT, Rows, SymmetricWindow>(arena, inputs, params, params_all, bin_i,
+                                                     nparams);
     for (int row_base = 0; row_base < num_times; row_base += Rows) {
       const int rows_here = (num_times - row_base < Rows) ? (num_times - row_base) : Rows;
       CUDA_SYNC_THREADS;
-      dffr_build_segment_table<SourceT, Rows>(arena->table, inputs.settings, inputs.kinematics,
-                                              arena->source, row_base, rows_here);
+      dffr_build_segment_table<SymmetricWindow, SourceT, Rows>(
+          arena->table, inputs.settings, inputs.kinematics, arena->source, row_base, rows_here);
       CUDA_SYNC_THREADS;
 
       const DFFRSegmentTable<Rows> &table = arena->table;
@@ -2251,23 +2726,27 @@ CUDA_KERNEL void dffr_segment_table_kernel(DFFRSegmentTableOutput output,
   }
 }
 
-// Host launchers of the two diagnostics; they synchronise.
+// Host launchers of the two diagnostics; they synchronise. Both windows' tiles hold the same arena.
 template <class SourceT, int Rows>
 inline void dffr_fill_template(cmplx *template_out, int *start_out,
                                const DFFRTileInputs<SourceT> &inputs, const double *params_all,
                                int num_bin, int nparams) {
   if (num_bin < 1) return;
-  const size_t shared_bytes = DFFRTile<SourceT, Rows>::table_bytes();
+  const size_t shared_bytes = DFFRTile<SourceT, Rows, false>::table_bytes();
 #ifdef __CUDACC__
-  stft_prepare_dynamic_shared(dffr_fill_template_kernel<SourceT, Rows>, shared_bytes);
-  dffr_fill_template_kernel<SourceT, Rows><<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
-      template_out, start_out, inputs, params_all, num_bin, nparams, nullptr);
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      stft_prepare_dynamic_shared(dffr_fill_template_kernel<SourceT, Rows, symmetric_window>,
+                                  shared_bytes);
+      dffr_fill_template_kernel<SourceT, Rows, symmetric_window>
+          <<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(template_out, start_out, inputs,
+                                                        params_all, num_bin, nparams, nullptr));
   gpuErrchk(cudaGetLastError());
   gpuErrchk(cudaDeviceSynchronize());
 #else
   std::vector<unsigned char> host_arena(shared_bytes);
-  dffr_fill_template_kernel<SourceT, Rows>(template_out, start_out, inputs, params_all, num_bin,
-                                           nparams, host_arena.data());
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      dffr_fill_template_kernel<SourceT, Rows, symmetric_window>(
+          template_out, start_out, inputs, params_all, num_bin, nparams, host_arena.data()));
 #endif
 }
 
@@ -2276,17 +2755,22 @@ inline void dffr_segment_table(const DFFRSegmentTableOutput &output,
                                const DFFRTileInputs<SourceT> &inputs, const double *params_all,
                                int num_bin, int nparams) {
   if (num_bin < 1) return;
-  const size_t shared_bytes = DFFRTile<SourceT, Rows>::table_bytes();
+  const size_t shared_bytes = DFFRTile<SourceT, Rows, false>::table_bytes();
 #ifdef __CUDACC__
-  stft_prepare_dynamic_shared(dffr_segment_table_kernel<SourceT, Rows>, shared_bytes);
-  dffr_segment_table_kernel<SourceT, Rows><<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(
-      output, inputs, params_all, num_bin, nparams, nullptr);
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      stft_prepare_dynamic_shared(dffr_segment_table_kernel<SourceT, Rows, symmetric_window>,
+                                  shared_bytes);
+      dffr_segment_table_kernel<SourceT, Rows, symmetric_window>
+          <<<num_bin, NUM_THREADS_HERE, shared_bytes>>>(output, inputs, params_all, num_bin,
+                                                        nparams, nullptr));
   gpuErrchk(cudaGetLastError());
   gpuErrchk(cudaDeviceSynchronize());
 #else
   std::vector<unsigned char> host_arena(shared_bytes);
-  dffr_segment_table_kernel<SourceT, Rows>(output, inputs, params_all, num_bin, nparams,
-                                           host_arena.data());
+  DFFR_WINDOW_DISPATCH(inputs.settings.sampled_window,
+      dffr_segment_table_kernel<SourceT, Rows, symmetric_window>(output, inputs, params_all,
+                                                                 num_bin, nparams,
+                                                                 host_arena.data()));
 #endif
 }
 

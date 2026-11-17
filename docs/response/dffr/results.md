@@ -186,7 +186,8 @@ on the ESA orbits that LAT ships, a year of one-day segments from day 10 of the 
 sources: 0.5 and 20 mHz, at each the two ḟ bounds of the global fit's GB prior (1.1e-18 and
 -6.6e-20 Hz/s at 0.5 mHz, 8.2e-13 and -2.3e-11 Hz/s at 20 mHz), each at two sky positions.
 Templates with the production settings but 60 side bins, on data windowed with the periodic Tukey
-window of taper 0.1157 that both responses integrate. Ranges over the four sources of each
+window of taper 0.1157, the window both responses integrated until 2026-11-16 (see the window
+convention below). Ranges over the four sources of each
 frequency; the segment error is max |h - d| / max |d| per segment and channel.
 
 | Frequency | Response | Flat mismatch, template pixels | Median segment error | Largest segment error | Noise-weighted mismatch |
@@ -207,11 +208,18 @@ frequency; the segment error is max |h - d| / max |d| per segment and channel.
   X + Y + Z (2.6e-3 to 3.7e-3 of its size against 3.4e-4 for DFFR), which carries 0.9 % of the
   signal of A there and far less noise, so the likelihood weights it heavily.
 - The window convention. The global fit windows the data with LAT's symmetric Tukey window, which
-  divides by N - 1 and is zero at the last sample; both responses integrate the periodic one. The
-  two data transforms differ by a flat mismatch of 3.6e-8 and a median segment error of 6.3e-5,
-  the same for every source and segment; in ln L at the true parameters it costs SNR² × 3.6e-8.
-  Production keeps its window, since its 10 side bins cost four orders of magnitude more (next
-  point); the validation ran on data with the periodic window.
+  divides by N - 1 and is zero at the first and the last sample. Until 2026-11-16 both responses
+  integrated the periodic one: the two data transforms differ by a flat mismatch of 3.6e-8 and a
+  median segment error of 6.3e-5, the same for every source and segment, which costs
+  SNR² × 3.6e-8 in ln L at the true parameters. Since then both integrate the symmetric window by
+  default. On 30 one-day segments of eight sources (ESA orbits; 3, 20 and 40 mHz and a chirping
+  source at 20 mHz, two sky positions each; 60 side bins; `stft_accuracy.py --model-window`), each
+  window on data of its own window gives the same numbers to four digits: DFFR a flat mismatch of
+  6.5e-10 to 1.2e-9, a median segment error of 3.2e-5 to 4.7e-5 and a noise-weighted mismatch of
+  1.8e-8 to 2.8e-8, the existing response 3.0e-10 to 1.0e-8, 1.4e-5 to 3.0e-5 and 1.8e-8 to
+  8.2e-8. Templates of the other window leave a flat mismatch of 3.5e-8 to 3.8e-8 (DFFR) and
+  3.6e-8 to 4.6e-8 (existing). The validation above ran on data and templates of the periodic
+  window.
 - Side bins. With the 10 side bins of production and the taper 0.1157, 1.3e-3 (20 mHz) to 1.7e-3
   (0.5 mHz) of (d|d) lies outside the template, for both responses: a noise-weighted mismatch of
   6.4e-4 to 8.8e-4, and a loss of 6 to 9 in ln L at the true parameters for a source of SNR 100.
@@ -407,8 +415,9 @@ the fly:
 ## Speed on the A100 and on the CPU
 
 DFFR against the existing response on the A100 (a year of one-day segments, the ESA production
-fixture; `L1Orbits` within 3 % except at batch 1), as the ratio of the existing time to the DFFR
-time, with the final Fisher kernel:
+fixture at 10 side bins; `L1Orbits` within 3 % except at batch 1), as the ratio of the existing
+time to the DFFR time, with the final Fisher kernel. The global fit runs 16 side bins, where DFFR
+`get_ll` costs 1.37 times and its Fisher matrix 1.46 times the 10-side-bin time (README, side bins):
 
 | Method | Batch 1 | 10 | 100 | 1000 | 10 000 | Per source at 10 000, existing / DFFR [µs] |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -452,23 +461,32 @@ time, with the final Fisher kernel:
   costs per segment. Compiled at `-O3`, which the module's build does not apply, the DFFR code runs
   2.3 to 2.9 times faster and its outputs move at rounding level (templates within 8e-15 of their
   peaks, gradients 6e-11); the DFFR Fisher then takes 0.30 to 0.42 of the existing one.
+- The two-template F-statistic (`get_fstat_terms_stft`, DFFR only; 2026-11-05, the same fixture on
+  another A100 of the same model, three runs, in which `get_ll_stft`, `get_swap_ll_stft` and
+  `get_fstat_ll_stft` repeat the table above within 1.3 %): 12.7 µs per source at 10 000 sources,
+  22 times less than `get_fstat_ll_stft` (277 µs) and 1.6 times `get_ll_stft` (7.8 µs); 14.4 µs at
+  1000 and 28.6 at 100, while a call of up to 10 sources costs 1.7 to 2.8 ms. At the size of a
+  full-band stage-1 call of the F-statistic search (114 000 to 166 176 sources, the same fixture),
+  it takes 12.7 µs per source against 43.0 µs for one `get_swap_ll_stft` call with T+ and Tx and
+  7.7 µs for `get_ll_stft`. 16 rows per pass are 17 % slower than 32.
 
 ## Kernel resources on the A100 and the H100
 
-Registers, stack and shared memory of the kernels as GBGPU links them (`kernel_resources.py`;
-with relocatable device code a kernel gets the largest register count among itself and the
-functions it calls). Blocks of 128 threads per SM follow from 65 536 registers per SM (4 blocks up
-to 128 registers, 3 up to 168, 2 up to 255) and from the shared memory (164 kB per SM on the A100,
-228 kB on the H100). One DFFR template holds 32 segment rows of 1012 bytes, the source constants
-and the settings: 32 672 bytes.
+Registers, stack and shared memory of the kernels as GBGPU links them (`kernel_resources.py`,
+2026-11-05, with the 64-bit data and noise indices of `domains.hpp`; with relocatable device code
+a kernel gets the largest register count among itself and the functions it calls). Blocks of 128
+threads per SM follow from 65 536 registers per SM (4 blocks up to 128 registers, 3 up to 168, 2 up
+to 255) and from the shared memory (164 kB per SM on the A100, 228 kB on the H100). One DFFR
+template holds 32 segment rows of 1012 bytes, the source constants and the settings: 32 664 bytes.
 
 | Kernel | Linked registers, A100 / H100 | Blocks per SM by registers | Blocks per SM by shared memory, A100 / H100 |
 | --- | --- | --- | --- |
-| existing response, every STFT kernel and its Fisher (set by `STFTFresnelGPU::get_fourier_value`) | 244 / 222 | 2 | 16 and more |
-| DFFR `get_ll`, `fill_global`, `get_ll` gradient | 154 to 164 | 3 | 4 / 6 |
-| DFFR swap, F-statistic (set by `STFTDomainGPU::add_ip_swap_contrib`) | 220 / 222 | 2 | 2 / 3 at 32 rows, 3 / 5 at 16 |
+| existing response, every STFT kernel and its Fisher (set by `STFTFresnelGPU::get_fourier_value`) | 244 / 222; on the H100 238 for the swap, its gradient and the four-filter F-statistic (set by `STFTDomainGPU::add_ip_swap_contrib`) | 2 | 14 / 20 and more |
+| DFFR `get_ll`, `fill_global`, `get_ll` gradient | 156 to 166 / 156 to 164 | 3 | 4 / 6 |
+| DFFR swap, F-statistic (set by `STFTDomainGPU::add_ip_swap_contrib`) | 244 / 238 | 2 | 2 / 3 at 32 rows, 3 / 5 at 16 |
 | DFFR swap gradient (`Template::values` and `build` out of line) | 254 / 254 | 2 | 2 / 3 |
-| DFFR Fisher, 4 rows per pass, 8 / 9 parameters (66 272 / 77 088 bytes of dynamic shared memory) | 176 / 183 | 2 | 2 / 3 and 2 / 2 |
+| DFFR Fisher, 4 rows per pass, 8 / 9 parameters (66 256 / 77 072 bytes of dynamic shared memory) | 176 / 183 | 2 | 2 / 3 and 2 / 2 |
+| DFFR two-template F-statistic (`dffr_get_fstat_kernel`; 37 280 / 18 784 bytes of dynamic shared memory at 32 / 16 rows) | 164 / 169 | 3 / 2 | 3 / 4 at 32 rows, 5 / 7 at 16 |
 
 The two-template DFFR kernels take 65 344 bytes of dynamic shared memory at 32 rows, above the
 48 kB a launch gets by default; the launch path raises a kernel's limit within the device's opt-in
@@ -477,8 +495,13 @@ module for sm_90 with nvcc; no H100 timing was made.
 
 ## Unit tests
 
-- LAT `tests/test_orbit_kinematics.py` (13 tests) and `tests/test_fresnel.py` (9 tests): the
-  tables above; CPU and A100.
+- LAT `tests/test_orbit_kinematics.py` (13 tests) and `tests/test_fresnel.py` (9 tests, 14 since
+  the symmetric window): the tables above; CPU and A100. Since 2026-11-16 `test_fresnel.py` also
+  compares the windowed transform of linear chirps (chirp rates ±4e-13 and 1e-20 Hz/s, 8
+  frequencies from 19 bins below to 18 above a 4.2 mHz carrier) with the direct sum over the
+  17 280 samples of a one-day segment at 5 s: each window within 1e-9 of the peak of its own sum
+  and more than 1e-5 from the other's, on the CPU and the GPU; it checks the arguments N and h and
+  that a group hands its Fresnel objects the symmetric window by default.
 - GBGPU `tests/test_stft_gb_dffr.py` (38 tests on the A100, 27 on the CPU, where the CUDA classes
   are skipped). The six likelihood methods of `STFTGBComputations(response="dffr")` on a fixture
   of 24 six-hour segments: `fill_global` followed by the inner product equals `get_ll` (rtol
@@ -500,7 +523,27 @@ module for sm_90 with nvcc; no H100 timing was made.
   build and are left as they are: the compact template against the `fill_global` grid asks for
   bit equality, and on the A100 375 of 1080 elements differ by at most 3.8e-15 (two kernels
   compiled separately); the swap gradient against host differences at rtol 1e-6 misses in f̈ of
-  the added source by 5.2e-4, a component whose step changes the phase less than rounding.
+  the added source by 5.2e-4, a component whose step changes the phase less than rounding. The
+  two-template F-statistic (2026-11-05): its N and M against those assembled from swap(T+, Tx), bit
+  for bit on the CPU and within 1e-11 of each row's largest entry on the GPU (measured up to
+  1e-12), on two data and two noise rows and in a window that cuts the bands; 2F against the 4x4
+  solve within 1e-12 of max(1, 2F); against the four-filter F-statistic within the rounding of its
+  filters' shifted phases; an empty batch, and the other response refused.
+- The same file since the symmetric window (2026-11-16, 87 tests, 31 of them CUDA tests): the
+  fixtures keep the periodic window, for which their bounds were set; the consumer identities,
+  the Fisher matrix and the CUDA tests run again with the symmetric window, and both responses
+  change by the same amount from one window to the other (1.06e-3 of the template peak, the two
+  changes agree to 2.6e-3 of their size). On the CPU all pass. On an A100 MIG slice the two kinds
+  of failure above occur in both windows and are kept as they are: the compact template (383 of
+  1080 elements, at most 3.5e-15, with the symmetric window), and the gradients against host
+  differences, the `get_ll` gradient now included. The host differences resolve ln L to its last
+  bit, 2^-130 on the fixture, so f̈ moves in steps of 3.7e-12, 1e-6 to 1.1e-5 of its value, and ḟ
+  in steps of 3.7e-19; kernel and host differ by 5 to 48 such steps, since they compute ln L in
+  different kernels with their own multiply-add contraction. The periodic `get_ll` gradient
+  landed on the same step before the change and misses by 31 steps after it, with its arithmetic
+  unchanged. On the GPU, `get_ll` and `fill_global` stay within 3.9e-15 and 7.0e-15 of the CPU's
+  peak (bound 1e-12) and the Fisher matrix within 1.0e-8 of sqrt(F_ii F_jj) (bound 1e-7), in both
+  windows.
 - GBGPU `tests/test_stft_gb.py`: the TDI-on-the-fly response with the DFFR setting it must ignore
   gives every output bit for bit; its exact amplitude and phase Fisher entries hold to 1.4e-6.
 - LAT `tests/test_gb_likelihood_engine.py`: the STFT band engine fills, evaluates, swaps and

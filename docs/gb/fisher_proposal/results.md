@@ -211,7 +211,7 @@ Local unit tests, outside this repository: the factor against exact
 rational inverses for SNR 0.3 to 300 and core condition numbers 10 to 1e6 at four temperatures, its
 limits ($F = 0$, $\beta = 0$, a null direction), the column rescaling, the fallback, the prior box for
 one-column and joint priors and its errors, the Jacobian at the edges, the production path through
-`STFTGBComputations` (both responses, CPU and CUDA), the joint prior and `fdot_bounds`, and the store
+`STFTGBComputations` (both responses, CPU and CUDA), the joint prior and `get_fdot_bounds`, and the store
 (a toy branch through an accepted swap, a birth, a death and a change of leaf order; the refresh
 blocks at intervals 1 and 3; the held matrix taking the block's $\beta$): 23 tests pass. The
 repository test that builds the production move, `tests/test_stft_store_windows.py`, passes (15

@@ -463,7 +463,10 @@ class DomainBase:
         if copy:
             target = self.__class__(self.arr.copy(), self.settings)
 
-        t_settings = template.settings
+        # now bring the template on the same backend as the target (if needed) so the add/subtract works
+        template_same_backend = template.with_backend(target.backend)
+
+        t_settings = template_same_backend.settings
         s_settings = target.settings
         if type(t_settings) is not type(s_settings):
             raise ValueError(
@@ -472,13 +475,13 @@ class DomainBase:
             )
 
         if isinstance(s_settings, FDSettings):
-            _apply_fd_add(target, sign, template.arr, t_settings)
+            _apply_fd_add(target, sign, template_same_backend.arr, t_settings)
         elif isinstance(s_settings, TDSettings):
-            _apply_td_add(target, sign, template.arr, t_settings)
+            _apply_td_add(target, sign, template_same_backend.arr, t_settings)
         elif isinstance(s_settings, STFTSettings):
-            _apply_stft_add(target, sign, template.arr, t_settings)
+            _apply_stft_add(target, sign, template_same_backend.arr, t_settings)
         elif isinstance(s_settings, WDMSettings):
-            _apply_wdm_add(target, sign, template.arr, t_settings)
+            _apply_wdm_add(target, sign, template_same_backend.arr, t_settings)
         else:
             raise ValueError(
                 f"add_signal is not implemented for domain {type(s_settings).__name__}."
@@ -527,6 +530,22 @@ def _apply_fd_add(target, sign, template_arr, template_settings):
     )
 
 
+def td_grid_offset(t0: float, grid_t0: float, dt: float, atol_samples: float = 1e-6) -> int:
+    """Number of samples from ``grid_t0`` to ``t0`` on the ``grid_t0 + k * dt`` grid.
+
+    Raises ``ValueError`` when ``t0`` is not on that grid (to ``atol_samples`` of a sample): a silent
+    rounding would shift the signal by up to half a sample.
+    """
+    samples = (float(t0) - float(grid_t0)) / float(dt)
+    k = round(samples)
+    if abs(samples - k) > atol_samples:
+        raise ValueError(
+            f"t0={float(t0)!r} is not on the time grid t0={float(grid_t0)!r} + k * dt={float(dt)!r} "
+            f"(off by {samples - k:+.3e} samples)."
+        )
+    return int(k)
+
+
 def _apply_td_add(target, sign, template_arr, template_settings):
     """Add ``sign * template_arr`` (TD) to ``target.arr`` over the time-range overlap."""
     data_settings = target.settings
@@ -536,7 +555,7 @@ def _apply_td_add(target, sign, template_arr, template_settings):
             f"({template_settings.dt}) must match for TD add_signal."
         )
 
-    time_offset = int(round((template_settings.t0 - data_settings.t0) / data_settings.dt))
+    time_offset = td_grid_offset(template_settings.t0, data_settings.t0, data_settings.dt)
     t_start_data = max(0, time_offset)
     t_end_data = min(data_settings.N, time_offset + template_settings.N)
     if t_start_data >= t_end_data:
@@ -1545,6 +1564,8 @@ class STFTSettings(DomainSettingsBase):
         min_freq: Lower edge of the active band (Hz). Defaults to ``0.0``.
         max_freq: Upper edge of the active band (Hz). If ``None``, the full range
             is used.
+        sample_cadence: Sample spacing of the time series the segments are cut from (seconds),
+            or ``None`` when unknown.
         **kwargs: Forwarded to :class:`DomainSettingsBase` (e.g. ``force_backend``).
     """
 
@@ -1555,6 +1576,7 @@ class STFTSettings(DomainSettingsBase):
     NF: int
     min_freq: Optional[float] = 0.0
     max_freq: Optional[float] = None
+    sample_cadence: Optional[float] = None
 
     def __init__(
         self,
@@ -1565,6 +1587,7 @@ class STFTSettings(DomainSettingsBase):
         NF: int,
         min_freq: Optional[float] = 0.0,
         max_freq: Optional[float] = None,
+        sample_cadence: Optional[float] = None,
         **kwargs,
     ):
         self.t0 = t0
@@ -1574,6 +1597,7 @@ class STFTSettings(DomainSettingsBase):
         self.NF = NF
         self.min_freq = min_freq
         self.max_freq = max_freq
+        self.sample_cadence = sample_cadence
         super().__init__(**kwargs)
 
     def __repr__(self):
@@ -1704,7 +1728,10 @@ class STFTSettings(DomainSettingsBase):
     @property
     def kwargs(self) -> dict:
         return dict(
-            min_freq=self.min_freq_input, max_freq=self.max_freq_input, force_backend=self.backend
+            min_freq=self.min_freq_input,
+            max_freq=self.max_freq_input,
+            sample_cadence=self.sample_cadence,
+            force_backend=self.backend,
         )
 
     @property
@@ -1823,6 +1850,7 @@ class STFTSettings(DomainSettingsBase):
             NF=new_NF,
             min_freq=new_min_freq,
             max_freq=new_max_freq,
+            sample_cadence=self.sample_cadence,
             force_backend=self.backend,
         )
 
@@ -1862,7 +1890,15 @@ def get_stft_settings(
     NF = nperseg // 2 + 1
 
     return STFTSettings(
-        t0=t0, dt=big_dt, df=DF, NT=NT, NF=NF, min_freq=min_freq, max_freq=max_freq, **kwargs
+        t0=t0,
+        dt=big_dt,
+        df=DF,
+        NT=NT,
+        NF=NF,
+        min_freq=min_freq,
+        max_freq=max_freq,
+        sample_cadence=dt,
+        **kwargs,
     )
 
 

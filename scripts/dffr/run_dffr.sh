@@ -44,7 +44,9 @@
 #   REFERENCE_BUILD_DIR (an older GBGPU build tree, for resources), BENCH_ARGS (extra arguments
 #   for stft_benchmarks.py), DAYS (default 365), N_SIDE_BINS (default 60; production takes 10),
 #   SURFACE_PROCESSES (default 4), MOJITO_FOLDER (default /project/lisa_nlddpc/Data/mojito_light),
-#   GLOBAL_FIT_RUNS_DIR (the full global-fit runs).
+#   GLOBAL_FIT_RUNS_DIR (the full global-fit runs), WINDOW (the Tukey window of the templates in
+#   golden, against_existing, benchmarks and the accuracy parts: symmetric, the default, as the
+#   data's, or periodic).
 set -euo pipefail
 
 usage="usage: run_dffr.sh --device cpu|gpu OUTPUT_ROOT [PART ...]"
@@ -61,6 +63,7 @@ dffr_python=${DFFR_PYTHON:-}
 mojito_l1=${MOJITO_L1:-}
 days=${DAYS:-365}
 n_side_bins=${N_SIDE_BINS:-60}
+window=${WINDOW:-symmetric}
 surface_processes=${SURFACE_PROCESSES:-4}
 mojito_folder=${MOJITO_FOLDER:-/project/lisa_nlddpc/Data/mojito_light}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -155,7 +158,7 @@ golden_part() {
 }
 
 against_existing() {
-    "$python_bin" "$script_dir/dffr_against_existing.py" --device "$device" \
+    "$python_bin" "$script_dir/dffr_against_existing.py" --device "$device" --window "$window" \
         --output "$regression_dir/against_existing_$device.npz" \
         | tee "$regression_dir/against_existing_$device.txt"
 }
@@ -167,7 +170,7 @@ benchmark_three_times() {
     for run in 1 2 3; do
         # shellcheck disable=SC2086
         "$python_bin" "$script_dir/stft_benchmarks.py" --device "$device" "${bench_swap_args[@]}" \
-            "$@" --output "$benchmark_dir/${stem}_run$run.json" ${BENCH_ARGS:-}
+            --window "$window" "$@" --output "$benchmark_dir/${stem}_run$run.json" ${BENCH_ARGS:-}
     done
 }
 
@@ -233,7 +236,7 @@ accuracy() {
     wait_all "${pids[@]}" || { echo "a truth run failed; see $truth_dir" >&2; return 1; }
     "$python_bin" "$script_dir/stft_accuracy.py" --device "$device" \
         --output "$accuracy_dir/year_pytdi_n$n_side_bins" --truth "$truth_dir" --days "$days" \
-        --n-side-bins "$n_side_bins"
+        --n-side-bins "$n_side_bins" --model-window "$window"
 }
 
 truth_chains() {
@@ -248,7 +251,7 @@ truth_chains() {
 accuracy_response() {
     "$python_bin" "$script_dir/stft_accuracy.py" --device "$device" \
         --output "$accuracy_dir/year_pyresponsetdi_n$n_side_bins" --days "$days" \
-        --n-side-bins "$n_side_bins"
+        --n-side-bins "$n_side_bins" --model-window "$window"
 }
 
 step0() {
@@ -270,7 +273,7 @@ step0() {
     done
     wait_all "${pids[@]}" || { echo "a truth run failed; see $step0_dir" >&2; return 1; }
     accuracy=("$python_bin" "$script_dir/stft_accuracy.py" --source-set step0 --device "$device"
-        --n-side-bins "$n_side_bins")
+        --n-side-bins "$n_side_bins" --model-window "$window")
     "${accuracy[@]}" --output "$step0_dir/year_n$n_side_bins" --truth "$step0_dir/truth" \
         --days "$days"
     "${accuracy[@]}" --output "$step0_dir/30d_instrument_n$n_side_bins" \

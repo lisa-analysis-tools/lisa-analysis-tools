@@ -7,16 +7,23 @@ same way EMRIs do.
 
 from .waveform import (  # noqa: F401
     SOBBHWaveform,
+    SOBBHTaylorT3TDIWaveform,
     phase,
     frequency,
     frequency_derivative,
     tau_to_x,
     time_to_merger,
     waveform_generate_h_plus_cross,
+    waveform_generate_amp_phase,
 )
 from .response import (  # noqa: F401
     SOBBHWaveWrap,
     SOBBHTDIonFlyWaveWrap,
     get_sobbh_response_wrapper,
     get_sobbh_tdionfly_gen,
+)
+
+
+from .waveform_gwtf import (  # noqa: F401
+    GWTF_generator,
 )

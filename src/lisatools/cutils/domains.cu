@@ -179,8 +179,8 @@ int STFTDomain::get_freq_index(double f) {
  * num_freqs + f_idx
  */
 CUDA_DEVICE
-int STFTDomain::get_data_index(int t_idx, int f_idx, int channel,
-                               int data_index) {
+size_t STFTDomain::get_data_index(int t_idx, int f_idx, int channel,
+                                  int data_index) {
   if (data_index >= num_data) {
 #ifdef __CUDACC__
 #else
@@ -188,7 +188,8 @@ int STFTDomain::get_data_index(int t_idx, int f_idx, int channel,
         "data_index is larger than available data instances.");
 #endif
   }
-  return ((data_index * num_channels + channel) * num_times + t_idx) *
+  // ! In 64 bits from the first factor: a split's buffer can hold more than 2^31 values.
+  return (((size_t)data_index * num_channels + channel) * num_times + t_idx) *
              num_freqs +
          f_idx;
 }
@@ -205,13 +206,13 @@ cmplx STFTDomain::get_data_value(int t_idx, int f_idx, int channel,
 
 /**
  * Compute the flat index for the diagonal inverse-covariance array.
- * Memory layout: [num_noise, num_channels, num_times, num_freqs]
+ * Memory layout: [num_noise, num_channels, num_times, num_freqs_noise]
  *   flat = ((noise_index * num_channels + channel) * num_times + t_idx) *
- * num_freqs + f_idx
+ * num_freqs_noise + f_idx
  */
 CUDA_DEVICE
-int STFTDomain::get_noise_index(int t_idx, int f_idx, int channel,
-                                int noise_index) {
+size_t STFTDomain::get_noise_index(int t_idx, int f_idx, int channel,
+                                   int noise_index) {
   if (noise_index >= num_noise) {
 #ifdef __CUDACC__
 #else
@@ -219,8 +220,8 @@ int STFTDomain::get_noise_index(int t_idx, int f_idx, int channel,
         "noise_index is larger than available noise instances.");
 #endif
   }
-  return ((noise_index * num_channels + channel) * num_times + t_idx) *
-             num_freqs +
+  return (((size_t)noise_index * num_channels + channel) * num_times + t_idx) *
+             num_freqs_noise +
          f_idx;
 }
 
@@ -236,13 +237,14 @@ cmplx STFTDomain::get_invC_value(int t_idx, int f_idx, int channel,
 
 /**
  * Compute the flat index for the full 3×3 inverse-covariance matrix array.
- * Memory layout: [num_noise, num_channels, num_channels, num_times, num_freqs]
+ * Memory layout: [num_noise, num_channels, num_channels, num_times,
+ * num_freqs_noise]
  *   flat = (((noise_index * num_channels + ch_i) * num_channels + ch_j)
- *             * num_times + t_idx) * num_freqs + f_idx
+ *             * num_times + t_idx) * num_freqs_noise + f_idx
  */
 CUDA_DEVICE
-int STFTDomain::get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
-                                      int noise_index) {
+size_t STFTDomain::get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
+                                         int noise_index) {
   if (noise_index >= num_noise) {
 #ifdef __CUDACC__
 #else
@@ -250,10 +252,10 @@ int STFTDomain::get_noise_index_cross(int t_idx, int f_idx, int ch_i, int ch_j,
         "noise_index is larger than available noise instances.");
 #endif
   }
-  return (((noise_index * num_channels + ch_i) * num_channels + ch_j) *
+  return ((((size_t)noise_index * num_channels + ch_i) * num_channels + ch_j) *
               num_times +
           t_idx) *
-             num_freqs +
+             num_freqs_noise +
          f_idx;
 }
 
@@ -282,16 +284,17 @@ cmplx STFTDomain::get_invC_cross_value(int t_idx, int f_idx, int ch_i, int ch_j,
  */
 CUDA_DEVICE
 void STFTDomain::get_inner_product_cross(cmplx* d_h, cmplx* h_h, cmplx h_val_i,
-                                         cmplx h_val_j, int t_idx, int f_idx,
+                                         cmplx h_val_j, int t_idx,
+                                         int f_idx_data, int f_idx_noise,
                                          int channel_i, int channel_j,
                                          int data_index, int noise_index) {
-  cmplx C_ij =
-      get_invC_cross_value(t_idx, f_idx, channel_i, channel_j, noise_index);
+  cmplx C_ij = get_invC_cross_value(t_idx, f_idx_noise, channel_i, channel_j,
+                                    noise_index);
   // Pre-multiply template value by the noise weight to share across d_h and
   // h_h.
   cmplx invC_h_j = C_ij * h_val_j;
 
-  cmplx d_i = get_data_value(t_idx, f_idx, channel_i, data_index);
+  cmplx d_i = get_data_value(t_idx, f_idx_data, channel_i, data_index);
   *d_h += gcmplx::conj(d_i) * invC_h_j;
   *h_h += gcmplx::conj(h_val_i) * invC_h_j;
 }
@@ -310,14 +313,15 @@ void STFTDomain::get_inner_product_cross(cmplx* d_h, cmplx* h_h, cmplx h_val_i,
  */
 CUDA_DEVICE
 void STFTDomain::get_inner_product_diag(cmplx* d_h, cmplx* h_h, cmplx h_val,
-                                        int t_idx, int f_idx, int channel,
+                                        int t_idx, int f_idx_data,
+                                        int f_idx_noise, int channel,
                                         int data_index, int noise_index) {
-  cmplx invC_ch = get_invC_value(t_idx, f_idx, channel, noise_index);
+  cmplx invC_ch = get_invC_value(t_idx, f_idx_noise, channel, noise_index);
   // Pre-multiply template value by the noise weight to share across d_h and
   // h_h.
   cmplx invC_h = invC_ch * h_val;
 
-  cmplx d_ch = get_data_value(t_idx, f_idx, channel, data_index);
+  cmplx d_ch = get_data_value(t_idx, f_idx_data, channel, data_index);
   *d_h += gcmplx::conj(d_ch) * invC_h;
   *h_h += gcmplx::conj(h_val) * invC_h;
 }
@@ -333,13 +337,14 @@ void STFTDomain::get_inner_product_diag(cmplx* d_h, cmplx* h_h, cmplx h_val,
  * involved.  Call inside a double loop over (ch_i, ch_j).
  */
 CUDA_DEVICE
-void STFTDomain::get_d_d_inner_product_cross(cmplx* d_d, int t_idx, int f_idx,
+void STFTDomain::get_d_d_inner_product_cross(cmplx* d_d, int t_idx,
+                                             int f_idx_data, int f_idx_noise,
                                              int channel_i, int channel_j,
                                              int data_index, int noise_index) {
-  cmplx C_ij =
-      get_invC_cross_value(t_idx, f_idx, channel_i, channel_j, noise_index);
-  cmplx d_j = get_data_value(t_idx, f_idx, channel_j, data_index);
-  cmplx d_i = get_data_value(t_idx, f_idx, channel_i, data_index);
+  cmplx C_ij = get_invC_cross_value(t_idx, f_idx_noise, channel_i, channel_j,
+                                    noise_index);
+  cmplx d_j = get_data_value(t_idx, f_idx_data, channel_j, data_index);
+  cmplx d_i = get_data_value(t_idx, f_idx_data, channel_i, data_index);
   *d_d += gcmplx::conj(d_i) * (C_ij * d_j);
 }
 
@@ -351,11 +356,12 @@ void STFTDomain::get_d_d_inner_product_cross(cmplx* d_d, int t_idx, int f_idx,
  * Call inside a single loop over channels.
  */
 CUDA_DEVICE
-void STFTDomain::get_d_d_inner_product_diag(cmplx* d_d, int t_idx, int f_idx,
+void STFTDomain::get_d_d_inner_product_diag(cmplx* d_d, int t_idx,
+                                            int f_idx_data, int f_idx_noise,
                                             int channel, int data_index,
                                             int noise_index) {
-  cmplx invC_ch = get_invC_value(t_idx, f_idx, channel, noise_index);
-  cmplx d_ch = get_data_value(t_idx, f_idx, channel, data_index);
+  cmplx invC_ch = get_invC_value(t_idx, f_idx_noise, channel, noise_index);
+  cmplx d_ch = get_data_value(t_idx, f_idx_data, channel, data_index);
   *d_d += gcmplx::conj(d_ch) * (invC_ch * d_ch);
 }
 
@@ -378,7 +384,8 @@ void STFTDomain::get_d_d_inner_product_diag(cmplx* d_d, int t_idx, int f_idx,
  */
 CUDA_DEVICE
 void STFTDomain::add_ip_contrib(cmplx* d_h_tmp, cmplx* h_h_tmp,
-                                cmplx* template_vals, int t_idx, int f_idx,
+                                cmplx* template_vals, int t_idx,
+                                int f_idx_data, int f_idx_noise,
                                 int data_index, int noise_index) {
 #ifdef __CUDACC__
   int tid = threadIdx.x;
@@ -391,14 +398,16 @@ void STFTDomain::add_ip_contrib(cmplx* d_h_tmp, cmplx* h_h_tmp,
     for (int ch_i = 0; ch_i < 3; ch_i++) {
       for (int ch_j = 0; ch_j < 3; ch_j++) {
         get_inner_product_cross(&d_h_val, &h_h_val, template_vals[ch_i],
-                                template_vals[ch_j], t_idx, f_idx, ch_i, ch_j,
-                                data_index, noise_index);
+                                template_vals[ch_j], t_idx, f_idx_data,
+                                f_idx_noise, ch_i, ch_j, data_index,
+                                noise_index);
       }
     }
   } else {
     for (int ch = 0; ch < num_channels; ch++) {
       get_inner_product_diag(&d_h_val, &h_h_val, template_vals[ch], t_idx,
-                             f_idx, ch, data_index, noise_index);
+                             f_idx_data, f_idx_noise, ch, data_index,
+                             noise_index);
     }
   }
   d_h_tmp[tid] += d_h_val;
@@ -414,8 +423,9 @@ void STFTDomain::add_ip_contrib(cmplx* d_h_tmp, cmplx* h_h_tmp,
  * @param d_d_tmp  Shared accumulator array for (d|d), indexed by tid
  */
 CUDA_DEVICE
-void STFTDomain::add_d_d_contrib(cmplx* d_d_tmp, int t_idx, int f_idx,
-                                 int data_index, int noise_index) {
+void STFTDomain::add_d_d_contrib(cmplx* d_d_tmp, int t_idx, int f_idx_data,
+                                 int f_idx_noise, int data_index,
+                                 int noise_index) {
 #ifdef __CUDACC__
   int tid = threadIdx.x;
 #else
@@ -425,14 +435,14 @@ void STFTDomain::add_d_d_contrib(cmplx* d_d_tmp, int t_idx, int f_idx,
   if (tdi_type == TDI_XYZ) {
     for (int ch_i = 0; ch_i < 3; ch_i++) {
       for (int ch_j = 0; ch_j < 3; ch_j++) {
-        get_d_d_inner_product_cross(&d_d_val, t_idx, f_idx, ch_i, ch_j,
-                                    data_index, noise_index);
+        get_d_d_inner_product_cross(&d_d_val, t_idx, f_idx_data, f_idx_noise,
+                                    ch_i, ch_j, data_index, noise_index);
       }
     }
   } else {
     for (int ch = 0; ch < num_channels; ch++) {
-      get_d_d_inner_product_diag(&d_d_val, t_idx, f_idx, ch, data_index,
-                                 noise_index);
+      get_d_d_inner_product_diag(&d_d_val, t_idx, f_idx_data, f_idx_noise, ch,
+                                 data_index, noise_index);
     }
   }
   d_d_tmp[tid] += d_d_val;
@@ -464,8 +474,8 @@ CUDA_DEVICE
 void STFTDomain::add_ip_swap_contrib(
     cmplx* d_h_add_tmp, cmplx* d_h_remove_tmp, cmplx* add_add_tmp,
     cmplx* remove_remove_tmp, cmplx* add_remove_tmp, cmplx* template_vals_add,
-    cmplx* template_vals_remove, int t_idx, int f_idx, int data_index,
-    int noise_index) {
+    cmplx* template_vals_remove, int t_idx, int f_idx_data, int f_idx_noise,
+    int data_index, int noise_index) {
 #ifdef __CUDACC__
   int tid = threadIdx.x;
 #else
@@ -486,31 +496,36 @@ void STFTDomain::add_ip_swap_contrib(
       for (int ch_j = 0; ch_j < 3; ch_j++) {
         get_inner_product_cross(&d_h_add_val, &add_add_val,
                                 template_vals_add[ch_i],
-                                template_vals_add[ch_j], t_idx, f_idx, ch_i,
-                                ch_j, data_index, noise_index);
+                                template_vals_add[ch_j], t_idx, f_idx_data,
+                                f_idx_noise, ch_i, ch_j, data_index,
+                                noise_index);
 
         get_inner_product_cross(&d_h_remove_val, &remove_remove_val,
                                 template_vals_remove[ch_i],
-                                template_vals_remove[ch_j], t_idx, f_idx, ch_i,
-                                ch_j, data_index, noise_index);
+                                template_vals_remove[ch_j], t_idx, f_idx_data,
+                                f_idx_noise, ch_i, ch_j, data_index,
+                                noise_index);
 
         get_inner_product_cross(&discard, &add_remove_val,
                                 template_vals_add[ch_i],
-                                template_vals_remove[ch_j], t_idx, f_idx, ch_i,
-                                ch_j, data_index, noise_index);
+                                template_vals_remove[ch_j], t_idx, f_idx_data,
+                                f_idx_noise, ch_i, ch_j, data_index,
+                                noise_index);
       }
     }
   } else {
     for (int ch = 0; ch < num_channels; ch++) {
       get_inner_product_diag(&d_h_add_val, &add_add_val, template_vals_add[ch],
-                             t_idx, f_idx, ch, data_index, noise_index);
+                             t_idx, f_idx_data, f_idx_noise, ch, data_index,
+                             noise_index);
 
       get_inner_product_diag(&d_h_remove_val, &remove_remove_val,
-                             template_vals_remove[ch], t_idx, f_idx, ch,
-                             data_index, noise_index);
+                             template_vals_remove[ch], t_idx, f_idx_data,
+                             f_idx_noise, ch, data_index, noise_index);
 
       get_inner_product_diag(&discard, &add_remove_val, template_vals_add[ch],
-                             t_idx, f_idx, ch, data_index, noise_index);
+                             t_idx, f_idx_data, f_idx_noise, ch, data_index,
+                             noise_index);
     }
   }
   d_h_add_tmp[tid] += d_h_add_val;
@@ -778,7 +793,9 @@ CUDA_DEVICE
 void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
                                             double f, cmplx* kernel_out,
                                             cmplx* moment_out) {
-  double t_end = t0 + dt;
+  // * The window ends where its span ends: dt for the periodic window, (N - 1) h for the
+  // * symmetric one.
+  double t_end = t0 + window_span;
   double t_roll_on = t0 + taper_duration;
   double t_roll_off = t_end - taper_duration;
 
@@ -803,14 +820,14 @@ void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
                           &term[i], with_moment ? &moment[i] : nullptr);
   }
 
-  // The right-ramp half-cosine is referenced to the segment END,
+  // The right-ramp half-cosine is referenced to the window END,
   // cos(pi*(t_end - t)/taper). Re-expressed as frequency shifts referenced to
-  // the Fourier origin t0 it carries constant phases exp(-/+ 2 pi i f_taper*dt)
-  // on the (f -/+ f_taper) terms. Those are unity iff f_taper*dt = 1/alpha is an
+  // the Fourier origin t0 it carries constant phases exp(-/+ 2 pi i f_taper*span)
+  // on the (f -/+ f_taper) terms. Those are unity iff f_taper*span = 1/alpha is an
   // integer (true for all historical alphas: 0.1, 0.5, 1.0); omitting them for
   // an off-grid taper silently degraded the windowed template to mm ~ 1e-2
   // (found 2026-07-02 with taper = 1e4 s at dt = 1 day, alpha = 0.2315).
-  double taper_rot = 2.0 * M_PI * f_taper * dt;
+  double taper_rot = 2.0 * M_PI * f_taper * window_span;
   cmplx right_rot_p = gcmplx::polar(1.0, -taper_rot);  // multiplies (f - f_taper)
   cmplx right_rot_m = gcmplx::polar(1.0, +taper_rot);  // multiplies (f + f_taper)
 
@@ -1172,7 +1189,7 @@ void compute_likelihood_contributions_kernel(
 
     int num_ch = domain.num_channels;
     // Base offset into template_vals for this binary (row-major).
-    int template_base = bin * num_ch * num_times_template * num_freqs_template;
+    size_t template_base = (size_t)bin * num_ch * num_times_template * num_freqs_template;
 
     for (int idx = start_idx; idx < total_tf; idx += incr_idx) {
       int t_local = idx / num_freqs_template;
@@ -1203,8 +1220,9 @@ void compute_likelihood_contributions_kernel(
                                    f_local];
       }
 
-      domain.add_ip_contrib(d_h_tmp, h_h_tmp, h_vals, t_idx, f_idx, data_index,
-                            noise_index);
+      // This kernel places pixels on the full grid, so data and noise share the bin.
+      domain.add_ip_contrib(d_h_tmp, h_h_tmp, h_vals, t_idx, f_idx, f_idx,
+                            data_index, noise_index);
     }
 
 #ifdef __CUDACC__

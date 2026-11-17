@@ -18,12 +18,12 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 from datetime import datetime, timezone
 from logging import getLogger
+import shutil
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
 from eryn.backends import HDFBackend
-from eryn.utils import get_integrated_act
 from scipy.interpolate import CubicSpline
 from tqdm import tqdm
 
@@ -79,6 +79,37 @@ _MBH_PARAM_INFO: Dict[str, ParameterInfo] = {
     "t_c": ParameterInfo("coalescence_time", r"$t_c\,[\mathrm{s}]$", "s"),
 }
 
+_EMRI_PARAM_INFO: Dict[str, ParameterInfo] = {
+    "m1": ParameterInfo("primary_mass_det_frame", r"$m_1\,[M_\odot]$", "solMass"),
+    "m2": ParameterInfo("secondary_mass_det_frame", r"$m_2\,[M_\odot]$", "solMass"),
+    "a": ParameterInfo("chi1", r"$a$", "dimensionless"),
+    "p0": ParameterInfo("semi_latus_rectum_tref", r"$p_0$", "dimensionless"),
+    "e0": ParameterInfo("eccentricity_tref", r"$e_0$", "dimensionless"),
+    "XI0": ParameterInfo("inclination_tref", r"$\Xi_0\,[\mathrm{rad}]$", "rad"),
+    "distance": ParameterInfo("luminosity_distance", r"$d_L\,[\mathrm{Gpc}]$", "Gpc"),
+    "qK": ParameterInfo("polar_angle_spin1", r"$\theta_K\,[\mathrm{rad}]$", "rad"),
+    "phiK": ParameterInfo("azimuthal_angle_spin1", r"$\phi_K\,[\mathrm{rad}]$", "rad"),
+    "Phi_phi0": ParameterInfo("azimuthal_orbit_phase_tref", r"$\Phi_{\phi,0}\,[\mathrm{rad}]$", "rad"),
+    "Phi_theta0": ParameterInfo("polar_orbit_phase_tref", r"$\Phi_{\theta,0}\,[\mathrm{rad}]$", "rad"),
+    "Phi_r0": ParameterInfo("mean_anomaly_tref", r"$\Phi_{r,0}\,[\mathrm{rad}]$", "rad"),
+    "ra": ParameterInfo("right_ascension", r"$\alpha\,[\mathrm{rad}]$", "rad"),
+    "dec": ParameterInfo("declination", r"$\delta\,[\mathrm{rad}]$", "rad"),
+}
+
+_SOBBH_PARAM_INFO: Dict[str, ParameterInfo] = {
+    "m1": ParameterInfo("primary_mass_det_frame", r"$m_1\,[M_\odot]$", "solMass"),
+    "m2": ParameterInfo("secondary_mass_det_frame", r"$m_2\,[M_\odot]$", "solMass"),
+    "s1z": ParameterInfo("spin1", r"$s_{1z}$", "dimensionless"),
+    "s2z": ParameterInfo("spin2", r"$s_{2z}$", "dimensionless"),
+    "distance": ParameterInfo("luminosity_distance", r"$d_L\,[\mathrm{Gpc}]$", "Gpc"),
+    "iota": ParameterInfo("inclination", r"$\iota\,[\mathrm{rad}]$", "rad"),
+    "f0": ParameterInfo("frequency_at_reference_time", r"$f_0\,[\mathrm{Hz}]$", "Hz"), 
+    "phi0": ParameterInfo("phase_at_reference_time", r"$\phi_{\mathrm{ref}}\,[\mathrm{rad}]$", "rad"),
+    "psi": ParameterInfo("polarization", r"$\psi\,[\mathrm{rad}]$", "rad"),
+    "ra": ParameterInfo("right_ascension", r"$\alpha\,[\mathrm{rad}]$", "rad"),
+    "dec": ParameterInfo("declination", r"$\delta\,[\mathrm{rad}]$", "rad"),
+}
+
 _NOISE_PARAM_INFO: Dict[str, ParameterInfo] = {
     "S_oms": ParameterInfo(
         "S_oms", r"$S_{\mathrm{oms}}\,[\mathrm{m}\mathrm{Hz}^{-1/2}]$", "m Hz^{-1/2}"
@@ -120,19 +151,29 @@ def _noise_param_info(sensitivity_backend) -> List[ParameterInfo]:
 PARAMETER_INFO_REGISTRY: Dict[str, Dict[str, ParameterInfo]] = {
     "gb": _GB_PARAM_INFO,
     "mbh": _MBH_PARAM_INFO,
+    "emri": _EMRI_PARAM_INFO,
     "psd": _NOISE_PARAM_INFO,
     "galfor": _GALFOR_PARAM_INFO,
+    "sobbh": _SOBBH_PARAM_INFO,
     # add entries for other source types as needed
 }
 
 _STOCHASTIC_BRANCHES = ["psd", "galfor"]
 
-# Corrections applied after TransformContainer to fix waveform-gen vs L3C unit mismatches.
+# Corrections applied after TransformContainer to fix waveform-gen vs L3C mismatches, keyed by L3C names.
+# A string key maps one parameter (``fn(x) -> x``); a tuple key maps its parameters jointly
+# (``fn(*xs) -> tuple``, one output per name, in the key's order).
 # The MBH transform applies gpc_to_mpc (Gpc→Mpc) for the waveform generator;
 # L3C requires distance in Gpc, so we invert here.
-_OUTPUT_CORRECTIONS_REGISTRY: Dict[str, Dict[str, Callable]] = {
+# Corrections that need the run's info (the SOBBH reference epoch) come from
+# ``SubmissionWriter._run_output_corrections`` instead.
+OutputCorrections = Dict[str | Tuple[str, ...], Callable]
+
+_OUTPUT_CORRECTIONS_REGISTRY: Dict[str, OutputCorrections] = {
     "gb": {},
     "mbh": {"luminosity_distance": lambda x: x * 1e-3},
+    "emri": {},
+    "sobbh": {},
     "psd": {},
     "galfor": {},
 }
@@ -140,6 +181,8 @@ _OUTPUT_CORRECTIONS_REGISTRY: Dict[str, Dict[str, Callable]] = {
 _REMOVED_PARAMS_REGISTRY: Dict[str, List[str]] = {
     "gb": ["frequency_double_dot"],
     "mbh": [],
+    "emri": [],
+    "sobbh": [],
     "psd": [],
     "galfor": [],
 }
@@ -148,28 +191,44 @@ source_types_names = dict(
     gb="GB",  # todo: separate the verification binaries into their own source type
     mbh="MBHB",
     emri="EMRI",
-    sobh="SOBHB",
+    sobbh="SOBHB",
     psd="NOISE",
     galfor="NOISE",  # todo: should we merge noise and stochastic together under a common "stochastic" source type?
 )
 
 # order of the mojito light mbh sources, sorted by merger time (earliest to latest), for the purpose of assigning `known_injection` labels in the metadata
 _MOJITO_LIGHT_MBH_ORDER = ["source_18", "source_5", "source_16", "source_7", "source_2", "source_12", "source_9", "source_4", "source_0", "source_15", "source_3", "source_10", "source_19", "source_13", "source_6", "source_17", "source_8", "source_1", "source_11", "source_14"] 
+# order of the mojito light emri sources, sorted by initial eccentricity.
+_MOJITO_LIGHT_EMRI_ORDER = ["source_0", "source_1", "source_3", "source_2", "source_5", "source_4", "source_6", "source_7"]
+# catalog order of the mojito light sobbh sources, for the purpose of assigning `known_injection` labels in the metadata
+_MOJITO_LIGHT_SOBHB_ORDER = ["source_0", "source_1", "source_2", "source_3", "source_4", "source_5"]
 
 MAX_SOURCES_PER_BATCH = 500
 
-def _apply_output_corrections(branch: str, samples_dict: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Apply branch-specific output corrections to a posterior mapping."""
+# comment of the per-branch metadata until its posteriors have been written
+_POSTERIORS_PENDING = "posteriors pending"
+
+def _apply_output_corrections(
+    branch: str,
+    samples_dict: dict[str, np.ndarray],
+    extra_corrections: OutputCorrections | None = None,
+) -> dict[str, np.ndarray]:
+    """Apply branch-specific output corrections to a posterior mapping.
+
+    ``extra_corrections`` are applied after the registry's, in the same format (see
+    ``_OUTPUT_CORRECTIONS_REGISTRY``). A correction is skipped unless all its parameters are in the mapping.
+    """
 
     corrected = dict(samples_dict)
-    transform = _OUTPUT_CORRECTIONS_REGISTRY[branch]
+    corrections = {**_OUTPUT_CORRECTIONS_REGISTRY[branch], **(extra_corrections or {})}
 
-    for key, func in transform.items():
-        if key in corrected:
-            corrected[key] = func(corrected[key])
-            logger.info(
-                f"Applied output correction for parameter '{key}' in branch '{branch}'"
-            )
+    for key, func in corrections.items():
+        names = (key,) if isinstance(key, str) else tuple(key)
+        if not all(name in corrected for name in names):
+            continue
+        values = func(*(corrected[name] for name in names))
+        corrected.update(zip(names, (values,) if isinstance(key, str) else values, strict=True))
+        logger.debug(f"Applied output correction for {names} in branch '{branch}'")
 
     return corrected
 
@@ -237,10 +296,10 @@ def _save_metadata_attributes(h5obj: h5py.File | h5py.Group, metadata: MetadataB
         value = getattr(metadata, field.name)
         if isinstance(value, (str, int, float)):
             h5obj.attrs[field.name] = value
-        elif isinstance(value, list):
-            h5obj.attrs[field.name] = json.dumps(value)
-        elif isinstance(value, dict):
-            h5obj.attrs[field.name] = json.dumps(value)
+        elif isinstance(value, (list, dict)):
+            # * sanitised as the JSON file is (to_json): a value json cannot write (a class a waveform put among
+            # * its kwargs, an array) must not cost the branch its metadata
+            h5obj.attrs[field.name] = json.dumps(metadata.json_sanitize(value))
         else:
             logger.warning(
                 f"Unsupported metadata field type for '{field.name}': {type(value)}. Skipping this field."
@@ -264,19 +323,21 @@ def _build_leaf_samples_dict(
     branch: str,
     log_prior: np.ndarray,
     log_likelihood: np.ndarray,
+    extra_corrections: OutputCorrections | None = None,
 ) -> dict[str, np.ndarray]:
     """Build one leaf's posterior mapping and apply corrections/filtering."""
 
     samples_dict = {name: samples_here[..., i] for i, name in enumerate(parameter_names)}
     samples_dict["logprior"] = log_prior
     samples_dict["loglikelihood"] = log_likelihood
-    samples_dict = _apply_output_corrections(branch, samples_dict)
-    samples_dict = _filter_removed_params(branch, samples_dict)
-
-    return {
+    # the leaf first: the corrections then run on this leaf's samples only
+    samples_dict = {
         name: values[:, leaf] if len(values.shape) == 2 else values
         for name, values in samples_dict.items()
     }
+    samples_dict = _apply_output_corrections(branch, samples_dict, extra_corrections)
+
+    return _filter_removed_params(branch, samples_dict)
 
 
 def _build_stochastic_samples_dict(
@@ -327,6 +388,16 @@ def _seconds_to_l3c_datetime(t: float) -> str:
     dt = datetime.fromtimestamp(t + lisa_epoch_seconds)
     return dt.strftime("%Y.%m.%d.%H.%M.%S")
 
+def _l3c_datetime_to_seconds(dt_str: str) -> float:
+    """Convert a L3C datetime string yyyy.mm.dd.hh.mm.ss to seconds with respect to LISA_EPOCH_TCB."""
+    from lisaconstants import LISA_EPOCH_TCB
+
+    format_str = "%Y-%m-%dT%H:%M:%S.%f"
+    lisa_epoch_seconds = datetime.strptime(LISA_EPOCH_TCB, format_str).timestamp()
+
+    dt = datetime.strptime(dt_str, "%Y.%m.%d.%H.%M.%S")
+    return dt.timestamp() - lisa_epoch_seconds
+
 
 def _seconds_to_duration_str(t: float) -> str:
     """Express a duration in seconds as L3C effective_observation_duration string."""
@@ -341,8 +412,8 @@ def _seconds_to_duration_str(t: float) -> str:
 
 def _infer_tdi_channels(curr: CurrentInfoGlobalFit) -> List[str]:
     """Infer TDI channel list from GB setup or sensitivity backend class name."""
-    if "gb" in curr.source_info and hasattr(curr.source_info["gb"], "tdi_setup"):
-        setup_str = curr.source_info["gb"].tdi_setup or "XYZ"
+    if "gb" in curr.source_info and hasattr(curr.source_info["gb"], "waveform"):
+        setup_str = curr.source_info["gb"].waveform.tdi_channel_setup or "XYZ"
         return list(setup_str)
     backend_name = type(curr.general_info.sensitivity_backend).__name__
     if "AET" in backend_name:
@@ -368,13 +439,17 @@ class BackendConsumer:
         curr: CurrentInfoGlobalFit = None,
         backend: HDFBackend | str = None,
     ):
+        # * A file is opened with the global fit's backend, which finds the run's group: "global_fit", or "mcmc"
+        # * in files written before the rename (eryn's own HDFBackend only looks under "mcmc").
+        from .hdfbackend import GFHDFBackend
+
         if backend is not None:
             if isinstance(backend, str):
-                self.backend = HDFBackend(filename=backend, read_only=True)
+                self.backend = GFHDFBackend(backend, read_only=True)
             else:
                 self.backend = backend
         elif curr is not None:
-            self.backend = HDFBackend(filename=curr.main_file_path, read_only=True)
+            self.backend = GFHDFBackend(curr.main_file_path, read_only=True)
         else:
             raise ValueError("Must provide either curr or backend.")
 
@@ -422,18 +497,54 @@ class BackendConsumer:
 
         return self._transforms
 
+    def kept_stage_start(self) -> int:
+        """The iteration the last step of the run's recipe started at: the samples from there on are the ones the
+        run keeps, the steps before it (burn-in, tuning, searches) are not posterior samples.
+
+        0, the whole chain, when the file records no recipe or no start of its steps (files written before the
+        recipe stored them). When the last step has not started (a run stopped before it), the whole chain too,
+        with a warning.
+        """
+        with self.backend.open() as f:
+            group = f[self.backend.name]
+            if "recipe" not in group:
+                return 0
+            steps = sorted(group["recipe"].values(), key=lambda step: step.attrs["order num"])
+            if not steps or not any("start iteration" in step.attrs for step in steps):
+                return 0
+            last = steps[-1]
+            if "start iteration" not in last.attrs:
+                logger.warning(
+                    f"The last recipe step ({last.name.rsplit('/', 1)[-1]!r}) has not started in this file: the "
+                    "whole chain is post-processed, the steps before it included."
+                )
+                return 0
+            return int(last.attrs["start iteration"])
+
     def store_cold_chains(self):
-        """Extract cold chains and inds for all branches and cache them."""
+        """Extract the cold chains and inds of all branches from the start of the kept stage, and cache them.
+
+        Only the iterations of the last recipe step are read (:meth:`kept_stage_start`), so the ACT, the thinning
+        and the posterior files hold no sample of the burn-in or tuning stages. ``discard`` of
+        :meth:`store_independent_samples` counts from there.
+        """
+        self.kept_start = start = self.kept_stage_start()
+        stop = int(self.backend.iteration)
+        if start >= stop:
+            raise ValueError(f"the kept stage starts at iteration {start}, and the file holds {stop}: nothing to keep.")
+        if start > 0:
+            logger.info(f"Post-processing the kept stage: iterations {start} to {stop} of the chain.")
+        kept = slice(start, stop)
         self._cold_chains = {}
         self._cold_inds = {}
-        all_chains = self.backend.get_chain()
-        all_inds = self.backend.get_inds()
+        all_chains = self.backend.get_chain(slice_vals=kept)
+        all_inds = self.backend.get_inds(slice_vals=kept)
         for branch in self.branches:
             self._cold_chains[branch] = all_chains[branch][:, :1]
             self._cold_inds[branch] = all_inds[branch][:, :1]
 
-        self._cold_log_prior = self.backend.get_log_prior()[:, :1]
-        self._cold_log_likelihood = self.backend.get_log_like()[:, :1]
+        self._cold_log_prior = self.backend.get_log_prior(slice_vals=kept)[:, :1]
+        self._cold_log_likelihood = self.backend.get_log_like(slice_vals=kept)[:, :1]
 
     @property
     def configured(self) -> bool:
@@ -467,27 +578,55 @@ class BackendConsumer:
             raise ValueError(f"Branch '{branch}' not found in cold chains.")
         return self._cold_inds[branch]
 
+    def _branch_periods(self, branch: str) -> dict:
+        """``{parameter index: period}`` of the branch's periodic parameters (``{}`` without a ``curr``)."""
+        try:
+            info = self._curr.source_info[branch]
+            periodic = info.get("periodic") if isinstance(info, dict) else getattr(info, "periodic", None)
+            if not periodic or branch not in periodic:
+                return {}
+            from .run import _periodic_names_to_indices
+
+            transform = info.get("transform") if isinstance(info, dict) else getattr(info, "transform", None)
+            return _periodic_names_to_indices(periodic[branch], transform)
+        except Exception:
+            return {}
+
     def compute_auto_correlation_time(
         self, branch: str = None, **act_kwargs
     ) -> Dict[str, np.ndarray] | np.ndarray:
-        """Compute the integrated ACT for the specified branch or all branches."""
+        """The integrated ACT, in iterations, of the kept cold chains: per branch, one value per series.
+
+        The estimate and the series are those of the recipe's convergence stop (``recipe.gating_series``,
+        ``sampling.utility.cold_chain_act``), so the two agree: the sampled parameters of the leaves that stay
+        active, periodic ones as sin and cos, with Sokal's automatic window. A branch with no such series (gb,
+        whose leaves come and go) gets 1, and so does a series whose ACT is not defined (a walker that never
+        moved), with a warning.
+        """
+        from lisatools.sampling.utility import cold_chain_act
+
+        from .recipe import gating_series
+
         if not self.configured:
             self.store_cold_chains()
-        if branch is not None:
-            if branch in self.branches:
-                return get_integrated_act(self._cold_chains[branch], **act_kwargs)
+        if branch is not None and branch not in self.branches:
             raise ValueError(f"Branch '{branch}' not found in cold chains.")
-        act: dict = get_integrated_act(self.cold_chains, **act_kwargs)
-
-        # now remove nans if present
-        for branch, value in act.items():
-            if not np.isfinite(value).all():
+        act = {}
+        for name in self.branches if branch is None else [branch]:
+            x, periods, _note = gating_series(
+                self._cold_chains[name][:, 0], self._cold_inds[name][:, 0], self._branch_periods(name)
+            )
+            if x is None:
+                act[name] = np.ones(1)
+                continue
+            tau, _reliable = cold_chain_act(x, periods, **act_kwargs)
+            if not np.isfinite(tau).all():
                 logger.warning(
-                    f"NaN values found in ACT for branch '{branch}'. These will be replaced with 1."
+                    f"NaN values found in ACT for branch '{name}'. These will be replaced with 1."
                 )
-                act[branch] = np.where(np.isfinite(value), value, 1.0)
-
-        return act
+                tau = np.where(np.isfinite(tau), tau, 1.0)
+            act[name] = tau
+        return act if branch is None else act[branch]
 
     def store_independent_samples(self, discard: int | float = 0.0, ess: int = 10000, **act_kwargs):
         """
@@ -853,6 +992,9 @@ def _extract_sensitivity_metadata(gi) -> tuple[dict, dict]:
     kwargs.pop("orbits")
     kwargs.pop("settings")
     kwargs.pop("window_values")
+    if kwargs["data_td_settings"] is not None:
+            kwargs.pop("data_td_settings")
+
     kwargs["force_backend"] = "cpu"
 
     domain_metadata = {
@@ -895,11 +1037,39 @@ class MetadataBase:
             k: getattr(self, k) for k in self.__dataclass_fields__.keys() if not k.startswith("_")
         }
 
+    def json_sanitize(self, obj: Any) -> Any:
+        """Recursively sanitize an object for JSON serialization."""
+        if isinstance(obj, dict):
+            return {k: self.json_sanitize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.json_sanitize(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self.json_sanitize(v) for v in obj)
+        elif isinstance(obj, set):
+            return sorted([self.json_sanitize(i) for i in obj], key=str)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        elif isinstance(obj, type):
+            return f"{obj.__module__}.{obj.__qualname__}"  # a class: its import path
+        elif isinstance(obj, np.generic):
+            return obj.item()
+        else:
+            logger.warning(f"Unsupported type {type(obj)} for JSON serialization. Converting to string.")
+            return str(obj)
+
+
     def to_json(self, filepath: str):
         """Save the metadata to a JSON file at the specified path."""
+        dictionary = self.json_sanitize(self.to_dict())
+
         with open(filepath, "w") as f:
-            json.dump(self.to_dict(), f, indent=4)
+            json.dump(dictionary, f, indent=4)
         logger.info(f"Saved metadata to {filepath}")
+
 
 
 @dataclasses.dataclass
@@ -1099,7 +1269,7 @@ class RunMetadata(MetadataBase):
             f"Reconstructing TDSettings object with t0: {self.observation_period_begin}, N: {self.number_of_time_samples}, dt: {self.time_step}"
         )
         return TDSettings(
-            t0=self.observation_period_begin,
+            t0=_l3c_datetime_to_seconds(self.observation_period_begin),
             N=self.number_of_time_samples,
             dt=self.time_step,
             force_backend="cpu",
@@ -1154,6 +1324,10 @@ class RunMetadata(MetadataBase):
             )
 
         window_values, _ = windowfun(self.window_type, N, alpha=self.window_alpha)
+
+        if "data_td_settings" not in sensitivity_kwargs:
+            data_td_settings = self.get_data_td_settings()
+            sensitivity_kwargs["data_td_settings"] = data_td_settings
 
         return sensitivity_class(
             orbits=orbits,
@@ -1216,12 +1390,16 @@ class SourceMetadata(MetadataBase):
     waveform_model: str
     waveform_model_code_link: str
     waveform_model_config: dict  # = dataclasses.field(default_factory=dict)
+    t_0: float
+    t_init: float
+    time_shift_corrected: bool = False
 
     detection_statistic: list[float] = dataclasses.field(default_factory=list)
     quality_flags: list[int] = dataclasses.field(default_factory=list)
 
     prior_model: str = ""
     prior_model_code_link: str = ""
+    prior_model_config_file: str = ""
     prior_model_config: dict = dataclasses.field(default_factory=dict)
 
     posterior_files: list[str] = dataclasses.field(
@@ -1239,6 +1417,7 @@ class StochasticMetadata(MetadataBase):
 
     prior_model: str = ""
     prior_model_code_link: str = ""
+    prior_model_config_file: str = ""
     prior_model_config: dict = dataclasses.field(default_factory=dict)
 
     posterior_files: list[str] = dataclasses.field(
@@ -1261,16 +1440,62 @@ class SubmissionWriter(BackendConsumer):
         backend: HDFBackend | str = None,
         ess: int = 10000,
         detection_criteria: DetectionCriteria = None,
+        run_metadata: RunMetadata = None,
     ):
+        """
+        Args:
+            run_metadata: RunMetadata of an existing submission (e.g. `RunMetadata.from_submission`), to
+                write the posteriors into that submission folder at a later time. If None, a new
+                submission is created from `curr`.
+        """
 
         super().__init__(curr=curr, backend=backend)
 
-        self.original_samples, self.samples, self.inds, self.log_prior, self.log_likelihood = self.process_samples(
-            ess=ess, return_inds=True
-        )
+        # samples are loaded lazily (see `load_samples`), so that the metadata can be written
+        # even if the sample post-processing fails
+        self._ess_submission = ess
 
         self.detection_criteria = detection_criteria or OccupancyDetectionCriteria()
-        self.run_metadata = RunMetadata.from_curr(self.curr)
+        self.run_metadata = run_metadata or RunMetadata.from_curr(self.curr)
+
+    def load_samples(self):
+        """Thin, transform and cache the independent samples for all branches."""
+        (
+            self._original_samples,
+            self._samples,
+            self._inds,
+            self._log_prior,
+            self._log_likelihood,
+        ) = self.process_samples(ess=self._ess_submission, return_inds=True)
+
+    @property
+    def samples_loaded(self) -> bool:
+        return hasattr(self, "_samples")
+
+    def _get_loaded(self, name: str):
+        if not self.samples_loaded:
+            self.load_samples()
+        return getattr(self, name)
+
+    @property
+    def original_samples(self) -> dict:
+        return self._get_loaded("_original_samples")
+
+    @property
+    def samples(self) -> dict:
+        return self._get_loaded("_samples")
+
+    @property
+    def inds(self) -> dict:
+        return self._get_loaded("_inds")
+
+    @property
+    def log_prior(self) -> np.ndarray:
+        return self._get_loaded("_log_prior")
+
+    @property
+    def log_likelihood(self) -> np.ndarray:
+        return self._get_loaded("_log_likelihood")
 
     def prepare_samples_for_submission(self, acs: AnalysisContainerArray):
         """
@@ -1279,12 +1504,19 @@ class SubmissionWriter(BackendConsumer):
         """
 
         for branch in self.branches:
-            prepare_fn = self.prepare_samples_registry.get(branch, None)
-            if prepare_fn:
-                logger.info(f"Preparing samples for branch '{branch}' using '{prepare_fn.__name__}'")
-                self.samples[branch], self.inds[branch] = prepare_fn(
-                    acs, self.original_samples[branch], self.samples[branch], self.inds[branch]
-                )
+            self._prepare_branch_samples(acs, branch)
+
+    def _prepare_branch_samples(self, acs: AnalysisContainerArray, branch: str):
+        """Run the registered preparation function for a single branch, if any."""
+        prepare_fn = self.prepare_samples_registry.get(branch, None)
+        if prepare_fn:
+            logger.info(f"Preparing samples for branch '{branch}' using '{prepare_fn.__name__}'")
+            self.samples[branch], self.inds[branch] = prepare_fn(
+                acs, self.original_samples[branch], self.samples[branch], self.inds[branch]
+            )
+            logger.info(f"Finished preparing samples for branch '{branch}'")
+        else:
+            logger.info(f"No preparation function registered for branch '{branch}'. Skipping.")
 
     def _prepare_mbhb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Sort the MBHB samples according to the coalescence time, and cluster them if there are multiple sources in the same block."""
@@ -1296,13 +1528,65 @@ class SubmissionWriter(BackendConsumer):
         inds = inds[:, sorted_indices]
 
         return samples, inds
-    
+
+    def _prepare_emri_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Sort the EMRI samples according to their initial eccentricity, and cluster them if there are multiple sources in the same block."""
+
+        e0_idx = list(PARAMETER_INFO_REGISTRY["emri"].keys()).index("e0")
+        mean_initial_eccentricities = samples[:, :, e0_idx].mean(axis=0) # shape (nleaves_max,)
+        sorted_indices = np.argsort(mean_initial_eccentricities)
+        samples = samples[:, sorted_indices, :]
+        inds = inds[:, sorted_indices]
+
+        return samples, inds
+
+    def _run_output_corrections(self, branch: str) -> OutputCorrections:
+        """Output corrections of ``branch`` that depend on this run (next to ``_OUTPUT_CORRECTIONS_REGISTRY``)."""
+        if branch == "sobbh":
+            return self._sobbh_output_corrections()
+        return {}
+
+    def _sobbh_output_corrections(self) -> OutputCorrections:
+        """Evolve the SOBBH frequency and phase from the data start to the catalogue reference epoch.
+
+        The gwtf waveform defines the sampled ``f0`` / ``phi0`` at the data start (the inverse of the
+        catalogue seeding of ``SOBHBSearchInterface``); L3C wants them at ``MOJITO_REFERENCE_TIME``.
+        With the block's ``phase_at_coalescence`` the sampled phase is the coalescence phase instead, and
+        the phase at the reference epoch follows from it and the evolved frequency.
+        """
+        from ..sources.utils import evolve_sobhb, sobhb_evolve_frequency_phase, sobhb_reference_phase
+        from .recipe import MOJITO_REFERENCE_TIME
+
+        t_start = float(self.curr.general_info.data_t0)
+        waveform_config = self.curr.source_metadata["sobbh"].waveform_model_config or {}
+        phase_at_coalescence = bool(waveform_config.get("phase_at_coalescence", False))
+
+        names = tuple(_SOBBH_PARAM_INFO[key].l3c_name for key in ("m1", "m2", "s1z", "s2z", "f0", "phi0"))
+
+        def evolve(m1, m2, s1, s2, f0, phase):
+            # unused leaves are NaN: evolve the finite samples only
+            finite = np.all(np.isfinite([m1, m2, s1, s2, f0, phase]), axis=0)
+            f_ref, phi_ref = np.full_like(f0, np.nan), np.full_like(phase, np.nan)
+            if finite.any():
+                intrinsic = (m1[finite], m2[finite], s1[finite], s2[finite])
+                if phase_at_coalescence:
+                    f_ref[finite] = evolve_sobhb(t_start, MOJITO_REFERENCE_TIME, *intrinsic, f0[finite])
+                    phi_ref[finite] = sobhb_reference_phase(*intrinsic, f_ref[finite], phase[finite])
+                else:
+                    f_ref[finite], phi_ref[finite] = sobhb_evolve_frequency_phase(
+                        *intrinsic, f0[finite], phase[finite], t_start=t_start, t_end=MOJITO_REFERENCE_TIME,
+                    )
+            return m1, m2, s1, s2, f_ref, phi_ref
+
+        logger.info(f"SOBBH f0/phi0 are evolved from t={t_start} to MOJITO_REFERENCE_TIME={MOJITO_REFERENCE_TIME}")
+        return {names: evolve}
+
     def _prepare_gb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare GB samples for submission running the clustering algorithm.
         """
         try:
-            import cupy as cp
+            import cupy as cp #type: ignore
         except ImportError:
             raise ImportError("cupy is required for GB clustering. Please install cupy to use this feature.")
         
@@ -1311,7 +1595,7 @@ class SubmissionWriter(BackendConsumer):
         from lisatools.globalfit.state import GBState
 
         gb_info = self.curr.source_info["gb"]
-        gb_wave_gen = GBGPU(**gb_info.initialize_kwargs)
+        gb_wave_gen = GBGPU(**gb_info.waveform.initialize_kwargs)
         gb_wave_gen.gpus = self.curr.general_info.gpus[:1] # use only one GPU for the clustering
 
         cluster_kwargs = dict(
@@ -1343,7 +1627,7 @@ class SubmissionWriter(BackendConsumer):
             acs.f_arr,
             gb_info.transform,
             gb_wave_gen,
-            gb_info.waveform_kwargs.copy(),
+            gb_info.waveform.waveform_kwargs,
             cp.asarray(gb_info.band_edges),
             gb_info.band_N_vals,
             reader,
@@ -1393,6 +1677,7 @@ class SubmissionWriter(BackendConsumer):
         return {
             "mbh": self._prepare_mbhb_samples,
             "gb": self._prepare_gb_samples,
+            "emri": self._prepare_emri_samples,
         }
 
     def _get_mbhb_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
@@ -1417,6 +1702,23 @@ class SubmissionWriter(BackendConsumer):
         yyyyy = f"{mean_frequency_microhz}"
 
         return f"{xxxxx}_{yyyyy}"
+
+    def _get_emri_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
+        """Get a label for an EMRI source based on its initial eccentricity."""
+        
+        e0_idx = list(PARAMETER_INFO_REGISTRY["emri"].keys()).index("e0")
+        mean_initial_eccentricity = leaf_samples[:, e0_idx].mean()
+        mean_initial_eccentricity_scaled = int(mean_initial_eccentricity * 1e3)  
+
+        xxxxx = f"{leaf_index:05d}"
+        yyyyy = f"{mean_initial_eccentricity_scaled}"
+
+        return f"{xxxxx}_{yyyyy}"
+
+    def _get_sobbh_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
+        """Get a label for a SOBBH source based on its catalog ordering."""
+
+        return f"{leaf_index:05d}"
     
     @property
     def get_source_label_registry(self) -> dict[str, Callable]:
@@ -1427,6 +1729,8 @@ class SubmissionWriter(BackendConsumer):
         return {
             "mbh": self._get_mbhb_label,
             "gb": self._get_gb_label,
+            "emri": self._get_emri_label,
+            "sobbh": self._get_sobbh_label,
         }
 
     @property
@@ -1435,7 +1739,9 @@ class SubmissionWriter(BackendConsumer):
         # for Mojito light, we don't have any known injections, so we return an empty list for each source type
         return {
             'mbh': _MOJITO_LIGHT_MBH_ORDER, 
-            'gb': []
+            'gb': [],
+            'emri': _MOJITO_LIGHT_EMRI_ORDER,
+            'sobbh': _MOJITO_LIGHT_SOBHB_ORDER
             }
 
 
@@ -1470,22 +1776,92 @@ class SubmissionWriter(BackendConsumer):
 
             self._relative_folders[branch] = subfolder_name # we store the relative path to the posterior folder, to be included in the metadata and used in the output files
 
+    @property
+    def stochastic_branches(self) -> list[str]:
+        """Stochastic branches (psd and/or galfor) present in this run; they are saved together."""
+        return [b for b in _STOCHASTIC_BRANCHES if b in self.branches]
+
+    @property
+    def resolvable_branches(self) -> list[str]:
+        """Branches whose leaves are saved as individual resolvable sources."""
+        return [b for b in self.branches if b not in _STOCHASTIC_BRANCHES]
+
     def save_posteriors(self):
         """Save the posterior samples for each detected source in the required format."""
         from tqdm import tqdm
 
-        self._save_stochastic_posterior()  
-        branches_resolvable = self.branches.copy()
-
-        for key in _STOCHASTIC_BRANCHES:
-            if key in branches_resolvable:
-                branches_resolvable.remove(key)
+        self._save_stochastic_posterior()
 
         # todo need a way to have ids
-        for branch in tqdm(branches_resolvable, desc="Saving posteriors for resolvable sources"):
+        for branch in tqdm(self.resolvable_branches, desc="Saving posteriors for resolvable sources"):
             logger.info(f"Saving posteriors for branch {branch}")
 
             self._save_source_posterior(branch)
+
+    def _source_parameter_info(self, branch: str) -> Tuple[list[str], list[str]]:
+        """Return the L3C parameter names and units for a resolvable branch."""
+        parameter_info: list[ParameterInfo] = list(PARAMETER_INFO_REGISTRY[branch].values())
+        return [p.l3c_name for p in parameter_info], [p.unit for p in parameter_info]
+
+    def _write_source_metadata(
+        self,
+        branch: str,
+        metadata: SourceMetadata,
+        posterior_files_map: dict[str, str],
+        detections: list[dict],
+    ):
+        """Write the h5 and json metadata files for a resolvable branch."""
+
+        source_name = source_types_names[branch]
+        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_{self.run_metadata.submission_timestamp}"
+
+        metadata_h5_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
+        )
+        metadata_json_filepath = os.path.join(
+            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
+        )
+
+        with h5py.File(metadata_h5_filepath, "w") as f:
+            source_group = f.create_group(name="sources")
+            posterior_group = source_group.create_group(name="posterior_files")
+
+            for j, (source_idx, posterior_file_path) in enumerate(posterior_files_map.items()):
+                posterior_group.create_dataset(source_idx, data=str(posterior_file_path))
+
+            source_group.create_dataset(
+                "detection", data=detections_to_structured_array(detections)
+            )
+
+            _save_metadata_attributes(f, metadata)
+
+        # copy prior file in the submission folder if it exists
+        if metadata.prior_model_config_file:
+            prior_file_path = os.path.join(self.curr.general_info.artifacts_file_dir, metadata.prior_model_config_file)
+            if os.path.exists(prior_file_path):
+                prior_file_dest = os.path.join(self.run_metadata.submission_folder, metadata.prior_model_config_file)
+                if not os.path.exists(prior_file_dest):
+                    shutil.copy(prior_file_path, prior_file_dest)
+                    logger.info(f"Copied prior model config file '{metadata.prior_model_config_file}' to submission folder.")
+                else:
+                    logger.info(f"Prior model config file '{metadata.prior_model_config_file}' already exists in submission folder. Skipping copy.")
+
+        logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
+
+        metadata.to_json(metadata_json_filepath)
+        logger.info(f"Saved metadata for branch '{branch}' to {metadata_json_filepath}")
+
+    def _write_source_metadata_skeleton(self, branch: str, extra_comment: str = _POSTERIORS_PENDING):
+        """Write the sample-independent metadata for a resolvable branch, with no detections."""
+
+        metadata: SourceMetadata = deepcopy(self.curr.source_metadata[branch])
+        metadata.comment = f"{metadata.comment} {extra_comment}".strip()
+        metadata.parameter_info, metadata.parameter_units = self._source_parameter_info(branch)
+        metadata.detection_statistic = []
+        metadata.detections = []
+        metadata.posterior_files = []
+
+        self._write_source_metadata(branch, metadata, {}, [])
 
     def _save_source_posterior(self, branch: str):
         """Save the posterior samples for a single detected source type, identified by `branch`."""
@@ -1494,11 +1870,7 @@ class SubmissionWriter(BackendConsumer):
         samples = self.samples[branch]
         inds = self.inds[branch]
 
-        parameter_info: list[ParameterInfo] = list(PARAMETER_INFO_REGISTRY[branch].values())
-
-        parameter_names = [p.l3c_name for p in parameter_info]
-        latex_names = [p.latex_name for p in parameter_info]
-        units = [p.unit for p in parameter_info]
+        parameter_names, units = self._source_parameter_info(branch)
 
         metadata: SourceMetadata = self.curr.source_metadata[branch]
 
@@ -1509,6 +1881,8 @@ class SubmissionWriter(BackendConsumer):
 
         posterior_files_map: dict[str, str] = {}
         label_to_statistic: dict[str, float] = {}
+
+        extra_corrections = self._run_output_corrections(branch)
 
         num_leaves = samples.shape[1]
         for leaf_count in range(0, num_leaves, MAX_SOURCES_PER_BATCH):
@@ -1534,6 +1908,7 @@ class SubmissionWriter(BackendConsumer):
                         branch=branch,
                         log_prior=self.log_prior,
                         log_likelihood=self.log_likelihood,
+                        extra_corrections=extra_corrections,
                     )
                     _save_posterior_dataset(f, source_label, leaf_samples)
 
@@ -1557,91 +1932,92 @@ class SubmissionWriter(BackendConsumer):
             })
 
         metadata.detection_statistic = list(label_to_statistic.values())
-        
+
         metadata.detections = detections
 
         metadata.posterior_files = list(posterior_files_map.values())
 
         # now save the metadata for this source
-        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{source_name}_{self.run_metadata.submission_timestamp}"
+        self._write_source_metadata(branch, metadata, posterior_files_map, detections)
 
+    def _build_stochastic_metadata(self, extra_comment: str = "") -> Tuple[StochasticMetadata, list[str]]:
+        """Build the combined StochasticMetadata (sample-independent) and the parameter names."""
+
+        branches_here = self.stochastic_branches
+        parameter_info = []
+        metadata_list = []
+
+        for branch in branches_here:
+            if branch == "psd":
+                _parameter_info = _noise_param_info(self.curr.general_info.sensitivity_backend)
+            else:
+                _parameter_info = list(PARAMETER_INFO_REGISTRY[branch].values())
+            parameter_info.extend(_parameter_info)
+            metadata_list.append(self.curr.source_metadata[branch])
+
+        parameter_names = [p.l3c_name for p in parameter_info]
+        units = [p.unit for p in parameter_info]
+        comments = [m.comment for m in metadata_list if m.comment]
+        if extra_comment:
+            comments.append(extra_comment)
+        metadata: StochasticMetadata = StochasticMetadata(
+            model_config={branch: metadata_list[i].model_config for i, branch in enumerate(branches_here)},
+            frequency_ranges=metadata_list[0].frequency_ranges,  # we assume the same frequency ranges for all stochastic branches; this can be relaxed if needed
+            prior_model=" ,".join(set(m.prior_model for m in metadata_list)),
+            prior_model_code_link=" ,".join(set(m.prior_model_code_link for m in metadata_list)),
+            prior_model_config_file=" ,".join(set(m.prior_model_config_file for m in metadata_list)),
+            prior_model_config={branch: metadata_list[i].prior_model_config for i, branch in enumerate(branches_here)},
+            comment=" ,".join(comments)
+        )
+
+        metadata.parameter_info = parameter_names
+        metadata.parameter_units = units
+
+        return metadata, parameter_names
+
+    def _write_stochastic_metadata(self, metadata: StochasticMetadata, posterior_filepath: str):
+        """Write the h5 and json metadata files for the stochastic component."""
+
+        effective_branch_name = "noise" #todo or stochastic?
+        metadata.posterior_file = posterior_filepath # we store the relative path to the posterior file in the metadata
+        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{effective_branch_name}_{self.run_metadata.submission_timestamp}"
         metadata_h5_filepath = os.path.join(
             self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
         )
         metadata_json_filepath = os.path.join(
             self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
         )
-
         with h5py.File(metadata_h5_filepath, "w") as f:
-            source_group = f.create_group(name="sources")
-            posterior_group = source_group.create_group(name="posterior_files")
+            noise_group = f.create_group(name=effective_branch_name)
+            posterior_group = noise_group.create_group(name="posterior_file")
+            posterior_group.create_dataset("posterior", data=str(posterior_filepath))
+            _save_metadata_attributes(noise_group, metadata)
 
-            for j, (source_idx, posterior_file_path) in enumerate(posterior_files_map.items()):
-                posterior_group.create_dataset(source_idx, data=str(posterior_file_path))
-
-            source_group.create_dataset(
-                "detection", data=detections_to_structured_array(detections)
-            )
-
-            _save_metadata_attributes(f, metadata)
-
-        logger.info(f"Saved metadata for branch '{branch}' to {metadata_h5_filepath}")
+        logger.info(f"Saved metadata for stochastic branch(es) to {metadata_h5_filepath}")
 
         metadata.to_json(metadata_json_filepath)
-        logger.info(f"Saved metadata for branch '{branch}' to {metadata_json_filepath}")
+        logger.info(f"Saved metadata for  stochastic branch(es) to {metadata_json_filepath}")
 
+    def _write_stochastic_metadata_skeleton(self, extra_comment: str = _POSTERIORS_PENDING):
+        """Write the sample-independent stochastic metadata, with no posterior file."""
+        if not self.stochastic_branches:
+            return
+        metadata, _ = self._build_stochastic_metadata(extra_comment=extra_comment)
+        self._write_stochastic_metadata(metadata, "")
 
     def _save_stochastic_posterior(self):
         """Save the posterior samples for the stochastic component, if applicable."""
 
-        if "psd" not in self.branches and "galfor" not in self.branches:
+        if not self.stochastic_branches:
             logger.info("No stochastic component detected in the branches. Skipping stochastic posterior saving.")
             return
 
-        # check if both psd and galfor are present and store everything together
-        elif "psd" in self.branches and "galfor" in self.branches:
-            branches_here = ["psd", "galfor"]
+        # if both psd and galfor are present, everything is stored together
+        branches_here = self.stochastic_branches
 
-        # if only one of them is present, we save it as the stochastic posterior
-        else:
-            branch = "psd" if "psd" in self.branches else "galfor"
-            branches_here = [branch]
-        
-        samples, inds = [], []
-        parameter_info = []
-        metadata_list = []
+        samples = np.concatenate([self.samples[branch] for branch in branches_here], axis=-1)
 
-        for branch in branches_here:
-            _samples = self.samples[branch]
-            _inds = self.inds[branch]
-            if branch == "psd":
-                _parameter_info = _noise_param_info(self.curr.general_info.sensitivity_backend)
-            else:
-                _parameter_info = list(PARAMETER_INFO_REGISTRY[branch].values())
-            _metadata = self.curr.source_metadata[branch]
-
-            samples.append(_samples)
-            inds.append(_inds)
-            parameter_info.extend(_parameter_info)
-            metadata_list.append(_metadata)
-            
-        samples = np.concatenate(samples, axis=-1)
-        inds = np.concatenate(inds, axis=-1)
-
-        parameter_names = [p.l3c_name for p in parameter_info]
-        latex_names = [p.latex_name for p in parameter_info]
-        units = [p.unit for p in parameter_info]
-        metadata: StochasticMetadata = StochasticMetadata(
-            model_config={branch: metadata_list[i].model_config for i, branch in enumerate(branches_here)},
-            frequency_ranges=metadata_list[0].frequency_ranges,  # we assume the same frequency ranges for all stochastic branches; this can be relaxed if needed
-            prior_model=" ,".join(set(m.prior_model for m in metadata_list)),
-            prior_model_code_link=" ,".join(set(m.prior_model_code_link for m in metadata_list)),
-            prior_model_config={branch: metadata_list[i].prior_model_config for i, branch in enumerate(branches_here)},
-            comment=" ,".join(m.comment for m in metadata_list if m.comment)
-        )
-
-        metadata.parameter_info = parameter_names
-        metadata.parameter_units = units
+        metadata, parameter_names = self._build_stochastic_metadata()
 
         if samples.shape[1] > 1:
             raise NotImplementedError("multiple leaves detected, not implemented yet")
@@ -1672,26 +2048,9 @@ class SubmissionWriter(BackendConsumer):
             posterior_samples = np.stack([samples_dict[param] for param in physical_param_names], axis=-1) # we extract the posterior samples as a 2D array of shape (nsamples, npars) for convenience. These do not include the logprior and loglikelihood, which are stored separately.
             group.create_dataset("p", data=posterior_samples)
             group.create_dataset("logprior", data=samples_dict["logprior"])
-            group.create_dataset("loglikelihood", data=samples_dict["loglikelihood"]) 
+            group.create_dataset("loglikelihood", data=samples_dict["loglikelihood"])
 
-        metadata.posterior_file = filepath # we store the relative path to the posterior file in the metadata        
-        metadata_base_filename = f"{self.run_metadata.run_type}_{self.run_metadata.global_fit_codename}_{self.run_metadata.run_id}_{effective_branch_name}_{self.run_metadata.submission_timestamp}"
-        metadata_h5_filepath = os.path.join(
-            self.run_metadata.submission_folder, f"{metadata_base_filename}.h5"
-        )
-        metadata_json_filepath = os.path.join(
-            self.run_metadata.submission_folder, f"{metadata_base_filename}.json"
-        )
-        with h5py.File(metadata_h5_filepath, "w") as f:
-            noise_group = f.create_group(name=effective_branch_name)
-            posterior_group = noise_group.create_group(name="posterior_file")
-            posterior_group.create_dataset("posterior", data=str(filepath))
-            _save_metadata_attributes(noise_group, metadata)
-
-        logger.info(f"Saved metadata for stochastic branch(es) to {metadata_h5_filepath}")
-
-        metadata.to_json(metadata_json_filepath)
-        logger.info(f"Saved metadata for  stochastic branch(es) to {metadata_json_filepath}")
+        self._write_stochastic_metadata(metadata, filepath)
 
     def save_data_and_residuals(self, acs: AnalysisContainerArray):
         """Save the input data and residuals to h5 files in the submission folder."""
@@ -1707,19 +2066,130 @@ class SubmissionWriter(BackendConsumer):
         save_residuals(acs, residuals_filepath)
         logger.info(f"Saved residuals to {residuals_filepath}")
 
-    def write_submission(self, acs: AnalysisContainerArray):
-        """Run the full submission writing pipeline."""
-        self.create_folders()
-        self.prepare_samples_for_submission(acs)
-        self.save_posteriors()
-
-        # finally save the overall run metadata
+    def _write_run_metadata(self):
         run_metadata_filepath = os.path.join(self.submission_folder, "global_metadata.json")
         self.run_metadata.to_json(run_metadata_filepath)
         logger.info(f"Saved overall run metadata to {run_metadata_filepath}")
 
+    def write_metadata(self, acs: AnalysisContainerArray):
+        """
+        Phase A: write everything that does not depend on the posterior samples
+        (run metadata, per-branch metadata without detections, input data and residuals).
+        """
+        self.create_folders()
+        # filled by `write_posteriors` as the posteriors of each source type are written
+        self.run_metadata.found_source_types_list = []
+        self._write_run_metadata()
         self.save_data_and_residuals(acs)
 
+        # a broken branch must not prevent the metadata of the others from being written
+        for branch in self.resolvable_branches:
+            try:
+                self._write_source_metadata_skeleton(branch)
+            except Exception:
+                logger.exception(f"Could not write the metadata for branch '{branch}'")
+        try:
+            self._write_stochastic_metadata_skeleton()
+        except Exception:
+            logger.exception("Could not write the metadata for the stochastic branch(es)")
+
+    def write_posteriors(self, acs: AnalysisContainerArray, branches: list[str] | None = None):
+        """
+        Phase B: process the samples and save posteriors + full metadata, one unit at a time.
+
+        The stochastic branches form a single unit; each resolvable branch is its own unit.
+        A failing unit is logged and recorded in its metadata comment, and the remaining units are
+        still processed. A summary RuntimeError is raised at the end if any unit failed.
+
+        Args:
+            acs: AnalysisContainerArray at the end of the run (used by the GB clustering).
+            branches: only post-process the units containing these branches (default: all). The
+                other units are left untouched, so they can be post-processed at a later time.
+        """
+        if not hasattr(self, "_relative_folders"):
+            self.create_folders()
+
+        units = [b for b in self.resolvable_branches if branches is None or b in branches]
+        if self.stochastic_branches and (
+            branches is None or any(b in branches for b in self.stochastic_branches)
+        ):
+            units.append("stochastic")
+
+        failures: dict[str, str] = {}
+
+        def _record_failure(unit: str, exc: Exception):
+            logger.exception(f"Post-processing failed for '{unit}'")
+            msg = f"postprocessing failed: {type(exc).__name__}: {exc}"
+            failures[unit] = msg
+            try:
+                if unit == "stochastic":
+                    self._write_stochastic_metadata_skeleton(extra_comment=msg)
+                else:
+                    self._write_source_metadata_skeleton(unit, extra_comment=msg)
+            except Exception:
+                logger.exception(f"Could not record the failure in the metadata of '{unit}'")
+
+        to_process = list(units)
+        if to_process:
+            try:
+                # thinning is shared across branches (joint ACT), so it cannot be split per unit
+                self.load_samples()
+            except Exception as exc:
+                for unit in to_process:
+                    _record_failure(unit, exc)
+                to_process = []
+
+        for unit in to_process:
+            try:
+                if unit == "stochastic":
+                    self._save_stochastic_posterior()
+                else:
+                    self._prepare_branch_samples(acs, unit)
+                    logger.info(f"Saving posteriors for branch {unit}")
+                    self._save_source_posterior(unit)
+            except Exception as exc:
+                _record_failure(unit, exc)
+
+        # only list the source types whose posteriors have been written, by this call or an earlier one
+        def _unit_types(unit_list):
+            unit_branches = [b for b in unit_list if b != "stochastic"]
+            if "stochastic" in unit_list:
+                unit_branches += self.stochastic_branches
+            return {source_types_names.get(b) for b in unit_branches}
+
+        failed_types = _unit_types([u for u in units if u in failures])
+        found = (
+            set(self.run_metadata.found_source_types_list)
+            | _unit_types([u for u in units if u not in failures])
+        ) - failed_types
+        self.run_metadata.found_source_types_list = [
+            s for s in self.run_metadata.searched_source_types_list if s in found
+        ]
+        self._write_run_metadata()
+
+        if failures:
+            summary = "; ".join(f"{unit}: {msg}" for unit, msg in failures.items())
+            raise RuntimeError(f"Submission post-processing failed for {len(failures)} unit(s): {summary}")
+
+    def write_submission(self, acs: AnalysisContainerArray, defer: list[str] | None = None):
+        """
+        Run the full submission writing pipeline: metadata first, then the posteriors.
+
+        Args:
+            defer: branches whose posteriors are not written now (their metadata says
+                "posteriors pending"); write them later with `write_posteriors(acs, branches=defer)`
+                on a writer built with `run_metadata=RunMetadata.from_submission(...)`, see
+                scripts/postprocess_submission.py.
+        """
+        self.write_metadata(acs)
+        if defer:
+            # the stochastic branches are written together, so deferring one defers all of them
+            if any(b in defer for b in self.stochastic_branches):
+                defer = list(defer) + [b for b in self.stochastic_branches if b not in defer]
+            logger.info(f"Posteriors deferred for branches {defer}")
+            self.write_posteriors(acs, branches=[b for b in self.branches if b not in defer])
+        else:
+            self.write_posteriors(acs)
 
 
 # === Save residuals ====

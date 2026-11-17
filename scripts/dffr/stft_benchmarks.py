@@ -1,9 +1,10 @@
-"""Wall-time benchmarks of the seven STFT GB methods of ``gbgpu.gbcomps.STFTGBComputations``.
+"""Wall-time benchmarks of the eight STFT GB methods of ``gbgpu.gbcomps.STFTGBComputations``.
 
-Times ``get_ll_stft``, ``get_swap_ll_stft``, ``get_fstat_ll_stft``, ``fill_global_stft``,
-``get_ll_grad_stft``, ``get_swap_ll_grad_stft`` and ``information_matrix`` against batch size on
-a production fixture of ``stft_fixtures.py``; ``information_matrix`` on all nine parameters, and
-as ``information_matrix_test_inds`` on the eight that the GB proposal of the global fit asks for.
+Times ``get_ll_stft``, ``get_swap_ll_stft``, ``get_fstat_ll_stft``, ``get_fstat_terms_stft`` (DFFR
+only), ``fill_global_stft``, ``get_ll_grad_stft``, ``get_swap_ll_grad_stft`` and
+``information_matrix`` against batch size on a production fixture of ``stft_fixtures.py``;
+``information_matrix`` on all nine parameters, and as ``information_matrix_test_inds`` on the
+eight that the GB proposal of the global fit asks for.
 Each point is one warm-up call followed by ``--repeats`` timed calls; on the GPU the device is
 synchronised before each clock reading. The times include the Python work of each method, which
 the global fit pays as well. ``--response`` selects the response. ``--dffr-rows`` times the DFFR
@@ -34,12 +35,15 @@ METHODS = (
     "get_ll_stft",
     "get_swap_ll_stft",
     "get_fstat_ll_stft",
+    "get_fstat_terms_stft",
     "fill_global_stft",
     "get_ll_grad_stft",
     "get_swap_ll_grad_stft",
     "information_matrix",
     "information_matrix_test_inds",
 )
+#: Methods the DFFR response alone provides.
+DFFR_ONLY_METHODS = ("get_fstat_terms_stft",)
 #: The parameters the GB proposal of the global fit samples (``test_inds`` of its transform):
 #: every parameter but fddot, which is filled.
 TEST_INDS = [0, 1, 2, 4, 5, 6, 7, 8]
@@ -61,6 +65,7 @@ def method_calls(fixture, batch_size):
             params, params_partner, **likelihood_indices
         ),
         "get_fstat_ll_stft": lambda: comp.get_fstat_ll_stft(params, **likelihood_indices),
+        "get_fstat_terms_stft": lambda: comp.get_fstat_terms_stft(params, **likelihood_indices),
         "fill_global_stft": lambda: comp.fill_global_stft(
             params, templates, data_index=cells, start_freq_inds=starts
         ),
@@ -139,10 +144,18 @@ def main(argv=None):
         help="first_order_delays of the DFFR comp in place of the fixture's setting, for an A/B of "
         "the two (--response dffr only)",
     )
+    parser.add_argument(
+        "--window",
+        choices=("symmetric", "periodic"),
+        default="symmetric",
+        help="Tukey window of the templates: the data's symmetric one, or the periodic one",
+    )
     parser.add_argument("--output", required=True, metavar="OUT_JSON")
     args = parser.parse_args(argv)
     if args.without_swap:
         args.methods = [method for method in args.methods if "swap" not in method]
+    if args.response != "dffr":
+        args.methods = [method for method in args.methods if method not in DFFR_ONLY_METHODS]
     for option in ("dffr_rows", "dffr_fisher_rows", "dffr_first_order_delays"):
         if getattr(args, option) is not None and args.response != "dffr":
             parser.error(f"--{option.replace('_', '-')} needs --response dffr")
@@ -154,6 +167,7 @@ def main(argv=None):
         num_segments=args.num_segments,
         num_sources=max(args.batch_sizes),
         response=args.response,
+        use_sym_window=args.window == "symmetric",
     )
     # * An instance attribute shadows the class constant for this comp only.
     if args.dffr_rows is not None:
@@ -188,6 +202,7 @@ def main(argv=None):
         metadata=fixtures.run_metadata(args.backend, args.mojito_l1),
         config=args.config,
         response=args.response,
+        window=args.window,
         dffr_rows=args.dffr_rows,
         dffr_fisher_rows=args.dffr_fisher_rows,
         dffr_first_order_delays=args.dffr_first_order_delays,

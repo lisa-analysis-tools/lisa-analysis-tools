@@ -43,8 +43,14 @@ public:
                    double dt, double df,
                    array_type<std::complex<double>> data_arr,
                    array_type<std::complex<double>> invC_arr,
-                   int num_data, int num_noise, int tdi_type)
+                   int num_data, int num_noise, int tdi_type,
+                   int num_freqs_noise = -1, bool noise_full_grid = false)
     {
+        // ! A full-grid noise row must hold every window of the data rows, or the kernels read past it.
+        if (noise_full_grid && num_freqs_noise < num_freqs)
+            throw std::invalid_argument(
+                "STFTDomainWrap: full-grid noise rows (num_freqs_noise) must be at least as "
+                "wide as the data rows (num_freqs).");
         cmplx *data_ptr = reinterpret_cast<cmplx*>(
             return_pointer_no_check(data_arr));
         cmplx *invC_ptr = reinterpret_cast<cmplx*>(
@@ -53,7 +59,8 @@ public:
         domain = new STFTDomain(num_times, num_freqs, num_channels,
                                 t0, f_min, f_max, dt, df,
                                 data_ptr, invC_ptr,
-                                num_data, num_noise, tdi_type);
+                                num_data, num_noise, tdi_type,
+                                num_freqs_noise, noise_full_grid);
     }
 
     ~STFTDomainWrap() {
@@ -155,11 +162,24 @@ public:
     STFTFresnelWrap(int num_times, int num_freqs, int num_channels,
                     double t0, double f_min, double f_max,
                     double dt, double df, double window_alpha = 0.0,
-                    bool use_midpoint = false, bool linear_envelope = false)
+                    bool use_midpoint = false, bool linear_envelope = false,
+                    int window_samples = 0, double sample_cadence = 0.0)
     {
+        // ! The symmetric window spans (N - 1) h only if its N samples fill the segment exactly.
+        if (window_samples != 0) {
+            if (window_samples < 2)
+                throw std::invalid_argument(
+                    "STFTFresnel: window_samples must be zero or at least two.");
+            if (!(sample_cadence > 0.0))
+                throw std::invalid_argument("STFTFresnel: sample_cadence must be positive.");
+            if (!(std::fabs(window_samples * sample_cadence - dt) <= 1.0e-12 * dt))
+                throw std::invalid_argument(
+                    "STFTFresnel: window_samples * sample_cadence must equal dt to within 1e-12.");
+        }
         fresnel = new STFTFresnel(num_times, num_freqs, num_channels,
                                   t0, f_min, f_max, dt, df, window_alpha,
-                                  use_midpoint, linear_envelope);
+                                  use_midpoint, linear_envelope, window_samples,
+                                  sample_cadence);
     }
 
     ~STFTFresnelWrap() { delete fresnel; }

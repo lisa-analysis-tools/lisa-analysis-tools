@@ -1,0 +1,55 @@
+type: gb
+priors: {class: mojitolight.GBPrior}  # its f0 range sets the bands; the setup clips it to the proposed (interior) bands
+# The most sources at once per walker: the 6616 start candidates and room for births, as mojito_galaxy_psd_v1 (the
+# user's choice of 2026-11-15). The F-statistic search on the MBHB residual ended at 7885 sources in one walker.
+nleaves: 8000
+num_prop_repeats: 50  # in-model repeats per propose, decided for these runs
+waveform:
+  class: GBGPU
+  runtime_kwargs: {oversample: 4, tdi_channel_setup: XYZ, tdi2: true}
+# DFFR with first-order delays, as the last full run and every DFFR run of the GB memory effort
+stft: {n_side_bins: 16, response: dffr, linear_envelope: true, use_midpoint: true, first_order_delays: true}
+# the ladder: beta = 1 / 1.2^k for the 11 coldest rungs, the hottest of the 12 at T = 10 (decided for these runs)
+tempering: {ratio: 1.2, Tmax: 10}
+pe_move:
+  class: GBSpecialRJPriorMove
+  # The values of the kept steps: every in-model proposal a Fisher-matrix one, the matrices held for 50 blocks. The
+  # recipe file sets the stretch to 0.5 and the refresh to every block for the burn-in (user, 2026-11-05).
+  kwargs:
+    stretch_probability: 0.0
+    num_stationary_fim_steps: 50
+    run_swaps: true
+    use_prior_removal: false
+    phase_maximize: false
+    ranks_needed: 0
+# * The F-statistic search move takes turns with the prior move, each propose picking one by its share of the stage's
+# * iterations (burn-in 0.4, kept steps 0.2); the prior move takes the rest. The move takes the pe_move's in-model knobs.
+# * It searches at every use (search_interval 1, the class default) and saves a summary record of every search.
+# * A band above 6 mHz or below 0.6 mHz (the class defaults of the two thresholds) is shut off after 5 searches in a
+# * row without a detection: the user's value of 2026-11-11, in place of the class default of 2.
+extra_moves:
+  fstat:
+    class: GBFStatRJMove
+    weight: 0.2  # kept steps
+    stage_weights: {burn-in: 0.4}  # keyed by the recipe file's step name
+    kwargs:
+      fstat_settings: {search_interval: 1, save_search_records: summary, shutoff_band_iteration: 5}
+  # The F-statistic split and merge: 0.4 of the burn-in, 0.3 of the kept steps. Its search part comes from the search
+  # memory that the GB block builds when no record files are given (design of the search memory).
+  split_merge:
+    class: GBFStatSplitMergeRJMove
+    weight: 0.3  # kept steps
+    stage_weights: {burn-in: 0.4}
+search:
+  search_type: point_estimate  # the candidates file, a catalogue table: one point per source
+  # The galaxy search's candidates, layout version 0.2 (GBs and VGBs in one table, 6616 rows), as mojito_galaxy_psd_v1.
+  # All lie inside the sampled f0 range, so the recipe file subtracts no fixed source (FIXED_SOURCES_FILE is None).
+  search_path: /workspace/rrondeel/erebor_dev/data/gb_candidates.hdf5
+  # ln A, f0 [mHz], fdot, phi0, cos iota, psi, alpha, sin delta; hotter chains are wider (as the last full run)
+  spread: [1e-3, 1e-9, 1e-19, 1e-3, 1e-3, 1e-3, 1e-4, 1e-4]
+  max_resample_tries: 2000
+  # the STFT computations take the parameters at the catalogue epoch, where the sources are
+  kwargs: {evolve_to_data_start: false}
+links:
+  waveform_model_code_link: https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors/blob/fb65c565aea06c62a41ddbe95bb6b40a1a9c04b6/src/ereborpriors/stock/mojitolight/gb.py

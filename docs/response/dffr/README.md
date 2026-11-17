@@ -39,7 +39,7 @@ Measured on one full A100 and on the CPU of SURF Spider; the details and the con
 
 | Quantity | DFFR against the existing response |
 | --- | --- |
-| Speed of the likelihood methods on the A100 (a year of one-day segments, 1000 to 10 000 sources) | 2.1 to 8.8 times faster; `get_ll` 7.7 µs per source instead of 63.5 at 10 000 sources |
+| Speed of the likelihood methods on the A100 (a year of one-day segments, 10 side bins, 1000 to 10 000 sources) | 2.1 to 8.8 times faster; `get_ll` 7.7 µs per source instead of 63.5 at 10 000 sources |
 | Speed of the Fisher matrix on the A100 | 1.6 to 2.0 times faster |
 | Speed of the galactic-binary block of the global fit (56 binaries, 32 walkers, 24 temperatures, one A100) | an iteration in 17.2 min instead of 31.6; the in-model likelihood evaluations 3.4 times faster |
 | Speed on the CPU, one thread | 0.28 to 0.40 of the time in the likelihood methods |
@@ -60,7 +60,7 @@ Measured on one full A100 and on the CPU of SURF Spider; the details and the con
 | LAT | `domaincomputation.py` | `STFTComputationGroup.cpp_kinematics(cpp_orbits)` builds the table on the group's device on first use and keeps it, one per orbits object; `kinematics_fields` returns its arrays. |
 | LAT | `cutils/lat_fresnel.hh` | The Fresnel integrals, their auxiliary functions and the derivatives of these, with DFFR's numerics, shared by `STFTFresnel` and DFFR. The header records its branches, their accuracy and its assumptions. |
 | LAT | `cutils/lat_stft_kernels.hh` | The likelihood kernels, written against a tile of pixels so that both responses feed the same consumers (next section). `ColumnTile` feeds them the existing response; `StftBandBinMap` and the launch path above 48 kB of shared memory serve DFFR. The Fisher kernel of the existing response keeps its own loop. |
-| LAT | `cutils/lat_dffr_kernels.hh` | DFFR settings, the source-model contract, the windowed transform, the closed-form TDI weights of both generations, the segment table, `DFFRTile`, and the DFFR Fisher matrix. The header records the definitions, conventions, accuracy and assumptions. |
+| LAT | `cutils/lat_dffr_kernels.hh` | DFFR settings, the source-model contract, the windowed transform, the closed-form TDI weights of both generations, the segment table, `DFFRTile`, the DFFR Fisher matrix, and the two-template F-statistic of a galactic binary. The header records the definitions, conventions, accuracy and assumptions. |
 | LAT | `response/tdiconfig.py` | `TDIConfig.generation`: 1 or 2 for the stock combinations, `None` otherwise. |
 | LAT | `globalfit/recipe.py` | The optional keys `response` and `first_order_delays` of `gb_stft_kwargs`. |
 | GBGPU | `cutils/gb_physics.hh` | The GB phase, frequency and amplitude formulas, shared by `GBTDIonTheFly` and the DFFR source model. |
@@ -117,7 +117,8 @@ belongs in a template of its own.
 (`stft_comps.cpp_kinematics(cpp_orbits)`) and calls `GBComputationGroupWrap.gb_dffr_get_ll` with
 the data index, the noise index, the parameters, `t_ref`, `n_side_bins`, the TDI generation, the
 envelope, the delays and the window starts; the entry point launches
-`stft_get_ll_launch<DFFRTile<GBDFFRSource, 32>>`. The window settings come from the bound
+`stft_get_ll_launch<DFFRTile<GBDFFRSource, 32, symmetric_window>>`, the instantiation of the
+window that the settings hold (`DFFR_WINDOW_DISPATCH`). The window settings come from the bound
 `STFTFresnel`, the grid and data from `STFTDomain`.
 
 **The Fisher matrix.** `dffr_information_matrix_kernel` is a kernel of its own with the estimator
@@ -132,6 +133,18 @@ the build the tile uses (`dffr_build_rows`); every stencil template equals the t
 `fill_global_stft` writes for its shifted parameters, bit for bit, and the kernel agrees with a
 reference that differences those templates to 3.3e-15 of sqrt(F_ii F_jj). On the GPU a pass holds
 4 segment rows (66 kB of shared memory on 8 parameters, 77 kB on 9); the CPU uses one.
+
+**The two-template F-statistic.** `dffr_get_fstat_kernel`, behind `comp.get_fstat_terms_stft`
+(DFFR only), computes the F-statistic of a galactic binary from two templates, T+ and Tx, the
+templates at A = 2, ι = π/2, φ0 = 0 and ψ = 0 or π/4. The four filters of `get_fstat_ll_stft` are
+T+, -Tx, i T+ and -i Tx, since φ0 enters a template only as exp(-iφ0), so N and M follow from the
+five products (d|T+), (d|Tx), (T+|T+), (Tx|Tx) and (T+|Tx), and 2F from the closed form of the
+same problem with two complex amplitudes. ψ changes no reception state, so Tx is a variant of the
+Fisher matrix's build that reads the states of T+, and a pixel evaluates its windowed sums once for
+both. The kernel contracts the five products itself, in the term order of the swap, rather than
+through `add_ip_swap_contrib`, whose registers would bind it to two blocks per SM. N and M equal
+those assembled from `get_swap_ll_stft(T+, Tx)` bit for bit on the CPU and to rounding on the GPU.
+The method returns N and M in the layout of `get_fstat_ll_stft`, and 2F.
 
 ## How to select it
 
@@ -161,7 +174,8 @@ The floor on the local chirp rate of a reception state is not a setting: DFFR ap
 `STFT_FDOT_FLOOR`, 1e-22 Hz/s, the sign-preserving floor of the existing response, which changes
 the phase by at most π floor (dt / 2)², 6e-13 rad on a one-day segment.
 
-DFFR reads from the bound computation group the taper `window_alpha` of its `STFTFresnel`, the
+DFFR reads from the bound computation group the taper `window_alpha` of its `STFTFresnel` and,
+for the symmetric window, the number N of samples per segment and their spacing h, the
 grid, data and inverse covariance of its `STFTDomain`, its `linear_envelope` and its kinematics
 table. It does not read `T`, `freq_from_tdi_phase` (how the existing response estimates its chirp)
 and for the same reason the `astro_track` argument of `information_matrix`, `use_midpoint` (DFFR
@@ -178,18 +192,34 @@ raises `TypeError`.
 
 These apply to both responses and were measured in the validation.
 
-- Side bins (`n_side_bins`). With the production taper of 0.1157 (1e4 s on a one-day segment), the
-  10 side bins of production leave 1.3e-3 (20 mHz) to 1.7e-3 (0.5 mHz) of a source's noise-weighted
-  power outside the template: a mismatch of 6.4e-4 to 8.8e-4 against time-domain data and a loss
-  of 6 to 9 in ln L at the true parameters for a source of SNR 100. A tone keeps 1.3e-6 to 5.8e-6
-  of its power beyond 30 bins and 4e-8 to 1e-7 beyond 60; the validation used 60. More side bins
-  cost time in proportion to the band, 2 n_side_bins + 1 bins per segment.
+- Side bins (`n_side_bins`). With the production taper of 0.1157 (1e4 s on a one-day segment), 10
+  side bins leave 1.3e-3 (20 mHz) to 1.7e-3 (0.5 mHz) of a source's noise-weighted power outside
+  the template: a mismatch of 6.4e-4 to 8.8e-4 against time-domain data and a loss of 6 to 9 in
+  ln L at the true parameters for a source of SNR 100. A tone keeps 1.3e-6 to 5.8e-6 of its power
+  beyond 30 bins and 4e-8 to 1e-7 beyond 60; the validation used 60. The benchmarks of this effort
+  ran at 10 side bins; the full-band global fit runs 16 (`N_SIDE_BINS` of
+  `galaxy_psd_dffr_global_fit_settings.py`). On an A100 80 GB at 713 segments and 24 000 sources,
+  10 / 12 / 16 side bins cost 15.0 / 17.0 / 20.5 µs per `get_ll`, 12.6 / 14.2 / 17.1 µs per
+  `fill_global` and 514 / 529 / 750 µs per 8-parameter Fisher matrix. The likelihood grows by
+  about 0.46 µs per bin of the 2 n_side_bins + 1 per segment; the Fisher matrix jumps from 12 to 16,
+  where a pass of 4 segment rows exceeds the 128 threads of a block. The GB move therefore computes
+  its Fisher matrix at 12 side bins (`FISHER_N_SIDE_BINS`), 4e-4 smaller than at 16 with the same
+  shape, and keeps the settings' side bins for every likelihood.
 - The window taper. A taper of 1/(14 mHz) = 71 s, as the tracked high-frequency settings had,
   leaves up to 1.9e-2 of a tone's power outside 10 side bins; 1e4 s leaves 1.4e-3. The taper also
   sets the width of the store windows and so the memory per cell of the GB block.
-- The window convention. The global fit windows the data with LAT's symmetric Tukey window, both
-  responses integrate the periodic one; the difference is a flat mismatch of 3.6e-8 and 6.3e-5 per
-  segment, four orders of magnitude below the side bins above. Production keeps its window.
+- The window convention. The global fit windows the data with LAT's Tukey window (`tukey()`,
+  scipy's `sym=True`), zero on the first and the last of a segment's N samples and (N - 1) h long.
+  Since 2026-11-16 both responses integrate this symmetric window by default
+  (`STFTComputationGroup(use_sym_window=True)`), with N and h from the settings' `sample_cadence`,
+  which `get_stft_settings` sets; a tapered group without it raises. `use_sym_window=False` gives
+  the periodic window (scipy's `sym=False`, N h long) that both integrated before. Against a
+  30-day time-domain truth, templates of the data's window match as before: a flat mismatch of
+  6.5e-10 to 1.2e-9 for DFFR in either window. Templates of the other window leave 3.5e-8 to 3.8e-8
+  and a median segment error of 6.2e-5 to 1.0e-4, which production carried until then. The
+  symmetric window costs DFFR 1.6 % in `get_ll` and 3.6 % in `fill_global` (365 segments, 1024
+  sources, an A100 MIG slice) and the existing response nothing; the periodic window runs as fast
+  as before.
 - `linear_envelope`. With it, DFFR and the existing response agree to a median mismatch of 5.6e-10
   on the production fixtures; without it each holds the amplitude constant over a segment in its
   own way, and they differ by about 1e-5. The TDI generation changes nothing between them. Since
