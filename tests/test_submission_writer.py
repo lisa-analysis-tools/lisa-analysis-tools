@@ -28,6 +28,8 @@ def _source_metadata(source_type):
         waveform_model="test",
         waveform_model_code_link="",
         waveform_model_config={},
+        t_0=0.0,
+        t_init=0.0,
     )
 
 

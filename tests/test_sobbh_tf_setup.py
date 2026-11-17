@@ -222,6 +222,27 @@ class SOBBHBlockPhaseTest(unittest.TestCase):
             self.assertIs(block.td_generator().init_kwargs["phase_at_coalescence"], flag)
             self.assertEqual(block.search_interface_kwargs(), {"phase_at_coalescence": flag})
 
+    def test_frequency_ranges_follow_the_leaf_priors(self):
+        general = SimpleNamespace(start_freq=1e-3, end_freq=1e-1)
+        info = {"priors": {"sobbh": SOBHBPrior.prior_factory()}}
+        ids = [4, 0, 2]
+        ctx = SimpleNamespace(general=general, cfg=SimpleNamespace(data=SimpleNamespace(source_ids={"sobhb": ids})))
+        self.assertEqual(self.block().frequency_ranges(ctx, info), [(1e-3, 1e-1)])
+
+        block = self.block(nleaves="auto", proposal_priors={"class": "mojitolight.SOBHBPrior"})
+        tiles = SOBHBPrior.per_source_prior_factory()
+        expected = [(tiles[i].priors_in["f0"].minimum, tiles[i].priors_in["f0"].maximum) for i in sorted(ids)]
+        self.assertEqual(block.frequency_ranges(ctx, info), expected)
+
+    def test_metadata_comment_documents_the_epoch_conversion(self):
+        for raw, phase in (({}, "orbital phase at the data start"), ({"phase_at_coalescence": True}, "coalescence phase")):
+            comment = self.block(**raw).metadata_comment(None)
+            self.assertIn("MOJITO_REFERENCE_TIME", comment)
+            self.assertIn(f"and the {phase}.", comment)
+            self.assertNotIn("frequency ranges", comment)
+        block = self.block(nleaves="auto", proposal_priors={"class": "mojitolight.SOBHBPrior"})
+        self.assertIn("frequency ranges", block.metadata_comment(None))
+
     def test_waveform_level_flags_are_rejected(self):
         from pydantic import ValidationError
 

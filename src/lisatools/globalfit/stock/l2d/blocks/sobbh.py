@@ -24,7 +24,7 @@ from pydantic import Field, model_validator
 
 from .base import (
     SPECIAL_MOVES, SPECIAL_SOURCE_MOVE_FILLED, BuildContext, ClassSpec, PEMove,
-    PriorRef, SourceBlock, StockPrior, TDGenerator, TDWaveformSpec, WaveformSpec,
+    PriorRef, SourceBlock, StockPrior, TDGenerator, TDWaveformSpec, WaveformSpec, make_proposal_priors,
 )
 
 
@@ -105,6 +105,32 @@ class SOBBHBlock(SourceBlock):
         if td is None or td.waveform_class is None:
             return td
         return td._replace(init_kwargs={**deepcopy(td.init_kwargs), "phase_at_coalescence": self.phase_at_coalescence})
+
+    def frequency_ranges(self, ctx: BuildContext, info: dict[str, Any]) -> list[tuple[float, float]]:
+        """With ``proposal_priors``, one range per leaf (in leaf order): the bounds of its prior on ``f0``, the
+        GW frequency at the data start. The analysis band otherwise."""
+        if self.proposal_priors is None:
+            return super().frequency_ranges(ctx, info)
+        leaf_priors = make_proposal_priors(self, ctx.cfg, info["priors"][self.type])
+        return [(float(p.priors_in["f0"].minimum), float(p.priors_in["f0"].maximum)) for p in leaf_priors]
+
+    def metadata_comment(self, ctx: BuildContext) -> str:
+        """The procedure ``SubmissionWriter`` applies to the written frequency and phase (its
+        ``_sobbh_output_corrections``), and what the frequency ranges are."""
+        from lisatools.globalfit.recipe import MOJITO_REFERENCE_TIME
+
+        sampled = "the coalescence phase" if self.phase_at_coalescence else "the orbital phase at the data start"
+        comment = (
+            f"The waveform is referenced to the data start (t_0 = t_init): the sampled quantities are the GW "
+            f"frequency at the data start and {sampled}. In the postprocessing, each posterior sample is evolved "
+            f"with the TaylorT3 spin-aligned PN relations of the waveform model (its own masses and spins) from t_0 "
+            f"to the MOJITO_REFERENCE_TIME ({MOJITO_REFERENCE_TIME} s), so the written frequency_at_reference_time "
+            f"and phase_at_reference_time are the GW frequency and the orbital phase at that time. The other "
+            f"parameters are written as sampled."
+        )
+        if self.proposal_priors is not None:
+            comment += " The frequency ranges are the bounds, per source, of the prior on the frequency at the data start."
+        return comment
 
     def search_interface_kwargs(self) -> dict[str, Any]:
         """The catalogue seeds carry the block's phase convention."""

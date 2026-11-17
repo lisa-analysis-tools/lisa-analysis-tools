@@ -428,6 +428,7 @@ class GBSetup(Setup, GBSettings):
         waveform_model_code_link: str = "",
         prior_model_code_link: str = "",
         prior_model_config_file: str = "",
+        data_t0: Optional[float] = None,
     ):
         """The GB branch's :class:`SourceMetadata`: per-band frequency ranges, GBGPU arguments.
 
@@ -450,6 +451,9 @@ class GBSetup(Setup, GBSettings):
             waveform_model_config=dict(
                 init_kwargs=init_kwargs, runtime_kwargs=self.waveform.waveform_kwargs
             ),
+            # both GBGPU's t0, the data start
+            t_0=data_t0 if data_t0 is not None else self.waveform.t0,
+            t_init=self.waveform.t0,
         )
 
     def prior_f0_range_hz(self) -> tuple[float, float]:
