@@ -123,6 +123,16 @@ class ShimGroup:
         return self._kinematics
 
 
+def sym_window_kwargs(settings, window_alpha, use_sym_window):
+    """N and h of the symmetric window for an STFTFresnelWrap on ``settings``, sampled at
+    SAMPLING_INTERVAL; none for the periodic window and the boxcar, as STFTComputationGroup."""
+    if not (use_sym_window and window_alpha > 0.0):
+        return {}
+    return dict(
+        window_samples=settings.get_nperseg(SAMPLING_INTERVAL), sample_cadence=SAMPLING_INTERVAL
+    )
+
+
 def array_module(backend):
     return lisatools.get_backend(backend).xp
 
@@ -174,11 +184,12 @@ def draw_angles(rng, num):
     return phi0, iota, psi, lam, beta
 
 
-def build_oracle_fixture(name, backend):
+def build_oracle_fixture(name, backend, use_sym_window=True):
     """One configuration of scripts/validation/stft_column_policy_oracle.py on ``backend``.
 
     Same grid, seeds, data, inverse covariance and sources as the oracle, so the arrays it
-    captures on the CPU must equal these.
+    captures on the CPU must equal these with the oracle's periodic window
+    (``use_sym_window=False``).
     """
     config = ORACLE_CONFIGS[name]
     segment_duration = 21600.0
@@ -227,6 +238,7 @@ def build_oracle_fixture(name, backend):
         settings.df,
         window_alpha=config["window_alpha"],
         use_midpoint=config["use_midpoint"],
+        **sym_window_kwargs(settings, config["window_alpha"], use_sym_window),
     )
     shim = ShimGroup(fresnel, domain, num_noise=1, buffers=(data, invc))
     comp = STFTGBComputations(
@@ -266,6 +278,7 @@ def build_oracle_fixture(name, backend):
         n_side_bins=4,
         linear_envelope=False,
         domain="shim",
+        use_sym_window=use_sym_window,
         **config,
     )
     return Fixture(
@@ -321,6 +334,7 @@ def production_settings(data_start, num_segments, backend):
         NF=int(SEGMENT_DURATION / SAMPLING_INTERVAL) // 2 + 1,
         min_freq=BAND_MIN_FREQ,
         max_freq=BAND_MAX_FREQ,
+        sample_cadence=SAMPLING_INTERVAL,
         force_backend=backend,
     )
     df = band_settings.df
@@ -328,6 +342,7 @@ def production_settings(data_start, num_segments, backend):
         *band_settings.args,
         min_freq=max(band_settings.ind_min - 0.5, 0.0) * df,
         max_freq=(band_settings.ind_min + CELL_WINDOW_WIDTH - 0.5) * df,
+        sample_cadence=SAMPLING_INTERVAL,
         force_backend=backend,
     )
     if (
@@ -341,7 +356,7 @@ def production_settings(data_start, num_segments, backend):
     return band_settings, cell_settings
 
 
-def build_group(cell_settings, backend, tdi_type, linear_envelope, rng):
+def build_group(cell_settings, backend, tdi_type, linear_envelope, rng, use_sym_window=True):
     """A real ``STFTComputationGroup`` over one cell per store window, as the band buffer builds it.
 
     The group's sensitivity backend gets equal-arm orbits because the GB kernels never read
@@ -372,6 +387,7 @@ def build_group(cell_settings, backend, tdi_type, linear_envelope, rng):
             window_alpha=PRODUCTION_WINDOW_ALPHA,
             use_midpoint=True,
             linear_envelope=linear_envelope,
+            use_sym_window=use_sym_window,
         ),
     )
     return container_array, container_array.cpp_splits[0]
@@ -421,12 +437,14 @@ def build_production_fixture(
     num_sources=24,
     orbits=None,
     response=RESPONSES[0],
+    use_sym_window=True,
 ):
     """One production-like configuration on a real computation group with two store windows.
 
     ``orbits`` may pass an already loaded ``(orbits, start)`` pair, so a large orbit file is read
     once per process. ``response`` selects the response of the comp; DFFR builds its kinematics
-    table through the group, as in a global-fit run.
+    table through the group, as in a global-fit run. ``use_sym_window`` selects the window of the
+    templates, the symmetric Tukey window of the data by default.
     """
     config = PRODUCTION_CONFIGS[name]
     if orbits is None:
@@ -438,7 +456,7 @@ def build_production_fixture(
 
     rng = np.random.default_rng(PRODUCTION_SEED)
     container_array, group = build_group(
-        cell_settings, backend, config["tdi_type"], config["linear_envelope"], rng
+        cell_settings, backend, config["tdi_type"], config["linear_envelope"], rng, use_sym_window
     )
     comp = STFTGBComputations(
         stft_comps=group,
@@ -482,6 +500,7 @@ def build_production_fixture(
         orbits_start=orbits_start,
         domain="STFTComputationGroup",
         response=response,
+        use_sym_window=use_sym_window,
     )
     return Fixture(
         name=name,
@@ -496,12 +515,14 @@ def build_production_fixture(
     )
 
 
-def build_fixture(name, backend, mojito_l1=None, orbits_cache=None, response=RESPONSES[0]):
+def build_fixture(
+    name, backend, mojito_l1=None, orbits_cache=None, response=RESPONSES[0], use_sym_window=True
+):
     """Build any configuration by name; ``orbits_cache`` maps an orbits kind to a loaded pair."""
     if response != RESPONSES[0] and name not in DFFR_CONFIGS:
         raise ValueError(f"{name} is not a configuration of the DFFR response: {DFFR_CONFIGS}")
     if name in ORACLE_CONFIGS:
-        return build_oracle_fixture(name, backend)
+        return build_oracle_fixture(name, backend, use_sym_window)
     kind = PRODUCTION_CONFIGS[name]["orbits"]
     orbits = None
     if orbits_cache is not None:
@@ -509,7 +530,12 @@ def build_fixture(name, backend, mojito_l1=None, orbits_cache=None, response=RES
             orbits_cache[kind] = load_orbits(kind, backend, mojito_l1)
         orbits = orbits_cache[kind]
     return build_production_fixture(
-        name, backend, mojito_l1=mojito_l1, orbits=orbits, response=response
+        name,
+        backend,
+        mojito_l1=mojito_l1,
+        orbits=orbits,
+        response=response,
+        use_sym_window=use_sym_window,
     )
 
 

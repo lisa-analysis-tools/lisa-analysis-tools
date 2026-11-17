@@ -117,7 +117,8 @@ belongs in a template of its own.
 (`stft_comps.cpp_kinematics(cpp_orbits)`) and calls `GBComputationGroupWrap.gb_dffr_get_ll` with
 the data index, the noise index, the parameters, `t_ref`, `n_side_bins`, the TDI generation, the
 envelope, the delays and the window starts; the entry point launches
-`stft_get_ll_launch<DFFRTile<GBDFFRSource, 32>>`. The window settings come from the bound
+`stft_get_ll_launch<DFFRTile<GBDFFRSource, 32, symmetric_window>>`, the instantiation of the
+window that the settings hold (`DFFR_WINDOW_DISPATCH`). The window settings come from the bound
 `STFTFresnel`, the grid and data from `STFTDomain`.
 
 **The Fisher matrix.** `dffr_information_matrix_kernel` is a kernel of its own with the estimator
@@ -173,7 +174,8 @@ The floor on the local chirp rate of a reception state is not a setting: DFFR ap
 `STFT_FDOT_FLOOR`, 1e-22 Hz/s, the sign-preserving floor of the existing response, which changes
 the phase by at most π floor (dt / 2)², 6e-13 rad on a one-day segment.
 
-DFFR reads from the bound computation group the taper `window_alpha` of its `STFTFresnel`, the
+DFFR reads from the bound computation group the taper `window_alpha` of its `STFTFresnel` and,
+for the symmetric window, the number N of samples per segment and their spacing h, the
 grid, data and inverse covariance of its `STFTDomain`, its `linear_envelope` and its kinematics
 table. It does not read `T`, `freq_from_tdi_phase` (how the existing response estimates its chirp)
 and for the same reason the `astro_track` argument of `information_matrix`, `use_midpoint` (DFFR
@@ -206,9 +208,18 @@ These apply to both responses and were measured in the validation.
 - The window taper. A taper of 1/(14 mHz) = 71 s, as the tracked high-frequency settings had,
   leaves up to 1.9e-2 of a tone's power outside 10 side bins; 1e4 s leaves 1.4e-3. The taper also
   sets the width of the store windows and so the memory per cell of the GB block.
-- The window convention. The global fit windows the data with LAT's symmetric Tukey window, both
-  responses integrate the periodic one; the difference is a flat mismatch of 3.6e-8 and 6.3e-5 per
-  segment, four orders of magnitude below the side bins above. Production keeps its window.
+- The window convention. The global fit windows the data with LAT's Tukey window (`tukey()`,
+  scipy's `sym=True`), zero on the first and the last of a segment's N samples and (N - 1) h long.
+  Since 2026-11-16 both responses integrate this symmetric window by default
+  (`STFTComputationGroup(use_sym_window=True)`), with N and h from the settings' `sample_cadence`,
+  which `get_stft_settings` sets; a tapered group without it raises. `use_sym_window=False` gives
+  the periodic window (scipy's `sym=False`, N h long) that both integrated before. Against a
+  30-day time-domain truth, templates of the data's window match as before: a flat mismatch of
+  6.5e-10 to 1.2e-9 for DFFR in either window. Templates of the other window leave 3.5e-8 to 3.8e-8
+  and a median segment error of 6.2e-5 to 1.0e-4, which production carried until then. The
+  symmetric window costs DFFR 1.6 % in `get_ll` and 3.6 % in `fill_global` (365 segments, 1024
+  sources, an A100 MIG slice) and the existing response nothing; the periodic window runs as fast
+  as before.
 - `linear_envelope`. With it, DFFR and the existing response agree to a median mismatch of 5.6e-10
   on the production fixtures; without it each holds the amplitude constant over a segment in its
   own way, and they differ by about 1e-5. The TDI generation changes nothing between them. Since

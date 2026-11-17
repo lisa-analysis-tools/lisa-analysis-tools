@@ -1,6 +1,6 @@
 """DFFR against the existing STFT response on the production sources: overlap and norm ratio.
 
-    python dffr_against_existing.py --device cpu [--output RESULTS.npz]
+    python dffr_against_existing.py --device cpu [--window periodic] [--output RESULTS.npz]
 
 Both responses evaluate the same sources on the same grid, each through ``STFTGBComputations``
 (``response="tdi_on_the_fly"`` and ``"dffr"``). Per source, the script fills the
@@ -16,7 +16,8 @@ from a time-domain truth is measured by ``stft_accuracy.py``.
 
 Fixture: ESA orbits, 32 one-day segments from 10 days after their start, the production band as
 one domain, the Tukey taper 0.1157 with the segment midpoints, n_side_bins = 10, and the 24
-sources of the production fixtures of ``stft_fixtures.py``. The settings are the two production
+sources of the production fixtures of ``stft_fixtures.py``. Both responses take the symmetric
+Tukey window of the data (scipy's ``sym=True``), or the periodic one with ``--window periodic``. The settings are the two production
 settings of the existing response on ESA orbits, TDI 2nd generation with the linear envelope and
 TDI 1st generation without it, and the two crossed ones, which tell the TDI generation and the
 envelope apart. DFFR takes the same generation and envelope, with its first-order delay terms on.
@@ -43,6 +44,7 @@ from stft_fixtures import (  # noqa: E402
     load_orbits,
     production_settings,
     production_sources,
+    sym_window_kwargs,
     to_host,
 )
 
@@ -59,7 +61,9 @@ SETTINGS = (
 )
 
 
-def templates_of_both(device, orbits, band, params, data, generation, linear_envelope):
+def templates_of_both(
+    device, orbits, band, params, data, generation, linear_envelope, use_sym_window=True
+):
     """(DFFR, existing) templates (num_sources, 3, NT, NF_active), one per source, host arrays."""
     from gbgpu.gbcomps import STFTGBComputations
 
@@ -105,6 +109,7 @@ def templates_of_both(device, orbits, band, params, data, generation, linear_env
         window_alpha=PRODUCTION_WINDOW_ALPHA,
         use_midpoint=True,
         linear_envelope=linear_envelope,
+        **sym_window_kwargs(band, PRODUCTION_WINDOW_ALPHA, use_sym_window),
     )
     table_arrays = {
         name: xp.zeros(int(np.prod(shape)) * band.NT) for name, shape in KINEMATICS_TABLE_FIELDS
@@ -150,8 +155,10 @@ def distances(dffr, existing):
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--device", choices=("cpu", "gpu"), default="cpu")
+    parser.add_argument("--window", choices=("symmetric", "periodic"), default="symmetric")
     parser.add_argument("--output", default=None, metavar="RESULTS_NPZ")
     args = parser.parse_args(argv)
+    print(f"[against existing] the {args.window} Tukey window in both responses")
 
     orbits = load_orbits("esa", args.device)
     band, _ = production_settings(orbits[1] + DATA_START_OFFSET, NUM_SEGMENTS, args.device)
@@ -161,7 +168,14 @@ def main(argv=None) -> None:
     results = {"params": params}
     for name, generation, linear_envelope in SETTINGS:
         dffr, existing = templates_of_both(
-            args.device, orbits, band, params, data, generation, linear_envelope
+            args.device,
+            orbits,
+            band,
+            params,
+            data,
+            generation,
+            linear_envelope,
+            args.window == "symmetric",
         )
         mismatch, phase, norm_ratio = distances(dffr, existing)
         results.update(
