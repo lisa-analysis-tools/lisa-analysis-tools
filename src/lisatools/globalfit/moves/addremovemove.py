@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -34,15 +33,6 @@ except ImportError:
     class ConditionalFlowMove:  # placeholder so isinstance checks are simply False
         pass
 
-try:
-    from eryn.moves import InfoMatrixMove
-    info_matrix_move_available = True
-except ImportError:
-    info_matrix_move_available = False
-
-    class InfoMatrixMove:  # placeholder so isinstance checks are simply False
-        pass
-
 from eryn.moves import CombineMove, Move, StretchMove, TemperatureControl, RedBlueMove
 from eryn.prior import ProbDistContainer
 from eryn.utils.transform import TransformContainer
@@ -50,10 +40,6 @@ from eryn.utils.transform import TransformContainer
 
 def _is_flow(move) -> bool:
     return flow_move_available and isinstance(move, ConditionalFlowMove)
-
-
-def _is_info_matrix(move) -> bool:
-    return info_matrix_move_available and isinstance(move, InfoMatrixMove)
 
 from tqdm import tqdm
 
@@ -77,27 +63,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
     This is done by first removing the contribution of the current sources in the cold chain from the residual,
     then proposing new sources for this leaf, and then adding back in the contribution of the new sources to the residual.
     This way we can make sure that the likelihoods are computed correctly for each proposed source and that the likelihoods are consistent with the current state of the residuals in the analysis container array.
-
-    **Information-matrix proposal.** An :class:`eryn.moves.InfoMatrixMove` among the inner moves proposes each
-    leaf from a Gaussian ``N(mean, covariance)`` that this move refreshes at the start of the leaf's round
-    (:meth:`_refresh_info_matrix`), once the leaf is exposed and the current likelihoods are known and before
-    the first repeat:
-
-    * the mean is the leaf's point (sampling basis) of the cold-chain walker with the largest likelihood;
-    * the covariance is ``info_matrix_gen`` at that point, with that walker's noise matrix
-      (``acs[walker].sens_mat``) on that walker's grid (``acs[walker].data.settings``). The generator caches
-      the derivative steps of each leaf;
-    * if the refresh fails (the waveform or the steps fail, the matrix is not finite or not positive
-      definite), a warning is logged and the leaf keeps the proposal of its last successful refresh. A leaf
-      that has none yet is updated without the information-matrix move for this round: the weights of the
-      other inner moves are renormalised (:meth:`_leaf_draw_weights`);
-    * nothing is computed while the move has zero weight.
-
-    The mean and the covariance are in the sampling basis and the ``InfoMatrixMove`` is built without a
-    ``transform``; unless ``info_matrix_gen`` has a ``proposal_basis``
-    (:class:`~lisatools.globalfit.infomatrix.ProposalBasis`): then both are in that basis and the move must be
-    built with that basis' ``transform`` and ``log_jacobian``. One prior per leaf (a list in ``priors``) is not
-    supported with this move.
 
     Args:
         branch_name: name of the branch that this move will operate on.
@@ -132,9 +97,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             then, inner moves that are or contain a flow move are left out of the draw (the other weights are
             renormalised), while the flow trainer is already fed, so the flow is trained when it is switched on.
             At least one inner move without a flow is required when ``flow_burnin > 0``.
-        info_matrix_gen: :class:`~lisatools.globalfit.infomatrix.InfoMatrixGenerator` of the branch, called as
-            ``info_matrix_gen(point, waveform, psd, basis_settings, leaf=..., parameter_transforms=...)``.
-            Required when an :class:`eryn.moves.InfoMatrixMove` is among the inner moves; not used otherwise.
         **kwargs: additional keyword arguments for the Move class.
     """
 
@@ -156,7 +118,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
         pad_out_of_prior: bool = False,
         flow_buffer_thin: int = 5,
         flow_burnin: int = 20,
-        info_matrix_gen: Callable | None = None,
         **kwargs,
     ):
 
@@ -247,11 +208,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 f"flow_burnin = {self.flow_burnin} needs an inner move without a flow to use until then."
             )
 
-        self.info_matrix_gen = info_matrix_gen
-        self._has_info_matrix = np.array([self._contains_info_matrix(move) for move in self.moves])
-        self._info_matrix_leaves = set()  # leaves with a proposal, i.e. refreshed at least once
-        self._check_info_matrix_setup()
-
     @property
     def periodic(self):
         """Periodicity dictionary propagated to all inner moves."""
@@ -294,142 +250,12 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             return any(_is_flow(sub) for sub in move.sub_moves)
         return _is_flow(move)
 
-    @staticmethod
-    def _contains_info_matrix(move) -> bool:
-        """Whether ``move`` is an information-matrix move or a ``CombineMove`` with one inside."""
-        if isinstance(move, CombineMove):
-            return any(_is_info_matrix(sub) for sub in move.sub_moves)
-        return _is_info_matrix(move)
-
-    @property
-    def _info_matrix_moves(self) -> list:
-        """The information-matrix moves among the inner moves that propose."""
-        return [move for move in self._proposing_moves if _is_info_matrix(move)]
-
-    def _check_info_matrix_setup(self) -> None:
-        """What an :class:`eryn.moves.InfoMatrixMove` among the inner moves needs from this move."""
-        moves = self._info_matrix_moves
-        if not moves:
-            return
-        if self.info_matrix_gen is None:
-            raise ValueError(
-                f"{self.branch_name}: an InfoMatrixMove is among the inner moves but info_matrix_gen is None;"
-                " pass the branch's InfoMatrixGenerator as info_matrix_gen."
-            )
-        for move in moves:
-            if move.branch_name != self.branch_name:
-                raise ValueError(
-                    f"InfoMatrixMove has branch_name {move.branch_name!r} but it is an inner move of the"
-                    f" {self.branch_name!r} move: the two must be the same."
-                )
-            # the generator's covariance and the move's Gaussian must be in the same basis
-            has_basis = getattr(self.info_matrix_gen, "proposal_basis", None) is not None
-            if (move.transform is not None) != has_basis:
-                raise ValueError(
-                    f"{self.branch_name}: the InfoMatrixMove {'has' if move.transform is not None else 'has no'}"
-                    f" transform but info_matrix_gen {'has a' if has_basis else 'has no'} proposal_basis; build"
-                    " the move with the transform and log_jacobian of info_matrix_gen.proposal_basis, or"
-                    " both without."
-                )
-        if isinstance(self.priors[self.branch_name], list):
-            raise ValueError(
-                f"{self.branch_name}: per-leaf priors are not supported with InfoMatrixMove yet"
-                " (info_matrix_gen holds one prior for all leaves)."
-            )
-
     def _draw_weights(self) -> np.ndarray:
         """Inner-move weights for this iteration: during ``flow_burnin``, the moves without a flow, renormalised."""
         if self._iterations >= self.flow_burnin or not self._has_flow.any():
             return self.move_weights
         weights = np.where(self._has_flow, 0.0, self.move_weights)
         return weights / weights.sum()
-
-    def _leaf_draw_weights(self, draw_weights: np.ndarray, leaf: int) -> np.ndarray:
-        """``draw_weights`` for one leaf: without the information-matrix moves while the leaf has no proposal.
-
-        Args:
-            draw_weights: Weights of ``self.moves`` for this iteration (from :meth:`_draw_weights`).
-            leaf: Leaf index.
-
-        Returns:
-            ``draw_weights`` itself if no entry has to be left out; otherwise a renormalised copy with a zero
-            for every entry that is, or contains, an information-matrix move.
-
-        Raises:
-            RuntimeError: No inner move is left to draw for this leaf.
-        """
-        if not self._has_info_matrix.any() or int(leaf) in self._info_matrix_leaves:
-            return draw_weights
-        weights = np.where(self._has_info_matrix, 0.0, draw_weights)
-        if weights.sum() <= 0.0:
-            raise RuntimeError(
-                f"{self.branch_name} leaf {leaf}: no inner move left to draw. The information-matrix move has"
-                " no proposal for this leaf (its refresh failed) and all the other inner moves have zero weight."
-            )
-        return weights / weights.sum()
-
-    def _info_matrix_waveform(self, walker: int) -> Callable:
-        """Waveform handed to ``info_matrix_gen`` for ``walker``: ``fn(*waveform_parameters) -> DomainBase``."""
-        return lambda *params: self.get_waveform_here(np.asarray(params))
-
-    def _info_matrix_device(self, walker: int):
-        """Context manager in which the information matrix of ``walker`` is computed (its device)."""
-        return nullcontext()
-
-    def _refresh_info_matrix(self, leaf: int, coords_cold: np.ndarray, prev_logl: np.ndarray) -> bool:
-        """Recompute the Gaussian proposal of ``leaf`` at the cold-chain walker with the largest likelihood.
-
-        The mean is that walker's point; the covariance is ``info_matrix_gen`` there, with the walker's own
-        noise matrix and grid. Both are in the generator's ``proposal_basis`` if it has one. Every
-        information-matrix move among the inner moves gets the new proposal.
-
-        Args:
-            leaf: Leaf index.
-            coords_cold: Sampling-basis coordinates of the leaf in the cold chain, shape ``(nwalkers, ndim)``.
-                Periodic parameters are already wrapped.
-            prev_logl: Current likelihoods of the leaf, shape ``(ntemps, nwalkers)``; row 0 is the cold chain.
-
-        Returns:
-            ``True`` if the proposal was refreshed. ``False`` if anything failed: a warning is logged and the
-            leaf keeps the proposal it had, if any.
-        """
-        leaf = int(leaf)
-        walker = int(np.argmax(prev_logl[0]))
-        point = np.array(coords_cold[walker], dtype=float)
-        basis = getattr(self.info_matrix_gen, "proposal_basis", None)
-        try:
-            # a waveform can fail in many ways: none of them may stop the sampler
-            with self._info_matrix_device(walker):
-                cov = self.info_matrix_gen(
-                    point,
-                    self._info_matrix_waveform(walker),
-                    self.acs[walker].sens_mat,
-                    self.acs[walker].data.settings,
-                    leaf=leaf,
-                    parameter_transforms=self.transform_fn,
-                    **({} if basis is None else dict(in_proposal_basis=True)),
-                )
-            mean = point if basis is None else basis.from_sampling(point)
-            for move in self._info_matrix_moves:
-                move.update_proposal({leaf: (mean, cov)})
-        except Exception as error:
-            kept = "keeping its previous proposal" if leaf in self._info_matrix_leaves else "it has no proposal yet"
-            logger.warning(
-                f"{self.branch_name} leaf {leaf}: information matrix refresh failed at walker {walker}"
-                f" ({kept}): {type(error).__name__}: {error}"
-            )
-            return False
-
-        self._info_matrix_leaves.add(leaf)
-        last = getattr(self.info_matrix_gen, "last", None) or {}
-        logger.info(
-            f"{self.branch_name} leaf {leaf}: information matrix refreshed at walker {walker}"
-            f" (logl {float(prev_logl[0, walker]):.3f}) in {last.get('time', np.nan):.2f}s;"
-            f" steps estimated: {last.get('estimated')}, condition number: {last.get('condition', np.nan):.3e}"
-            f"{'' if basis is None else f', basis: {basis.name}'}"
-        )
-        logger.debug(f"{self.branch_name} leaf {leaf}: information matrix steps {np.asarray(last.get('eps')).tolist()}")
-        return True
 
     # --- inner autocorrelation time (the recipe's RepeatController sets the repeats from it) --- #
     record_inner_chain = False  # keep every repeat's cold-chain coordinates of the leaf being updated
@@ -905,10 +731,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
             # same object the acceptance step below reads via
             # temperature_control_here.betas.
             move.active_betas = temperature_control_here.betas
-        elif _is_info_matrix(move):
-            # this leaf's Gaussian, broadened by 1 / beta of this leaf's live ladder
-            move.active_condition = leaf
-            move.active_betas = temperature_control_here.betas
 
         # Split the ensemble in half and iterate over these two halves.
         inds = self.get_split_inds()
@@ -1034,12 +856,6 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
 
         # TODO/DOCS: detailed acceptance/swap accounting; see code for the per-leaf
         loop and the ``compute_like`` calls used to score proposals.
-
-        With an :class:`eryn.moves.InfoMatrixMove` among the inner moves, each active leaf's Gaussian proposal
-        is refreshed once per call, after the leaf is exposed and its current likelihoods are computed and
-        before its repeats: at the cold-chain walker with the largest likelihood, with that walker's noise
-        matrix (:meth:`_refresh_info_matrix`). A failed refresh logs a warning; the leaf keeps its previous
-        proposal or, if it has none, runs this call's repeats without the move.
 
         Args:
             model: ``eryn`` model object containing ``analysis_container_arr``,
@@ -1188,21 +1004,13 @@ class ResidualAddOneRemoveOneMove(GlobalFitMove, StretchMove, Move):
                 prev_logl, prev_logp
             )
 
-            # information-matrix proposal of this leaf, at the best cold walker (skipped at zero weight)
-            leaf_weights = draw_weights
-            if draw_weights[self._has_info_matrix].sum() > 0.0:
-                self._refresh_info_matrix(
-                    leaf, new_state.branches[self.branch_name].coords[0, :, leaf], prev_logl
-                )
-                leaf_weights = self._leaf_draw_weights(draw_weights, leaf)
-
             # fix this need to compute prev_logl for all walkers
             _free_pool()
             for repeat in tqdm(range(self.num_repeats), desc=f"{self.branch_name} update, leaf {leaf}"):
 
                 # pick move; a CombineMove runs its sub-moves in order, each with its own accept/reject
                 move_here = self.moves[
-                    model.random.choice(np.arange(len(self.moves)), p=leaf_weights)
+                    model.random.choice(np.arange(len(self.moves)), p=draw_weights)
                 ]
                 steps = move_here.sub_moves if isinstance(move_here, CombineMove) else [move_here]
 
@@ -1591,23 +1399,6 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
             self.waveform_gen_method
         )
         return wave_gen(*coords, **self.waveform_gen_kwargs)
-
-    def _info_matrix_waveform(self, walker: int) -> Callable:
-        """Waveform for the information matrix of ``walker``, from the replica of the walker's split.
-
-        The walker's residual and noise matrix live on the device of split ``acs.split_map[walker]`` (the
-        map :meth:`AnalysisContainerArray.unpack_indices` routes with), so the templates are generated there
-        too, as in :meth:`_apply_cold_chain_sources`. To be called inside :meth:`_info_matrix_device`.
-        """
-        wave_gen = getattr(
-            self.waveform_generators[int(self.acs.split_map[walker])], self.waveform_gen_method
-        )
-        return lambda *params: wave_gen(*params, **self.waveform_gen_kwargs)
-
-    def _info_matrix_device(self, walker: int):
-        """Device context of the walker's split (the CPU one when the array has no GPUs)."""
-        device = None if self.acs.gpus is None else self.acs.gpus[int(self.acs.split_map[walker])]
-        return self.acs.device_context(device)
 
     def _apply_cold_chain_sources(self, coords: np.ndarray, sign: int) -> None:
         """Split-parallel residual bookkeeping (add-back / subtract).

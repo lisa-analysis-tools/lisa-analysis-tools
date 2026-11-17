@@ -64,7 +64,6 @@ class MBHBlock(SourceBlock):
     SOURCE_TYPE: ClassVar[str] = "MBHB"
     SETTINGS_NAME: ClassVar[str] = "MBHSettings"
     SETUP_NAME: ClassVar[str] = "MBHSetup"
-    PROPOSAL_BASES: ClassVar[tuple[str, ...]] = ("chirp",)
     SEARCH_INTERFACE: ClassVar[str] = "MBHBSearchInterface"
     TD_WAVEFORM_METHOD: ClassVar[str | None] = "get_td_signals"
     PE_MOVES: ClassVar[dict[str, PEMove]] = {
@@ -86,14 +85,12 @@ class MBHBlock(SourceBlock):
     )
 
     def filled_move_kwargs(self, ctx: BuildContext, info: dict[str, Any]) -> dict[str, dict]:
-        filled = super().filled_move_kwargs(ctx, info)
         if not any(move.class_name == "SkyMove" for move in self.inner_moves or []):
-            return filled
+            return {}
         ind_map = sky_ind_map(info["basis"], self.SKY_BASIS)
         to_lisa, from_lisa = make_sky_wrappers(ctx.general.orbits, self.waveform_t0(ctx), ind_map)
         return {
-            **filled,
             "SkyMove": dict(
                 ind_map=ind_map, coord_frame="icrs", to_lisa_frame=to_lisa, from_lisa_frame=from_lisa
-            ),
+            )
         }

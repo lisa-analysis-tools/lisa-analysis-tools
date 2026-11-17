@@ -80,7 +80,9 @@ class BaseSearchInterface(ABC):
                  spread: typing.Optional[float | np.ndarray | str] = None,
                  is_eryn_backend: bool = False,
                  periodic: typing.Optional[dict[str, dict[str, float]]] = None,
-                 max_resample_tries: int = 50):
+                 max_resample_tries: int = 50,
+                 fallback_spread: typing.Optional[float | np.ndarray] = None,
+                 leaf_priors: typing.Optional[list] = None):
         """
         Parameters
         ----------
@@ -109,9 +111,21 @@ class BaseSearchInterface(ABC):
             after the transform to the sampling basis.
         max_resample_tries : int, optional
             Resample passes for walkers drawn outside the prior around a point value. Default 50.
+        fallback_spread : float or np.ndarray, optional
+            With ``spread="info_matrix"``: the numeric spread (same forms as ``spread``) of a source whose
+            information matrix cannot be computed, e.g. a starting point on the edge of the prior. Such a source
+            is seeded with it, with a warning; the others keep their matrix. Without it that source raises.
+        leaf_priors : list, optional
+            One prior per leaf (the per-source priors the PE move scores the leaves with). If given, the walkers
+            scattered around the point of leaf ``k`` are redrawn until they are inside ``leaf_priors[k]``; the
+            branch prior otherwise.
         """
 
         self.search_type = search_type
+        self.fallback_spread = fallback_spread
+        self.leaf_priors = leaf_priors
+        self.fallback_leaves = []  # leaves seeded with fallback_spread at the last info_matrix_covariances
+        self.resample_passes = None  # (num_temps, num_leaves) resample passes of the last draw_from_point_value
         self.max_resample_tries = int(max_resample_tries)
         self.search_path = search_path
         self.spread = spread
@@ -435,16 +449,19 @@ class BaseSearchInterface(ABC):
         entries = [{name: values[index] for name, values in columns.items()} for index in np.ndindex(shape)]
         return entries, shape
 
-    def get_covariance_matrices_from_spread(self, num_leaves: int, num_dim: int) -> np.ndarray:
+    def get_covariance_matrices_from_spread(self, num_leaves: int, num_dim: int, spread=None) -> np.ndarray:
         """
         Returns the covariance matrix computed from the spread for the given number of leaves.
+
+        ``spread`` defaults to ``self.spread``; pass another numeric spread (e.g. ``fallback_spread``) to convert it.
         """
-        if isinstance(self.spread, str):
+        spread = self.spread if spread is None else spread
+        if isinstance(spread, str):
             raise ValueError(
-                f"spread {self.spread!r} is not a numeric spread: its covariances come from info_matrix_covariances"
+                f"spread {spread!r} is not a numeric spread: its covariances come from info_matrix_covariances"
             )
 
-        spread = np.asarray(self.spread, dtype=float)
+        spread = np.asarray(spread, dtype=float)
         if spread.ndim == 0:
             cov = spread.item() ** 2 * np.eye(num_dim)
             covs = np.tile(cov, (num_leaves, 1, 1))
@@ -541,6 +558,10 @@ class BaseSearchInterface(ABC):
         betas = np.ones(1) if betas is None else np.asarray(betas, dtype=float)
 
         covs = np.empty((len(betas), num_leaves, num_dim, num_dim), dtype=float)
+        fallback = None
+        if self.fallback_spread is not None:
+            fallback = self.get_covariance_matrices_from_spread(num_leaves, num_dim, spread=self.fallback_spread)
+        self.fallback_leaves = []
         for leaf in range(num_leaves):
             try:
                 # * cap=True: the starting scatter only (the generator caps if it has a distance_cap)
@@ -548,12 +569,19 @@ class BaseSearchInterface(ABC):
                     starting_points[leaf], signal_gen, psd, grid, leaf=leaf, betas=betas, cap=True
                 )
             except Exception as error:
-                error_class = ValueError if isinstance(error, ValueError) else RuntimeError
-                raise error_class(
+                message = (
                     f"The information-matrix covariance of branch {self.branch_name}, source {leaf} failed at the "
                     f"starting point {starting_points[leaf].tolist()} (sampling basis {list(self.sampling_basis)}): "
                     f"{error}"
-                ) from error
+                )
+                if fallback is None:
+                    error_class = ValueError if isinstance(error, ValueError) else RuntimeError
+                    raise error_class(message) from error
+                # * The source is seeded with the numeric fallback, widened by 1 / beta as a numeric spread is.
+                logger.warning(f"{message} Seeding this source with fallback_spread instead.")
+                covs[:, leaf] = fallback[leaf][None] / np.maximum(betas, 1e-10)[:, None, None]
+                self.fallback_leaves.append(leaf)
+                continue
             last = getattr(info_matrix_gen, "last", None) or {}
             # * Only what the generator reports about its cap: nothing is added when it did not run.
             cap_report = ""
@@ -645,13 +673,21 @@ class BaseSearchInterface(ABC):
         elif betas is not None:
             logger.info(f"Scaling initial covariance by betas: {betas}")
 
-        leaf_prior = priors[self.branch_name]
+        branch_prior = priors[self.branch_name]
+        if self.leaf_priors is not None and len(self.leaf_priors) != num_leaves:
+            raise ValueError(
+                f"leaf_priors holds {len(self.leaf_priors)} priors for the {num_leaves} leaves of {self.branch_name}"
+            )
 
-        coords = leaf_prior.rvs(size=(num_temps, num_walkers, num_leaves)) # np.empty((num_temps, num_walkers, num_leaves, num_dim), dtype=float)
+        # * resample passes each (temperature, leaf) needed: a diagnostic of how much of the scatter the prior cuts
+        self.resample_passes = np.zeros((num_temps, num_leaves), dtype=int)
+        coords = branch_prior.rvs(size=(num_temps, num_walkers, num_leaves)) # np.empty((num_temps, num_walkers, num_leaves, num_dim), dtype=float)
         parameters_searched = self.parameters_searched if self.parameters_searched is not None else np.arange(num_dim)
     
         for leaf in range(num_leaves):
             center = starting_points[leaf]
+            # * the prior the walkers of this leaf must be inside: its own, if the leaves have their own
+            leaf_prior = branch_prior if self.leaf_priors is None else self.leaf_priors[leaf]
             leaf_cov = None if per_temperature else covariances[leaf]
             for t in range(num_temps):
                 if per_temperature:
@@ -686,6 +722,7 @@ class BaseSearchInterface(ABC):
                     draws_tmp[np.ix_(bad, parameters_searched)] = redraws
                     bad = ~np.isfinite(leaf_prior.logpdf(draws_tmp))
                     tries += 1
+                self.resample_passes[t, leaf] = tries
 
                 coords[t, :, leaf] = draws_tmp
         return coords

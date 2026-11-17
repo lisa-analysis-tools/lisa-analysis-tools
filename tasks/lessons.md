@@ -114,3 +114,12 @@ Planning the seed study I asked the user which MBH starting points to use, sayin
 it; the user: "there should be a folder containing one file per source" (11 parameters each, already wired in
 `mojito_input/mbh_with_search`). **Pattern**: before a question about what data exists, open every entry of the
 directory listing and grep the run configs for the path; ask only what the files cannot answer.
+
+## 2026-11-17 — locate a crash before reporting where it is
+Reported that an MBH search candidate crashed the GPU response "on its first waveform" because the harness log
+stopped right after printing the point. User: "I am sure I have generated templates for this source before at the
+search values". The crash was at a finite-difference stencil point (sin_delta + 2 steps > 1 gives a NaN
+declination); the lines printed after the first template were buffered and lost when the process died.
+**Pattern**: a process killed by a GPU assert loses its buffered output, so the last line in the log is not where
+it died. Before saying where a crash is, reproduce the suspected call alone (it took one script) and flush every
+progress print in harnesses. When the user says a claim contradicts their experience, test the claim first.

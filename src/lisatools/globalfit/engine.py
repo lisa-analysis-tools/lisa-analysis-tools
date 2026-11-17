@@ -144,9 +144,8 @@ class Settings:
     # file's recipe.
     signal_gen: Optional[Callable] = None
     # Per-branch information-matrix covariance generator
-    # (``lisatools.globalfit.infomatrix.InfoMatrixGenerator``), shared by the
-    # branch's search interface (starting scatter) and its PE move
-    # (``InfoMatrixMove`` proposals). ``None``: the branch uses neither.
+    # (``lisatools.globalfit.infomatrix.InfoMatrixGenerator``), read by the
+    # branch's search interface for the starting scatter. ``None``: not used.
     info_matrix_gen: Optional[Any] = None
 
 
