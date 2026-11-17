@@ -542,6 +542,9 @@ class SourceBlock(MoveBlock):
     SETTINGS_NAME: ClassVar[str]      # Settings / Setup classes in lisatools.globalfit.stock.erebor
     SETUP_NAME: ClassVar[str]
     NEEDS_REFERENCE_TIME: ClassVar[bool] = True
+    # the residuals of a seeded state are rebuilt with one waveform call per leaf over the walkers (False: one
+    # call per walker)
+    BATCHED_SIGNAL_GEN: ClassVar[bool] = True
     SUPPORTS_INFO_MATRIX: ClassVar[bool] = True
     # waveform methods the special PE move must be told about (TDMBHSpecialMove sets its own)
     WAVEFORM_METHODS: ClassVar[dict[str, str]] = {}
@@ -763,7 +766,7 @@ class SourceBlock(MoveBlock):
         if self.search is not None:
             signal_gen = SignalGen(
                 WaveformHandle(waveform_class, init_kwargs), "get_signals_for_residuals",
-                info["transform_fn"], self.waveform.runtime_kwargs,
+                info["transform_fn"], self.waveform.runtime_kwargs, supports_batch=self.BATCHED_SIGNAL_GEN,
             )
         search_interface = make_search_interface(self, info)
         # the leaves' own priors (proposal_priors): the seeds of a leaf are drawn inside its prior, and the

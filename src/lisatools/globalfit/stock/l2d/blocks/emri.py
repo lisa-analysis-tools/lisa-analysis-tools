@@ -23,6 +23,8 @@ class EMRIBlock(SourceBlock):
     SETUP_NAME: ClassVar[str] = "EMRISetup"
     SEARCH_INTERFACE: ClassVar[str] = "EMRISearchInterface"
     TD_WAVEFORM_METHOD: ClassVar[str | None] = "get_td_signals"
+    # * the batched EMRI call holds every walker's full time series at once and runs out of device memory
+    BATCHED_SIGNAL_GEN: ClassVar[bool] = False
     WAVEFORM_METHODS: ClassVar[dict[str, str]] = dict(
         waveform_gen_method="get_signals_for_residuals", waveform_like_method="__call__"
     )

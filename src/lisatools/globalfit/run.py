@@ -217,7 +217,8 @@ def subtract_state_templates(acs: AnalysisContainerArray, state: GFState, signal
 
     ``signal_gen_map`` is ``{branch name: fn(*sampling_params) -> DomainBase}`` (``Settings.signal_gen``).
     One leaf at a time, with the domain-aware ``DomainBase.add_signal`` (a template may cover only part of
-    the data), as ``subtract_initial_signal`` does.
+    the data), as ``subtract_initial_signal`` does; a generator with ``supports_batch`` is called once per
+    leaf with 1-D params over the walkers (one template per walker), any other once per walker.
     """
     acs_flat = acs.flatten()
     for name, gen in signal_gen_map.items():
@@ -227,9 +228,13 @@ def subtract_state_templates(acs: AnalysisContainerArray, state: GFState, signal
             walkers = np.flatnonzero(inds0[:, leaf])
             if walkers.size == 0:
                 continue
-            for w in walkers:
-                template = gen(*coords0[w, leaf])
-                acs_flat[w].data.add_signal(template, sign=-1)
+            if getattr(gen, "supports_batch", False):
+                for w, template in zip(walkers, gen(*coords0[walkers, leaf].T)):
+                    acs_flat[w].data.add_signal(template, sign=-1)
+            else:
+                for w in walkers:  # one template on the device at a time
+                    template = gen(*coords0[w, leaf])
+                    acs_flat[w].data.add_signal(template, sign=-1)
             del template
             acs.free_gpu_memory()
         logger.info(f"rebuilt {name} residuals from {int(inds0.sum())} active leaves (cold chain).")

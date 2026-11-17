@@ -48,12 +48,13 @@ class SignalGen:
     ``waveform`` is a waveform object or a :class:`WaveformHandle` (resolved on the first call). Scalar params
     (one leaf) give one signal, the ``Settings.signal_gen`` contract; 1-D params (a batch, e.g. over walkers)
     give a ``DomainBaseArray``. ``kwargs`` are added to ``runtime_kwargs`` (e.g. ``td_settings``).
+
+    ``supports_batch`` tells ``run.subtract_state_templates`` whether to call it once per leaf with 1-D params
+    over the walkers (as ``subtract_initial_signal``) or once per walker.
     """
 
-    # run.py build_acs: one call per leaf with 1-D params over the walkers (as subtract_initial_signal)
-    supports_batch = True
-
-    def __init__(self, waveform, method: str, transform, runtime_kwargs: dict[str, Any]):
+    def __init__(self, waveform, method: str, transform, runtime_kwargs: dict[str, Any], supports_batch: bool = True):
+        self.supports_batch = supports_batch
         self.source = waveform
         self.method = method
         self.transform = transform
