@@ -781,9 +781,6 @@ def evolve_sobhb(
     return f_end if xp is np else xp.asarray(f_end)
 
 
-
-
-
 def sobhb_coalescence_phase(
         m1: float,
         m2: float,
@@ -851,6 +848,29 @@ def sobhb_reference_phase(
     phase_offset = sobhb_coalescence_phase(m1, m2, s1, s2, f_ref, 0.0)  # P(x_ref) mod 2 pi
     phi_ref = np.mod(np.asarray(phi_coal, dtype=np.float64) - phase_offset, 2 * np.pi)
     return float(phi_ref) if phi_ref.ndim == 0 else phi_ref
+
+def sobhb_evolve_frequency_phase(
+        m1: float,
+        m2: float,
+        s1: float,
+        s2: float,
+        f_start: float,
+        phase_start: float,
+        t_start: float,
+        t_end: float,
+        return_all: bool = False
+    ):
+    """
+    Convenience wrapper to evolve a SOBHB from a starting frequency and phase at a starting time to an ending time, returning the ending frequency and phase. Uses the TaylorT3 waveform approximant.
+    """
+
+    f_end = evolve_sobhb(t_start, t_end, m1, m2, s1, s2, f_start)
+    phi_coal = sobhb_coalescence_phase(m1, m2, s1, s2, f_start, phase_start)
+    phi_end = sobhb_reference_phase(m1, m2, s1, s2, f_end, phi_coal)
+    
+    if return_all:
+        return m1, m2, s1, s2, f_end, phi_end
+    return f_end, phi_end
 
 
 def psi_rotation_icrs_to_ecliptic(lam_ecl, beta_ecl):
