@@ -2401,6 +2401,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 xp.add.at(scale_counts[0], (scale_inds, t_i), 1)
                 xp.add.at(scale_counts[1], (scale_inds, t_i), accept.astype(scale_counts.dtype))
 
+            # * To log Fisher jumps proposed and accepted per (scale, temperature)
+            scale_inds = getattr(self, "_last_jump_scale_inds", None)
+            scale_counts = getattr(self, "_jump_scale_counts", None)
+            if scale_inds is not None and scale_counts is not None:
+                n_temps = scale_counts.shape[2]
+                cells = scale_inds * n_temps + t_i
+                scale_counts[0] += xp.bincount(
+                    cells, minlength=scale_counts[0].size
+                ).reshape(scale_counts[0].shape)
+                # weights instead of cells[accept]: older CuPy raises on an empty bincount input
+                scale_counts[1] += xp.bincount(
+                    cells, weights=accept.astype(xp.float64), minlength=scale_counts[1].size
+                ).astype(scale_counts.dtype).reshape(scale_counts[1].shape)
+
             self._debug_verify_in_model(
                 buffer_obj, curr, new, slots, N_vals, delta_ll, keep, map_cpu, move_i,
             )

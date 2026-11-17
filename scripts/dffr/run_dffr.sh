@@ -91,7 +91,7 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 [ "$device" = gpu ] || export JAX_PLATFORMS=cpu
 export PYTHONWARNINGS=ignore::DeprecationWarning
 
-golden() { "$python_bin" "$script_dir/stft_golden_outputs.py" --window "$window" "$@"; }
+golden() { "$python_bin" "$script_dir/stft_golden_outputs.py" "$@"; }
 
 require_dffr_python() {
     [ -n "$dffr_python" ] || { echo "DFFR_PYTHON is not set" >&2; return 2; }
