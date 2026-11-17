@@ -236,7 +236,7 @@ class GBBlock(SourceBlock):
             waveform_model_code_link=self.links.waveform_model_code_link,
             prior_model_code_link=self.links.prior_model_code_link,
             prior_model_config_file=self.links.prior_model_config_file,
-            t_0 = general_setup.data_t0
+            data_t0=general_setup.data_t0,
         )
         return BlockBuild(setup, metadata, find_class(self.waveform.class_name, self.WAVEFORM_MODULES))
 
