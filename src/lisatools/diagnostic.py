@@ -665,6 +665,38 @@ def dh_dlambda(
     return dh_I
 
 
+def _stencil_problem(
+    step: float,
+    params: np.ndarray,
+    index: int,
+    more_accurate: bool,
+    parameter_transforms: Optional[TransformContainer],
+    prior: Any,
+) -> Optional[str]:
+    """Why the stencil of :func:`dh_dlambda` at ``step`` cannot be evaluated, or ``None`` if it can.
+
+    The stencil points are ``params`` with ``params[index]`` moved by ``+-step`` (and ``+-2 step`` with
+    ``more_accurate``). One of them outside the support of ``prior``, or with a waveform parameter that is
+    not a finite number after ``parameter_transforms``, makes the step unusable.
+    """
+    offsets = step * np.array([-2.0, -1.0, 1.0, 2.0] if more_accurate else [-1.0, 1.0])
+    points = np.repeat(params[None, :], len(offsets), axis=0)
+    points[:, index] += offsets
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if prior is not None:
+            log_prior = prior.logpdf(points)
+            log_prior = np.asarray(log_prior.get() if hasattr(log_prior, "get") else log_prior, dtype=float)
+            if not np.all(np.isfinite(log_prior)):
+                return "outside the prior"
+        values = points if parameter_transforms is None else parameter_transforms.both_transforms(points)
+        try:
+            finite = np.all(np.isfinite(np.asarray(values, dtype=float)))
+        except (TypeError, ValueError):  # a None among the waveform parameters
+            finite = False
+    return None if finite else "a waveform parameter that is not finite"
+
+
 def estimate_eps(
     waveform_model: callable,
     params: np.ndarray | list,
@@ -672,6 +704,7 @@ def estimate_eps(
     inner_product_kwargs: Optional[dict] = {},
     steps: Optional[np.ndarray | list] = None,
     return_changes: Optional[bool] = False,
+    prior: Any = None,
     **kwargs: dict,
 ) -> np.ndarray | Tuple[np.ndarray, list, list]:
     """Estimate the derivative step size of each parameter at ``params``.
@@ -703,17 +736,32 @@ def estimate_eps(
             step where the waveform raises (a step that large leaves the waveform's domain, e.g. a mass
             with no inspiral in band), with a warning.
         return_changes: If ``True``, also return the ladders and the changes :math:`c_k`.
+        prior: Prior of ``params`` (an object with ``logpdf(points) -> array``, e.g. an eryn
+            ``ProbDistContainer``). If given, a step whose stencil leaves its support is skipped.
         **kwargs: Keyword arguments passed to :func:`dh_dlambda`.
+
+    A step is **skipped**, and the next one of the ladder tried, when a point of its stencil
+    (``value +- step``, and ``value +- 2 step`` with ``more_accurate``) is outside the support of ``prior``
+    or has a waveform parameter that is not a finite number after ``parameter_transforms`` (e.g.
+    ``arcsin`` of a ``sin_delta`` above 1). Such a point does not make every waveform raise: a NaN
+    parameter can crash or hang a GPU kernel instead. The waveform is not called for a skipped step, the
+    changes :math:`c_k` are taken between the neighbouring steps that are left, and one warning per
+    parameter names the steps skipped.
+
+    A step whose derivative is exactly zero or not finite is left out in the same way, with a warning. This
+    is a step below the resolution of the waveform: its stencil points give the same waveform, e.g. a
+    phase that is added to a large number before the waveform sees it.
 
     Returns:
         Array with one step per parameter in ``deriv_inds``. If ``return_changes is True``, a tuple
         ``(eps, ladders, changes)`` with one array per parameter in the two lists (``changes`` is one
-        shorter than its ladder).
+        shorter than its ladder; the entry of a step is the change to the next step used, and NaN for a
+        step that was skipped or has no step used after it).
 
     Raises:
-        ValueError: If a ladder has fewer than two steps, or no pair of neighbouring steps of a parameter
-            gives a finite change (e.g. every step leaves the waveform's domain). A waveform error at the
-            smallest step is raised as it is.
+        ValueError: If a ladder has fewer than two steps, fewer than two of its steps can be used, or no
+            pair of neighbouring steps of a parameter gives a finite change (e.g. every step leaves the
+            waveform's domain). A waveform error at the smallest step used is raised as it is.
 
     """
     params = np.asarray(params, dtype=float)
@@ -740,8 +788,25 @@ def estimate_eps(
         if len(ladder) < 2:
             raise ValueError("A step ladder needs at least two steps.")
         change = np.full(len(ladder) - 1, np.nan)
-        previous = dh_dlambda(ladder[0], waveform_model, params, i, **kwargs)
-        for k in range(1, len(ladder)):
+        problems = [
+            _stencil_problem(
+                step, params, i, kwargs.get("more_accurate", True), kwargs.get("parameter_transforms"), prior
+            )
+            for step in ladder
+        ]
+        usable = [k for k, problem in enumerate(problems) if problem is None]
+        if len(usable) < len(ladder):
+            skipped = ", ".join(f"{ladder[k]:.3g} ({problem})" for k, problem in enumerate(problems) if problem)
+            warnings.warn(f"estimate_eps: parameter {i}: skipping the steps {skipped}.")
+        if len(usable) < 2:
+            raise ValueError(
+                f"Parameter {i} (value {params[i]}) has {len(usable)} usable step(s) in its ladder {ladder}: "
+                "the others have a stencil point outside the prior or a waveform parameter that is not finite."
+            )
+        earlier = usable[0]
+        unresolved = []
+        previous = dh_dlambda(ladder[earlier], waveform_model, params, i, **kwargs)
+        for k in usable[1:]:
             try:
                 current = dh_dlambda(ladder[k], waveform_model, params, i, **kwargs)
             except Exception as error:
@@ -751,12 +816,23 @@ def estimate_eps(
                     f"({type(error).__name__}: {error}); using the smaller steps only."
                 )
                 break
-            diff = difference(previous, current)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                change[k - 1] = inner_product(diff, diff, **inner_product_kwargs) / inner_product(
-                    previous, previous, **inner_product_kwargs
-                )
-            previous = current
+            norm = inner_product(previous, previous, **inner_product_kwargs)
+            if not np.isfinite(norm) or norm == 0.0:
+                # the earlier step has no derivative to compare with: its stencil points give the same
+                # waveform (a step below the resolution of the waveform) or one that is not finite.
+                # Leave it out and go on from the current step.
+                unresolved.append(ladder[earlier])
+            else:
+                diff = difference(previous, current)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    change[earlier] = inner_product(diff, diff, **inner_product_kwargs) / norm
+            earlier, previous = k, current
+        if unresolved:
+            warnings.warn(
+                f"estimate_eps: parameter {i}: the steps {', '.join(f'{step:.3g}' for step in unresolved)} give a zero "
+                "or non-finite derivative (a step below the resolution of the waveform gives identical stencil "
+                "points); they are left out."
+            )
         if not np.any(np.isfinite(change)):
             raise ValueError(f"No step of parameter {i} gives a finite derivative; ladder: {ladder}.")
         eps[n] = ladder[int(np.nanargmin(change))]
