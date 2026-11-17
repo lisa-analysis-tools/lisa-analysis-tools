@@ -1840,6 +1840,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 *parent.args,
                 min_freq=max(parent.ind_min - 0.5, 0.0) * parent.df,
                 max_freq=(parent.ind_min + width - 0.5) * parent.df,
+                sample_cadence=getattr(parent, "sample_cadence", None),
                 force_backend=parent.kwargs["force_backend"],
             )
             if cell_settings.NF_active != width or cell_settings.min_freq != parent.min_freq:
@@ -1984,6 +1985,7 @@ class SubBandBuffer(AnalysisContainerArray, LISAToolsParallelModule):
                 window_alpha=parent_group.window_alpha,
                 use_midpoint=parent_group.use_midpoint,
                 linear_envelope=parent_group.linear_envelope,
+                use_sym_window=getattr(parent_group, "use_sym_window", True),
             )
             if self._reads_parent_noise_rows:
                 # * The cells read their walkers' parent rows: the array allocates no noise. 

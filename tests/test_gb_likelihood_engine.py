@@ -1066,15 +1066,23 @@ class STFTEngineNumericTest(unittest.TestCase):
             band_aca.linear_data_arr[0].size,
             2 * 3 * settings.NT * settings.NF_active,
         )
-        # linear_envelope is copied from the parent group as well (its default is True)
+        # linear_envelope and use_sym_window are copied from the parent group as well (both
+        # default to True)
         self.assertEqual(
             band_aca.domain_group_kwargs,
-            dict(tdi_type="XYZ", window_alpha=0.0, use_midpoint=False, linear_envelope=True),
+            dict(
+                tdi_type="XYZ",
+                window_alpha=0.0,
+                use_midpoint=False,
+                linear_envelope=True,
+                use_sym_window=True,
+            ),
         )
         group = band_aca.cpp_splits[0]
         self.assertIsInstance(group, STFTComputationGroup)
         self.assertEqual(group.window_alpha, 0.0)
         self.assertFalse(group.use_midpoint)
+        self.assertTrue(group.use_sym_window)
         self.assertEqual(group.num_data, 2)
 
 

@@ -943,11 +943,13 @@ void domains_part(nb::module_ &m) {
 #else
     nb::class_<STFTFresnelWrap>(m, "STFTFresnelWrapCPU")
 #endif
-    .def(nb::init<int, int, int, double, double, double, double, double, double, bool, bool>(),
+    .def(nb::init<int, int, int, double, double, double, double, double, double, bool, bool, int,
+                  double>(),
          nb::arg("num_times"), nb::arg("num_freqs"), nb::arg("num_channels"),
          nb::arg("t0"), nb::arg("f_min"), nb::arg("f_max"),
          nb::arg("dt"), nb::arg("df"), nb::arg("window_alpha") = 0.0,
-         nb::arg("use_midpoint") = false, nb::arg("linear_envelope") = false)
+         nb::arg("use_midpoint") = false, nb::arg("linear_envelope") = false,
+         nb::arg("window_samples") = 0, nb::arg("sample_cadence") = 0.0)
     .def("compute_phase_kernel_moments", &STFTFresnelWrap::compute_phase_kernel_moments,
          nb::arg("kernel_out"), nb::arg("moment_out"), nb::arg("f_effs"),
          nb::arg("t_refs"), nb::arg("f0s"), nb::arg("fdot0s"),

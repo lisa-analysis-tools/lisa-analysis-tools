@@ -793,7 +793,9 @@ CUDA_DEVICE
 void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
                                             double f, cmplx* kernel_out,
                                             cmplx* moment_out) {
-  double t_end = t0 + dt;
+  // * The window ends where its span ends: dt for the periodic window, (N - 1) h for the
+  // * symmetric one.
+  double t_end = t0 + window_span;
   double t_roll_on = t0 + taper_duration;
   double t_roll_off = t_end - taper_duration;
 
@@ -818,14 +820,14 @@ void STFTFresnel::get_windowed_fourier_core(double f0, double fdot0, double t0,
                           &term[i], with_moment ? &moment[i] : nullptr);
   }
 
-  // The right-ramp half-cosine is referenced to the segment END,
+  // The right-ramp half-cosine is referenced to the window END,
   // cos(pi*(t_end - t)/taper). Re-expressed as frequency shifts referenced to
-  // the Fourier origin t0 it carries constant phases exp(-/+ 2 pi i f_taper*dt)
-  // on the (f -/+ f_taper) terms. Those are unity iff f_taper*dt = 1/alpha is an
+  // the Fourier origin t0 it carries constant phases exp(-/+ 2 pi i f_taper*span)
+  // on the (f -/+ f_taper) terms. Those are unity iff f_taper*span = 1/alpha is an
   // integer (true for all historical alphas: 0.1, 0.5, 1.0); omitting them for
   // an off-grid taper silently degraded the windowed template to mm ~ 1e-2
   // (found 2026-07-02 with taper = 1e4 s at dt = 1 day, alpha = 0.2315).
-  double taper_rot = 2.0 * M_PI * f_taper * dt;
+  double taper_rot = 2.0 * M_PI * f_taper * window_span;
   cmplx right_rot_p = gcmplx::polar(1.0, -taper_rot);  // multiplies (f - f_taper)
   cmplx right_rot_m = gcmplx::polar(1.0, +taper_rot);  // multiplies (f + f_taper)
 
