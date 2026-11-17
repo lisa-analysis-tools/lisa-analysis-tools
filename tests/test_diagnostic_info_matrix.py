@@ -1,6 +1,7 @@
 """Information matrix (:mod:`lisatools.diagnostic`) for waveforms that return ``DomainBase`` objects."""
 
 import unittest
+import warnings
 
 import numpy as np
 
@@ -294,6 +295,126 @@ class DomainInfoMatrixTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "no root"):
             estimate_eps(always_fails, self.params, deriv_inds=[0], inner_product_kwargs=self.ip_kwargs)
+
+    def _recording(self):
+        seen = []
+
+        def waveform(amp, f0, phi, tc):
+            seen.append((amp, f0, phi, tc))
+            return self.full_grid_waveform(amp, f0, phi, tc)
+
+        return waveform, seen
+
+    def test_estimate_eps_skips_the_steps_that_leave_the_prior(self):
+        """A stencil point outside the prior: the step is skipped without a waveform call, the next one is tried."""
+        from eryn.priors import ProbDistContainer, UniformDistribution
+
+        phi = self.params[2]
+        bounds = [(0.1, 10.0), (0.0, 1.0), (phi - 1.0, phi + 3e-3), (-1e3, 1e3)]
+        prior = ProbDistContainer({i: UniformDistribution(lo, hi) for i, (lo, hi) in enumerate(bounds)})
+        waveform, seen = self._recording()
+        with self.assertWarnsRegex(UserWarning, r"parameter 2: skipping the steps 0\.01 \(outside the prior\)"):
+            eps, ladders, changes = estimate_eps(
+                waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs, return_changes=True,
+                prior=prior,
+            )
+        # the five-point stencil reaches phi + 2 step: only the 1e-2 step leaves the prior
+        self.assertTrue(all(abs(call[2] - phi) <= 2e-3 * (1 + 1e-12) for call in seen))
+        self.assertEqual(len(seen), 9 * 4)
+        self.assertEqual(len(ladders[0]), 10)
+        self.assertTrue(np.isnan(changes[0][-1]) and np.all(np.isfinite(changes[0][:-1])))
+        free = estimate_eps(self.full_grid_waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs)
+        np.testing.assert_allclose(eps, free)
+        # three-point stencil: phi + step is inside for every step
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            estimate_eps(
+                waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs, prior=prior,
+                more_accurate=False, steps=np.logspace(-6, np.log10(2.5e-3), 4),
+            )
+
+    def test_estimate_eps_skips_a_step_in_the_middle_and_goes_on(self):
+        ladder = np.logspace(-8, -3, 6)
+        phi = self.params[2]
+
+        class Hole:  # a prior whose support excludes the stencil of one step only
+            def logpdf(self, points):
+                bad = np.isclose(np.abs(points[:, 2] - phi), 2e-6, rtol=1e-6)
+                return np.where(bad, -np.inf, 0.0)
+
+        waveform, seen = self._recording()
+        with self.assertWarnsRegex(UserWarning, "skipping the steps 1e-06"):
+            eps, _, changes = estimate_eps(
+                waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs, return_changes=True,
+                prior=Hole(), steps=ladder,
+            )
+        self.assertEqual(len(seen), 5 * 4)
+        self.assertFalse(any(np.isclose(abs(call[2] - phi), 2e-6, rtol=1e-6) for call in seen))
+        # the 1e-7 step is compared with the next step used, 1e-5; the skipped step has no change
+        self.assertTrue(np.isnan(changes[0][2]))
+        self.assertTrue(np.all(np.isfinite(np.delete(changes[0], 2))))
+        self.assertIn(eps[0], np.delete(ladder, 2))
+
+    def test_estimate_eps_skips_the_steps_with_a_waveform_parameter_that_is_not_finite(self):
+        """sin(delta) near 1: arcsin of a stencil point above 1 is NaN, which must never reach the waveform."""
+        from eryn.utils import TransformContainer
+
+        names = ["amp", "f0", "sin_phi", "tc"]
+        transform = TransformContainer(input_basis=names, output_basis=names, parameter_transforms={"sin_phi": np.arcsin})
+        params = self.params.copy()
+        params[2] = 0.995  # the waveform's phi = arcsin(0.995)
+        waveform, seen = self._recording()
+        with self.assertWarnsRegex(UserWarning, r"0\.01 \(a waveform parameter that is not finite\)"):
+            eps = estimate_eps(
+                waveform, params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs, parameter_transforms=transform,
+            )
+        self.assertTrue(np.all(np.isfinite(np.array(seen))))
+        self.assertEqual(len(seen), 9 * 4)  # 0.995 + 2 * 1e-2 > 1: that step only
+        self.assertLessEqual(eps[0], 1e-3)
+        # without the check the same call hands the waveform a NaN
+        self.assertTrue(np.isnan(transform.both_transforms(np.array([[1.0, 0.03, 1.015, 0.0]]))[0, 2]))
+
+    def test_estimate_eps_leaves_out_the_steps_below_the_waveform_resolution(self):
+        """A phase added to a large number first: small steps give identical stencil points, a zero derivative."""
+        offset = 2.0e7  # float spacing 3.7e-9
+
+        def waveform(amp, f0, phi, tc):
+            return self.full_grid_waveform(amp, f0, np.mod(phi + offset, 2 * np.pi), tc)
+
+        with self.assertWarnsRegex(UserWarning, r"parameter 2: the steps 1e-11, 1e-10.* zero or non-finite"):
+            eps, ladders, changes = estimate_eps(
+                waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs, return_changes=True
+            )
+        self.assertTrue(np.all(np.isnan(changes[0][:2])))
+        self.assertGreaterEqual(eps[0], 1e-7)  # well above the resolution
+        info = info_matrix(eps, waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs)
+        exact = info_matrix(
+            1e-3, self.full_grid_waveform, self.params, deriv_inds=[2], inner_product_kwargs=self.ip_kwargs
+        )
+        np.testing.assert_allclose(info, exact, rtol=1e-4)
+
+    def test_estimate_eps_needs_two_usable_steps(self):
+        class Nowhere:
+            def logpdf(self, points):
+                return np.full(len(points), -np.inf)
+
+        waveform, seen = self._recording()
+        with self.assertWarns(UserWarning), self.assertRaisesRegex(ValueError, "0 usable step"):
+            estimate_eps(waveform, self.params, deriv_inds=[1], inner_product_kwargs=self.ip_kwargs, prior=Nowhere())
+        self.assertEqual(seen, [])
+
+    def test_info_matrix_takes_the_prior_through_a_partial(self):
+        from functools import partial
+
+        from eryn.priors import ProbDistContainer, UniformDistribution
+
+        bounds = [(0.1, 10.0), (0.0, 1.0), (-10.0, 10.0), (-1e3, 1e3)]
+        prior = ProbDistContainer({i: UniformDistribution(lo, hi) for i, (lo, hi) in enumerate(bounds)})
+        with_prior = info_matrix(
+            partial(estimate_eps, prior=prior), self.full_grid_waveform, self.params, inner_product_kwargs=self.ip_kwargs
+        )
+        without = info_matrix(estimate_eps, self.full_grid_waveform, self.params, inner_product_kwargs=self.ip_kwargs)
+        np.testing.assert_array_equal(with_prior, without)
 
     def test_estimate_eps_without_a_finite_step_raises(self):
         def waveform(*params):
