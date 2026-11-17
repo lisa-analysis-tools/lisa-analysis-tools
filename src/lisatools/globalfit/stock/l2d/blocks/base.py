@@ -589,8 +589,8 @@ class SourceBlock(MoveBlock):
     def _proposal_priors_fit_the_leaves(self):
         if self.proposal_priors is None:
             return self
-        if self.nleaves != "auto":
-            raise ValueError("proposal_priors: the leaves are the source ids, so nleaves must be 'auto'.")
+        # if self.nleaves != "auto":
+        #     raise ValueError("proposal_priors: the leaves are the source ids, so nleaves must be 'auto'.")
         if self.search is not None and self.search.search_type == "prior":
             raise ValueError(
                 "proposal_priors: a prior search draws from the branch prior, outside the per-leaf priors; "
