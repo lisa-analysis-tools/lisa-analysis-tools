@@ -144,6 +144,12 @@ def main(argv=None):
         help="first_order_delays of the DFFR comp in place of the fixture's setting, for an A/B of "
         "the two (--response dffr only)",
     )
+    parser.add_argument(
+        "--window",
+        choices=("symmetric", "periodic"),
+        default="symmetric",
+        help="Tukey window of the templates: the data's symmetric one, or the periodic one",
+    )
     parser.add_argument("--output", required=True, metavar="OUT_JSON")
     args = parser.parse_args(argv)
     if args.without_swap:
@@ -161,6 +167,7 @@ def main(argv=None):
         num_segments=args.num_segments,
         num_sources=max(args.batch_sizes),
         response=args.response,
+        use_sym_window=args.window == "symmetric",
     )
     # * An instance attribute shadows the class constant for this comp only.
     if args.dffr_rows is not None:
@@ -195,6 +202,7 @@ def main(argv=None):
         metadata=fixtures.run_metadata(args.backend, args.mojito_l1),
         config=args.config,
         response=args.response,
+        window=args.window,
         dffr_rows=args.dffr_rows,
         dffr_fisher_rows=args.dffr_fisher_rows,
         dffr_first_order_delays=args.dffr_first_order_delays,

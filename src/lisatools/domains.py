@@ -1564,6 +1564,8 @@ class STFTSettings(DomainSettingsBase):
         min_freq: Lower edge of the active band (Hz). Defaults to ``0.0``.
         max_freq: Upper edge of the active band (Hz). If ``None``, the full range
             is used.
+        sample_cadence: Sample spacing of the time series the segments are cut from (seconds),
+            or ``None`` when unknown.
         **kwargs: Forwarded to :class:`DomainSettingsBase` (e.g. ``force_backend``).
     """
 
@@ -1574,6 +1576,7 @@ class STFTSettings(DomainSettingsBase):
     NF: int
     min_freq: Optional[float] = 0.0
     max_freq: Optional[float] = None
+    sample_cadence: Optional[float] = None
 
     def __init__(
         self,
@@ -1584,6 +1587,7 @@ class STFTSettings(DomainSettingsBase):
         NF: int,
         min_freq: Optional[float] = 0.0,
         max_freq: Optional[float] = None,
+        sample_cadence: Optional[float] = None,
         **kwargs,
     ):
         self.t0 = t0
@@ -1593,6 +1597,7 @@ class STFTSettings(DomainSettingsBase):
         self.NF = NF
         self.min_freq = min_freq
         self.max_freq = max_freq
+        self.sample_cadence = sample_cadence
         super().__init__(**kwargs)
 
     def __repr__(self):
@@ -1723,7 +1728,10 @@ class STFTSettings(DomainSettingsBase):
     @property
     def kwargs(self) -> dict:
         return dict(
-            min_freq=self.min_freq_input, max_freq=self.max_freq_input, force_backend=self.backend
+            min_freq=self.min_freq_input,
+            max_freq=self.max_freq_input,
+            sample_cadence=self.sample_cadence,
+            force_backend=self.backend,
         )
 
     @property
@@ -1842,6 +1850,7 @@ class STFTSettings(DomainSettingsBase):
             NF=new_NF,
             min_freq=new_min_freq,
             max_freq=new_max_freq,
+            sample_cadence=self.sample_cadence,
             force_backend=self.backend,
         )
 
@@ -1881,7 +1890,15 @@ def get_stft_settings(
     NF = nperseg // 2 + 1
 
     return STFTSettings(
-        t0=t0, dt=big_dt, df=DF, NT=NT, NF=NF, min_freq=min_freq, max_freq=max_freq, **kwargs
+        t0=t0,
+        dt=big_dt,
+        df=DF,
+        NT=NT,
+        NF=NF,
+        min_freq=min_freq,
+        max_freq=max_freq,
+        sample_cadence=dt,
+        **kwargs,
     )
 
 

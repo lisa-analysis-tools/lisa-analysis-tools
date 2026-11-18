@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -11,7 +12,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from inspect import Attribute
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy
@@ -131,6 +132,7 @@ from .gbbands import (
     return_x,
     unpack_special_index,
 )
+from .gbbandstructure import stft_band_width_hz, worst_case_fdot_hz_per_s
 from .gbmemprobe import make_probe
 from ...utils.devicereplicas import release_gb_comp_groups
 
@@ -2399,6 +2401,20 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
                 xp.add.at(scale_counts[0], (scale_inds, t_i), 1)
                 xp.add.at(scale_counts[1], (scale_inds, t_i), accept.astype(scale_counts.dtype))
 
+            # * To log Fisher jumps proposed and accepted per (scale, temperature)
+            scale_inds = getattr(self, "_last_jump_scale_inds", None)
+            scale_counts = getattr(self, "_jump_scale_counts", None)
+            if scale_inds is not None and scale_counts is not None:
+                n_temps = scale_counts.shape[2]
+                cells = scale_inds * n_temps + t_i
+                scale_counts[0] += xp.bincount(
+                    cells, minlength=scale_counts[0].size
+                ).reshape(scale_counts[0].shape)
+                # weights instead of cells[accept]: older CuPy raises on an empty bincount input
+                scale_counts[1] += xp.bincount(
+                    cells, weights=accept.astype(xp.float64), minlength=scale_counts[1].size
+                ).astype(scale_counts.dtype).reshape(scale_counts[1].shape)
+
             self._debug_verify_in_model(
                 buffer_obj, curr, new, slots, N_vals, delta_ll, keep, map_cpu, move_i,
             )
@@ -3384,6 +3400,13 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
 
         if self.backend.uses_cupy:
             self.xp.cuda.runtime.setDevice(model.analysis_container_arr.gpus[0])
+            # * The level every propose should start from: a fall over the run shows that a move
+            # * kept arrays on a card after its propose.
+            logger.info(
+                "[GB_MEMORY %s] device memory free at the start of the propose: %.2f GiB",
+                self.name,
+                free_device_bytes(self.xp, model.analysis_container_arr.gpus) / 2**30,
+            )
         # Run-time source of truth is the ACA that arrives with the model:
         # refresh the domain quantities and re-bind the parent engine (FD
         # prototype comp + move-level engine) if this ACA differs from the
@@ -3701,6 +3724,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self.mempool.free_all_blocks()
         with tm.span("ll_inject_final"):
             new_state.log_like[:] = self.check_ll_inject(model, new_band_sorter)
+        # * The rebuild above is the last reader of the data copy; kept, it would take a card's
+        # * share of the walkers' data from every other GB move until this move's next propose.
+        self.reset_non_gb_linear_data_arr = None
 
         # Per-band progressive leaf caps advance AFTER the final residual
         # rebuild so the convergence metric sees the accepted state. Only
@@ -3771,6 +3797,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
             self._mem_probe.finish()
 
         self._release_stft_comp_groups()
+        # * Nothing reads the incoming state after the propose; kept, it pins a whole sampler state
+        # * on the host.
+        self.current_state = None
 
         return new_state, accepted
 
@@ -4287,6 +4316,624 @@ def gather_gmms(gmms):
 from lisatools.sampling.gmm import vec_fit_gmm_min_bic
 
 # ======================================================================================================================
+# The search memory: GMM fits of the F-statistic searches, the counts of the searches and the rule that limits them
+# ======================================================================================================================
+# It runs no search and uses numpy and the standard library only, so the search move, the split and merge move and the
+# recipe can share one object that lives on the host. Its fits are of three kinds, by the input of the search that made
+# them: the residual of the best walker (set as a whole after every search that gives a proposal), the data in the reach
+# windows around the sources (raw data) and that residual with the window's own sources added back (residual plus
+# sources); the last two are added. It saves itself to one file after every change, so a restarted run has its fits and
+# its counts.
+
+# Columns of a fit: the sampling columns of the GB branch, as the search's record holds them
+FIT_COLUMNS = 8
+# What a fit description (a dict handed to set_fits or add_fits) must hold, and what it may hold with its default
+_REQUIRED_FIT_ENTRIES = ("weights", "means", "covs", "mins", "maxs", "low_mhz", "high_mhz")
+_OPTIONAL_FIT_ENTRIES = {"search_number": 0, "pass_number": 0, "walker": 0, "largest_snr": float("nan"),
+                         "threshold": float("nan")}
+
+
+def _read_only(array):
+    """The array with its write flag off, so that a fit handed out cannot be changed by its reader."""
+    array.flags.writeable = False
+    return array
+
+
+@dataclass(frozen=True, eq=False)
+class SearchFit:
+    """One Gaussian mixture of one search of one frequency range.
+
+    ``means`` (components, 8) and ``covs`` (components, 8, 8) are in the unit box of the searched range, y = 2 (x - min)
+    / (max - min) - 1 per column, with the box corners ``mins`` and ``maxs`` (8,) in sampling units; ``weights``
+    (components,) sum to one. ``largest_snr`` is the largest sqrt(2F) of the search's first stage and ``threshold`` the
+    gate's threshold on it. The arrays are read-only. Fits compare by field, not by ``==``.
+    """
+
+    kind: str
+    band: int
+    low_mhz: float
+    high_mhz: float
+    search_number: int
+    pass_number: int
+    walker: int
+    largest_snr: float
+    threshold: float
+    weights: np.ndarray
+    means: np.ndarray
+    covs: np.ndarray
+    mins: np.ndarray
+    maxs: np.ndarray
+
+
+class FStatSearchMemory:
+    """The fits of the F-statistic searches, the counts of the searches of one kind, and the rule that limits them.
+
+    The memory is bound to the layout of the run once: the edges of the GB bands, the width of one frequency bin (one
+    over the span) and the reach window W of each band, all in mHz. A second bind with another layout is an error.
+
+    A restart from an older sampler checkpoint finds the memory as the last run left it, so its fits and counts may be
+    newer than the sampler state; that is harmless in the burn-in and has no effect in the kept steps. The search of
+    the kind "raw data" is made once in a run, so the memory also keeps a flag for it (``raw_data_searched``).
+
+    Args:
+        path: The file the memory saves itself to and loads at the bind; None keeps the memory in memory only.
+        resume: True for a run that resumes: the bind then loads the file when it exists. False for a run that starts
+            fresh: the bind then raises ValueError when the file exists, so that a file left by an earlier run in the
+            same folder cannot seed a new run.
+    """
+
+    # The kinds of fit, by the input of the search that made them
+    KIND_RESIDUAL = "residual"
+    KIND_RAW_DATA = "raw_data"
+    KIND_RESIDUAL_PLUS_SOURCES = "residual_plus_sources"
+    KINDS = (KIND_RESIDUAL, KIND_RAW_DATA, KIND_RESIDUAL_PLUS_SOURCES)
+    # * A search of the kind "residual plus sources" starts only while fewer than this
+    # * many searches of that kind are counted within the reach window around the middle of its window
+    MAX_SEARCHES_WITHIN_REACH = 5
+    # The layout of a restarted run is computed again, so two layouts agree when their numbers agree to this
+    LAYOUT_RELATIVE_TOLERANCE = 1e-12
+    # The format of the file, stored in it
+    FILE_FORMAT = 1
+
+    def __init__(self, path=None, resume=False):
+        self.path = None if path is None else os.fspath(path)
+        self.resume = bool(resume)
+        self._layout = None
+        self._counts = None
+        self._fits = []
+        self._searched = []
+        self._version = 0
+        self._fixed = False
+        self._raw_data_searched = False
+
+    # ==================================================================================================================
+    # The layout and the state that can be read
+    # ==================================================================================================================
+
+    def bind(self, band_edges_mhz, bin_mhz, window_mhz):
+        """Bind the memory to the layout of the run, and load the file at ``path`` when the run resumes.
+
+        Args:
+            band_edges_mhz: The edges of the GB bands (number of bands + 1,), increasing.
+            bin_mhz: The width of one frequency bin, one over the span.
+            window_mhz: The reach window W of each band (number of bands,).
+
+        A second bind with the same layout does nothing. When ``resume`` is True and the file exists, it is loaded; when
+        ``resume`` is False and the file exists, the bind raises ValueError naming the file. Raises ValueError also for a
+        layout that is not valid, for a second bind with another layout, for a file that was made for another layout, and
+        for a file that cannot be read. An error at the first bind leaves the memory not bound; an error at a later bind
+        leaves it as it was.
+        """
+        layout = self._checked_layout(band_edges_mhz, bin_mhz, window_mhz)
+        if self._layout is not None:
+            self._require_same_layout(layout, "this bind")
+            return
+        file_exists = self.path is not None and os.path.exists(self.path)
+        if file_exists and not self.resume:
+            raise ValueError(f"the search memory file {self.path} exists, but this run does not resume: remove the file, "
+                             "use another folder, or bind a memory made with resume=True")
+        self._layout = layout
+        self._counts = np.zeros(self._number_of_bins(), dtype=np.int32)
+        if file_exists:
+            try:
+                self._load()
+            except Exception:
+                self._layout, self._counts = None, None
+                raise
+
+    @property
+    def is_bound(self):
+        return self._layout is not None
+
+    @property
+    def version(self):
+        """A number that grows by one with every call of ``set_fits``, ``add_fits`` or ``finish_raw_data_search`` that
+        changes the fits; counts, searched ranges and the raw data flag do not change it."""
+        return self._version
+
+    @property
+    def fixed(self):
+        """True from the start of the kept steps: the split and merge's search part is fixed, so the memory takes no new
+        fit and starts no new search."""
+        return self._fixed
+
+    @property
+    def raw_data_searched(self):
+        """True once the search of the kind "raw data", which is made once in a run, has ended and its fits are stored.
+
+        The flag is saved with the fits, so a run that resumes knows that the search was made also when it gave no fit.
+        """
+        return self._raw_data_searched
+
+    @property
+    def search_counts(self):
+        """A copy of the counts: one integer per frequency bin of the run, the searches of the kind "residual plus
+        sources" counted at the bin in the middle of their window."""
+        self._require_bound()
+        return self._counts.copy()
+
+    @property
+    def searched_ranges(self):
+        """The searched windows of the kind "residual plus sources", (n, 2) (low, high) in mHz in the order they
+        started, whether or not they gave a fit."""
+        return np.array(self._searched, dtype=np.float64).reshape(-1, 2)
+
+    def band_of(self, frequency_mhz):
+        """The band of each frequency (scalar or array), by the sorter's rule: the band holds its lower edge and not its
+        upper edge, and the last edge belongs to the last band. Raises ValueError outside the layout."""
+        self._require_bound()
+        edges = self._layout["band_edges_mhz"]
+        frequency = self._checked_frequency(frequency_mhz)
+        return np.minimum(np.searchsorted(edges, frequency, side="right") - 1, edges.size - 2)
+
+    def bin_of(self, frequency_mhz):
+        """The frequency bin of each frequency (scalar or array), counted from the first band edge. Raises ValueError
+        outside the layout."""
+        self._require_bound()
+        frequency = self._checked_frequency(frequency_mhz)
+        index = np.floor((frequency - self._layout["band_edges_mhz"][0]) / self._layout["bin_mhz"]).astype(np.int64)
+        return np.minimum(index, self._counts.size - 1)
+
+    # ==================================================================================================================
+    # The fits
+    # ==================================================================================================================
+
+    def fix(self):
+        """Fix the memory from the start of the kept steps: it takes no new fit and starts no new search from now on, which
+        keeps what the split and merge reads the same after a restart. The flag is saved."""
+        self._require_bound()
+        if not self._fixed:
+            self._fixed = True
+            self._save()
+
+    def set_fits(self, kind, fits):
+        """Set all fits of one kind in one change: remove every stored fit of the kind and store the given list.
+
+        The search move sets the kind "residual" this way after every search that gives it a new proposal, one fit per
+        usable band and an empty list when every band is shut off, so that the memory mirrors the latest search: a band
+        that passed in an earlier search and not in this one drops out.
+
+        Args:
+            kind: One of ``KINDS``.
+            fits: A list of fit descriptions, possibly empty. A description is a dict with ``weights`` (components,),
+                ``means`` (components, 8) and ``covs`` (components, 8, 8) in the unit box; ``mins`` and ``maxs`` (8,),
+                the corners of that box in sampling units, with maxs above mins; ``low_mhz`` and ``high_mhz``, the
+                searched range, whose middle gives the band of the fit; and optionally ``search_number``,
+                ``pass_number``, ``walker``, ``largest_snr`` and ``threshold``, what the search reports about itself.
+
+        The version grows by one and the file is written once when anything changed; nothing changes when the kind had
+        no fit and the list is empty. Returns True when the memory took the list and False when it is fixed. Every
+        description is checked before anything changes and its arrays are copied. Raises ValueError for an unknown
+        kind, a description with an entry missing or unknown, an array of the wrong shape or with a value that is not
+        finite, a box without width, or a range outside the layout.
+        """
+        self._require_bound()
+        new_fits = self._checked_fits(kind, fits)
+        if self._fixed:
+            return False
+        kept = [fit for fit in self._fits if fit.kind != kind]
+        if len(kept) == len(self._fits) and not new_fits:
+            return True
+        self._fits = kept + new_fits
+        self._version += 1
+        self._save()
+        return True
+
+    def add_fits(self, kind, fits):
+        """Add several fits of one kind in one change: the fits of all windows and passes of one search call.
+
+        The arguments and checks are those of ``set_fits``, which describes a fit; the fits already stored stay. The
+        version grows by one and the file is written once; an empty list changes nothing. Returns True when the memory
+        took the list and False when it is fixed.
+        """
+        self._require_bound()
+        new_fits = self._checked_fits(kind, fits)
+        if self._fixed:
+            return False
+        if new_fits:
+            self._fits += new_fits
+            self._version += 1
+            self._save()
+        return True
+
+    def finish_raw_data_search(self, fits):
+        """Add the fits of the kind "raw data" and record that this search was made, in one change and one file write.
+
+        The search of this kind is made once in a run. The fits and the flag ``raw_data_searched`` are saved together,
+        so a kill leaves both or neither, and a run that resumes knows that the search was made also when it gave no
+        fit (``fits`` may be empty). The arguments and checks are those of ``add_fits``. The version grows by one when
+        ``fits`` is not empty. Returns True when the memory took the list and False when it is fixed. Raises
+        RuntimeError when the search was already recorded.
+        """
+        self._require_bound()
+        new_fits = self._checked_fits(self.KIND_RAW_DATA, fits)
+        if self._fixed:
+            return False
+        if self._raw_data_searched:
+            raise RuntimeError("the search of the kind raw data was already recorded")
+        self._fits += new_fits
+        self._raw_data_searched = True
+        if new_fits:
+            self._version += 1
+        self._save()
+        return True
+
+    def screen_fits(self, kind, fits):
+        """Apply the memory's own check to each fit description alone, and change nothing.
+
+        ``set_fits``, ``add_fits`` and ``finish_raw_data_search`` check a whole list and raise ValueError for the
+        first description that fails. A caller that wants to store the good ones and leave the others out asks here
+        first; the rule stays in one place, ``_checked_fit``, which this method calls for each description.
+
+        Args:
+            kind: One of ``KINDS``.
+            fits: A list of fit descriptions, as ``set_fits`` takes them.
+
+        Returns ``(accepted, refused)``: ``accepted`` holds the descriptions that pass, the very objects, in the order
+        given; ``refused`` holds a ``(position, reason)`` for each description that fails, with its position in
+        ``fits`` and the message of the ValueError that ``add_fits`` raises for it. The call changes no state and writes
+        no file, also when the memory is fixed. Raises ValueError for an unknown kind and RuntimeError when the memory
+        is not bound.
+        """
+        self._require_bound()
+        # an unknown kind is a mistake of the caller, refused as in the other calls, and not a flawed description
+        self._checked_fits(kind, [])
+        accepted, refused = [], []
+        for position, description in enumerate(fits):
+            try:
+                self._checked_fit(kind, description)
+            except ValueError as error:
+                refused.append((position, str(error)))
+            else:
+                accepted.append(description)
+        return accepted, refused
+
+    def fits(self, band=None, kind=None):
+        """The stored fits, in the order they were added, as a list of ``SearchFit``; only those of ``band`` and
+        of ``kind`` when given."""
+        return [fit for fit in self._fits
+                if (band is None or fit.band == band) and (kind is None or fit.kind == kind)]
+
+    def count_fits(self, band, kind):
+        """The number of fits of ``kind`` in ``band``."""
+        return len(self.fits(band=band, kind=kind))
+
+    def combined(self, band, weights_by_kind):
+        """One mixture of a band from the fits of chosen kinds, in one unit box that spans them.
+
+        Args:
+            band: The band.
+            weights_by_kind: A dict from kind to the weight of that kind, in the order the components are to follow. The
+                weight of a kind is shared equally among the fits of that kind in the band, and a kind without a fit
+                gives its weight to the others: the shares are divided by their total.
+
+        Returns a dict with ``weights`` (components,), ``means`` (components, 8), ``covs`` (components, 8, 8), ``mins``
+        and ``maxs`` (8,), the components of the kinds in the order of the dict and, within a kind, in the order the fits
+        were added; or None when no chosen kind has a fit in the band. Raises ValueError for an unknown kind or a weight
+        that is negative or not finite.
+        """
+        chosen, shares = [], []
+        for kind, weight in weights_by_kind.items():
+            if kind not in self.KINDS:
+                raise ValueError(f"unknown kind {kind!r}; the kinds are {list(self.KINDS)}")
+            if not np.isfinite(weight) or weight < 0.0:
+                raise ValueError(f"the weight of kind {kind!r} must be finite and not negative, not {weight}")
+            of_kind = self.fits(band=band, kind=kind)
+            if weight == 0.0 or not of_kind:
+                continue
+            chosen += of_kind
+            shares += [weight / len(of_kind)] * len(of_kind)
+        if not chosen:
+            return None
+        total = sum(shares)
+        return self.combine_fits(chosen, [share / total for share in shares])
+
+    @staticmethod
+    def combine_fits(fits, shares):
+        """The mixture of several fits of one band in the box that spans them, the shares of the fits as the weight
+        of each fit's components.
+
+        Each fit's means are taken to sampling units and back into the spanning box, a mean by the map between the two
+        boxes and a covariance by the ratio of the half widths on both sides. Nothing else changes, so the combined
+        mixture is the weighted union of the fits' mixtures. Args: ``fits``, a list of ``SearchFit``, and ``shares``, one
+        per fit, summing to one. Returns the dict of ``combined``. Raises ValueError for a spanning box without width.
+        """
+        mins = np.min([fit.mins for fit in fits], axis=0)
+        maxs = np.max([fit.maxs for fit in fits], axis=0)
+        half = 0.5 * (maxs - mins)
+        if np.any(half <= 0.0):
+            raise ValueError(f"the spanning box has no width in the columns {np.flatnonzero(half <= 0.0).tolist()}")
+        weights, means, covariances = [], [], []
+        for fit, share in zip(fits, shares):
+            source_half = 0.5 * (fit.maxs - fit.mins)
+            # A component in sampling units, then in the spanning box: an affine map per column, so a covariance
+            # scales by the ratio of the half widths on both sides
+            sampling_means = fit.mins + (fit.means + 1.0) * source_half
+            means.append((sampling_means - mins) / half - 1.0)
+            ratio = source_half / half
+            covariances.append(fit.covs * ratio[None, :, None] * ratio[None, None, :])
+            weights.append(share * fit.weights / fit.weights.sum())
+        return {"weights": np.concatenate(weights), "means": np.concatenate(means), "covs": np.concatenate(covariances),
+                "mins": mins, "maxs": maxs}
+
+    # ==================================================================================================================
+    # The counts and the searched ranges of the kind "residual plus sources"
+    # ==================================================================================================================
+
+    def search_count_within_reach(self, frequency_mhz):
+        """The searches counted within the reach window around a frequency: the counts of the bins from f - W to f + W,
+        with W the reach window of the band of that frequency. Returns an int."""
+        self._require_bound()
+        edges = self._layout["band_edges_mhz"]
+        frequency = float(frequency_mhz)
+        reach = float(self._layout["window_mhz"][self.band_of(frequency)])
+        first = self.bin_of(max(frequency - reach, edges[0]))
+        last = self.bin_of(min(frequency + reach, edges[-1]))
+        return int(self._counts[first:last + 1].sum())
+
+    def start_window_searches(self, windows):
+        """Ask to start searches of the kind "residual plus sources" in several windows, and count those that may start.
+
+        The windows are taken in order, each by the limit: a search may start only while fewer than
+        ``MAX_SEARCHES_WITHIN_REACH`` searches are counted within the reach window around the middle of its window, the
+        searches started earlier in this call included. A search that starts adds one to the count of the bin at the
+        middle and keeps the window in the searched ranges, whether or not it gives a fit. The file is written once for
+        the call, when a search started.
+
+        Args:
+            windows: The low and high end of each window in mHz, (n, 2), a list of pairs or an array.
+
+        Returns a boolean array of length n, True where the search may start. A fixed memory starts none and changes
+        nothing. Every window is checked before anything changes; raises ValueError for a window that is not a pair,
+        is empty, or lies outside the layout.
+        """
+        self._require_bound()
+        edges = self._layout["band_edges_mhz"]
+        try:
+            checked = [(float(low), float(high)) for low, high in windows]
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"windows must be pairs of a low and a high end in mHz: {error}") from error
+        for low, high in checked:
+            if not (edges[0] <= low < high <= edges[-1]):
+                raise ValueError(f"the window {low} to {high} mHz is empty or outside the layout "
+                                 f"{edges[0]} to {edges[-1]} mHz")
+        started = np.zeros(len(checked), dtype=bool)
+        if self._fixed:
+            return started
+        for position, (low, high) in enumerate(checked):
+            middle = 0.5 * (low + high)
+            if self.search_count_within_reach(middle) < self.MAX_SEARCHES_WITHIN_REACH:
+                self._counts[self.bin_of(middle)] += 1
+                self._searched.append((low, high))
+                started[position] = True
+        if started.any():
+            self._save()
+        return started
+
+    def would_start_window_searches(self, windows):
+        """The answer of ``start_window_searches`` without a change: which windows the limit would let start.
+
+        The call takes the windows in order and counts those that would start, as ``start_window_searches`` does, and
+        changes no count, no range, no file and no version. A caller can then search first and register afterwards,
+        so that a search that is cut short leaves nothing registered. The arguments, the checks and the result are
+        those of ``start_window_searches``.
+        """
+        self._require_bound()
+        # The same code on a copy that shares the fits, which it does not change, and has no file to write
+        probe = type(self).__new__(type(self))
+        probe.__dict__.update(self.__dict__, path=None, _counts=self._counts.copy(), _searched=list(self._searched))
+        return probe.start_window_searches(windows)
+
+    def outside_searched_ranges(self, frequencies_mhz):
+        """Which frequencies lie in no searched range of the kind "residual plus sources" (the ends of a range count as
+        inside). Returns a boolean array of the shape of the input."""
+        frequencies = np.asarray(frequencies_mhz, dtype=np.float64)
+        inside = np.zeros(frequencies.shape, dtype=bool)
+        for low, high in self._searched:
+            inside |= (frequencies >= low) & (frequencies <= high)
+        return ~inside
+
+    # ==================================================================================================================
+    # The checks of what comes in
+    # ==================================================================================================================
+
+    def _require_bound(self):
+        if self._layout is None:
+            raise RuntimeError("the memory is not bound to a layout: call bind first")
+
+    def _number_of_bins(self):
+        span = self._layout["band_edges_mhz"][-1] - self._layout["band_edges_mhz"][0]
+        return int(np.ceil(span / self._layout["bin_mhz"]))
+
+    def _checked_frequency(self, frequency_mhz):
+        frequency = np.asarray(frequency_mhz, dtype=np.float64)
+        edges = self._layout["band_edges_mhz"]
+        if np.any(frequency < edges[0]) or np.any(frequency > edges[-1]) or not np.all(np.isfinite(frequency)):
+            raise ValueError(f"a frequency lies outside the layout, {edges[0]} to {edges[-1]} mHz")
+        return frequency
+
+    @staticmethod
+    def _checked_layout(band_edges_mhz, bin_mhz, window_mhz):
+        edges = np.array(band_edges_mhz, dtype=np.float64)
+        windows = np.array(window_mhz, dtype=np.float64)
+        bin_width = float(bin_mhz)
+        if edges.ndim != 1 or edges.size < 2 or not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0.0):
+            raise ValueError("band_edges_mhz must be one-dimensional, finite, increasing and hold at least two edges")
+        if windows.shape != (edges.size - 1,) or not np.all(np.isfinite(windows)) or np.any(windows <= 0.0):
+            raise ValueError(f"window_mhz must hold one positive window for each of the {edges.size - 1} bands")
+        if not np.isfinite(bin_width) or bin_width <= 0.0:
+            raise ValueError(f"bin_mhz must be positive, not {bin_mhz}")
+        return {"band_edges_mhz": edges, "bin_mhz": bin_width, "window_mhz": windows}
+
+    def _require_same_layout(self, layout, what):
+        """Raises ValueError unless ``layout`` agrees with the bound layout, naming what differs."""
+        tolerance = self.LAYOUT_RELATIVE_TOLERANCE
+        differing = []
+        for name in ("band_edges_mhz", "window_mhz"):
+            first, second = self._layout[name], layout[name]
+            if first.shape != second.shape or not np.allclose(first, second, rtol=tolerance, atol=0.0):
+                differing.append(f"{name} ({first.size} against {second.size} values)")
+        if not np.isclose(self._layout["bin_mhz"], layout["bin_mhz"], rtol=tolerance, atol=0.0):
+            differing.append(f"bin_mhz ({self._layout['bin_mhz']} against {layout['bin_mhz']})")
+        if differing:
+            raise ValueError(f"the layout of {what} differs from the bound layout in: {', '.join(differing)}")
+
+    def _checked_fits(self, kind, fits):
+        """The fits of a list of descriptions as ``SearchFit``, all checked, or ValueError."""
+        if kind not in self.KINDS:
+            raise ValueError(f"unknown kind {kind!r}; the kinds are {list(self.KINDS)}")
+        return [self._checked_fit(kind, description) for description in fits]
+
+    def _checked_fit(self, kind, description):
+        if not hasattr(description, "keys"):
+            raise ValueError(f"a fit description must be a dict, not {type(description).__name__}")
+        missing = [name for name in _REQUIRED_FIT_ENTRIES if name not in description]
+        unknown = [name for name in description if name not in _REQUIRED_FIT_ENTRIES and name not in _OPTIONAL_FIT_ENTRIES]
+        if missing or unknown:
+            raise ValueError(f"a fit description lacks the entries {missing} and has the unknown entries {unknown}")
+        entries = {**_OPTIONAL_FIT_ENTRIES, **description}
+        low_mhz, high_mhz = entries["low_mhz"], entries["high_mhz"]
+        arrays = [np.array(entries[name], dtype=np.float64) for name in ("weights", "means", "covs", "mins", "maxs")]
+        weights, means, covs, mins, maxs = arrays
+        count = weights.shape[0] if weights.ndim == 1 else 0
+        if (count < 1 or means.shape != (count, FIT_COLUMNS) or covs.shape != (count, FIT_COLUMNS, FIT_COLUMNS)
+                or mins.shape != (FIT_COLUMNS,) or maxs.shape != (FIT_COLUMNS,)):
+            raise ValueError(f"a fit needs weights (c,), means (c, {FIT_COLUMNS}), covs (c, {FIT_COLUMNS}, "
+                             f"{FIT_COLUMNS}), mins and maxs ({FIT_COLUMNS},); got {weights.shape}, {means.shape}, "
+                             f"{covs.shape}, {mins.shape}, {maxs.shape}")
+        if not all(np.all(np.isfinite(array)) for array in arrays):
+            raise ValueError("a fit must hold finite values only")
+        if np.any(weights < 0.0) or weights.sum() <= 0.0:
+            raise ValueError("the weights of a fit must not be negative and must have a positive sum")
+        if np.any(maxs <= mins):
+            raise ValueError("the box of a fit needs maxs above mins in every column")
+        if not (self._layout["band_edges_mhz"][0] <= low_mhz < high_mhz <= self._layout["band_edges_mhz"][-1]):
+            raise ValueError(f"the searched range {low_mhz} to {high_mhz} mHz is empty or outside the layout")
+        band = int(self.band_of(0.5 * (low_mhz + high_mhz)))
+        return SearchFit(kind=kind, band=band, low_mhz=float(low_mhz), high_mhz=float(high_mhz),
+                         search_number=int(entries["search_number"]), pass_number=int(entries["pass_number"]),
+                         walker=int(entries["walker"]), largest_snr=float(entries["largest_snr"]),
+                         threshold=float(entries["threshold"]),
+                         **{name: _read_only(array) for name, array in
+                            zip(("weights", "means", "covs", "mins", "maxs"), arrays)})
+
+    # ==================================================================================================================
+    # The file
+    # ==================================================================================================================
+
+    def _state_arrays(self):
+        """The whole state as arrays (no pickles): the layout, the counts, the searched ranges, and the fits padded to the
+        largest number of components with NaN, as the search's record pads its bands."""
+        fits = self._fits
+        most = max((fit.weights.size for fit in fits), default=0)
+        padded = {"fit_weights": np.full((len(fits), most), np.nan),
+                  "fit_means": np.full((len(fits), most, FIT_COLUMNS), np.nan),
+                  "fit_covs": np.full((len(fits), most, FIT_COLUMNS, FIT_COLUMNS), np.nan)}
+        for index, fit in enumerate(fits):
+            count = fit.weights.size
+            padded["fit_weights"][index, :count] = fit.weights
+            padded["fit_means"][index, :count] = fit.means
+            padded["fit_covs"][index, :count] = fit.covs
+        return {
+            "file_format": np.array(self.FILE_FORMAT), "version": np.array(self._version), "fixed": np.array(self._fixed),
+            "raw_data_searched": np.array(self._raw_data_searched),
+            "band_edges_mhz": self._layout["band_edges_mhz"], "bin_mhz": np.array(self._layout["bin_mhz"]),
+            "window_mhz": self._layout["window_mhz"], "counts": self._counts, "searched_ranges": self.searched_ranges,
+            "fit_kinds": np.array([fit.kind for fit in fits], dtype="U32"),
+            "fit_bands": np.array([fit.band for fit in fits], dtype=np.int64),
+            "fit_low_mhz": np.array([fit.low_mhz for fit in fits], dtype=np.float64),
+            "fit_high_mhz": np.array([fit.high_mhz for fit in fits], dtype=np.float64),
+            "fit_search_numbers": np.array([fit.search_number for fit in fits], dtype=np.int64),
+            "fit_pass_numbers": np.array([fit.pass_number for fit in fits], dtype=np.int64),
+            "fit_walkers": np.array([fit.walker for fit in fits], dtype=np.int64),
+            "fit_largest_snr": np.array([fit.largest_snr for fit in fits], dtype=np.float64),
+            "fit_thresholds": np.array([fit.threshold for fit in fits], dtype=np.float64),
+            "fit_component_counts": np.array([fit.weights.size for fit in fits], dtype=np.int64),
+            "fit_mins": np.array([fit.mins for fit in fits], dtype=np.float64).reshape(len(fits), FIT_COLUMNS),
+            "fit_maxs": np.array([fit.maxs for fit in fits], dtype=np.float64).reshape(len(fits), FIT_COLUMNS),
+            **padded,
+        }
+
+    @staticmethod
+    def _state_keys():
+        """The names of the arrays a file must hold."""
+        return ("version", "fixed", "band_edges_mhz", "bin_mhz", "window_mhz", "counts", "searched_ranges", "fit_kinds",
+                "fit_bands", "fit_low_mhz", "fit_high_mhz", "fit_search_numbers", "fit_pass_numbers", "fit_walkers",
+                "fit_largest_snr", "fit_thresholds", "fit_component_counts", "fit_mins", "fit_maxs", "fit_weights",
+                "fit_means", "fit_covs")
+
+    def _save(self):
+        """Write the state to ``path`` under a temporary name and rename it over the file, so that a reader or a crash
+        never sees half a file. Does nothing without a path."""
+        if self.path is None:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        temporary = self.path + ".tmp"
+        with open(temporary, "wb") as handle:
+            np.savez_compressed(handle, **self._state_arrays())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.path)
+
+    def _load(self):
+        """Read the file into the state. Raises ValueError for a file that cannot be read, of another format or made for
+        another layout; the state is changed only when the whole file is valid."""
+        try:
+            with np.load(self.path, allow_pickle=False) as stored:
+                arrays = {key: stored[key] for key in stored.files}
+        except Exception as error:
+            raise ValueError(f"cannot read the search memory file {self.path}: {error}") from error
+        if int(arrays.get("file_format", -1)) != self.FILE_FORMAT:
+            raise ValueError(f"{self.path} has file format {arrays.get('file_format')}, expected {self.FILE_FORMAT}")
+        missing = [key for key in self._state_keys() if key not in arrays]
+        if missing:
+            raise ValueError(f"{self.path} lacks the entries {missing}")
+        layout = self._checked_layout(arrays["band_edges_mhz"], arrays["bin_mhz"], arrays["window_mhz"])
+        self._require_same_layout(layout, f"the file {self.path}")
+        counts = arrays["counts"].astype(np.int32)
+        if counts.shape != self._counts.shape:
+            raise ValueError(f"{self.path} holds {counts.size} counts, the layout has {self._counts.size} bins")
+        fits = []
+        for index in range(arrays["fit_kinds"].size):
+            count = int(arrays["fit_component_counts"][index])
+            fits.append(SearchFit(
+                kind=str(arrays["fit_kinds"][index]), band=int(arrays["fit_bands"][index]),
+                low_mhz=float(arrays["fit_low_mhz"][index]), high_mhz=float(arrays["fit_high_mhz"][index]),
+                search_number=int(arrays["fit_search_numbers"][index]), pass_number=int(arrays["fit_pass_numbers"][index]),
+                walker=int(arrays["fit_walkers"][index]), largest_snr=float(arrays["fit_largest_snr"][index]),
+                threshold=float(arrays["fit_thresholds"][index]),
+                weights=_read_only(arrays["fit_weights"][index, :count].copy()),
+                means=_read_only(arrays["fit_means"][index, :count].copy()),
+                covs=_read_only(arrays["fit_covs"][index, :count].copy()),
+                mins=_read_only(arrays["fit_mins"][index].copy()), maxs=_read_only(arrays["fit_maxs"][index].copy())))
+        self._counts, self._fits = counts, fits
+        self._searched = [(float(low), float(high)) for low, high in arrays["searched_ranges"]]
+        self._version, self._fixed = int(arrays["version"]), bool(arrays["fixed"])
+        # a file written before the flag existed has no key, and no raw data search was recorded then
+        self._raw_data_searched = bool(arrays["raw_data_searched"]) if "raw_data_searched" in arrays else False
+
+
+# ======================================================================================================================
 # The F-statistic RJ move: births from an F-statistic search of the bands on the STFT/DFFR response
 # ======================================================================================================================
 
@@ -4356,34 +5003,13 @@ class GBFStatSettings:
             )
 
 
-class GBFStatRJMove(GBSpecialBase):
-    """Reversible-jump GB move whose births come from an F-statistic search of the bands, on the STFT/DFFR response.
+class FStatSearchBase:
+    """The columns, constants and static math of the F-statistic search: the start draws, the amplitudes and their map to
+    the extrinsic parameters, the gate, the theta rows, the samplers and the mixture fit.
 
-    It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back). :meth:`setup`
-    searches when the schedule of ``search_interval`` says so, and the search's mixture becomes the RJ proposal. A
-    search runs on the residual of the max-likelihood walker, in every interior band that is not shut off:
-
-    1. stage 1 samples f0, fdot and the sky of each band with the F-statistic, which maximizes the four amplitude
-       parameters analytically; one Eryn sampler per band (``nsamplers``) runs on the run's own prior restricted to
-       the band (:class:`BandMaskTransform`);
-    2. a band passes when the largest stored cold sqrt(2F) exceeds the gate's threshold (:meth:`detection_gate`);
-    3. stage 2 samples every column of the passing bands with the full likelihood, from the F-statistic maximizers at
-       stage 1's last state;
-    4. one Gaussian mixture per passing band, fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
-       theta+-, lam periodic, becomes the RJ proposal (:class:`FStatPhaseProposal`).
-
-    On several cards the walker's data and noise rows are copied to every card (:meth:`_fill_search_holder`), and each
-    likelihood call's rows are shared out in equal blocks, so every card works on every stage of the search.
-
-    A search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
-    ``save_search_records`` asks for one. The math (the start draws, the amplitudes and their map to the extrinsic
-    parameters, the gate, the theta rows) sits in static and class methods. Points are in the GB sampling basis, with
+    :class:`FStatResidualSearch`, which runs the search, and :class:`GBFStatRJMove`, which keeps these names as its own
+    class attributes, both inherit it. It has no constructor and holds no state. Points are in the GB sampling basis, with
     the columns ``COL_*``.
-
-    Args:
-        *args: :class:`GBSpecialBase`'s arguments.
-        fstat_settings: The search's settings; None takes the defaults of :class:`GBFStatSettings`.
-        **kwargs: :class:`GBSpecialBase`'s keyword arguments.
     """
 
     # Sampling columns of the GB branch: ln A, f0 (mHz), fdot, phi0, cos iota, psi, lam, sin beta
@@ -4417,306 +5043,21 @@ class GBFStatRJMove(GBSpecialBase):
     )
     SEARCH_LOG_NAME = "fstat_search.log"
 
-    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None, **kwargs):
-        # * always an RJ move: its proposal only arrives with the first search, after construction
-        super().__init__(*args, **{**kwargs, "is_rj_prop": True})
-        self.fstat_settings = deepcopy(fstat_settings) if fstat_settings is not None else GBFStatSettings()
-        settings = self.fstat_settings
-        if not isinstance(self._basis_settings, STFTSettings):
-            raise NotImplementedError(
-                f"{type(self).__name__} searches on the STFT response only, not on "
-                f"{type(self._basis_settings).__name__}."
-            )
-        response = getattr(self.gb_stft_comp, "response", None)
-        if response != "dffr":
-            raise NotImplementedError(
-                f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
-            )
-        # * The value rules are GBFStatSettings' own (__post_init__); output_dir is filled by the builders, so here.
-        if settings.save_search_records != "none" and settings.output_dir is None:
-            raise ValueError(
-                "fstat_settings: save_search_records needs output_dir; the recipe builders set "
-                "<run>_artifacts/fstat_search/"
-            )
-        # index of the next saved record, counted on from the files in output_dir at the first save
-        self._next_record = None
-        # one container per card that receives the searched walker, built at the first search on several cards
-        self._search_holder = None
-
-    def setup(self, model, branches):
-        """Search when this propose is due, else keep the proposal of the latest search.
-
-        The search runs at the move's proposes 0, M, 2M and so on, with M the setting ``search_interval`` (1: at every
-        propose). ``num_proposals`` counts the move's earlier proposes (``propose()`` raises it after ``setup()``). A
-        move without a proposal searches whatever the schedule, since ``propose()`` skips the whole propose of an RJ
-        move that has none: after a restart, which keeps no proposal, or after searches that found nothing.
-        """
-        interval = int(self.fstat_settings.search_interval)
-        if self.num_proposals % interval != 0 and self.rj_proposal_distribution is not None:
-            logger.info("[GB_FSTAT_SEARCH %s] propose %d: no search (interval %d); the latest proposal stays",
-                        self.name, self.num_proposals, interval)
-            return
-        self._search(model, branches)
-
-    # ==================================================================================================================
-    # The search, in its steps
-    # ==================================================================================================================
-
-    def _search(self, model, branches):
-        """One search, in the steps of the class docstring. The steps' outputs go into one dict, from which
-        :meth:`_finish_search` writes the logs and the record."""
-        time_start = time.perf_counter()
-        holder = model.analysis_container_arr
-        walker = int(np.argmax(asnumpy(holder.likelihood())))
-        search = {"walker": walker, "num_proposals": int(self.num_proposals), "bands": self._search_bands()}
-        if not search["bands"]["active"].any():
-            self.rj_proposal_distribution = self.gpu_priors if self.backend.uses_cupy else self.priors
-            self._finish_search(search, time_start, "every band is shut off; the prior is the proposal")
-            return
-        search_holder, owners = self._search_owners(holder, walker)
-        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, search["bands"])
-        search["gate"] = self._apply_gate(search["stage_1"], search["bands"])
-        if not search["gate"]["detected"].any():
-            self._finish_search(search, time_start, "no band passes; the latest proposal stays")
-            return
-        search["start"] = self._stage_2_start(search["likelihood_1"], search["stage_1"], search["gate"])
-        search["stage_2"], search["likelihood_2"] = self._run_stage_2(
-            search_holder, owners, search["bands"], search["gate"], search["start"])
-        search["mixtures"] = self._build_proposal(search["stage_2"])
-        if search["mixtures"]["proposal"] is None:
-            self._finish_search(
-                search, time_start, "no passing band has a usable stage-2 chain; the latest proposal stays", warn=True)
-            return
-        self.rj_proposal_distribution = {"gb": search["mixtures"]["proposal"]}
-        self._finish_search(search, time_start, f"{int(search['mixtures']['usable'].sum())} bands in the proposal")
-
-    def _search_bands(self):
-        """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
-        those searched, which leaves out the bands that found nothing in the last ``shutoff_band_iteration`` searches
-        and lie wholly above ``shutoff_high_frequency_threshold`` or wholly below ``shutoff_low_frequency_threshold``."""
-        settings = self.fstat_settings
-        edges_mhz = asnumpy(self.band_edges) * 1e3
-        ids = np.array([0]) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
-        low, high = edges_mhz[ids], edges_mhz[ids + 1]
-        active = np.ones(len(ids), dtype=bool)
-        history = getattr(self, "found_source_in_band", None)
-        iterations = int(settings.shutoff_band_iteration)
-        if history is not None and len(history) >= iterations:
-            silent = np.all(~history[-iterations:], axis=0)
-            # * two separate shutoffs, each off when its threshold is None
-            eligible = np.zeros(len(ids), dtype=bool)
-            if settings.shutoff_high_frequency_threshold is not None:
-                eligible |= low * 1e-3 >= float(settings.shutoff_high_frequency_threshold)
-            if settings.shutoff_low_frequency_threshold is not None:
-                eligible |= high * 1e-3 <= float(settings.shutoff_low_frequency_threshold)
-            active = ~(silent & eligible)
-        return {"ids": ids, "low_mhz": low, "high_mhz": high, "active": active}
-
-    def _band_mask(self, low_mhz, high_mhz):
-        """The band restriction of the run prior for Eryn's samplers, one band per sampler."""
-        # below the run prior's f0 range, where the joint prior is -inf with finite fdot bounds
-        outside_f0 = 0.5 * float(self.joint_f0_fdot_prior(self.priors["gb"]).f0_min)
-        return BandMaskTransform(low_mhz, high_mhz, outside_f0)
-
-    def _search_owners(self, holder, walker):
-        """The holder the search reads and its rows that hold the walker's residual. On several cards: the search
-        holder, with the walker copied into its row on every card; else ``holder`` and the walker itself."""
-        gpus = getattr(holder, "gpus", None)
-        if gpus is None or len(gpus) < 2:
-            return holder, [walker]
-        return self._fill_search_holder(holder, walker), list(range(len(gpus)))
-
-    def _build_search_holder(self, holder):
-        """One container per card of ``holder`` on its full STFT grid, built as the GB band buffer builds its cells:
-        data and noise rows of zeros on the card, a sensitivity backend made from the card's split, and the split's
-        Fresnel settings. Its rows receive the searched walker at each search."""
-        xp = self.xp
-        settings = holder.settings
-        data_shape = (int(holder.nchannels),) + tuple(holder.end_shape)
-        noise_shape = tuple(holder.shape_sens) + tuple(holder.end_shape)
-        containers = []
-        for split, card in enumerate(holder.gpus):
-            with xp.cuda.Device(int(card)):
-                # ! A backend of its own: the array rebinds its containers' noise arrays, which must not be the main
-                # ! holder's. The split's backend holds the card's own orbit tables.
-                split_backend = holder.cpp_splits[split].sensitivity_backend
-                sensitivity = type(split_backend)(**dict(split_backend.kwargs))
-                sensitivity.data_shape = settings.basis_shape_active
-                noise_zeros = xp.zeros(noise_shape, dtype=xp.complex128)
-                sensitivity.sens_mat = noise_zeros
-                sensitivity.invC = noise_zeros
-                sensitivity.channel_shape = tuple(holder.shape_sens)
-                data = settings.associated_class(xp.zeros(data_shape, dtype=xp.complex128), settings)
-                containers.append(AnalysisContainer(data, sensitivity))
-        group = holder.cpp_splits[0]
-        cards = [int(card) for card in holder.gpus]
-        return AnalysisContainerArray(
-            containers, gpus=cards, complex_psd=True, gpu_assignment=cards,
-            domain_group_kwargs=dict(tdi_type=group.tdi_type, window_alpha=group.window_alpha,
-                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope))
-
-    def _fill_search_holder(self, holder, walker):
-        """The search holder, built at the first call, with ``walker``'s data and noise rows of ``holder`` copied card
-        to card into its row on every card, and its (d|d) for those rows."""
-        if self._search_holder is None:
-            self._search_holder = self._build_search_holder(holder)
-        search_holder = self._search_holder
-        xp = self.xp
-        split = int(np.asarray(asnumpy(holder.split_map))[walker])
-        row = int(np.flatnonzero(np.asarray(asnumpy(holder.gpu_splits[split])) == walker)[0])
-        data_size = int(holder.nchannels) * int(holder.data_length)
-        noise_size = int(np.prod(holder.shape_sens)) * int(holder.data_length)
-        data_row = holder.linear_data_arr[split][row * data_size:(row + 1) * data_size]
-        noise_row = holder.linear_psd_arr[split][row * noise_size:(row + 1) * noise_size]
-        # ! The walker's rows come from its card's stream; each copy runs on its target card's stream, which the
-        # ! search's kernels then follow.
-        xp.cuda.Device(int(holder.gpus[split])).synchronize()
-        for target, card in enumerate(search_holder.gpus):
-            with xp.cuda.Device(int(card)):
-                for source, destination in ((data_row, search_holder.linear_data_arr[target]),
-                                            (noise_row, search_holder.linear_psd_arr[target])):
-                    if destination.size != source.size:
-                        raise ValueError(f"search holder row of {destination.size} entries for a walker row of "
-                                         f"{source.size}")
-                    destination.data.copy_from_device_async(source.data, source.nbytes)
-        search_holder.compute_d_d_terms()
-        return search_holder
-
-    def _run_stage_1(self, holder, owners, bands):
-        """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
-        restricted to each band. Returns the samplers' outputs and the likelihood, whose terms the maximizers reuse."""
-        settings = self.fstat_settings
-        betas = np.asarray(settings.betas_1, dtype=float)
-        low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
-        mask = np.zeros(self.NDIM, dtype=bool)
-        mask[list(self.SAMPLED_COLUMNS)] = True
-        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
-                                           fstat=True)
-        start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
-        output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
-                                        self.periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
-                                        progress=bool(settings.progress))
-        return output, likelihood
-
-    def _apply_gate(self, stage_1, bands):
-        """The gate on each searched band's stage-1 maximum, and the shutoff history's row of this search. Returns the
-        decisions, the thresholds, the targets and sqrt(2F) of the stored cold samples."""
-        settings = self.fstat_settings
-        # sqrt(2F) is the optimal SNR of the template at the F-statistic maximum
-        snr = np.sqrt(np.maximum(2.0 * stage_1["cold_ll"], 0.0))
-        # * the gate reads the maximum: the stage-1 cold walkers sit on several peaks without mixing, so the median and
-        # * the minimum read the lower peaks
-        detected, thresholds, targets = self.detection_gate(
-            snr, bands["low_mhz"][bands["active"]] * 1e-3, float(settings.snr_eff_threshold),
-            settings.shutoff_high_frequency_threshold, float(settings.galfor_inflation_factor))
-        found_row = np.zeros(len(bands["ids"]), dtype=bool)
-        found_row[np.flatnonzero(bands["active"])[detected]] = True
-        history = getattr(self, "found_source_in_band", None)
-        self.found_source_in_band = found_row[None] if history is None else np.vstack([history, found_row])
-        return {"detected": detected, "thresholds": thresholds, "targets": targets, "snr": snr}
-
-    def _stage_2_start(self, likelihood, stage_1, gate):
-        """Stage 2's start in the passing bands: the last stage-1 cold rows with the four analytic columns at their
-        maximizers. Returns the rows (bands, walkers, 8), F there, the rows replaced and the seconds."""
-        time_start = time.perf_counter()
-        nwalkers = int(self.fstat_settings.nwalkers)
-        n_detected = int(gate["detected"].sum())
-        last = stage_1["last_cold"][gate["detected"]].reshape(-1, self.NDIM)
-        rows, fstat, replaced = self._maximized_rows(likelihood, last)
-        return {
-            "rows": rows.reshape(n_detected, nwalkers, self.NDIM), "fstat": fstat.reshape(n_detected, nwalkers),
-            "replaced": replaced.reshape(n_detected, nwalkers), "seconds": time.perf_counter() - time_start,
-        }
-
-    def _maximized_rows(self, likelihood, coords):
-        """Rows with ln A, phi0, cos iota and psi at the F-statistic maximum, F there, and the rows replaced.
-
-        A row keeps its old values where it cannot be scored, where the maximum has no amplitude, or where the maximized
-        point falls outside the run prior; an amplitude beyond the prior's range is clipped into it first.
-        """
-        xp = likelihood.engine.xp
-        transform = self.parameter_transforms
-        coords = np.asarray(coords, dtype=float)
-        params_phys = transform.both_transforms(coords)
-        projections, overlaps, two_f, keep = likelihood.terms(xp.asarray(params_phys))
-        amplitudes = self.fstat_amplitudes(projections, overlaps, keep)
-        amplitude, cos_iota, psi, phi0 = (np.asarray(asnumpy(value), dtype=float)
-                                          for value in self.extrinsics_from_amplitudes(amplitudes))
-        fstat = np.asarray(asnumpy(xp.where(keep, 0.5 * two_f, self.REJECTED_LL)), dtype=float)
-        fstat[~np.isfinite(fstat)] = self.REJECTED_LL
-        maximized_phys = params_phys.copy()
-        maximized_phys[:, self.PHYS_AMP] = amplitude
-        maximized_phys[:, self.PHYS_PHI0] = phi0
-        maximized_phys[:, self.PHYS_IOTA] = np.arccos(cos_iota)
-        maximized_phys[:, self.PHYS_PSI] = psi
-        scored = (fstat > self.REJECTED_LL) & (amplitude > 0.0) & np.isfinite(amplitude)
-        maximized = coords.copy()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            maximized[scored] = transform.both_inverse_transforms(maximized_phys[scored])
-        prior_container = self.priors["gb"]
-        bounds = self.one_column_bounds(prior_container, self.COL_LN_AMP)
-        if bounds is not None:
-            # a hair inside the box, so the clipped point is not on the edge the prior may exclude
-            margin = 1e-9 * (bounds[1] - bounds[0])
-            maximized[scored, self.COL_LN_AMP] = np.clip(maximized[scored, self.COL_LN_AMP], bounds[0] + margin,
-                                                         bounds[1] - margin)
-        outside = ~np.isfinite(asnumpy(prior_container.logpdf(maximized)))
-        maximized[outside] = coords[outside]
-        return maximized, fstat, scored & ~outside
-
-    def _run_stage_2(self, holder, owners, bands, gate, start):
-        """Stage 2 in the passing bands: the full likelihood over every column (phi0 left to the analytic maximum when
-        phase_maximize), from the maximized rows at every temperature. Returns the samplers' outputs, with the cold
-        chains, and the likelihood."""
-        settings = self.fstat_settings
-        betas = np.asarray(settings.betas_2, dtype=float)
-        passing = np.flatnonzero(bands["active"])[gate["detected"]]
-        low, high = bands["low_mhz"][passing], bands["high_mhz"][passing]
-        mask = np.ones(self.NDIM, dtype=bool)
-        if self.phase_maximize:
-            mask[self.COL_PHI0] = False
-        likelihood = FStatSearchLikelihood(self._likelihood_engine, holder, owners, self.parameter_transforms,
-                                           fstat=False, phase_maximize=self.phase_maximize,
-                                           waveform_kwargs=self.waveform_kwargs)
-        output = self.run_band_samplers(
-            likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
-            self._band_mask(low, high), mask, self.periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
-            record_cold_coords=True, progress=bool(settings.progress))
-        return output, likelihood
-
-    def _build_proposal(self, stage_2):
-        """The RJ proposal from the passing bands' stage-2 cold chains: one mixture per band over :meth:`theta_rows`
-        with theta+, theta- and lam periodic (:class:`FStatPhaseProposal`). Returns the usable bands, the proposal
-        (None when no band is usable), the mixture's seven component lists, the bands per fit chunk and the seconds."""
-        time_start = time.perf_counter()
-        cold_coords = stage_2["cold_coords"]
-        samples = cold_coords.reshape(cold_coords.shape[0], -1, self.NDIM)
-        # * a band whose chain never moved in a column (zero range, which the mixture's box map divides by) or holds a
-        # * value that is not finite is left out, not the search
-        usable = np.all(np.isfinite(samples), axis=(1, 2)) & np.all(np.ptp(samples, axis=1) > 0.0, axis=1)
-        if not usable.any():
-            return {"usable": usable, "proposal": None, "components": None, "chunk": None,
-                    "seconds": time.perf_counter() - time_start}
-        gpu = int(self.xp.cuda.runtime.getDevice()) if self.backend.uses_cupy else None
-        theta = self.theta_rows(cold_coords[usable].reshape(int(usable.sum()), -1, self.NDIM))
-        components, chunk = self.fit_band_mixtures(theta, gpu, periodic=self.GMM_PERIODIC)
-        mixture = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy, periodic=self.GMM_PERIODIC)
-        return {"usable": usable, "proposal": FStatPhaseProposal(mixture), "components": components, "chunk": chunk,
-                "seconds": time.perf_counter() - time_start}
-
     # ==================================================================================================================
     # Eryn's samplers of the search and the mixture fit
     # ==================================================================================================================
 
     @staticmethod
     def run_band_samplers(log_like_fn, start, prior_container, transform, gibbs_mask, periodic, burn, nsteps, betas,
-                          record_cold_coords=False, progress=True):
+                          record_cold_coords=False, progress=True, use_gpu=False):
         """One Eryn EnsembleSampler with one independent sampler per band; keeps the cold chain only.
 
         ``start`` is (n_bands, ntemps, nwalkers, 8) and ``betas`` the start ladder (coldest first, the same for every
         band), which Eryn adapts per sampler with its ends kept. The sampler stores nothing, since every temperature of
         a full-band search would be large and only the cold rows serve. ``progress`` shows Eryn's progress bar over the
-        burn + nsteps steps. Returns ``cold_ll`` (n_bands, nsteps,
+        burn + nsteps steps. ``use_gpu`` runs Eryn's stretch proposal on the card; its random draws then come from
+        CuPy's global generator, which the GB moves seed from the run seed when they are built, and not from the
+        sampler's own generator. The default keeps the proposal on the host. Returns ``cold_ll`` (n_bands, nsteps,
         nwalkers), ``last_cold`` (n_bands, nwalkers, 8), ``cold_coords`` (n_bands, nsteps, nwalkers, 8) when asked, the
         cold acceptance and the swap acceptance per band, the adapted ladders and the wall time.
         """
@@ -4725,11 +5066,14 @@ class GBFStatRJMove(GBSpecialBase):
         betas = np.asarray(betas, dtype=float)
         if betas.shape != (ntemps,):
             raise ValueError(f"the ladder has {betas.shape} betas, the start {ntemps} temperatures")
+        # the default keeps the original call, so that a caller that wraps StretchMove sees no new keyword
+        stretch_move = (StretchMove(gibbs_sampling_setup=("gb", gibbs_mask), use_gpu=True) if use_gpu
+                        else StretchMove(gibbs_sampling_setup=("gb", gibbs_mask)))
         sampler = EnsembleSampler(
             nwalkers, ndim, log_like_fn, {"gb": prior_container},
             tempering_kwargs=dict(betas=betas) if ntemps > 1 else {},
             branch_names=["gb"], nleaves_max=1,
-            moves=StretchMove(gibbs_sampling_setup=("gb", gibbs_mask)),
+            moves=stretch_move,
             vectorize=True, periodic=periodic, nsamplers=n_bands,
             prior_transform_fn={"gb": transform}, track_moves=False,
         )
@@ -4790,122 +5134,8 @@ class GBFStatRJMove(GBSpecialBase):
         return components, chunk
 
     # ==================================================================================================================
-    # The search's logs and record
+    # The mixtures' padded arrays, as the record keeps them
     # ==================================================================================================================
-
-    def _finish_search(self, search, time_start, outcome, warn=False):
-        """The search's line in the run log, its block in the search log and, when asked, its saved record."""
-        search["total_seconds"] = time.perf_counter() - time_start
-        search["outcome"] = outcome
-        (logger.warning if warn else logger.info)("[GB_FSTAT_SEARCH %s] %s", self.name, self._search_summary(search))
-        settings = self.fstat_settings
-        if settings.output_dir is None:
-            return
-        os.makedirs(settings.output_dir, exist_ok=True)
-        with open(os.path.join(settings.output_dir, self.SEARCH_LOG_NAME), "a") as handle:
-            handle.write(self._search_log_block(search))
-        if settings.save_search_records != "none":
-            self._save_record(self._search_record(search))
-
-    def _search_summary(self, search):
-        """One line: the propose, the walker, the bands searched and passing, the outcome and the times."""
-        active = search["bands"]["active"]
-        parts = [f"propose {search['num_proposals']}, walker {search['walker']}, {int(active.sum())} of "
-                 f"{len(active)} bands searched"]
-        if "gate" in search:
-            gate = search["gate"]
-            thresholds = ", ".join(f"{value:.2f}" for value in np.unique(gate["thresholds"]))
-            parts.append(f"{int(gate['detected'].sum())} pass (thresholds {thresholds})")
-        parts.append(search["outcome"])
-        times = [f"{name} {search[key]['seconds']:.1f} s" for name, key in
-                 (("stage 1", "stage_1"), ("stage 2", "stage_2"), ("mixtures", "mixtures")) if key in search]
-        times.append(f"total {search['total_seconds']:.1f} s")
-        return "; ".join(parts) + "; " + ", ".join(times)
-
-    def _search_log_block(self, search):
-        """The search's block in fstat_search.log: its line, the stages and one line per passing band."""
-        lines = [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.name}: {self._search_summary(search)}"]
-        if "stage_1" in search:
-            stage_1, likelihood = search["stage_1"], search["likelihood_1"]
-            lines.append(
-                f"  stage 1: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s in the "
-                f"F-statistic; cold acceptance {stage_1['acceptance_cold'].min():.3f} to "
-                f"{stage_1['acceptance_cold'].max():.3f}")
-        if "start" in search:
-            replaced = search["start"]["replaced"]
-            lines.append(f"  maximizers: {int(replaced.sum())} of {replaced.size} start rows moved to the maximum, "
-                         f"{search['start']['seconds']:.1f} s")
-        if "stage_2" in search:
-            likelihood = search["likelihood_2"]
-            lines.append(f"  stage 2: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s "
-                         "in the likelihood")
-        if "gate" in search and search["gate"]["detected"].any():
-            bands, gate = search["bands"], search["gate"]
-            searched = np.flatnonzero(bands["active"])
-            largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
-            mixtures = search.get("mixtures")
-            counts = iter([] if mixtures is None or mixtures["components"] is None
-                          else [len(asnumpy(weights)) for weights in mixtures["components"][0]])
-            for order, position in enumerate(np.flatnonzero(gate["detected"])):
-                band = searched[position]
-                line = (f"    band {bands['ids'][band]}: {bands['low_mhz'][band]:.6f} to {bands['high_mhz'][band]:.6f} "
-                        f"mHz, largest sqrt(2F) {largest[position]:.2f} against {gate['thresholds'][position]:.2f}")
-                if "stage_2" in search:
-                    line += f", stage-2 cold acceptance {search['stage_2']['acceptance_cold'][order]:.3f}"
-                if mixtures is not None:
-                    line += (f", {next(counts)} mixture components" if mixtures["usable"][order]
-                             else ", chain not usable")
-                lines.append(line)
-        return "\n".join(lines) + "\n"
-
-    def _search_record(self, search):
-        """The search's arrays, under the keys of the port's earlier record; at "summary" without CHAIN_KEYS."""
-        settings = self.fstat_settings
-        bands = search["bands"]
-        record = {
-            "walker": search["walker"], "num_proposals": search["num_proposals"], "band_ids": bands["ids"],
-            "band_low_mhz": bands["low_mhz"], "band_high_mhz": bands["high_mhz"], "active": bands["active"],
-            "settings": json.dumps(asdict(settings)), "outcome": search["outcome"],
-            "total_seconds": search["total_seconds"],
-        }
-        if "stage_1" in search:
-            stage_1, likelihood, gate = search["stage_1"], search["likelihood_1"], search["gate"]
-            snr = gate["snr"]
-            record.update({
-                "stage1_cold_fstat": stage_1["cold_ll"].astype(np.float32),
-                "stage1_snr_quantiles": np.quantile(snr.reshape(len(snr), -1), [0.0, 0.05, 0.5, 0.95, 1.0], axis=1).T,
-                "stage1_last_cold": stage_1["last_cold"], "stage1_acceptance_cold": stage_1["acceptance_cold"],
-                "stage1_swap_acceptance": stage_1["swap_acceptance"], "stage1_seconds": stage_1["seconds"],
-                "stage1_betas_start": np.asarray(settings.betas_1, dtype=float), "stage1_betas_end": stage_1["betas"],
-                "stage1_rows": likelihood.rows, "stage1_calls": likelihood.calls,
-                "stage1_likelihood_seconds": likelihood.seconds,
-                "detected": gate["detected"], "detection_rule": "maximum", "detection_thresholds": gate["thresholds"],
-                "detection_targets": gate["targets"],
-            })
-        if "start" in search:
-            start = search["start"]
-            record.update({"stage2_start": start["rows"], "stage2_start_fstat": start["fstat"],
-                           "stage2_start_replaced": start["replaced"], "maximize_seconds": start["seconds"]})
-        if "stage_2" in search:
-            stage_2, likelihood = search["stage_2"], search["likelihood_2"]
-            record.update({
-                "stage2_cold_coords": stage_2["cold_coords"], "stage2_cold_ll": stage_2["cold_ll"],
-                "stage2_acceptance_cold": stage_2["acceptance_cold"],
-                "stage2_swap_acceptance": stage_2["swap_acceptance"],
-                "stage2_betas_start": np.asarray(settings.betas_2, dtype=float), "stage2_betas_end": stage_2["betas"],
-                "stage2_seconds": stage_2["seconds"], "stage2_rows": likelihood.rows, "stage2_calls": likelihood.calls,
-                "stage2_likelihood_seconds": likelihood.seconds,
-            })
-        if "mixtures" in search:
-            mixtures = search["mixtures"]
-            record.update({"gmm_usable": mixtures["usable"], "gmm_seconds": mixtures["seconds"]})
-            if mixtures["components"] is not None:
-                record.update(self.padded_components(mixtures["components"]), gmm_layout="theta_lam",
-                              gmm_chunk_bands=mixtures["chunk"])
-        if settings.save_search_records != "full":
-            for key in self.CHAIN_KEYS:
-                record.pop(key, None)
-        return record
 
     @staticmethod
     def padded_components(components):
@@ -4926,18 +5156,6 @@ class GBFStatRJMove(GBSpecialBase):
             padded["gmm_means"][band, :count] = asnumpy(means[band])
             padded["gmm_covs"][band, :count] = asnumpy(covs[band])
         return padded
-
-    def _save_record(self, record):
-        """The record as <move name>_search_<n>.npz in output_dir, n counting on from the files there, so that a
-        continued run adds to them."""
-        folder = self.fstat_settings.output_dir
-        prefix = f"{self.name.replace(' ', '_')}_search_"
-        if self._next_record is None:
-            taken = [int(name[len(prefix):-4]) for name in os.listdir(folder)
-                     if name.startswith(prefix) and name.endswith(".npz") and name[len(prefix):-4].isdigit()]
-            self._next_record = max(taken, default=-1) + 1
-        np.savez_compressed(os.path.join(folder, f"{prefix}{self._next_record:05d}.npz"), **record)
-        self._next_record += 1
 
     # ==================================================================================================================
     # Math of the search: the band-restricted start draws, the F-statistic algebra, the gate and the theta rows
@@ -5067,6 +5285,1136 @@ class GBFStatRJMove(GBSpecialBase):
         phi0 = xp.mod(0.5 * (theta_plus - theta_minus) + np.pi * phase_copy, 2.0 * np.pi)
         psi = xp.mod(0.25 * (theta_plus + theta_minus) + 0.5 * np.pi * phase_copy + np.pi * psi_copy, 2.0 * np.pi)
         return phi0, psi
+
+
+@dataclass
+class SeedGrid:
+    """The seed grid of one window in factored form: ``n_chirp`` (f0, fdot) points and ``n_sky`` sky points.
+
+    Row ``chirp * n_sky + sky`` of the grid is the pair. ``chirp_node`` is f0 in frequency bins, an integer. The sky
+    points are right ascension and sine declination, the frame of the sampled columns 6 and 7 in this run.
+    """
+
+    chirp_f0_mhz: np.ndarray
+    chirp_fdot: np.ndarray
+    chirp_node: np.ndarray
+    sky_ra: np.ndarray
+    sky_sin_dec: np.ndarray
+    ln_amp: float
+    observation_seconds: float
+
+    @property
+    def n_chirp(self):
+        return len(self.chirp_f0_mhz)
+
+    @property
+    def n_sky(self):
+        return len(self.sky_ra)
+
+    @property
+    def bin_mhz(self):
+        return 1e3 / self.observation_seconds
+
+    @property
+    def drift_bin(self):
+        return 1.0 / self.observation_seconds**2
+
+    def rows(self, chirp_index, sky_index=None):
+        """Sampling rows (chirp points chosen x sky points chosen, 8), chirp-major.
+
+        The columns that the F-statistic maximizes over (phi0, cos iota, psi) are zero and ln A sits at the middle of
+        its prior.
+        """
+        chirp_index = np.atleast_1d(chirp_index)
+        sky_index = np.arange(self.n_sky) if sky_index is None else np.atleast_1d(sky_index)
+        rows = np.zeros((len(chirp_index) * len(sky_index), FStatSearchBase.NDIM))
+        rows[:, FStatSearchBase.COL_LN_AMP] = self.ln_amp
+        rows[:, FStatSearchBase.COL_F0] = np.repeat(self.chirp_f0_mhz[chirp_index], len(sky_index))
+        rows[:, FStatSearchBase.COL_FDOT] = np.repeat(self.chirp_fdot[chirp_index], len(sky_index))
+        rows[:, FStatSearchBase.COL_LAM] = np.tile(self.sky_ra[sky_index], len(chirp_index))
+        rows[:, FStatSearchBase.COL_SIN_BETA] = np.tile(self.sky_sin_dec[sky_index], len(chirp_index))
+        return rows
+
+
+@dataclass(frozen=True)
+class SeedStartInputs:
+    """What a seeded start needs that differs from call to call, for each searched window in the order of the call.
+
+    ``source_rows`` holds one (sources of the window, 8) array of sampling rows per window, ``reach_bins`` the reach
+    window W of each window's band in frequency bins, ``epoch_fraction`` the time from the parameters' epoch to the
+    middle of the data over the span, and ``observation_seconds`` the span.
+    """
+
+    source_rows: list
+    reach_bins: np.ndarray
+    epoch_fraction: float
+    observation_seconds: float
+
+    def subset(self, window_indices):
+        """The inputs of some of the windows, in the order of ``window_indices``."""
+        window_indices = np.asarray(window_indices, dtype=int)
+        return SeedStartInputs([self.source_rows[index] for index in window_indices],
+                               np.asarray(self.reach_bins)[window_indices], self.epoch_fraction,
+                               self.observation_seconds)
+
+
+class FStatResidualSearch(FStatSearchBase, LISAToolsParallelModule):
+    """The F-statistic search of bands on the residual of one walker, on the STFT/DFFR response.
+
+    :meth:`run` searches the bands it is given, in these steps, and returns what each step made:
+
+    1. stage 1 samples f0, fdot and the sky of each band with the F-statistic, which maximizes the four amplitude
+       parameters analytically; one Eryn sampler per band (``nsamplers``) runs on the run's own prior restricted to
+       the band (:class:`BandMaskTransform`);
+    2. a band passes when the largest stored cold sqrt(2F) exceeds the gate's threshold (:meth:`detection_gate`);
+    3. stage 2 samples every column of the passing bands with the full likelihood, from the F-statistic maximizers at
+       stage 1's last state;
+    4. one Gaussian mixture per passing band is fitted to its stage-2 cold chain over theta+- = 2 psi +- phi0 with
+       theta+-, lam periodic.
+
+    A band may be a window inside one, and :meth:`run` takes any number of them in one call: :meth:`source_windows`
+    makes the windows around sources. With ``seeds`` stage 1 starts from the best rows of a seed grid
+    (:meth:`seed_grid`) that is scored on the input of the search. :meth:`run_passes` searches a window again after its
+    best row is taken out. :meth:`add_sources_back` and :meth:`restored_residual` give a search the walker's residual
+    with chosen sources added back, and put the row back as it was.
+
+    On several cards each :meth:`run` copies the walker's data and noise rows to every card (:meth:`_fill_search_holder`),
+    and each likelihood call's rows are shared out in equal blocks, so every card works on every stage of the search.
+    Since the copies are made at the start of each :meth:`run`, every pass of :meth:`run_passes` reads the residual as
+    the passes before left it.
+
+    The search chooses neither the bands nor the walker and changes nothing of the run: the caller turns the fit into a
+    proposal. It keeps no sampler and no data between calls, except the containers of those copies, which stay until
+    its owner calls :meth:`release_search_holder`. :meth:`finish` writes one line to the run log and a block to
+    ``fstat_search.log``, and saves the search's record when ``save_search_records`` asks for one.
+
+    Args:
+        fstat_settings: The search's settings, kept as given (the owner of the search holds the copy); None takes the
+            defaults of :class:`GBFStatSettings`.
+        priors: The run's prior dict; its ``"gb"`` entry is the container of the start draws and of the prior test.
+        parameter_transforms: The GB parameter transform container.
+        phase_maximize: Whether stage 2 leaves phi0 to the analytic maximum.
+        waveform_kwargs: The waveform keywords of stage 2's likelihood; None takes none.
+        name: The label of the log lines and the prefix of the record files.
+        force_backend: The backend, as for the moves; None takes the preferred one.
+    """
+
+    # The seed grid of a window: 192 sky points and 5 fdot values around the line of each source, from the cost test
+    # of the window search (the peak was found in 16 of 18 cases at 62.5 s per window searched alone)
+    SEED_SKY_POINTS = 192
+    SEED_FDOT_HALF_STEPS = 2
+    # The step between fdot values, in drift bins (one over the span squared)
+    SEED_FDOT_STEP_DRIFT_BINS = 2.0
+    # Two seeds at one sky point differ by at least this many f0 bins
+    SEED_MIN_F0_BINS = 4
+    # * At most this many seeds lie within the reach window of each other: one loud leftover spreads over hundreds of
+    # * rows along its f0 and fdot line and would take every seed
+    SEED_NEIGHBOURHOOD_CAP = 4
+    # The best rows of a grid that its ranking walks down
+    SEED_RANKING_POOL = 200_000
+    # Rows per call of the grid's likelihood (35.5 us per row on a full card) and rows of a grid made at once (13 MB)
+    SEED_BATCH_ROWS = 20_000
+    SEED_GRID_PIECE_ROWS = 200_000
+    # The golden angle of the Fibonacci spiral that places the sky points
+    GOLDEN_ANGLE = np.pi * (3.0 - np.sqrt(5.0))
+    # A window that passes the gate has its best row taken out and is searched again, at most this many times in all
+    MAX_PASSES = 4
+    # * Windows of one call: the size that has run in production (40 bands in one call, 7680 rows per call in stage 1)
+    WINDOWS_PER_CALL = 40
+
+    def __init__(self, fstat_settings: Optional[GBFStatSettings] = None, *, priors, parameter_transforms,
+                 phase_maximize=False, waveform_kwargs=None, name="fstat search", force_backend=None):
+        LISAToolsParallelModule.__init__(self, force_backend=force_backend)
+        self.fstat_settings = fstat_settings if fstat_settings is not None else GBFStatSettings()
+        self.priors = priors
+        self.parameter_transforms = parameter_transforms
+        self.phase_maximize = phase_maximize
+        self.waveform_kwargs = waveform_kwargs if waveform_kwargs is not None else {}
+        self.name = name
+        # index of the next saved record, counted on from the files in output_dir at the first save
+        self._next_record = None
+        # one container per card that receives the searched walker, built at the first search on several cards
+        self._search_holder = None
+
+    @classmethod
+    def supported_backends(cls):
+        return ["lisatools_" + backend_name for backend_name in cls.GPU_RECOMMENDED()]
+
+    # ==================================================================================================================
+    # The windows around sources and the seed grid of a window
+    # ==================================================================================================================
+
+    @classmethod
+    def source_windows(cls, source_frequencies_mhz, source_bands, band_edges_mhz, reach_mhz):
+        """The windows around sources, in the form of the ``bands`` dict that :meth:`run` takes.
+
+        A source has the window of its frequency plus and minus the reach window of its band, clipped to the band;
+        windows of one band that overlap become one. ``source_bands`` holds the band of each source, ``band_edges_mhz``
+        (bands + 1) and ``reach_mhz`` (bands) are host arrays. Returns ``ids`` (the band of each window), ``low_mhz``
+        and ``high_mhz`` (the windows in order of frequency) and ``active`` (all True). Raises ValueError for a source
+        outside its band or a reach that is not positive.
+        """
+        frequencies = np.asarray(source_frequencies_mhz, dtype=float)
+        source_bands = np.asarray(source_bands, dtype=int)
+        edges = np.asarray(band_edges_mhz, dtype=float)
+        reach = np.asarray(reach_mhz, dtype=float)
+        if np.any(reach <= 0.0):
+            raise ValueError("every band needs a positive reach window")
+        if np.any(frequencies < edges[source_bands]) or np.any(frequencies > edges[source_bands + 1]):
+            raise ValueError("a source lies outside its band")
+        ids, lows, highs = [], [], []
+        for source in np.argsort(frequencies, kind="stable"):
+            band = int(source_bands[source])
+            low = max(edges[band], frequencies[source] - reach[band])
+            high = min(edges[band + 1], frequencies[source] + reach[band])
+            if ids and ids[-1] == band and low <= highs[-1]:
+                highs[-1] = max(highs[-1], high)
+            else:
+                ids.append(band)
+                lows.append(low)
+                highs.append(high)
+        return {"ids": np.array(ids, dtype=int), "low_mhz": np.array(lows, dtype=float),
+                "high_mhz": np.array(highs, dtype=float), "active": np.ones(len(ids), dtype=bool)}
+
+    @staticmethod
+    def window_members(bands, frequencies_mhz):
+        """The index of the window that holds each frequency, -1 where none does; the ends of a window count as inside.
+
+        ``bands`` is a dict of windows in order of frequency, as :meth:`source_windows` makes it. A frequency at an edge
+        that two windows share belongs to the upper one, as a source at the edge of two bands belongs to the upper band.
+        """
+        frequencies = np.asarray(frequencies_mhz, dtype=float)
+        low = np.asarray(bands["low_mhz"], dtype=float)
+        high = np.asarray(bands["high_mhz"], dtype=float)
+        if len(low) == 0:
+            return np.full(frequencies.shape, -1, dtype=int)
+        index = np.searchsorted(low, frequencies, side="right") - 1
+        inside = (index >= 0) & (frequencies <= high[np.maximum(index, 0)])
+        return np.where(inside, index, -1)
+
+    @classmethod
+    def fibonacci_sky(cls, count):
+        """Near-uniform points on the sphere along a golden-angle spiral: right ascension and sine declination."""
+        index = np.arange(count)
+        return np.mod(index * cls.GOLDEN_ANGLE, 2.0 * np.pi), 1.0 - 2.0 * (index + 0.5) / count
+
+    @classmethod
+    def line_fdot(cls, f0_mhz, source_rows, epoch_fraction, observation_seconds):
+        """fdot at each f0 (mHz) on the line f0 + mu T fdot = constant through each source: (n_f0, n_sources).
+
+        The line is the degeneracy of a chirping source at the parameters' epoch: moving f0 by df moves the best fdot by
+        -df / (mu T), with mu T the time from the epoch to the middle of the data.
+        """
+        f0_mhz = np.atleast_1d(np.asarray(f0_mhz, dtype=float))
+        source_rows = np.atleast_2d(source_rows)
+        shift_hz = (source_rows[None, :, cls.COL_F0] - f0_mhz[:, None]) * 1e-3
+        return source_rows[None, :, cls.COL_FDOT] + shift_hz / (epoch_fraction * observation_seconds)
+
+    @classmethod
+    def seed_grid(cls, source_rows, window_low_mhz, window_high_mhz, reach_bins, epoch_fraction, observation_seconds,
+                  prior_container):
+        """The seed grid of one window.
+
+        The f0 nodes lie one bin apart over the union of the reach windows of the sources, clipped to the window. At
+        each node the fdot values lie ``SEED_FDOT_STEP_DRIFT_BINS`` apart on the line of constant mid-span frequency
+        through each source whose reach holds the node, ``SEED_SKY_POINTS`` sky points on a Fibonacci sphere go with
+        every (f0, fdot), and rows whose fdot lies outside the prior's bounds are dropped. ``source_rows`` are the
+        sampling rows of the window's sources and ``reach_bins`` the reach window of the window's band in bins. Returns
+        a :class:`SeedGrid`, with no rows when no node lies within the reach of a source.
+        """
+        bin_mhz, drift_bin = 1e3 / observation_seconds, 1.0 / observation_seconds**2
+        sources = np.atleast_2d(np.asarray(source_rows, dtype=float))
+        reach_mhz = reach_bins * bin_mhz
+        low_mhz = max(float(window_low_mhz), sources[:, cls.COL_F0].min() - reach_mhz)
+        high_mhz = min(float(window_high_mhz), sources[:, cls.COL_F0].max() + reach_mhz)
+        nodes = np.arange(int(np.ceil(low_mhz / bin_mhz)), int(np.floor(high_mhz / bin_mhz)) + 1)
+        near = np.abs(nodes[:, None] * bin_mhz - sources[None, :, cls.COL_F0]) <= reach_mhz
+        nodes, near = nodes[near.any(axis=1)], near[near.any(axis=1)]
+        sky_ra, sky_sin_dec = cls.fibonacci_sky(cls.SEED_SKY_POINTS)
+        bounds = cls.one_column_bounds(prior_container, cls.COL_LN_AMP)
+        ln_amp = 0.5 * (bounds[0] + bounds[1]) if bounds is not None else 0.0
+        if len(nodes) == 0:
+            return SeedGrid(np.zeros(0), np.zeros(0), np.zeros(0, dtype=int), sky_ra, sky_sin_dec, float(ln_amp),
+                            float(observation_seconds))
+        lines = cls.line_fdot(nodes * bin_mhz, sources, epoch_fraction, observation_seconds)
+        step = cls.SEED_FDOT_STEP_DRIFT_BINS * drift_bin
+        offsets = np.arange(-cls.SEED_FDOT_HALF_STEPS, cls.SEED_FDOT_HALF_STEPS + 1) * step
+        chirp_node, chirp_fdot = [], []
+        for position, node in enumerate(nodes):
+            values = (lines[position, near[position]][:, None] + offsets[None, :]).ravel()
+            # * rounding to the step and keeping the unique values stops near-coincident lines from multiplying rows
+            values = np.unique(np.round(values / step)) * step
+            chirp_node.append(np.full(len(values), node))
+            chirp_fdot.append(values)
+        chirp_node, chirp_fdot = np.concatenate(chirp_node), np.concatenate(chirp_fdot)
+        chirp_f0 = chirp_node * bin_mhz
+        fdot_low, fdot_high = cls.joint_f0_fdot_prior(prior_container).get_fdot_bounds(chirp_f0)
+        inside = (chirp_fdot >= asnumpy(fdot_low)) & (chirp_fdot <= asnumpy(fdot_high))
+        return SeedGrid(chirp_f0[inside], chirp_fdot[inside], chirp_node[inside], sky_ra, sky_sin_dec, float(ln_amp),
+                        float(observation_seconds))
+
+    @classmethod
+    def select_seeds(cls, grid, scores, nwalkers, reach_bins):
+        """The best rows of a grid, at most ``nwalkers`` of them.
+
+        The ranking by F walks down from the best row and keeps a row unless a kept row has the same sky point and an
+        f0 node less than ``SEED_MIN_F0_BINS`` away, or ``SEED_NEIGHBOURHOOD_CAP`` kept rows already lie within
+        ``reach_bins`` of its node. ``scores`` are the F values (n_chirp, n_sky). Returns the rows (count, 8) and a dict
+        with the chirp index, the sky index and F of each seed; fewer than ``nwalkers`` rows when the ranking runs out
+        or the cap blocks the rest. This is :meth:`select_seeds_of_windows` for one window on numpy.
+        """
+        return cls.select_seeds_of_windows([grid], [scores], nwalkers, [reach_bins])[0]
+
+    @classmethod
+    def select_seeds_of_windows(cls, grids, scores, nwalkers, reach_bins, xp=np):
+        """The best rows of the seed grids of several windows, at most ``nwalkers`` of each, ranked in one call.
+
+        ``grids`` is a list of :class:`SeedGrid`, ``scores`` the list of their F arrays (n_chirp, n_sky) on the host,
+        ``reach_bins`` one value for each window and ``xp`` numpy or cupy. Returns a list with the ``(rows, info)`` that
+        :meth:`select_seeds` returns for each window.
+
+        A round takes, in every window, the best entry that no kept seed blocks. A kept seed blocks the entries at its
+        sky point less than ``SEED_MIN_F0_BINS`` away in f0 node, and every chirp row that has
+        ``SEED_NEIGHBOURHOOD_CAP`` kept seeds within ``reach_bins`` of its node. Only entries with F above
+        ``REJECTED_LL`` and among the ``SEED_RANKING_POOL`` largest of their window can become seeds. Both rules only
+        block more entries as seeds are kept, so a round gives the seed that a walk down the ranked rows keeps next.
+
+        The windows are padded with -inf into one array (windows, most chirp rows, most sky points) that is built on
+        ``xp``, so that only the real entries cross to the card and the host builds no padded copy. The rounds of all
+        windows run together and end after the first round that keeps no seed in any window, which costs one small host
+        check per round; the kept indices come back in one copy. The call holds the array and one copy of it for the
+        pool's thresholds: 16 bytes per padded entry on ``xp``. On numpy the windows are ranked one at a time, so that
+        no window is padded to the largest.
+
+        Equal F values: the pool keeps every entry equal to its threshold and a round takes the first best entry in
+        chirp-major order. A ranking that sorts a pool cut at exactly ``SEED_RANKING_POOL`` entries leaves the order of
+        equal values undefined, so the seeds differ from such a ranking only where F values that it reaches are equal.
+        """
+        if xp is np and len(grids) > 1:
+            # one window at a time: no window is padded to the largest, and the rounds read only its own entries
+            ranked = []
+            for grid, window_scores, window_reach in zip(grids, scores, reach_bins):
+                ranked += cls.select_seeds_of_windows([grid], [window_scores], nwalkers, [window_reach])
+            return ranked
+        num_windows = len(grids)
+        host_scores = [np.asarray(window_scores) for window_scores in scores]
+        max_chirp = max((grid.n_chirp for grid in grids), default=0)
+        max_sky = max((grid.n_sky for grid in grids), default=0)
+        num_rounds = int(nwalkers) if max_chirp * max_sky > 0 else 0
+        # rows: chirp index, sky index and 1 for a round that kept a seed; columns: the windows
+        kept = np.zeros((3, num_rounds, num_windows), dtype=np.int64)
+        if num_rounds:
+            # the padding is built on xp, so that only the real entries cross to the card
+            open_scores = xp.full((num_windows, max_chirp, max_sky), -xp.inf)
+            chirp_nodes = xp.zeros((num_windows, max_chirp), dtype=xp.int64)
+            for window, (grid, window_scores) in enumerate(zip(grids, host_scores)):
+                open_scores[window, :grid.n_chirp, :grid.n_sky] = xp.asarray(window_scores)
+                chirp_nodes[window, :grid.n_chirp] = xp.asarray(grid.chirp_node)
+            reach = xp.asarray(np.asarray(reach_bins, dtype=float))
+            # rows the ranking never reaches: not scored, or below the pool of the best rows of their window
+            xp.copyto(open_scores, -xp.inf, where=open_scores <= cls.REJECTED_LL)
+            if max_chirp * max_sky > cls.SEED_RANKING_POOL:
+                cut = max_chirp * max_sky - cls.SEED_RANKING_POOL
+                thresholds = xp.partition(open_scores.reshape(num_windows, -1), cut, axis=1)[:, cut]
+                xp.copyto(open_scores, -xp.inf, where=open_scores < thresholds[:, None, None])
+            window_index = xp.arange(num_windows)
+            # the same entries with the sky point first, so that one sky point of every window is one indexed read
+            open_by_sky = open_scores.swapaxes(1, 2)
+            seeds_in_reach = xp.zeros((num_windows, max_chirp), dtype=xp.int64)
+            open_rows = xp.ones((num_windows, max_chirp), dtype=bool)
+            chosen_chirp, chosen_sky, chosen_valid = [], [], []
+            for _ in range(num_rounds):
+                # the best open entry of each window: the best chirp row first, then the best sky point of that row
+                row_best = xp.where(open_rows, open_scores.max(axis=2), -xp.inf)
+                chirp = row_best.argmax(axis=1)
+                valid = row_best[window_index, chirp] > -xp.inf
+                sky = open_scores[window_index, chirp].argmax(axis=1)
+                chosen_chirp.append(chirp)
+                chosen_sky.append(sky)
+                chosen_valid.append(valid)
+                # the one host check of a round: no window has a seed left
+                if not bool(valid.any()):
+                    break
+                # the kept entry closes itself, so that the result does not depend on SEED_MIN_F0_BINS being above 0
+                open_scores[window_index, chirp, sky] = xp.where(valid, -xp.inf, open_scores[window_index, chirp, sky])
+                node_distance = xp.abs(chirp_nodes - chirp_nodes[window_index, chirp][:, None])
+                too_close = valid[:, None] & (node_distance < cls.SEED_MIN_F0_BINS)
+                open_by_sky[window_index, sky] = xp.where(too_close, -xp.inf, open_by_sky[window_index, sky])
+                seeds_in_reach += valid[:, None] & (node_distance <= reach[:, None])
+                open_rows &= seeds_in_reach < cls.SEED_NEIGHBOURHOOD_CAP
+            kept = asnumpy(xp.stack([xp.stack(chosen_chirp), xp.stack(chosen_sky),
+                                     xp.stack(chosen_valid).astype(xp.int64)]))
+        results = []
+        for window, (grid, window_scores) in enumerate(zip(grids, host_scores)):
+            count = int(kept[2, :, window].sum())
+            chirp_index, sky_index = kept[0, :count, window].copy(), kept[1, :count, window].copy()
+            rows = (np.concatenate([grid.rows(chirp, sky) for chirp, sky in zip(chirp_index, sky_index)]) if count
+                    else np.zeros((0, cls.NDIM)))
+            results.append((rows, {"chirp_index": chirp_index, "sky_index": sky_index,
+                                   "fstat": window_scores[chirp_index, sky_index] if count else np.zeros(0)}))
+        return results
+
+    # ==================================================================================================================
+    # The search, in its steps
+    # ==================================================================================================================
+
+    def run(self, holder, walker, bands, *, engine, periodic, seeds=None):
+        """One search of the walker's residual in the bands, from stage 1 to the mixture fit.
+
+        ``holder`` is the model's analysis container array, ``walker`` the index of the walker in it, ``bands`` a dict
+        of ``ids``, ``low_mhz``, ``high_mhz`` (the f0 edges in mHz) and ``active`` (the bands to search), ``engine`` the
+        caller's band likelihood engine and ``periodic`` its Eryn periodic container. A band may be a window inside one
+        (:meth:`source_windows`), and the ids of several may repeat. ``seeds`` is None for the start from prior draws,
+        or a :class:`SeedStartInputs` with one entry for each searched band for the start from the seed grid. Returns a
+        dict with ``walker``, ``bands``, the output of each step that ran and ``status``: "no_range" (no band is
+        active), "no_detection" (no band passes the gate), "no_usable_fit" (no passing band has a usable stage-2 chain)
+        or "fitted".
+        """
+        search = {"walker": walker, "bands": bands}
+        if not bands["active"].any():
+            search["status"] = "no_range"
+            return search
+        search_holder, owners = self._search_owners(holder, walker)
+        search["stage_1"], search["likelihood_1"] = self._run_stage_1(search_holder, owners, bands, engine, periodic,
+                                                                      seeds)
+        search["gate"] = self._apply_gate(search["stage_1"], bands)
+        if not search["gate"]["detected"].any():
+            search["status"] = "no_detection"
+            return search
+        search["start"] = self._stage_2_start(search["likelihood_1"], search["stage_1"], search["gate"])
+        search["stage_2"], search["likelihood_2"] = self._run_stage_2(
+            search_holder, owners, bands, search["gate"], search["start"], engine, periodic)
+        search["mixtures"] = self._fit_mixtures(search["stage_2"])
+        search["status"] = "fitted" if search["mixtures"]["usable"].any() else "no_usable_fit"
+        return search
+
+    def _band_mask(self, low_mhz, high_mhz):
+        """The band restriction of the run prior for Eryn's samplers, one band per sampler."""
+        # below the run prior's f0 range, where the joint prior is -inf with finite fdot bounds
+        outside_f0 = 0.5 * float(self.joint_f0_fdot_prior(self.priors["gb"]).f0_min)
+        return BandMaskTransform(low_mhz, high_mhz, outside_f0)
+
+    def _search_owners(self, holder, walker):
+        """The holder the search reads and its rows that hold the walker's residual. On several cards: the search
+        holder, with the walker copied into its row on every card; else ``holder`` and the walker itself."""
+        gpus = getattr(holder, "gpus", None)
+        if gpus is None or len(gpus) < 2:
+            return holder, [walker]
+        return self._fill_search_holder(holder, walker), list(range(len(gpus)))
+
+    def _build_search_holder(self, holder):
+        """One container per card of ``holder`` on its full STFT grid, built as the GB band buffer builds its cells:
+        data and noise rows of zeros on the card, a sensitivity backend made from the card's split, and the split's
+        Fresnel settings. Its rows receive the searched walker at each search."""
+        xp = self.xp
+        settings = holder.settings
+        data_shape = (int(holder.nchannels),) + tuple(holder.end_shape)
+        noise_shape = tuple(holder.shape_sens) + tuple(holder.end_shape)
+        containers = []
+        for split, card in enumerate(holder.gpus):
+            with xp.cuda.Device(int(card)):
+                # ! A backend of its own: the array rebinds its containers' noise arrays, which must not be the main
+                # ! holder's. The split's backend holds the card's own orbit tables.
+                split_backend = holder.cpp_splits[split].sensitivity_backend
+                sensitivity = type(split_backend)(**dict(split_backend.kwargs))
+                sensitivity.data_shape = settings.basis_shape_active
+                noise_zeros = xp.zeros(noise_shape, dtype=xp.complex128)
+                sensitivity.sens_mat = noise_zeros
+                sensitivity.invC = noise_zeros
+                sensitivity.channel_shape = tuple(holder.shape_sens)
+                data = settings.associated_class(xp.zeros(data_shape, dtype=xp.complex128), settings)
+                containers.append(AnalysisContainer(data, sensitivity))
+        group = holder.cpp_splits[0]
+        cards = [int(card) for card in holder.gpus]
+        return AnalysisContainerArray(
+            containers, gpus=cards, complex_psd=True, gpu_assignment=cards,
+            domain_group_kwargs=dict(tdi_type=group.tdi_type, window_alpha=group.window_alpha,
+                                     use_midpoint=group.use_midpoint, linear_envelope=group.linear_envelope,
+                                     use_sym_window=getattr(group, "use_sym_window", True)))
+
+    def _fill_search_holder(self, holder, walker):
+        """The search holder, built at the first call, with ``walker``'s data and noise rows of ``holder`` copied card
+        to card into its row on every card, and its (d|d) for those rows."""
+        if self._search_holder is None:
+            self._search_holder = self._build_search_holder(holder)
+        search_holder = self._search_holder
+        xp = self.xp
+        split = int(np.asarray(asnumpy(holder.split_map))[walker])
+        row = int(np.flatnonzero(np.asarray(asnumpy(holder.gpu_splits[split])) == walker)[0])
+        data_size = int(holder.nchannels) * int(holder.data_length)
+        noise_size = int(np.prod(holder.shape_sens)) * int(holder.data_length)
+        data_row = holder.linear_data_arr[split][row * data_size:(row + 1) * data_size]
+        noise_row = holder.linear_psd_arr[split][row * noise_size:(row + 1) * noise_size]
+        # ! The walker's rows come from its card's stream; each copy runs on its target card's stream, which the
+        # ! search's kernels then follow.
+        xp.cuda.Device(int(holder.gpus[split])).synchronize()
+        for target, card in enumerate(search_holder.gpus):
+            with xp.cuda.Device(int(card)):
+                for source, destination in ((data_row, search_holder.linear_data_arr[target]),
+                                            (noise_row, search_holder.linear_psd_arr[target])):
+                    if destination.size != source.size:
+                        raise ValueError(f"search holder row of {destination.size} entries for a walker row of "
+                                         f"{source.size}")
+                    destination.data.copy_from_device_async(source.data, source.nbytes)
+        search_holder.compute_d_d_terms()
+        return search_holder
+
+    def release_search_holder(self):
+        """Drop the search holder. Its containers leave the cards once the search dicts that refer to them are gone,
+        and the next search on several cards builds it again. On one card there is none."""
+        self._search_holder = None
+
+    def _run_stage_1(self, holder, owners, bands, engine, periodic, seeds=None):
+        """Stage 1 in the searched bands: the F-statistic over f0, fdot and the sky, from draws of the run prior
+        restricted to each band, or from the best rows of each band's seed grid when ``seeds`` (a
+        :class:`SeedStartInputs`) is given. ``holder`` and ``owners`` are those of :meth:`_search_owners`. Returns the
+        samplers' outputs and the likelihood, whose terms the maximizers reuse; with seeds the outputs hold
+        ``seeding``, the facts of :meth:`_seeded_start`."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_1, dtype=float)
+        low, high = bands["low_mhz"][bands["active"]], bands["high_mhz"][bands["active"]]
+        mask = np.zeros(self.NDIM, dtype=bool)
+        mask[list(self.SAMPLED_COLUMNS)] = True
+        likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms,
+                                           fstat=True)
+        start = self.band_start(self.priors["gb"], low, high, len(betas), int(settings.nwalkers))
+        if seeds is not None:
+            start, seeding = self._seeded_start(holder, owners, bands, engine, start, seeds)
+        output = self.run_band_samplers(likelihood, start, self.priors["gb"], self._band_mask(low, high), mask,
+                                        periodic, int(settings.burn_1), int(settings.nsteps_1), betas,
+                                        progress=bool(settings.progress), use_gpu=self.backend.uses_cupy)
+        if seeds is not None:
+            output["seeding"] = seeding
+        return output, likelihood
+
+    def _apply_gate(self, stage_1, bands):
+        """The gate on each searched band's stage-1 maximum. Returns the decisions, the thresholds, the targets and
+        sqrt(2F) of the stored cold samples."""
+        settings = self.fstat_settings
+        # sqrt(2F) is the optimal SNR of the template at the F-statistic maximum
+        snr = np.sqrt(np.maximum(2.0 * stage_1["cold_ll"], 0.0))
+        # * the gate reads the maximum: the stage-1 cold walkers sit on several peaks without mixing, so the median and
+        # * the minimum read the lower peaks
+        detected, thresholds, targets = self.detection_gate(
+            snr, bands["low_mhz"][bands["active"]] * 1e-3, float(settings.snr_eff_threshold),
+            settings.shutoff_high_frequency_threshold, float(settings.galfor_inflation_factor))
+        return {"detected": detected, "thresholds": thresholds, "targets": targets, "snr": snr}
+
+    def _stage_2_start(self, likelihood, stage_1, gate):
+        """Stage 2's start in the passing bands: the last stage-1 cold rows with the four analytic columns at their
+        maximizers. Returns the rows (bands, walkers, 8), F there, the rows replaced and the seconds."""
+        time_start = time.perf_counter()
+        nwalkers = int(self.fstat_settings.nwalkers)
+        n_detected = int(gate["detected"].sum())
+        last = stage_1["last_cold"][gate["detected"]].reshape(-1, self.NDIM)
+        rows, fstat, replaced = self._maximized_rows(likelihood, last)
+        return {
+            "rows": rows.reshape(n_detected, nwalkers, self.NDIM), "fstat": fstat.reshape(n_detected, nwalkers),
+            "replaced": replaced.reshape(n_detected, nwalkers), "seconds": time.perf_counter() - time_start,
+        }
+
+    def _maximized_rows(self, likelihood, coords):
+        """Rows with ln A, phi0, cos iota and psi at the F-statistic maximum, F there, and the rows replaced.
+
+        A row keeps its old values where it cannot be scored, where the maximum has no amplitude, or where the maximized
+        point falls outside the run prior; an amplitude beyond the prior's range is clipped into it first.
+        """
+        xp = likelihood.engine.xp
+        transform = self.parameter_transforms
+        coords = np.asarray(coords, dtype=float)
+        params_phys = transform.both_transforms(coords)
+        projections, overlaps, two_f, keep = likelihood.terms(xp.asarray(params_phys))
+        amplitudes = self.fstat_amplitudes(projections, overlaps, keep)
+        amplitude, cos_iota, psi, phi0 = (np.asarray(asnumpy(value), dtype=float)
+                                          for value in self.extrinsics_from_amplitudes(amplitudes))
+        fstat = np.asarray(asnumpy(xp.where(keep, 0.5 * two_f, self.REJECTED_LL)), dtype=float)
+        fstat[~np.isfinite(fstat)] = self.REJECTED_LL
+        maximized_phys = params_phys.copy()
+        maximized_phys[:, self.PHYS_AMP] = amplitude
+        maximized_phys[:, self.PHYS_PHI0] = phi0
+        maximized_phys[:, self.PHYS_IOTA] = np.arccos(cos_iota)
+        maximized_phys[:, self.PHYS_PSI] = psi
+        scored = (fstat > self.REJECTED_LL) & (amplitude > 0.0) & np.isfinite(amplitude)
+        maximized = coords.copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            maximized[scored] = transform.both_inverse_transforms(maximized_phys[scored])
+        prior_container = self.priors["gb"]
+        bounds = self.one_column_bounds(prior_container, self.COL_LN_AMP)
+        if bounds is not None:
+            # a hair inside the box, so the clipped point is not on the edge the prior may exclude
+            margin = 1e-9 * (bounds[1] - bounds[0])
+            maximized[scored, self.COL_LN_AMP] = np.clip(maximized[scored, self.COL_LN_AMP], bounds[0] + margin,
+                                                         bounds[1] - margin)
+        outside = ~np.isfinite(asnumpy(prior_container.logpdf(maximized)))
+        maximized[outside] = coords[outside]
+        return maximized, fstat, scored & ~outside
+
+    def _run_stage_2(self, holder, owners, bands, gate, start, engine, periodic):
+        """Stage 2 in the passing bands: the full likelihood over every column (phi0 left to the analytic maximum when
+        phase_maximize), from the maximized rows at every temperature. ``holder`` and ``owners`` are those of
+        :meth:`_search_owners`. Returns the samplers' outputs, with the cold chains, and the likelihood."""
+        settings = self.fstat_settings
+        betas = np.asarray(settings.betas_2, dtype=float)
+        passing = np.flatnonzero(bands["active"])[gate["detected"]]
+        low, high = bands["low_mhz"][passing], bands["high_mhz"][passing]
+        mask = np.ones(self.NDIM, dtype=bool)
+        if self.phase_maximize:
+            mask[self.COL_PHI0] = False
+        likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms,
+                                           fstat=False, phase_maximize=self.phase_maximize,
+                                           waveform_kwargs=self.waveform_kwargs)
+        output = self.run_band_samplers(
+            likelihood, np.repeat(start["rows"][:, None], len(betas), axis=1), self.priors["gb"],
+            self._band_mask(low, high), mask, periodic, int(settings.burn_2), int(settings.nsteps_2), betas,
+            record_cold_coords=True, progress=bool(settings.progress), use_gpu=self.backend.uses_cupy)
+        return output, likelihood
+
+    def _fit_mixtures(self, stage_2):
+        """The mixtures of the passing bands' stage-2 cold chains: one per band over :meth:`theta_rows` with theta+,
+        theta- and lam periodic. Returns the usable bands, the mixture's seven component lists (None when no band is
+        usable), the bands per fit chunk and the seconds."""
+        time_start = time.perf_counter()
+        cold_coords = stage_2["cold_coords"]
+        samples = cold_coords.reshape(cold_coords.shape[0], -1, self.NDIM)
+        # * a band whose chain never moved in a column (zero range, which the mixture's box map divides by) or holds a
+        # * value that is not finite is left out, not the search
+        usable = np.all(np.isfinite(samples), axis=(1, 2)) & np.all(np.ptp(samples, axis=1) > 0.0, axis=1)
+        if not usable.any():
+            return {"usable": usable, "components": None, "chunk": None,
+                    "seconds": time.perf_counter() - time_start}
+        gpu = int(self.xp.cuda.runtime.getDevice()) if self.backend.uses_cupy else None
+        theta = self.theta_rows(cold_coords[usable].reshape(int(usable.sum()), -1, self.NDIM))
+        components, chunk = self.fit_band_mixtures(theta, gpu, periodic=self.GMM_PERIODIC)
+        return {"usable": usable, "components": components, "chunk": chunk,
+                "seconds": time.perf_counter() - time_start}
+
+    # ==================================================================================================================
+    # The seeded start, the passes and the input of a search
+    # ==================================================================================================================
+
+    def _score_seed_grid(self, likelihood, grid):
+        """F of every row of a seed grid, (n_chirp, n_sky): in pieces of ``SEED_GRID_PIECE_ROWS`` rows, which bound the
+        host memory, and calls of ``SEED_BATCH_ROWS`` rows of the likelihood."""
+        scores = np.empty((grid.n_chirp, grid.n_sky))
+        chirp_per_piece = max(1, self.SEED_GRID_PIECE_ROWS // grid.n_sky)
+        for first_chirp in range(0, grid.n_chirp, chirp_per_piece):
+            chirp_index = np.arange(first_chirp, min(first_chirp + chirp_per_piece, grid.n_chirp))
+            rows = grid.rows(chirp_index)
+            values = np.empty(len(rows))
+            for first_row in range(0, len(rows), self.SEED_BATCH_ROWS):
+                batch = slice(first_row, first_row + self.SEED_BATCH_ROWS)
+                values[batch] = likelihood(rows[batch])
+            scores[chirp_index] = values.reshape(len(chirp_index), -1)
+        return scores
+
+    def _seeded_start(self, holder, owners, bands, engine, start, seeds):
+        """Put the best rows of each searched window's seed grid into the stage-1 start.
+
+        The grid of a window is scored on the input of this search, so it is made anew at every search. The best rows
+        become the f0, fdot and sky of the first walkers of every temperature; the walkers that the seeds do not fill
+        keep their prior draws. ``holder`` and ``owners`` are those of :meth:`_search_owners`, ``start`` is (windows,
+        ntemps, nwalkers, 8) and ``seeds`` a :class:`SeedStartInputs` with one entry for each searched window. Returns
+        the start and a dict of facts: ``grid_rows`` scored, their ``seconds``, and ``seed_counts`` and ``best_fstat``
+        of each window.
+
+        All windows are scored first and ranked in one call of :meth:`select_seeds_of_windows` on the search's array
+        module, so the host holds the scores of all windows of the call at once: about 2 MB per window on average and
+        10 MB for the largest windows seen.
+        """
+        searched = np.flatnonzero(bands["active"])
+        if len(seeds.source_rows) != len(searched) or len(seeds.reach_bins) != len(searched):
+            raise ValueError("the seeded start needs the sources and the reach of each searched window")
+        nwalkers = int(self.fstat_settings.nwalkers)
+        # * a likelihood object of its own keeps the rows and seconds of the grids out of the record's stage-1 counts
+        likelihood = FStatSearchLikelihood(engine, holder, owners, self.parameter_transforms, fstat=True)
+        time_start = time.perf_counter()
+        grid_rows, seed_counts, best_fstat = 0, np.zeros(len(searched), dtype=int), np.full(len(searched), np.nan)
+        grids, window_scores = [], []
+        for window, band in enumerate(searched):
+            grids.append(self.seed_grid(seeds.source_rows[window], bands["low_mhz"][band], bands["high_mhz"][band],
+                                        seeds.reach_bins[window], seeds.epoch_fraction, seeds.observation_seconds,
+                                        self.priors["gb"]))
+            window_scores.append(self._score_seed_grid(likelihood, grids[-1]))
+        # one ranking for all windows of the call
+        chosen = self.select_seeds_of_windows(grids, window_scores, nwalkers, seeds.reach_bins, xp=self.xp)
+        for window, ((rows, _), scores) in enumerate(zip(chosen, window_scores)):
+            for column in self.SAMPLED_COLUMNS:
+                start[window, :, :len(rows), column] = rows[None, :, column]
+            grid_rows += scores.size
+            seed_counts[window] = len(rows)
+            if scores.size:
+                best_fstat[window] = scores.max()
+        seconds = time.perf_counter() - time_start
+        logger.info("[GB_FSTAT_SEARCH %s] seed grids of %d windows: %.3e rows in %.1f s (%.1f us per row), seeds per "
+                    "window %d to %d", self.name, len(searched), grid_rows, seconds, 1e6 * seconds / max(grid_rows, 1),
+                    seed_counts.min(), seed_counts.max())
+        return start, {"grid_rows": grid_rows, "seconds": seconds, "seed_counts": seed_counts, "best_fstat": best_fstat}
+
+    def run_passes(self, holder, walker, bands, *, engine, periodic, seeds=None, after_pass=None):
+        """Search windows in passes: a window that passes the gate has the best row of its stage 2 taken out of the
+        walker's residual and is searched again, until no window passes or ``MAX_PASSES`` passes have run.
+
+        The first pass searches all of ``bands``. Each later pass searches the windows that passed the gate in the pass
+        before, with the same sources (``seeds``, or None for the prior start) and a seed grid made anew on the
+        changed residual. Returns a list with one search dict of :meth:`run` for each pass; each holds ``pass_number``,
+        ``windows`` (the indices into ``bands`` of the windows it searched) and ``seconds``, and a pass that another
+        follows holds ``subtracted_rows`` (:meth:`_subtract_best_rows`). ``after_pass`` is called with the dict of each
+        pass as soon as it ends, before the best rows are taken out. The subtractions change the walker's residual, so
+        the caller keeps it with :meth:`restored_residual`.
+        """
+        passes = []
+        window_index = np.arange(len(bands["ids"]))
+        current, current_seeds = bands, seeds
+        for pass_number in range(self.MAX_PASSES):
+            time_start = time.perf_counter()
+            searched = np.flatnonzero(current["active"])
+            search = self.run(holder, walker, current, engine=engine, periodic=periodic, seeds=current_seeds)
+            search["pass_number"], search["windows"] = pass_number, window_index[searched]
+            search["seconds"] = time.perf_counter() - time_start
+            passes.append(search)
+            if after_pass is not None:
+                after_pass(search)
+            if "gate" not in search or not search["gate"]["detected"].any() or pass_number == self.MAX_PASSES - 1:
+                break
+            passing = search["gate"]["detected"]
+            search["subtracted_rows"] = self._subtract_best_rows(holder, walker, search, engine)
+            window_index = window_index[searched[passing]]
+            current = {name: np.asarray(current[name])[searched[passing]]
+                       for name in ("ids", "low_mhz", "high_mhz", "active")}
+            current_seeds = None if current_seeds is None else current_seeds.subset(np.flatnonzero(passing))
+        return passes
+
+    def _subtract_best_rows(self, holder, walker, search, engine):
+        """Take the best stage-2 row of each window that passed the gate out of the walker's residual, in one fill call.
+
+        The best row is the cold row of the largest ln L of the window's chain. A window whose best row was not scored
+        keeps its residual, and a warning names it. Returns the best rows (windows that passed, 8), NaN where nothing
+        was taken out.
+        """
+        cold_ll = search["stage_2"]["cold_ll"]
+        count = cold_ll.shape[0]
+        log_likelihood = cold_ll.reshape(count, -1)
+        best = np.argmax(log_likelihood, axis=1)
+        rows = search["stage_2"]["cold_coords"].reshape(count, -1, self.NDIM)[np.arange(count), best]
+        scored = log_likelihood[np.arange(count), best] > self.REJECTED_LL
+        bands = search["bands"]
+        passing = np.flatnonzero(bands["active"])[search["gate"]["detected"]]
+        for window in passing[~scored]:
+            logger.warning("[GB_FSTAT_SEARCH %s] the best row of the window %.6f to %.6f mHz was not scored and "
+                           "stays in the residual", self.name, bands["low_mhz"][window], bands["high_mhz"][window])
+        self._fill_rows(holder, walker, rows[scored], -1, engine)
+        return np.where(scored[:, None], rows, np.nan)
+
+    def _fill_rows(self, holder, walker, source_rows, factor, engine):
+        """Put the templates of sampling rows into the walker's row of the container (factor +1) or take them out (-1).
+
+        One fill call for all rows: the kernel adds with atomic operations, so rows of one walker that overlap are safe.
+        """
+        rows = np.asarray(source_rows, dtype=float).reshape(-1, self.NDIM)
+        if len(rows) == 0:
+            return
+        xp = engine.xp
+        params_phys = xp.asarray(self.parameter_transforms.both_transforms(rows))
+        walker_index = xp.full(len(rows), int(walker), dtype=xp.int32)
+        engine.fill_template(holder, params_phys, walker_index, None, factor=factor,
+                             waveform_kwargs=self.waveform_kwargs)
+
+    def add_sources_back(self, holder, walker, source_rows, *, engine):
+        """Add the templates of sources back into the walker's residual, in one fill call.
+
+        The input of a search that must see these sources: the data with them present. Pair it with
+        :meth:`restored_residual`, which writes the saved row back.
+        """
+        self._fill_rows(holder, walker, source_rows, +1, engine)
+
+    @staticmethod
+    def _walker_row(holder, walker):
+        """The walker's row of the container's flat data buffer: a view that the template fills write into."""
+        split, intra = int(holder.split_map[walker]), int(holder.ac_to_intra[walker])
+        size = int(holder.nchannels) * int(holder.data_length)
+        return holder.linear_data_arr[split][intra * size:(intra + 1) * size]
+
+    @contextmanager
+    def restored_residual(self, holder, walker):
+        """Keep the walker's residual through a block that changes it: copy it on entry, write it back on exit.
+
+        Yields a dict that holds ``likelihood_before``, the walker's ln L on entry, and, after the block,
+        ``likelihood_after`` and ``likelihood_difference``. The row is written back also when the block raises. Raises
+        RuntimeError when the bytes of the row differ from the copy after the write back.
+        """
+        walker = int(walker)
+        row = self._walker_row(holder, walker)
+        device = None if holder.gpus is None else int(holder.gpu_map[walker])
+        facts = {"likelihood_before": float(holder.likelihood(index=np.array([walker]))[0])}
+        with holder.device_context(device):
+            saved = row.copy()
+        try:
+            yield facts
+        finally:
+            with holder.device_context(device):
+                row[:] = saved
+                xp = get_array_module(row)
+                # * compared as 64-bit words, so that a sign of zero or a NaN that changed is seen
+                differing = bool(xp.any(row.view(xp.uint64) != saved.view(xp.uint64)))
+            facts["likelihood_after"] = float(holder.likelihood(index=np.array([walker]))[0])
+            facts["likelihood_difference"] = facts["likelihood_after"] - facts["likelihood_before"]
+            if differing:
+                raise RuntimeError("the walker's residual differs from its copy after the write back")
+
+    @staticmethod
+    def fit_descriptions(search, pass_number=0):
+        """One fit description for each usable band of a search that fitted, in the order of the mixture's components,
+        as :meth:`FStatSearchMemory.set_fits` and ``add_fits`` take it: the band's edges in mHz as the searched range,
+        the mixture's weights, means, covariances and box as host arrays, the propose of the move, the walker the search
+        ran on and the pass, and the largest sqrt(2F) of the band's first stage with the gate's threshold on it."""
+        bands, gate, mixtures = search["bands"], search["gate"], search["mixtures"]
+        searched = np.flatnonzero(bands["active"])
+        usable = np.flatnonzero(gate["detected"])[mixtures["usable"]]
+        largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
+        weights, means, covariances, _, _, mins, maxs = mixtures["components"]
+        descriptions = []
+        for order, position in enumerate(usable):
+            band = searched[position]
+            descriptions.append({
+                "weights": asnumpy(weights[order]), "means": asnumpy(means[order]), "covs": asnumpy(covariances[order]),
+                "mins": asnumpy(mins[order]), "maxs": asnumpy(maxs[order]),
+                "low_mhz": float(bands["low_mhz"][band]), "high_mhz": float(bands["high_mhz"][band]),
+                "search_number": int(search["num_proposals"]), "pass_number": int(pass_number),
+                "walker": int(search["walker"]),
+                "largest_snr": float(largest[position]), "threshold": float(gate["thresholds"][position]),
+            })
+        return descriptions
+
+    # ==================================================================================================================
+    # The search's logs and record
+    # ==================================================================================================================
+
+    def finish(self, search, time_start, outcome, warn=False):
+        """The search's line in the run log, its block in the search log and, when asked, its saved record."""
+        search["total_seconds"] = time.perf_counter() - time_start
+        search["outcome"] = outcome
+        (logger.warning if warn else logger.info)("[GB_FSTAT_SEARCH %s] %s", self.name, self._search_summary(search))
+        settings = self.fstat_settings
+        if settings.output_dir is None:
+            return
+        os.makedirs(settings.output_dir, exist_ok=True)
+        with open(os.path.join(settings.output_dir, self.SEARCH_LOG_NAME), "a") as handle:
+            handle.write(self._search_log_block(search))
+        if settings.save_search_records != "none":
+            self._save_record(self._search_record(search))
+
+    def _search_summary(self, search):
+        """One line: the propose, the walker, the bands searched and passing, the outcome and the times."""
+        active = search["bands"]["active"]
+        parts = [f"propose {search['num_proposals']}, walker {search['walker']}, {int(active.sum())} of "
+                 f"{len(active)} bands searched"]
+        if "gate" in search:
+            gate = search["gate"]
+            thresholds = ", ".join(f"{value:.2f}" for value in np.unique(gate["thresholds"]))
+            parts.append(f"{int(gate['detected'].sum())} pass (thresholds {thresholds})")
+        parts.append(search["outcome"])
+        times = [f"{name} {search[key]['seconds']:.1f} s" for name, key in
+                 (("stage 1", "stage_1"), ("stage 2", "stage_2"), ("mixtures", "mixtures")) if key in search]
+        times.append(f"total {search['total_seconds']:.1f} s")
+        return "; ".join(parts) + "; " + ", ".join(times)
+
+    def _search_log_block(self, search):
+        """The search's block in fstat_search.log: its line, the stages and one line per passing band."""
+        lines = [f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.name}: {self._search_summary(search)}"]
+        if "stage_1" in search:
+            stage_1, likelihood = search["stage_1"], search["likelihood_1"]
+            lines.append(
+                f"  stage 1: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s in the "
+                f"F-statistic; cold acceptance {stage_1['acceptance_cold'].min():.3f} to "
+                f"{stage_1['acceptance_cold'].max():.3f}")
+        if "start" in search:
+            replaced = search["start"]["replaced"]
+            lines.append(f"  maximizers: {int(replaced.sum())} of {replaced.size} start rows moved to the maximum, "
+                         f"{search['start']['seconds']:.1f} s")
+        if "stage_2" in search:
+            likelihood = search["likelihood_2"]
+            lines.append(f"  stage 2: {likelihood.rows} rows in {likelihood.calls} calls, {likelihood.seconds:.1f} s "
+                         "in the likelihood")
+        if "gate" in search and search["gate"]["detected"].any():
+            bands, gate = search["bands"], search["gate"]
+            searched = np.flatnonzero(bands["active"])
+            largest = gate["snr"].reshape(len(searched), -1).max(axis=1)
+            mixtures = search.get("mixtures")
+            counts = iter([] if mixtures is None or mixtures["components"] is None
+                          else [len(asnumpy(weights)) for weights in mixtures["components"][0]])
+            for order, position in enumerate(np.flatnonzero(gate["detected"])):
+                band = searched[position]
+                line = (f"    band {bands['ids'][band]}: {bands['low_mhz'][band]:.6f} to {bands['high_mhz'][band]:.6f} "
+                        f"mHz, largest sqrt(2F) {largest[position]:.2f} against {gate['thresholds'][position]:.2f}")
+                if "stage_2" in search:
+                    line += f", stage-2 cold acceptance {search['stage_2']['acceptance_cold'][order]:.3f}"
+                if mixtures is not None:
+                    line += (f", {next(counts)} mixture components" if mixtures["usable"][order]
+                             else ", chain not usable")
+                lines.append(line)
+        return "\n".join(lines) + "\n"
+
+    def _search_record(self, search):
+        """The search's arrays, under the keys of the port's earlier record; at "summary" without CHAIN_KEYS."""
+        settings = self.fstat_settings
+        bands = search["bands"]
+        record = {
+            "walker": search["walker"], "num_proposals": search["num_proposals"], "band_ids": bands["ids"],
+            "band_low_mhz": bands["low_mhz"], "band_high_mhz": bands["high_mhz"], "active": bands["active"],
+            "settings": json.dumps(asdict(settings)), "outcome": search["outcome"],
+            "total_seconds": search["total_seconds"],
+        }
+        if "stage_1" in search:
+            stage_1, likelihood, gate = search["stage_1"], search["likelihood_1"], search["gate"]
+            snr = gate["snr"]
+            record.update({
+                "stage1_cold_fstat": stage_1["cold_ll"].astype(np.float32),
+                "stage1_snr_quantiles": np.quantile(snr.reshape(len(snr), -1), [0.0, 0.05, 0.5, 0.95, 1.0], axis=1).T,
+                "stage1_last_cold": stage_1["last_cold"], "stage1_acceptance_cold": stage_1["acceptance_cold"],
+                "stage1_swap_acceptance": stage_1["swap_acceptance"], "stage1_seconds": stage_1["seconds"],
+                "stage1_betas_start": np.asarray(settings.betas_1, dtype=float), "stage1_betas_end": stage_1["betas"],
+                "stage1_rows": likelihood.rows, "stage1_calls": likelihood.calls,
+                "stage1_likelihood_seconds": likelihood.seconds,
+                "detected": gate["detected"], "detection_rule": "maximum", "detection_thresholds": gate["thresholds"],
+                "detection_targets": gate["targets"],
+            })
+        if "start" in search:
+            start = search["start"]
+            record.update({"stage2_start": start["rows"], "stage2_start_fstat": start["fstat"],
+                           "stage2_start_replaced": start["replaced"], "maximize_seconds": start["seconds"]})
+        if "stage_2" in search:
+            stage_2, likelihood = search["stage_2"], search["likelihood_2"]
+            record.update({
+                "stage2_cold_coords": stage_2["cold_coords"], "stage2_cold_ll": stage_2["cold_ll"],
+                "stage2_acceptance_cold": stage_2["acceptance_cold"],
+                "stage2_swap_acceptance": stage_2["swap_acceptance"],
+                "stage2_betas_start": np.asarray(settings.betas_2, dtype=float), "stage2_betas_end": stage_2["betas"],
+                "stage2_seconds": stage_2["seconds"], "stage2_rows": likelihood.rows, "stage2_calls": likelihood.calls,
+                "stage2_likelihood_seconds": likelihood.seconds,
+            })
+        if "mixtures" in search:
+            mixtures = search["mixtures"]
+            record.update({"gmm_usable": mixtures["usable"], "gmm_seconds": mixtures["seconds"]})
+            if mixtures["components"] is not None:
+                record.update(self.padded_components(mixtures["components"]), gmm_layout="theta_lam",
+                              gmm_chunk_bands=mixtures["chunk"])
+        if settings.save_search_records != "full":
+            for key in self.CHAIN_KEYS:
+                record.pop(key, None)
+        return record
+
+    def _save_record(self, record):
+        """The record as <move name>_search_<n>.npz in output_dir, n counting on from the files there, so that a
+        continued run adds to them."""
+        folder = self.fstat_settings.output_dir
+        prefix = f"{self.name.replace(' ', '_')}_search_"
+        if self._next_record is None:
+            taken = [int(name[len(prefix):-4]) for name in os.listdir(folder)
+                     if name.startswith(prefix) and name.endswith(".npz") and name[len(prefix):-4].isdigit()]
+            self._next_record = max(taken, default=-1) + 1
+        np.savez_compressed(os.path.join(folder, f"{prefix}{self._next_record:05d}.npz"), **record)
+        self._next_record += 1
+
+
+class GBFStatRJMove(FStatSearchBase, GBSpecialBase):
+    """Reversible-jump GB move whose births come from an F-statistic search of the bands, on the STFT/DFFR response.
+
+    It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back). :meth:`setup`
+    searches when the schedule of ``search_interval`` says so, and the search's mixture becomes the RJ proposal. A
+    search runs on the residual of the max-likelihood walker, in every interior band that is not shut off, in the steps
+    of :class:`FStatResidualSearch`: the F-statistic over f0, fdot and the sky (stage 1), the gate on its maximum, the
+    full likelihood over every column of the passing bands (stage 2) and one Gaussian mixture per passing band over
+    theta+- = 2 psi +- phi0 with theta+-, lam periodic, which becomes the RJ proposal (:class:`FStatPhaseProposal`).
+
+    The move keeps the schedule, the choice of the bands with the history that shuts them off, and the proposal. The
+    search writes one line to the run log and a block to ``fstat_search.log``, and saves its record when
+    ``save_search_records`` asks for one. The columns, the constants and the math of the search are class attributes
+    of the move as well (:class:`FStatSearchBase`).
+
+    Given a search memory, the move also writes the fit of each search into it, for the split and merge move to read:
+    one fit of the kind "residual" for each usable band after a search that fitted, the empty list after a search with
+    no band to search, and nothing after a search that found nothing. The move's own proposal stays the fit of its
+    latest search alone, and a fixed memory refuses the list without a change to the move.
+
+    Args:
+        *args: :class:`GBSpecialBase`'s arguments.
+        fstat_settings: The search's settings; None takes the defaults of :class:`GBFStatSettings`.
+        fstat_search_memory: The search memory that takes the fit of each search (:class:`FStatSearchMemory`), which the
+            split and merge move binds; None writes nothing. The recipe builders hand it over.
+        **kwargs: :class:`GBSpecialBase`'s keyword arguments.
+    """
+
+    # The search memory that takes the fit of each search, or None (set by the constructor)
+    fstat_search_memory = None
+
+    def __init__(self, *args, fstat_settings: Optional[GBFStatSettings] = None,
+                 fstat_search_memory: Optional[FStatSearchMemory] = None, **kwargs):
+        # * always an RJ move: its proposal only arrives with the first search, after construction
+        super().__init__(*args, **{**kwargs, "is_rj_prop": True})
+        self.fstat_settings = deepcopy(fstat_settings) if fstat_settings is not None else GBFStatSettings()
+        settings = self.fstat_settings
+        if not isinstance(self._basis_settings, STFTSettings):
+            raise NotImplementedError(
+                f"{type(self).__name__} searches on the STFT response only, not on "
+                f"{type(self._basis_settings).__name__}."
+            )
+        response = getattr(self.gb_stft_comp, "response", None)
+        if response != "dffr":
+            raise NotImplementedError(
+                f"{type(self).__name__} computes its F-statistic with the DFFR response only, not {response!r}."
+            )
+        # * The value rules are GBFStatSettings' own (__post_init__); output_dir is filled by the builders, so here.
+        if settings.save_search_records != "none" and settings.output_dir is None:
+            raise ValueError(
+                "fstat_settings: save_search_records needs output_dir; the recipe builders set "
+                "<run>_artifacts/fstat_search/"
+            )
+        if fstat_search_memory is not None and not isinstance(fstat_search_memory, FStatSearchMemory):
+            raise TypeError(
+                f"{type(self).__name__}: fstat_search_memory must be an FStatSearchMemory or None, not "
+                f"{type(fstat_search_memory).__name__}"
+            )
+        self.fstat_search_memory = fstat_search_memory
+        # the search of this move, built at the first search (see residual_search)
+        self._residual_search = None
+
+    @property
+    def residual_search(self):
+        """The search this move runs, built at the first use from the move's own settings, priors, transforms, name and
+        backend."""
+        if self._residual_search is None:
+            self._residual_search = FStatResidualSearch(
+                self.fstat_settings, priors=self.priors, parameter_transforms=self.parameter_transforms,
+                phase_maximize=self.phase_maximize, waveform_kwargs=self.waveform_kwargs, name=self.name,
+                force_backend=self.force_backend)
+        return self._residual_search
+
+    def setup(self, model, branches):
+        """Search when this propose is due, else keep the proposal of the latest search.
+
+        The search runs at the move's proposes 0, M, 2M and so on, with M the setting ``search_interval`` (1: at every
+        propose). ``num_proposals`` counts the move's earlier proposes (``propose()`` raises it after ``setup()``). A
+        move without a proposal searches whatever the schedule, since ``propose()`` skips the whole propose of an RJ
+        move that has none: after a restart, which keeps no proposal, or after searches that found nothing.
+        """
+        interval = int(self.fstat_settings.search_interval)
+        if self.num_proposals % interval != 0 and self.rj_proposal_distribution is not None:
+            logger.info("[GB_FSTAT_SEARCH %s] propose %d: no search (interval %d); the latest proposal stays",
+                        self.name, self.num_proposals, interval)
+            return
+        self._search(model, branches)
+
+    # ==================================================================================================================
+    # The search of the move: its bands, its history and its proposal
+    # ==================================================================================================================
+
+    def _search(self, model, branches):
+        """One search of the max-likelihood walker's residual (:meth:`FStatResidualSearch.run`), then the history row
+        and the proposal of this move, then the logs and the record (:meth:`FStatResidualSearch.finish`) and, with a
+        memory, the fit in it (:meth:`_write_fit_to_memory`)."""
+        time_start = time.perf_counter()
+        holder = model.analysis_container_arr
+        walker = int(np.argmax(asnumpy(holder.likelihood())))
+        search = self.residual_search.run(holder, walker, self._search_bands(),
+                                          engine=self._likelihood_engine, periodic=self.periodic)
+        search["num_proposals"] = int(self.num_proposals)
+        status = search["status"]
+        if "gate" in search:
+            self._record_found_bands(search["bands"], search["gate"])
+        if status == "no_range":
+            self.rj_proposal_distribution = self.gpu_priors if self.backend.uses_cupy else self.priors
+            outcome = "every band is shut off; the prior is the proposal"
+        elif status == "no_detection":
+            outcome = "no band passes; the latest proposal stays"
+        elif status == "no_usable_fit":
+            outcome = "no passing band has a usable stage-2 chain; the latest proposal stays"
+        else:
+            self.rj_proposal_distribution = {"gb": self._proposal_from_fit(search["mixtures"]["components"])}
+            outcome = f"{int(search['mixtures']['usable'].sum())} bands in the proposal"
+        self.residual_search.finish(search, time_start, outcome, warn=status == "no_usable_fit")
+        if self.fstat_search_memory is not None:
+            self._write_fit_to_memory(search)
+        # * The search of this propose is over; kept, its holder would take memory on every card from the proposals of
+        # * all GB moves. The containers leave with ``search`` when this method ends.
+        self.residual_search.release_search_holder()
+
+    def _search_bands(self):
+        """The interior bands (the two edge bands are only neighbours): their ids, their f0 edges in mHz and the mask of
+        those searched, which leaves out the bands that found nothing in the last ``shutoff_band_iteration`` searches
+        and lie wholly above ``shutoff_high_frequency_threshold`` or wholly below ``shutoff_low_frequency_threshold``."""
+        settings = self.fstat_settings
+        edges_mhz = asnumpy(self.band_edges) * 1e3
+        ids = np.array([0]) if self.num_bands == 1 else np.arange(1, self.num_bands - 1)
+        low, high = edges_mhz[ids], edges_mhz[ids + 1]
+        active = np.ones(len(ids), dtype=bool)
+        history = getattr(self, "found_source_in_band", None)
+        iterations = int(settings.shutoff_band_iteration)
+        if history is not None and len(history) >= iterations:
+            silent = np.all(~history[-iterations:], axis=0)
+            # * two separate shutoffs, each off when its threshold is None
+            eligible = np.zeros(len(ids), dtype=bool)
+            if settings.shutoff_high_frequency_threshold is not None:
+                eligible |= low * 1e-3 >= float(settings.shutoff_high_frequency_threshold)
+            if settings.shutoff_low_frequency_threshold is not None:
+                eligible |= high * 1e-3 <= float(settings.shutoff_low_frequency_threshold)
+            active = ~(silent & eligible)
+        return {"ids": ids, "low_mhz": low, "high_mhz": high, "active": active}
+
+    def _record_found_bands(self, bands, gate):
+        """Append this search's row to the history that shuts bands off: the bands that passed the gate."""
+        found_row = np.zeros(len(bands["ids"]), dtype=bool)
+        found_row[np.flatnonzero(bands["active"])[gate["detected"]]] = True
+        history = getattr(self, "found_source_in_band", None)
+        self.found_source_in_band = found_row[None] if history is None else np.vstack([history, found_row])
+
+    def _proposal_from_fit(self, components):
+        """The RJ proposal from the fit's seven component lists: one mixture over every band, wrapped by
+        :class:`FStatPhaseProposal`."""
+        mixture = FullGaussianMixtureModel(*components, use_cupy=self.backend.uses_cupy, periodic=self.GMM_PERIODIC)
+        return FStatPhaseProposal(mixture)
+
+    # ==================================================================================================================
+    # The search memory: the fit of each search, for the split and merge
+    # ==================================================================================================================
+
+    def _write_fit_to_memory(self, search):
+        """Mirror this search in the memory's fits of the kind "residual" (:meth:`FStatSearchMemory.set_fits`).
+
+        After a search that fitted the memory gets one fit for each usable band (:meth:`_fit_descriptions`); after one
+        with no band to search it gets the empty list, so that it drops what the move no longer has; after one that
+        found nothing it gets no call, as the move's own proposal stays too. A fixed memory refuses the list and the
+        move goes on as before. A description that the memory's check refuses (:meth:`FStatSearchMemory.screen_fits`)
+        is left out with one warning and does not stop the run: the other fits are set, and the band of the refused
+        one drops out of the memory as a band that no longer passes. Called by :meth:`_search` after the search's log
+        and record are written.
+        """
+        status = search["status"]
+        memory = self.fstat_search_memory
+        if status == "fitted":
+            descriptions = self._fit_descriptions(search)
+            fits, refused = memory.screen_fits(memory.KIND_RESIDUAL, descriptions)
+            for position, reason in refused:
+                logger.warning(
+                    "[GB_SEARCH_MEMORY %s] propose %d: the fit of the band %.6f to %.6f mHz is refused by the memory "
+                    "and left out: %s", self.name, search["num_proposals"], descriptions[position]["low_mhz"],
+                    descriptions[position]["high_mhz"], reason)
+        elif status == "no_range":
+            fits = []
+        else:
+            return
+        stored = memory.set_fits(memory.KIND_RESIDUAL, fits)
+        logger.info(
+            "[GB_SEARCH_MEMORY %s] propose %d: %s", self.name, search["num_proposals"],
+            f"fits of the residual: {len(fits)} set, version {memory.version}" if stored
+            else f"the memory is fixed, fits of the residual: {len(fits)} not stored")
+
+    def _fit_descriptions(self, search):
+        """One fit description for each usable band of a search that fitted, in the order of the mixture's components,
+        as :meth:`FStatSearchMemory.set_fits` takes it: the band's edges in mHz as the searched range, the mixture's
+        weights, means, covariances and box as host arrays, the propose of the move and the walker the search ran on,
+        and the largest sqrt(2F) of the band's first stage with the gate's threshold on it. The rule is that of
+        :meth:`FStatResidualSearch.fit_descriptions`."""
+        return FStatResidualSearch.fit_descriptions(search)
 
 
 # ======================================================================================================================
@@ -5226,6 +6574,2293 @@ class FStatPhaseProposal:
 
 # * The name of the FD serial search, which settings files still import.
 GBSpecialRJSerialSearchMCMC = GBFStatRJMove
+
+
+# ==================================================================================================
+# The split and merge moves on the band cells: the helpers shared by the stretched jump and the
+# F-statistic split and merge move
+# ==================================================================================================
+
+
+class GBSplitMergeCellsMixin:
+    """Production helpers of the GB moves that split one source of a cell into two and merge two
+    into one; it comes before :class:`GBSpecialBase` among a move's bases.
+
+    Carved out of ``GBStretchedJumpRJMove`` of the clone stack ``env/stretched_jump``, line for
+    line, with five generalisations: :meth:`_run_rj_step` builds the per-half tables through the
+    hook :meth:`_half_tables`; :meth:`_run_half` hands the buffer and the band temperatures to the
+    class's ``_propose``; the first part of a proposal, from the cells' rows to the direction draw,
+    is :meth:`_cell_state`, whose partner kernel takes its width and cutoff per cell;
+    :meth:`_apply` counts through the hook :meth:`_outcome_masks` into ``_move_counts``, which
+    :meth:`_log_counts` prints under the class's ``LOG_TAG``; and :meth:`rj_bookkeeping_log_terms`
+    holds the bookkeeping part of the acceptance, to which each class adds its own terms.
+
+    A class with the mixin sets ``self._frequency_range`` from :meth:`_dead_row_frequency_range`
+    in its constructor and defines ``_propose(band_sorter, buffer_obj, band_temps, picked,
+    tables)``, ``TERM_NAMES``, ``COUNTER_NAMES`` (the four below first), ``LOG_TAG``,
+    ``split_log_acceptance_terms`` with the keywords of ``TERM_NAMES``, and ``_outcome_masks``.
+    Points are in the GB sampling basis, ln A in column 0 and f0 (mHz) in column 1.
+    """
+
+    # Counters of a propose that every class keeps first, one row each, per temperature
+    COUNTER_NAMES = ("split proposed", "split accepted", "merge proposed", "merge accepted")
+    LOG_TAG = "GB_SPLIT_MERGE"
+
+    def _dead_row_frequency_range(self):
+        """f0 range (mHz) of the distribution from which the band sorter draws the dead rows.
+
+        The band shares are the probabilities that a dead row's pre-drawn f0 falls in each band, so they come from this
+        distribution, the prior in the recipe. Its f0 entry is read as :meth:`_prior_box` reads the prior: a one-column
+        prior with ``minimum`` and ``maximum``, or a joint (f0, fdot) prior with ``f0_min`` and ``f0_max``.
+        """
+        # ! like the prior box, this takes the f0 marginal to be uniform; any other would bias the band shares
+        for columns, distribution in getattr(self.rj_proposal_distribution["gb"], "priors", []):
+            columns = [int(column) for column in np.asarray(columns).reshape(-1)]
+            if columns[0] != 1:
+                continue
+            if len(columns) == 1 and hasattr(distribution, "minimum") and hasattr(distribution, "maximum"):
+                return float(distribution.minimum), float(distribution.maximum)
+            if len(columns) == 2 and hasattr(distribution, "f0_min") and hasattr(distribution, "get_fdot_bounds"):
+                return float(distribution.f0_min), float(distribution.f0_max)
+        raise TypeError(
+            f"{self.name}: the band shares need the f0 range of rj_proposal_distribution['gb']: a one-column prior "
+            "with minimum and maximum, or a joint (f0, fdot) prior with f0_min, f0_max and get_fdot_bounds"
+        )
+
+    def _column_periods(self, ndim):
+        """Period of each sampling column, np.inf where the column is not periodic."""
+        periods = np.full(ndim, np.inf)
+        periodic = getattr(self, "periodic", None)
+        if periodic is not None:
+            for column, period in zip(periodic.inds_periodic.get("gb", []), periodic.periods.get("gb", [])):
+                periods[int(column)] = float(period)
+        return self.xp.asarray(periods)
+
+    def _inside_band(self, frequencies, bands):
+        """Whether f0 (mHz) lies in band ``bands``, by the test that gives a sorter row its band."""
+        hertz = frequencies / 1e3
+        return (hertz >= self.band_edges[bands]) & (hertz < self.band_edges[bands + 1])
+
+    def run_proposal(self, model, state, band_sorter, band_temps):
+        """Production's pass, with the band shares and the counters set up first and one log line of them after it."""
+        xp = self.xp
+        with np.errstate(divide="ignore"):
+            self._log_band_shares = xp.log(self.band_shares(self.band_edges * 1e3, *self._frequency_range, xp=xp))
+        self._move_counts = xp.zeros((len(self.COUNTER_NAMES), self.ntemps), dtype=xp.int64)
+        result = super().run_proposal(model, state, band_sorter, band_temps)
+        self._log_counts()
+        return result
+
+    def _log_counts(self):
+        """One log line of the propose's splits and merges: acceptance in the cold chain and over all temperatures,
+        and the applications that made no proposal."""
+        counts = asnumpy(self._move_counts)
+        parts = []
+        for kind, proposed, accepted in (("split", counts[0], counts[1]), ("merge", counts[2], counts[3])):
+            cold = accepted[0] / proposed[0] if proposed[0] else float("nan")
+            total = accepted.sum() / proposed.sum() if proposed.sum() else float("nan")
+            parts.append(f"{kind} cold {cold:.4f} (n={proposed[0]}) all {total:.4f} (n={proposed.sum()})")
+        # The class's own counters by name, after the four that every class keeps
+        names = enumerate(self.COUNTER_NAMES[4:], start=4)
+        others = ", ".join(f"{name} {int(counts[row].sum())}" for row, name in names)
+        logger.info("[%s %s] %s | %s", self.LOG_TAG, self.name, " | ".join(parts), others)
+
+    def _run_rj_step(self, model, band_sorter, buffer_obj, band_temps, picked,
+                     ll_change_log, prop_counts, acc_counts, round_i, scheduler):
+        """Split or merge at the picked rows, once per walker parity: the even walkers' cells first, then the odd ones'.
+
+        Before each half the class's tables come from :meth:`_half_tables` (the stretched jump's
+        friend tables, built from the live rows of the other parity as they are then; None for a
+        class that reads none), and the second half reads the outcome of the first. ``round_i``
+        and ``scheduler`` serve production's checks of births and deaths.
+        """
+        xp = self.xp
+        num_picked = len(picked["ids"])
+        accepted = xp.zeros(num_picked, dtype=bool)
+        parity = picked["walker_inds"] % 2
+        for half in (0, 1):
+            members = xp.flatnonzero(parity == half)
+            if len(members) == 0:
+                continue
+            subset = {
+                key: value[members] if getattr(value, "ndim", 0) >= 1 and value.shape[0] == num_picked else value
+                for key, value in picked.items()
+            }
+            tables = self._half_tables(band_sorter, half)
+            accepted[members] = self._run_half(
+                band_sorter, buffer_obj, band_temps, subset, tables, ll_change_log, prop_counts, acc_counts)
+        rj_seq = self.debugger.rj_seq
+        if rj_seq is not None:
+            rj_seq["accepted"] = bool(accepted[rj_seq["idx"]])
+
+    def _half_tables(self, band_sorter, half):
+        """The tables that ``_propose`` reads in the cells of walker parity ``half``: None here.
+
+        The stretched jump returns its friend tables of the other parity, built from the live rows
+        as they are before the half.
+        """
+        return None
+
+    def _run_half(self, band_sorter, buffer_obj, band_temps, picked, tables, ll_change_log, prop_counts,
+                  acc_counts):
+        """Split or merge in the cells of one walker parity; returns which cells accepted their move."""
+        proposal = self._propose(band_sorter, buffer_obj, band_temps, picked, tables)
+        delta_ll = self._likelihood_changes(buffer_obj, picked, proposal)
+        accepted = self._decide(band_temps, picked, proposal, delta_ll, band_sorter.nleaves_max)
+        self._apply(band_sorter, buffer_obj, picked, proposal, delta_ll, accepted, ll_change_log, prop_counts,
+                    acc_counts)
+        return accepted
+
+    def _cell_rows(self, band_sorter, specials):
+        """Rows of the main sorter in each cell ``specials``, one line per cell, padded with -1."""
+        xp = self.xp
+        order = xp.argsort(specials)
+        rows = xp.flatnonzero(xp.isin(band_sorter.special_band_inds, specials))
+        cells = order[xp.searchsorted(specials[order], band_sorter.special_band_inds[rows])]
+        # Grouped by cell, the sorter's order kept inside a cell; the key has no ties, so any sort gives this order
+        grouping = xp.argsort(cells * band_sorter.num_sources + rows)
+        rows, cells = rows[grouping], cells[grouping]
+        counts = xp.bincount(cells, minlength=len(specials))
+        starts = xp.cumsum(counts) - counts
+        padded = xp.full((len(specials), int(counts.max())), -1, dtype=rows.dtype)
+        padded[cells, xp.arange(len(rows)) - starts[cells]] = rows
+        return padded
+
+    def _choose_primaries(self, cell_rows, is_member, picked_ids):
+        """Position of each cell's primary in its rows, -1 when the cell makes no move: the picked row while it is a
+        member of its cell. A subclass may choose otherwise, with :meth:`_primary_log_ratio` for its term."""
+        xp = self.xp
+        position = xp.argmax(cell_rows == picked_ids[:, None], axis=1)
+        is_primary = is_member[xp.arange(len(picked_ids)), position]
+        return xp.where(is_primary, position, -1)
+
+    def _primary_log_ratio(self, num_members_lower):
+        """ln of the primary's probability in the upper state over that in the lower state, for a split from a lower
+        state with ``num_members_lower`` members. Zero here: the primary is the picked row in both states."""
+        return self.xp.zeros(num_members_lower.shape)
+
+    def _coherent_bin_mhz(self):
+        """One coherent resolution element, 1 / Tobs, in mHz: the unit of the settings given in bins.
+
+        On FD and WDM production's ``df`` is 1 / Tobs. On STFT the bin comes from the span ``NT * dt`` that the band
+        layout uses (``gbbandstructure.stft_band_structure``).
+        """
+        settings = getattr(self, "_basis_settings", None)
+        # ! STFTSettings.df is the segment's pixel spacing 1 / dt, not 1 / Tobs (714 times wider over 714 days)
+        if isinstance(settings, STFTSettings):
+            return 1e3 / (float(settings.NT) * float(settings.dt))
+        return self.df * 1e3
+
+    def _cell_state(self, band_sorter, picked, kernel_width, cutoff, blocked=None):
+        """The first part of every class's proposal: the cells' rows and members, the primary, its
+        partner probabilities and the direction drawn.
+
+        ``kernel_width`` and ``cutoff`` of the partner kernel are in mHz, scalars or one value per
+        cell. ``blocked`` marks the cells that may not propose (None blocks none; the stretched
+        jump's cells without a friend table); the direction is drawn for every cell either way.
+        Returns a dict of ``bands``, ``periods``, ``cell_rows``, ``alive``, ``frequencies``,
+        ``is_member``, ``is_dead``, ``num_dead``, ``num_alive``, ``num_members``, ``position``,
+        ``has_primary``, ``primary_rows``, ``old_primary``, ``partner_log_lower``, ``has_partner``,
+        ``log_split``, ``log_merge``, ``possible`` and the masks ``split`` and ``merge``.
+        """
+        xp = self.xp
+        num_cells, ndim = len(picked["ids"]), band_sorter.ndim
+        bands = picked["band_inds"]
+        periods = self._column_periods(ndim)
+
+        # * The cells' rows: the members are the alive rows with f0 inside the band's edges
+        cell_rows = self._cell_rows(band_sorter, picked["specials"])
+        valid = cell_rows >= 0
+        safe_rows = xp.where(valid, cell_rows, 0)
+        alive = valid & band_sorter.inds[safe_rows]
+        frequencies = band_sorter.coords[safe_rows, 1]
+        is_member = alive & self._inside_band(frequencies, bands[:, None])
+        is_dead = valid & ~band_sorter.inds[safe_rows]
+        num_dead = is_dead.sum(axis=1)
+        num_alive = alive.sum(axis=1)
+        num_members = is_member.sum(axis=1)
+
+        # * The primary, whether it has a partner within the cutoff, and the direction
+        position = self._choose_primaries(cell_rows, is_member, picked["ids"])
+        has_primary = position >= 0
+        position = xp.where(has_primary, position, 0)
+        primary_rows = cell_rows[xp.arange(num_cells), position]
+        old_primary = self.wrap_periodic(band_sorter.coords[primary_rows], periods, xp=xp)
+        partner_log_lower, has_partner = self.partner_log_probabilities(
+            old_primary[:, 1], frequencies, is_member, position, kernel_width, cutoff, xp=xp)
+        log_split, log_merge = self.direction_log_probabilities(has_partner, num_dead, xp=xp)
+        possible = has_primary & (xp.isfinite(log_split) | xp.isfinite(log_merge))
+        if blocked is None:
+            blocked = xp.zeros(num_cells, dtype=bool)
+        with np.errstate(divide="ignore"):
+            split = possible & ~blocked & (xp.log(xp.random.rand(num_cells)) < log_split)
+        merge = possible & ~blocked & ~split
+        return dict(
+            bands=bands, periods=periods, cell_rows=cell_rows, alive=alive, frequencies=frequencies,
+            is_member=is_member, is_dead=is_dead, num_dead=num_dead, num_alive=num_alive,
+            num_members=num_members, position=position, has_primary=has_primary,
+            primary_rows=primary_rows, old_primary=old_primary, partner_log_lower=partner_log_lower,
+            has_partner=has_partner, log_split=log_split, log_merge=log_merge, possible=possible,
+            split=split, merge=merge,
+        )
+
+    @staticmethod
+    def _fill_cells(buffer_obj, add, points, slots, N_vals):
+        """Put templates into the cells' residuals (``add``) or take them out, one template per cell and call."""
+        if len(slots) == 0:
+            return
+        if add:
+            buffer_obj.add_sources_to_band_buffer(points, slots, N_vals)
+        else:
+            buffer_obj.remove_sources_from_band_buffer(points, slots, N_vals)
+
+    def _likelihood_changes(self, buffer_obj, picked, proposal):
+        """ln L changes of the proposals that passed their gates, scored by three calls on the cells' residuals.
+
+        A split takes the primary out, puts child a in and scores child b; a merge takes the primary out, then the
+        partner, and scores the merged source. Each call scores one template against the residual as it is then, so
+        the cross terms between the templates are exact. Until the decisions, the residuals hold child a (split) and
+        lack the partner (merge).
+        """
+        xp = self.xp
+        delta_ll = xp.full(len(picked["ids"]), -1e300)
+        rows = xp.flatnonzero(proposal["ok"])
+        if len(rows) == 0:
+            return delta_ll
+        slots = picked["slot_index"][rows]
+        N_vals = None if picked["N_vals"] is None else picked["N_vals"][rows]
+        split = proposal["split"][rows]
+        old_primary, middle = proposal["old_primary"][rows], proposal["middle"][rows]
+        removal = buffer_obj.get_removal_ll(old_primary, slots, slots, N_vals)
+        buffer_obj.remove_sources_from_band_buffer(old_primary, slots, N_vals)
+        # Child a of a split enters the residual and the partner of a merge leaves it, so one call scores both
+        buffer_obj.get_ll(middle, slots, slots, N_vals)
+        inner_d_h, inner_h_h = buffer_obj.d_h_out.real, buffer_obj.h_h_out.real
+        middle_change = xp.where(
+            buffer_obj.kept_out, xp.where(split, inner_d_h, -inner_d_h) - 0.5 * inner_h_h, -1e300)
+        for add, kind in ((True, split), (False, ~split)):
+            self._fill_cells(buffer_obj, add, middle[kind], slots[kind], None if N_vals is None else N_vals[kind])
+        last_change = buffer_obj.get_add_ll(proposal["last"][rows], slots, slots, N_vals)
+        delta_ll[rows] = removal + middle_change + last_change
+        return delta_ll
+
+    def _decide(self, band_temps, picked, proposal, delta_ll, num_slots):
+        """Accept or reject each proposal, the cells of one walker in turn and in random order, so that the uniform
+        prior on the walker's count k is taken at its value just before each decision, as for production's births."""
+        xp = self.xp
+        num_cells = len(picked["ids"])
+        beta = band_temps[picked["band_inds"], picked["temp_inds"]]
+        walker_cell = picked["temp_inds"] * self.nwalkers + picked["walker_inds"]
+        log_u = xp.log(xp.random.rand(num_cells))
+        order = xp.lexsort(xp.stack([xp.random.rand(num_cells), walker_cell]))
+        _, first, group = xp.unique(walker_cell[order], return_index=True, return_inverse=True)
+        rank = xp.empty(num_cells, dtype=xp.int64)
+        rank[order] = xp.arange(num_cells) - first[group]
+        split = proposal["split"]
+        sign = xp.where(split, 1.0, -1.0)
+        accepted = xp.zeros(num_cells, dtype=bool)
+        for position in range(int(rank.max()) + 1):
+            rows = xp.flatnonzero((rank == position) & proposal["ok"])
+            if len(rows) == 0:
+                continue
+            k_now = self._k_walker[walker_cell[rows]]
+            # A merge takes minus the terms of its reverse split, whose lower state holds k - 1 sources
+            terms = self.split_log_acceptance_terms(
+                num_alive_walker=xp.where(split[rows], k_now, k_now - 1), num_slots=num_slots, xp=xp,
+                **{name: proposal[name][rows] for name in self.TERM_NAMES})
+            log_alpha = beta[rows] * delta_ll[rows] + sign[rows] * (terms + proposal["log_primary_ratio"][rows])
+            take = rows[(log_alpha >= log_u[rows]) & xp.isfinite(log_alpha) & (delta_ll[rows] > -1e299)]
+            accepted[take] = True
+            self._k_walker[walker_cell[take]] += xp.where(split[take], 1, -1)
+        return accepted
+
+    def _apply(self, band_sorter, buffer_obj, picked, proposal, delta_ll, accepted, ll_change_log, prop_counts,
+               acc_counts):
+        """Write the outcomes: the residuals, the sorter's rows, the held Fisher matrices and the counters."""
+        xp = self.xp
+        split, ok = proposal["split"], proposal["ok"]
+        slots, N_vals = picked["slot_index"], picked["N_vals"]
+        temps, walkers, bands = picked["temp_inds"], picked["walker_inds"], picked["band_inds"]
+
+        def fill(add, rows, points):
+            self._fill_cells(buffer_obj, add, points, slots[rows], None if N_vals is None else N_vals[rows])
+
+        # * The residuals: an accepted move adds its last template, a rejected one gets its old templates back. Two
+        # * templates of one cell go in separate calls, as in every fill of production.
+        rows = xp.flatnonzero(ok)
+        fill(True, rows, xp.where(accepted[rows, None], proposal["last"][rows], proposal["old_primary"][rows]))
+        rows = xp.flatnonzero(ok & ~accepted & split)
+        fill(False, rows, proposal["middle"][rows])
+        rows = xp.flatnonzero(ok & ~accepted & ~split)
+        fill(True, rows, proposal["middle"][rows])
+
+        # * The sorter: the primary's row holds child a or the merged source; the second row takes child b or dies
+        done = xp.flatnonzero(accepted)
+        if len(done):
+            done_split = split[done]
+            primary_rows, second_rows = proposal["primary_rows"][done], proposal["second_rows"][done]
+            band_sorter.coords[primary_rows] = xp.where(
+                done_split[:, None], proposal["middle"][done], proposal["last"][done])
+            band_sorter.coords[second_rows[done_split]] = proposal["last"][done[done_split]]
+            band_sorter.inds[second_rows] = done_split
+            # Both rows' sources changed, so their held Fisher matrices no longer apply
+            held = getattr(self, "_held_fim_rows", None)
+            if held is not None:
+                changed = asnumpy(xp.concatenate([primary_rows, second_rows]))
+                held["fim_valid"][changed] = False
+                held["fim_age"][changed] = 0
+            ll_change_log[temps[done], walkers[done], bands[done]] += delta_ll[done]
+            acc_counts[0][temps[done], walkers[done], bands[done]] += 1
+
+        # * Counters: production's proposal counts, and the move's own per temperature
+        proposed = proposal["proposed"]
+        prop_counts[0][temps[proposed], walkers[proposed], bands[proposed]] += 1
+        masks = self._outcome_masks(proposal, accepted)
+        for row, mask in enumerate(masks):
+            xp.add.at(self._move_counts[row], temps[mask], 1)
+
+    def _outcome_masks(self, proposal, accepted):
+        """The cells that each counter of ``COUNTER_NAMES`` counts, in its order: here the four that
+        every class keeps first; a class appends the masks of its own counters."""
+        split, proposed = proposal["split"], proposal["proposed"]
+        return [proposed & split, accepted & split, proposed & ~split, accepted & ~split]
+
+    # * Math shared by the split and merge moves
+
+    @staticmethod
+    def amplitude_vectors(points, xp=np):
+        """u = (Re C-, Im C-, Re C+, Im C+) of each point (n, 4), in the DFFR waveform's convention: C- = A (1 +
+        cos iota)^2 / 2 exp(i (2 psi - phi0)), C+ = A (1 - cos iota)^2 / 2 exp(i (2 psi + phi0))."""
+        amplitude, phase, cos_iota, psi = xp.exp(points[:, 0]), points[:, 3], points[:, 4], points[:, 5]
+        norm_minus = 0.5 * amplitude * (1.0 + cos_iota) ** 2
+        norm_plus = 0.5 * amplitude * (1.0 - cos_iota) ** 2
+        theta_minus, theta_plus = 2.0 * psi - phase, 2.0 * psi + phase
+        return xp.stack([norm_minus * xp.cos(theta_minus), norm_minus * xp.sin(theta_minus),
+                         norm_plus * xp.cos(theta_plus), norm_plus * xp.sin(theta_plus)], axis=-1)
+
+    @staticmethod
+    def amplitude_columns(vectors, copies, xp=np):
+        """(ln A, phi0, cos iota, psi) of the point with u = ``vectors``, at its (phi0, psi) copy ``copies`` (n,):
+        copy 0 has phi0 = (theta+ - theta-) / 2, an odd copy adds (pi, pi / 2), copies 2 and 3 add pi to psi."""
+        root_minus = xp.sqrt(xp.hypot(vectors[:, 0], vectors[:, 1]))
+        root_plus = xp.sqrt(xp.hypot(vectors[:, 2], vectors[:, 3]))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_amplitude = xp.log(0.5 * (root_minus + root_plus) ** 2)
+            # (|C-| - |C+|) / (2 A), in the form that keeps its digits near cos iota = +-1
+            cos_iota = (root_minus - root_plus) / (root_minus + root_plus)
+        theta_minus = xp.arctan2(vectors[:, 1], vectors[:, 0])
+        theta_plus = xp.arctan2(vectors[:, 3], vectors[:, 2])
+        phase_copy, psi_copy = copies % 2, copies // 2
+        phase = xp.mod(0.5 * (theta_plus - theta_minus) + np.pi * phase_copy, 2.0 * np.pi)
+        psi = xp.mod(0.25 * (theta_plus + theta_minus) + 0.5 * np.pi * phase_copy + np.pi * psi_copy, 2.0 * np.pi)
+        return xp.stack([log_amplitude, phase, cos_iota, psi], axis=-1)
+
+    @staticmethod
+    def log_volume(points, xp=np):
+        """ln |det du / d(ln A, phi0, cos iota, psi)| at each point: A^3 (1 - cos^2 iota)^3, times A for ln A."""
+        return 4.0 * points[:, 0] + 3.0 * xp.log1p(-points[:, 4] ** 2)
+
+    @staticmethod
+    def principal_difference(difference, periods, xp=np):
+        """Shortest signed difference on the circle, in [-P/2, P/2), on the columns with a finite period P.
+
+        ``periods`` holds one entry per column of the last axis of ``difference``, np.inf for a column that is not
+        periodic; those columns come back unchanged.
+        """
+        periods = xp.asarray(periods)
+        periodic = xp.isfinite(periods)
+        safe_periods = xp.where(periodic, periods, 1.0)
+        wrapped = (difference + 0.5 * safe_periods) % safe_periods - 0.5 * safe_periods
+        return xp.where(periodic, wrapped, difference)
+
+    @staticmethod
+    def wrap_periodic(values, periods, xp=np):
+        """Values of the columns with a finite period P moved into [0, P), the support of their uniform priors."""
+        periods = xp.asarray(periods)
+        periodic = xp.isfinite(periods)
+        safe_periods = xp.where(periodic, periods, 1.0)
+        return xp.where(periodic, values % safe_periods, values)
+
+    @staticmethod
+    def partner_log_probabilities(primary_frequencies, member_frequencies, member_valid, primary_slots, kernel_width,
+                                  cutoff, xp=np):
+        """ln q(s | r) of each member s as the merge partner of the primary r, and whether r has a partner at all.
+
+        The partners of r are the valid members other than r whose frequency lies within ``cutoff`` of r's, the
+        cutoff included. Each gets the weight exp(-(f_r - f_s)^2 / (2 kernel_width^2)), normalised over the partners
+        in logarithms, so that a far partner does not underflow; every other member gets -inf.
+
+        ``primary_frequencies`` (n,), ``member_frequencies`` and ``member_valid`` (n, M), ``primary_slots`` (n,) the
+        position of r on the member axis; ``kernel_width`` and ``cutoff`` in the units of the
+        frequencies, scalars or one value per primary (n,). Returns ``(log_probabilities,
+        has_partner)`` of shapes (n, M) and (n,).
+        """
+        num_members = member_frequencies.shape[1]
+        # * a scalar broadcasts against every member, one value per primary against its own row
+        kernel_width = xp.reshape(xp.asarray(kernel_width, dtype=xp.float64), (-1, 1))
+        cutoff = xp.reshape(xp.asarray(cutoff, dtype=xp.float64), (-1, 1))
+        distances = xp.abs(member_frequencies - primary_frequencies[:, None])
+        is_primary = xp.arange(num_members)[None, :] == primary_slots[:, None]
+        is_partner = member_valid & ~is_primary & (distances <= cutoff)
+        has_partner = xp.any(is_partner, axis=1)
+        log_weights = xp.where(is_partner, -0.5 * (distances / kernel_width) ** 2, -xp.inf)
+        # The row's largest weight is taken out before the sum; a row without partners stays at -inf
+        row_maximum = xp.where(has_partner, xp.max(log_weights, axis=1), 0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_norm = xp.log(xp.sum(xp.exp(log_weights - row_maximum[:, None]), axis=1)) + row_maximum
+            log_probabilities = xp.where(is_partner, log_weights - log_norm[:, None], -xp.inf)
+        return log_probabilities, has_partner
+
+    @staticmethod
+    def direction_log_probabilities(has_partner, num_dead, xp=np):
+        """ln p_split and ln p_merge of an application whose primary is given.
+
+        A split needs a dead row in the cell, a merge a partner within the cutoff. Both possible gives 1/2 each, one
+        possible gives it 1, none gives -inf to both (no proposal).
+        """
+        can_split = xp.asarray(num_dead) >= 1
+        can_merge = xp.asarray(has_partner, dtype=bool)
+        both = can_split & can_merge
+        log_half = np.log(0.5)
+        log_split = xp.where(both, log_half, xp.where(can_split, 0.0, -xp.inf))
+        log_merge = xp.where(both, log_half, xp.where(can_merge, 0.0, -xp.inf))
+        return log_split, log_merge
+
+    @staticmethod
+    def band_shares(band_edges, prior_minimum, prior_maximum, xp=np):
+        """Share P_b of the prior's frequency range [prior_minimum, prior_maximum] that falls in each band.
+
+        Band b is [band_edges[b], band_edges[b + 1]], in the units of the prior's bounds. With a prior uniform in
+        frequency, P_b is the probability that a dead row's pre-drawn frequency falls in band b, the label
+        probability that a split removes and a merge restores.
+        """
+        edges = xp.asarray(band_edges, dtype=xp.float64)
+        overlap = xp.minimum(edges[1:], prior_maximum) - xp.maximum(edges[:-1], prior_minimum)
+        return xp.clip(overlap, 0.0, None) / (prior_maximum - prior_minimum)
+
+    @staticmethod
+    def rj_bookkeeping_log_terms(*, log_prior_ratio, num_alive_walker, num_slots, log_band_share,
+                                 num_dead_lower, log_partner_upper, log_merge_upper,
+                                 log_split_lower, xp=np):
+        """The part of a split's ln alpha that every class shares, for a primary fixed by the scan.
+
+        In the lower state the walker holds k = ``num_alive_walker`` sources and the cell
+        m_c = ``num_dead_lower`` dead rows. The terms: ln pi(a') + ln pi(b') - ln pi(a)
+        (``log_prior_ratio``); ln((k + 1) / (N - k)), the uniform prior on k against
+        N = ``num_slots`` labelled slots; -ln P_b, the label of the dead row the split takes;
+        ln m_c, the choice of that row; ln q(s | r, x'), the partner choice of the reverse merge;
+        ln p_merge(x'; r) - ln p_split(x; r). A class adds the terms of its own map in its
+        ``split_log_acceptance_terms``; a merge takes minus the terms of its reverse split, with
+        the counts of its lower state.
+        """
+        num_alive = xp.asarray(num_alive_walker, dtype=xp.float64)
+        with np.errstate(divide="ignore"):
+            log_count_prior = xp.log(num_alive + 1.0) - xp.log(num_slots - num_alive)
+            log_slot_choice = xp.log(xp.asarray(num_dead_lower, dtype=xp.float64))
+        return (
+            log_prior_ratio + log_count_prior - log_band_share + log_slot_choice + log_partner_upper
+            + log_merge_upper - log_split_lower
+        )
+
+
+# ==================================================================================================
+# The F-statistic split and merge move
+# ==================================================================================================
+
+
+@dataclass
+class GBFStatSplitMergeSettings:
+    """Settings of :class:`GBFStatSplitMergeRJMove`, the options of a production run only: every
+    value of the proposal is a class constant (``move_recipe.md``, section 7)."""
+
+    # The search records whose band mixtures form the companion's search part: paths or glob
+    # patterns, several files per band merged with equal weight per file. None runs the move
+    # without a search part, whose weight then goes to the local and the prior parts.
+    record_files: Optional[Sequence[str]] = None
+
+
+class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
+    """Reversible-jump GB move that splits one source of a cell into two and merges two into one,
+    with the amplitudes from the F-statistic on the pair-free residual (``move_recipe.md``).
+
+    It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back)
+    and replaces the birth and death of :class:`GBSpecialRJPriorMove` by a split and a merge, with
+    the cell helpers of :class:`GBSplitMergeCellsMixin`. The picked row is the primary of its cell
+    while it is a member, an alive source with f0 inside the band's edges. A split keeps the
+    parent's intrinsic point in child a, draws child b's from a mixture of the band's search
+    record, a local Gaussian of analytic width and the prior, within the window W of the parent's
+    frequency, and draws the pair's eight amplitudes from their tempered Gaussian on the
+    parent-free residual. A merge takes a partner within W, keeps the primary's intrinsic point and
+    draws its four amplitudes from the tempered Gaussian of its F-statistic row on the pair-free
+    residual. Every density is a function of the lower state and that residual only.
+
+    STFT buffers with the DFFR response only, whose kernels give the F-statistic and swap rows. The
+    math sits in static and class methods in one section, ported from the prototype
+    ``split_merge_math.py`` with the array module as an argument. Points are in the GB sampling
+    basis with the columns ``COL_*``; 6 and 7 hold ICRS right ascension and sine declination.
+
+    Given a search memory that is not fixed, the move also makes the searches that fill it, at
+    the start of a propose (:meth:`setup`): the F-statistic search of
+    :class:`FStatResidualSearch` in windows around the sources of the cold walker with the highest
+    likelihood, on that walker's residual with the sources of the windows added back and the
+    walker's residual written back afterwards (:meth:`_search_windows`). The fits go to the memory
+    and the search part of the next rebuild reads them. A window search that raises is skipped
+    with a warning.
+
+    Args:
+        *args: :class:`GBSpecialBase`'s arguments.
+        fstat_split_merge_settings: The move's settings; None takes the defaults of
+            :class:`GBFStatSplitMergeSettings`.
+        fstat_search_memory: The search memory whose fits make the search part of the companion's
+            mixture (:class:`FStatSearchMemory`); None reads the record files of the settings. The
+            move binds the memory to its layout, builds the search part from it at construction and
+            again at the start of each propose when the memory's version changed, and makes the
+            searches that fill it at the start of each propose, until :meth:`apply_settings`
+            fixes it. Record files and a memory together are an error.
+        **kwargs: :class:`GBSpecialBase`'s keyword arguments, with ``rj_proposal_distribution``,
+            from which the band sorter draws the dead rows.
+    """
+
+    # * Sampling columns of the GB branch, named by what they hold (the committed F-statistic move
+    # * names 6 and 7 COL_LAM and COL_SIN_BETA, after an older frame)
+    COL_LN_AMP, COL_F0, COL_FDOT, COL_PHI0, COL_COS_IOTA, COL_PSI, COL_RA, COL_SIN_DEC = range(8)
+    NDIM = 8
+    # The columns of the circular amplitudes u, in the order of amplitude_columns, and the intrinsic
+    # columns in the Cholesky order of every Gaussian over them, right ascension last
+    AMPLITUDE_COLUMNS = (COL_LN_AMP, COL_PHI0, COL_COS_IOTA, COL_PSI)
+    INTRINSIC_ORDER = (COL_F0, COL_FDOT, COL_SIN_DEC, COL_RA)
+    # The companion's columns besides f0, in the order the prior part draws them, and their
+    # positions within INTRINSIC_ORDER
+    COMPANION_ORDER = (COL_FDOT, COL_SIN_DEC, COL_RA)
+    REST_IN_INTRINSIC = (1, 2, 3)
+    # The (phi0, psi) copies of one point of u; a draw takes each with probability 1 / 4
+    NUM_COPIES = 4
+    LOG_NUM_COPIES = float(np.log(4.0))
+    TWO_PI = 2.0 * np.pi
+    LOG_TWO_PI = float(np.log(TWO_PI))
+    # * u = CIRCULAR_FROM_FILTER a for the amplitudes a of the filters (T+, -Tx, i T+, -i Tx): the
+    # * harmonic projections of GBFStatRJMove.extrinsics_from_amplitudes. Its rows are orthogonal
+    # * with norm sqrt(2), so the inverse is half the transpose and its determinant has magnitude 4.
+    CIRCULAR_FROM_FILTER = np.array([
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, -1.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0, -1.0],
+        [0.0, -1.0, -1.0, 0.0],
+    ])
+    FILTER_FROM_CIRCULAR = 0.5 * CIRCULAR_FROM_FILTER.T
+    # Filter j is FILTER_COEFFICIENTS[j] times template FILTER_TEMPLATES[j] (0 for T+, 1 for Tx)
+    FILTER_COEFFICIENTS = np.array([1.0, -1.0, 1.0j, -1.0j])
+    FILTER_TEMPLATES = np.array([0, 1, 0, 1])
+    # Upper-triangle order of the F-statistic overlaps (numpy.triu_indices(4))
+    TRIU = np.triu_indices(4)
+    # The sampling rows of the two templates: A = 2, cos iota = 0, phi0 = 0, psi = 0 (T+) or pi / 4
+    # (Tx), as the DFFR checks form them
+    FILTER_LOG_AMPLITUDE = float(np.log(2.0))
+    FILTER_CROSS_PSI = 0.25 * np.pi
+    # * The companion mixture's weights of the search, local and prior parts (plan decision 44);
+    # * with no search component active around f1, w_s goes to the other two in proportion
+    COMPANION_WEIGHTS = (0.50, 0.35, 0.15)
+    PART_SEARCH, PART_LOCAL, PART_PRIOR = range(3)
+    # * The weights of a band's search part from the memory: the fit on the residual takes two
+    # * thirds, and one third is shared equally among the fits of the other two kinds; the memory
+    # * divides the shares by their total, so a band without a fit of one side gives its weight to
+    # * the other
+    RESIDUAL_FIT_WEIGHT = 2.0 / 3.0
+    OTHER_FITS_WEIGHT = 1.0 / 3.0
+    # The tempered SNR whose width the local part takes when the parent's own tempered SNR is larger
+    RHO_REF = 4.5
+    # * The sky metric's antenna floor c_ant in 1 per rad^2: the user's value of 2026-11-09 from
+    # * check 11, whose synthetic points on the ecliptic plane allow 0.5 to 5 per rad^2 and where 1
+    # * lies closest to production's Fisher widths everywhere
+    ANTENNA_FLOOR = 1.0
+    # The ridge of the amplitude Gaussians, epsilon = RIDGE_FRACTION tr(beta M) / d, keeps them
+    # regular when two templates nearly coincide; the move evaluates its own densities, so the
+    # ridge costs no exactness
+    RIDGE_FRACTION = 1e-3
+    # * Right ascension's conditional standard deviation is capped at pi / 2 and its density sums
+    # * the images -2 to 2: the first image left out lies at least 5 pi from the conditional mean,
+    # * below exp(-48) of the kept terms
+    RA_STD_CAP = 0.5 * np.pi
+    NUM_IMAGES_PER_SIDE = 2
+    # The window rule: W is half the own-source width at the band's centre, with the chirp drift of
+    # a system of this chirp mass over the span in place of the band layout's worst case
+    FIDUCIAL_CHIRP_MASS_MSUN = 0.3
+    # * The obliquity of the ecliptic (IAU 2006, 84381.406 arcsec): production loads its orbits in
+    # * the ICRS frame, where the orbit's pole sits at right ascension 3 pi / 2 and declination
+    # * pi / 2 minus this angle
+    OBLIQUITY_ICRS_RAD = float(np.deg2rad(84381.406 / 3600.0))
+    # The light time of one astronomical unit, the radius of the orbital Doppler phase (499 s)
+    LIGHT_TIME_SECONDS = AU_SI / C_SI
+    # The precision 12 / w^2 of a uniform prior box of width w, the module's constant, which
+    # production's fisher_proposal_factor takes
+    PRIOR_PRECISION_FACTOR = PRIOR_PRECISION_FACTOR
+    # f0 is sampled in mHz
+    HZ_PER_MHZ = 1e-3
+    # The record's layout: theta+ and theta- in the columns of phi0 and psi, the others as sampled
+    RECORD_LAYOUT = "theta_lam"
+    # Keys of a search record that the move reads
+    RECORD_KEYS = (
+        "band_low_mhz", "active", "detected", "gmm_usable", "gmm_counts", "gmm_weights",
+        "gmm_means", "gmm_covs", "gmm_mins", "gmm_maxs", "gmm_layout",
+    )
+    # Inputs of split_log_acceptance_terms that a proposal carries, besides the walker's count and
+    # the slot number
+    TERM_NAMES = (
+        "log_prior_ratio", "log_band_share", "num_dead_lower", "log_partner_upper",
+        "log_merge_upper", "log_split_lower", "log_merge_density", "log_split_density",
+    )
+    # Counters of a propose, one row each, per temperature; a cell without a proposal counts once,
+    # under the first rule it fails
+    COUNTER_NAMES = GBSplitMergeCellsMixin.COUNTER_NAMES + (
+        "no primary", "no direction possible", "companion beyond window", "companion outside band",
+        "band at cap", "companion outside prior", "amplitude system not finite",
+        # The proposed splits by the part their companion came from: the share of each part
+        "companion from search", "companion from local", "companion from prior",
+    )
+    # The proposal's masks besides split and merge, all False until a step sets them
+    OUTCOME_FLAGS = (
+        "usable", "gates", "beyond_window", "outside_band", "at_cap", "outside_prior", "not_finite",
+    )
+    LOG_TAG = "GB_FSTAT_SPLIT_MERGE"
+    # The search memory that makes the search part, or None when it comes from record files (set by
+    # the constructor)
+    fstat_search_memory = None
+    # The search of the move's own fits, built at the first use (see residual_search)
+    _residual_search = None
+
+    def __init__(self, *args,
+                 fstat_split_merge_settings: Optional[GBFStatSplitMergeSettings] = None,
+                 fstat_search_memory: Optional[FStatSearchMemory] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fstat_split_merge_settings = (
+            deepcopy(fstat_split_merge_settings) if fstat_split_merge_settings is not None
+            else GBFStatSplitMergeSettings()
+        )
+        if fstat_search_memory is not None:
+            if not isinstance(fstat_search_memory, FStatSearchMemory):
+                raise TypeError(
+                    f"{type(self).__name__}: fstat_search_memory must be an FStatSearchMemory "
+                    f"or None, not {type(fstat_search_memory).__name__}"
+                )
+            if self.fstat_split_merge_settings.record_files is not None:
+                raise ValueError(
+                    f"{self.name}: record_files and a search memory both give the search part; "
+                    "use one"
+                )
+        self.fstat_search_memory = fstat_search_memory
+        if self.rj_proposal_distribution is None:
+            raise ValueError(
+                f"{self.name}: the move needs rj_proposal_distribution, from which the band sorter "
+                "draws the dead rows"
+            )
+        periodic = getattr(self, "periodic", None)
+        periodic_columns = [] if periodic is None else periodic.inds_periodic.get("gb", [])
+        if 1 in [int(column) for column in periodic_columns]:
+            raise ValueError(
+                f"{self.name}: the split and the merge need a non-periodic f0 in sampling column 1")
+        self._frequency_range = self._dead_row_frequency_range()
+        settings = self._basis_settings
+        if not isinstance(settings, STFTSettings) or self.gb_stft_comp is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} runs on STFT buffers with an STFT comp only, not on "
+                f"{type(settings).__name__} with gb_stft_comp {type(self.gb_stft_comp).__name__}."
+            )
+        response = getattr(self.gb_stft_comp, "response", None)
+        if response != "dffr":
+            raise NotImplementedError(
+                f"{type(self).__name__} takes its F-statistic and swap rows from the DFFR response "
+                f"only, not {response!r}."
+            )
+        # * The span T = NT dt and the epoch fraction mu = (t0 + T / 2 - t_ref) / T: f0, fdot and
+        # * phi0 are values at the comp's t_ref, the catalogue epoch (the move's own t_ref argument
+        # * belongs to the FD computation)
+        self._observation_seconds = float(settings.NT) * float(settings.dt)
+        reference_time = float(self.gb_stft_comp.t_ref)
+        self._epoch_fraction = (
+            (float(settings.t0) + 0.5 * self._observation_seconds - reference_time)
+            / self._observation_seconds
+        )
+        # The window W of each band (mHz), from the taper of the comp's bound group
+        edges_hz = np.asarray(asnumpy(self.band_edges), dtype=float)
+        window_mhz = self.own_source_window_mhz(
+            0.5 * (edges_hz[:-1] + edges_hz[1:]), self._observation_seconds,
+            float(self.gb_stft_comp.stft_comps.window_alpha))
+        self._window_mhz = self.xp.asarray(window_mhz)
+        window_bins = window_mhz / self._coherent_bin_mhz()
+        logger.info(
+            "[%s %s] span %.2f days, epoch fraction %.4f, window W from %.1f to %.1f bins",
+            self.LOG_TAG, self.name, self._observation_seconds / 86400.0, self._epoch_fraction,
+            float(window_bins.min()), float(window_bins.max()),
+        )
+        if self.fstat_search_memory is None:
+            self._load_record(self.fstat_split_merge_settings.record_files)
+        else:
+            # * only this move computes the reach window of each band, so it binds the memory
+            self.fstat_search_memory.bind(
+                edges_hz * 1e3, self._coherent_bin_mhz(), window_mhz)
+            self._search_part_version = None
+            self._refresh_search_part()
+
+    @classmethod
+    def own_source_window_mhz(cls, band_centres_hz, observation_seconds, window_alpha):
+        """The window W of each band in mHz (host array): half the own-source width of a GB at the
+        band's centre, as the search driver ``run_search.py`` computes it.
+
+        The width is the band width rule of ``gbbandstructure`` without its safety factor, with the
+        chirp drift over the span of a system of FIDUCIAL_CHIRP_MASS_MSUN in place of the rule's
+        worst case: the orbital Doppler swing, that drift and the window's floor, added.
+        """
+        centres_hz = np.atleast_1d(np.asarray(band_centres_hz, dtype=float))
+        full = stft_band_width_hz(
+            centres_hz, observation_seconds, window_alpha, k_safety_factor=1.0)
+        worst = worst_case_fdot_hz_per_s(centres_hz) * observation_seconds
+        fiducial = (
+            (96.0 / 5.0) * np.pi ** (8.0 / 3.0)
+            * (cls.FIDUCIAL_CHIRP_MASS_MSUN * MTSUN_SI) ** (5.0 / 3.0)
+            * centres_hz ** (11.0 / 3.0) * observation_seconds
+        )
+        return 0.5 * (full - worst + fiducial) * 1e3
+
+    # ==============================================================================================
+    # The record of the search part
+    # ==============================================================================================
+
+    def _load_record(self, record_files):
+        """The companion's search part from the record files (:meth:`record_components`), held on
+        the device as ``_record_counts``, ``_record_log_weights``, ``_record_centres``,
+        ``_record_means`` and ``_record_factors``."""
+        xp = self.xp
+        components = self.record_components(
+            record_files, np.asarray(asnumpy(self.band_edges), dtype=float) * 1e3,
+            self._coherent_bin_mhz())
+        for name in ("counts", "log_weights", "centres", "means", "factors"):
+            setattr(self, f"_record_{name}", xp.asarray(components[name]))
+        counts = components["counts"]
+        logger.info(
+            "[%s %s] search part: %d record files, %d bands with components, %d components in all, "
+            "at most %d in a band", self.LOG_TAG, self.name, len(components["paths"]),
+            int(np.count_nonzero(counts)), int(counts.sum()), int(counts.max(initial=0)),
+        )
+
+    @classmethod
+    def record_components(cls, record_files, band_edges_mhz, bin_mhz):
+        """The companion's search part from the record files, padded over the bands (host arrays).
+
+        The bands of each file come from :meth:`record_band_mixtures`, their components' intrinsic
+        marginals in the sampling columns from :meth:`record_in_sampling_columns`. A move band holds
+        the components of every file that has some for it, each file's weights normalised and
+        divided by the number of such files (the equal-weight union of the search readout,
+        ``search_readout.union_mixture``). Returns ``paths``, ``counts`` (bands,), ``log_weights``
+        and ``centres`` (bands, K), ``means`` (bands, K, 4) and ``factors`` (bands, K, 4, 4) in
+        INTRINSIC_ORDER; beyond a band's count the log weights are -inf, the centre frequencies NaN
+        (never active), the means zero and the factors the identity.
+        """
+        num_bands = len(band_edges_mhz) - 1
+        parts = [[] for _ in range(num_bands)]
+        paths = cls.record_paths(record_files)
+        for path in paths:
+            with np.load(path, allow_pickle=False) as stored:
+                record = {key: stored[key] for key in cls.RECORD_KEYS if key in stored.files}
+            mixtures = cls.record_band_mixtures(record, band_edges_mhz, bin_mhz, name=path)
+            for band, mixture in mixtures:
+                weights, means, _, factors = cls.record_in_sampling_columns(record, mixture)
+                parts[band].append((weights / np.sum(weights), means, factors))
+        return dict(paths=paths, **cls.padded_search_part(parts))
+
+    @classmethod
+    def padded_search_part(cls, parts):
+        """The search part padded over the bands (host arrays) from ``parts``: for each band the
+        list of its parts, each a (weights, means, factors) with the weights normalised and the
+        means and factors in the sampling columns INTRINSIC_ORDER. A band holds the components of
+        all its parts, each part's weights divided by the number of parts. Returns what
+        :meth:`record_components` returns without ``paths``: ``counts`` (bands,), ``log_weights``
+        and ``centres`` (bands, K), ``means`` (bands, K, 4) and ``factors`` (bands, K, 4, 4); beyond
+        a band's count the log weights are -inf, the centre frequencies NaN (never active), the
+        means zero and the factors the identity.
+        """
+        num_bands = len(parts)
+        dimension = len(cls.INTRINSIC_ORDER)
+        counts = np.array(
+            [sum(len(part[0]) for part in band_parts) for band_parts in parts], dtype=int)
+        most = int(counts.max(initial=0))
+        log_weights = np.full((num_bands, most), -np.inf)
+        centres = np.full((num_bands, most), np.nan)
+        means = np.zeros((num_bands, most, dimension))
+        factors = np.tile(np.eye(dimension), (num_bands, most, 1, 1))
+        for band, band_parts in enumerate(parts):
+            if not band_parts:
+                continue
+            count = counts[band]
+            weights = np.concatenate([part[0] / len(band_parts) for part in band_parts])
+            log_weights[band, :count] = np.log(weights / np.sum(weights))
+            means[band, :count] = np.concatenate([part[1] for part in band_parts])
+            factors[band, :count] = np.concatenate([part[2] for part in band_parts])
+            centres[band, :count] = means[band, :count, 0]
+        return dict(counts=counts, log_weights=log_weights, centres=centres, means=means,
+                    factors=factors)
+
+    @staticmethod
+    def record_paths(record_files):
+        """The record files of the setting in their order: each entry a path or a glob pattern,
+        whose matches come sorted; a file named twice is read once and an entry that matches no
+        file is an error. None gives no file."""
+        if record_files is None:
+            return []
+        single = isinstance(record_files, (str, os.PathLike))
+        entries = [record_files] if single else list(record_files)
+        paths = []
+        for entry in entries:
+            matches = sorted(glob.glob(os.path.expanduser(str(entry))))
+            if not matches:
+                raise FileNotFoundError(f"the search record entry {entry!r} matches no file")
+            for match in matches:
+                if match not in paths:
+                    paths.append(match)
+        return paths
+
+    @staticmethod
+    def record_band_mixtures(record, band_edges_mhz, bin_mhz, name="the record"):
+        """(move band, mixture index) of each band of a search record that holds a mixture.
+
+        The record's searched bands (``band_low_mhz``) are matched to the move's bands by their
+        lower edge within ``bin_mhz``; a searched band that matches none is an error. As the
+        F-statistic move writes its record, ``detected`` runs over the searched bands that were
+        ``active``, ``gmm_usable`` over the detected ones and the mixture arrays over the usable
+        ones, so a band's mixture index is its rank among the usable. A record without
+        ``gmm_counts`` (no band passed the gate) holds no mixture.
+        """
+        low = np.atleast_1d(np.asarray(record["band_low_mhz"], dtype=float))
+        offsets = np.abs(low[:, None] - np.asarray(band_edges_mhz, dtype=float)[None, :-1])
+        bands = np.argmin(offsets, axis=1)
+        unmatched = offsets[np.arange(len(low)), bands] > bin_mhz
+        if unmatched.any():
+            raise ValueError(
+                f"{name}: the searched bands with lower edges {low[unmatched].tolist()} mHz match "
+                "no band of the move within one bin"
+            )
+        if "gmm_counts" not in record:
+            return []
+        active = np.atleast_1d(np.asarray(record["active"], dtype=bool))
+        detected = np.atleast_1d(np.asarray(record["detected"], dtype=bool))
+        usable = np.atleast_1d(np.asarray(record["gmm_usable"], dtype=bool))
+        if len(detected) != active.sum() or len(usable) != detected.sum() or (
+                len(np.atleast_1d(record["gmm_counts"])) != usable.sum()):
+            raise ValueError(f"{name}: the shapes of active, detected, gmm_usable and gmm_counts "
+                             "do not nest as the F-statistic move writes them")
+        found = []
+        detected_rank = usable_rank = 0
+        for active_rank, searched in enumerate(np.flatnonzero(active)):
+            if not detected[active_rank]:
+                continue
+            if usable[detected_rank]:
+                found.append((int(bands[searched]), usable_rank))
+                usable_rank += 1
+            detected_rank += 1
+        return found
+
+    # ==============================================================================================
+    # The search part from the memory
+    # ==============================================================================================
+
+    @classmethod
+    def search_part_weights(cls, memory, band):
+        """The weight of each kind of fit in the search part of ``band``, as
+        :meth:`FStatSearchMemory.combined` takes them, in the order the kinds' components follow in
+        the mixture.
+
+        The fit on the residual has RESIDUAL_FIT_WEIGHT. OTHER_FITS_WEIGHT is shared among the fits
+        on the raw data and on the residual plus the window's sources, so that each of them gets the
+        same share whatever its kind: a kind has the share of its fits. A kind without a fit has
+        weight zero, and the memory divides the shares by their total, so a band without a fit on
+        the residual gives all its weight to the others and the reverse.
+        """
+        others = (memory.KIND_RAW_DATA, memory.KIND_RESIDUAL_PLUS_SOURCES)
+        num_others = sum(memory.count_fits(band, kind) for kind in others)
+        weights = {memory.KIND_RESIDUAL: cls.RESIDUAL_FIT_WEIGHT}
+        for kind in others:
+            weights[kind] = (
+                cls.OTHER_FITS_WEIGHT * memory.count_fits(band, kind) / num_others
+                if num_others else 0.0
+            )
+        return weights
+
+    @classmethod
+    def memory_components(cls, mixtures, failed=None):
+        """The companion's search part from one combined mixture per band, padded over the bands
+        (host arrays).
+
+        ``mixtures`` holds, for each band of the move, the dict of
+        :meth:`FStatSearchMemory.combined` (weights, means and covariances in the unit box of its
+        corners ``mins`` and ``maxs``, the weighting among the fits done) or None for a band without
+        a fit. Each goes through :meth:`record_in_sampling_columns` as a record of one band, and the
+        bands are padded by :meth:`padded_search_part`, as :meth:`record_components` does for the
+        record files. Returns the arrays of :meth:`record_components` without ``paths``.
+
+        When ``failed`` is a list, a band whose covariances have no Cholesky factor (a covariance
+        that is not positive definite) or a factor that is not finite is left without a search
+        part, as a band without a fit, and its number is appended to the list. Without a list the
+        error is raised, as for the record files.
+        """
+        parts = [[] for _ in mixtures]
+        for band, mixture in enumerate(mixtures):
+            if mixture is None:
+                continue
+            record = {
+                "gmm_layout": cls.RECORD_LAYOUT, "gmm_counts": np.array([len(mixture["weights"])]),
+                "gmm_weights": mixture["weights"][None], "gmm_means": mixture["means"][None],
+                "gmm_covs": mixture["covs"][None], "gmm_mins": mixture["mins"][None],
+                "gmm_maxs": mixture["maxs"][None],
+            }
+            try:
+                weights, means, _, factors = cls.record_in_sampling_columns(record, 0)
+                if failed is not None and not np.isfinite(factors).all():
+                    raise np.linalg.LinAlgError("the factor of a covariance is not finite")
+            except np.linalg.LinAlgError:
+                if failed is None:
+                    raise
+                failed.append(band)
+                continue
+            parts[band].append((weights / np.sum(weights), means, factors))
+        return cls.padded_search_part(parts)
+
+    def setup(self, model, branches):
+        """The start of each propose, which ``propose`` of :class:`GBSpecialBase` calls first.
+
+        While the memory is not fixed (the burn-in) the move first makes the searches that the
+        memory still needs (:meth:`_search_windows`: at the first propose the raw data and the
+        residual plus the window's sources around every source of the cold walker with the
+        highest likelihood, later the residual plus sources around sources that lie in no range
+        searched before). Then it brings the search part up to the memory's version
+        (:meth:`_refresh_search_part`), so that a fit made at this propose is read at once and the
+        arrays do not change within a propose. With a fixed memory it only does the second, and a
+        move that reads record files has nothing to do.
+        """
+        super().setup(model, branches)
+        memory = self.fstat_search_memory
+        if memory is not None:
+            if memory.is_bound and not memory.fixed:
+                self._search_windows(model, branches)
+            self._refresh_search_part()
+
+    def _refresh_search_part(self):
+        """Hold the search part of the memory's fits on the device when the memory's version is not
+        the version the arrays were built from: one combined mixture for each band
+        (:meth:`search_part_weights`), converted by :meth:`memory_components`. Called by the
+        constructor, by :meth:`setup` and by :meth:`apply_settings`; the five arrays are those of
+        :meth:`_load_record`.
+
+        A band whose covariances are not positive definite (:meth:`memory_components`) is left
+        without a search part, as a band without a fit, and one warning names the band, the
+        memory's version and the band's fits. The other bands are built as usual and the version
+        counts as built, so the band is tried again at the next version. The skip happens only
+        where the arrays are rebuilt: at the construction, at the start of a propose while the
+        memory is not fixed and at the request to fix. It does not touch the kept iterations, in
+        which the memory is fixed and nothing is rebuilt.
+        """
+        memory = self.fstat_search_memory
+        if memory.version == self._search_part_version:
+            return
+        mixtures = [
+            memory.combined(band, self.search_part_weights(memory, band))
+            for band in range(self.num_bands)
+        ]
+        failed = []
+        components = self.memory_components(mixtures, failed=failed)
+        for band in failed:
+            fits = [(fit.kind, fit.search_number, fit.pass_number)
+                    for fit in memory.fits(band=band)]
+            logger.warning(
+                "[%s %s] search part from the memory, version %d: band %d is left without a search "
+                "part: the covariance of its fits (kind, search, pass) %s has no finite Cholesky "
+                "factor", self.LOG_TAG, self.name, memory.version, band, fits,
+            )
+        for name in ("counts", "log_weights", "centres", "means", "factors"):
+            setattr(self, f"_record_{name}", self.xp.asarray(components[name]))
+        self._search_part_version = memory.version
+        counts = components["counts"]
+        logger.info(
+            "[%s %s] search part from the memory, version %d: %d fits, %d bands with components, "
+            "%d components in all, at most %d in a band",
+            self.LOG_TAG, self.name, memory.version, len(memory.fits()),
+            int(np.count_nonzero(counts)), int(counts.sum()), int(counts.max(initial=0)),
+        )
+
+    def apply_settings(self, *, fix_search_part: Optional[bool] = None) -> None:
+        """Change the move's settings at a recipe step, in the form of ``apply_settings`` of the
+        add/remove move: keyword arguments only, and None keeps the current value.
+
+        ``fix_search_part=True`` brings the search part up to the memory's version and then fixes
+        the memory, so that from then on it takes no new fit and the arrays stay; asking again does
+        nothing more. A move that reads record files has a search part that does not change, so the
+        request does nothing there. ``fix_search_part=False`` asks to release a fixed search part,
+        which raises ValueError: the fix holds for the rest of the run.
+        """
+        if fix_search_part is None:
+            return
+        if not isinstance(fix_search_part, (bool, np.bool_)):
+            raise ValueError(
+                f"{self.name}: fix_search_part must be True, False or None, not {fix_search_part!r}"
+            )
+        memory = self.fstat_search_memory
+        if fix_search_part:
+            if memory is not None:
+                self._refresh_search_part()
+                memory.fix()
+        elif memory is None or memory.fixed:
+            raise ValueError(f"{self.name}: a fixed search part cannot be released")
+
+    # ==============================================================================================
+    # The searches at the start of a propose
+    # ==============================================================================================
+
+    @property
+    def residual_search(self):
+        """The search this move runs for its own fits, built at the first use from the class
+        defaults of :class:`GBFStatSettings` and the move's priors, transforms, waveform keywords,
+        name and backend, as the search move builds its own. It writes no record and no search
+        log file: its fits go to the memory."""
+        if self._residual_search is None:
+            self._residual_search = FStatResidualSearch(
+                GBFStatSettings(), priors=self.priors,
+                parameter_transforms=self.parameter_transforms,
+                phase_maximize=self.phase_maximize, waveform_kwargs=self.waveform_kwargs,
+                name=self.name, force_backend=self.force_backend)
+        return self._residual_search
+
+    def _search_windows(self, model, branches):
+        """Make the searches that the memory still needs, at the start of a propose while the
+        memory is not fixed.
+
+        The walker is the one the search move takes, the one with the highest likelihood in the
+        container, and its sources are those of its cold chain in the interior bands
+        (:meth:`_walker_sources`). The searches run on the residual of that walker, in windows
+        around sources (:meth:`FStatResidualSearch.source_windows`), in two kinds
+        (:meth:`_search_kind`):
+
+        - "raw data", once in a run (the memory keeps the flag): a window around every source, on
+          the residual with all those sources added back;
+        - "residual plus sources": a window around every source that lies in no range searched
+          for this kind before, as far as the memory's limit lets the search start, on the
+          residual with every source inside these windows added back.
+
+        At the first propose both kinds run, on the same input. Later proposes search only around
+        sources that have appeared outside every searched range, and most start nothing. The
+        device memory that the searches used goes back to the pool at the end, before the propose
+        builds its sorter.
+        """
+        memory = self.fstat_search_memory
+        holder = model.analysis_container_arr
+        # * Row w of the container is the residual of walker w of the cold chain: the cells' fills
+        # * put the cold sources of walker w into row w (adjust_sources_in_residual_buffer)
+        walker = int(np.argmax(asnumpy(holder.likelihood())))
+        sources = self._walker_sources(branches, walker)
+        frequencies = sources[:, self.COL_F0]
+        searched = False
+        if not memory.raw_data_searched:
+            windows = self._windows_around(frequencies)
+            self._search_kind(memory.KIND_RAW_DATA, holder, walker, windows, sources,
+                              len(windows["ids"]))
+            searched = True
+        new_sources = memory.outside_searched_ranges(frequencies)
+        if new_sources.any():
+            windows = self._windows_around(frequencies[new_sources])
+            allowed = memory.would_start_window_searches(
+                np.column_stack([windows["low_mhz"], windows["high_mhz"]]))
+            if allowed.any():
+                self._search_kind(
+                    memory.KIND_RESIDUAL_PLUS_SOURCES, holder, walker,
+                    {name: values[allowed] for name, values in windows.items()}, sources,
+                    len(windows["ids"]))
+                searched = True
+        if searched:
+            # * The searches of this propose are over; kept, their holder would take memory on
+            # * every card from the proposals of all GB moves.
+            self.residual_search.release_search_holder()
+            # the search dicts went out of scope with the calls; this returns their device memory
+            free_bytes = free_device_bytes(self.xp, holder.gpus)
+            logger.info("[%s %s] device memory free after the searches: %.2f GiB",
+                        self.LOG_TAG, self.name, free_bytes / 2**30)
+
+    def _walker_sources(self, branches, walker):
+        """The sampling rows (n, 8) of the sources in the cold chain of ``walker`` that lie in an
+        interior band, on the host."""
+        branch = branches["gb"]
+        occupied = np.asarray(asnumpy(branch.inds[0, walker]), dtype=bool)
+        rows = np.asarray(asnumpy(branch.coords[0, walker]), dtype=float)[occupied]
+        edges_mhz = np.asarray(asnumpy(self.band_edges), dtype=float) * 1e3
+        return self.interior_rows(rows, edges_mhz)
+
+    def _windows_around(self, frequencies_mhz):
+        """The windows around sources at these frequencies, in the form of the ``bands`` dict that
+        the search's ``run`` takes: plus and minus the reach window of each source's band."""
+        edges_mhz = np.asarray(asnumpy(self.band_edges), dtype=float) * 1e3
+        return self.residual_search.source_windows(
+            frequencies_mhz, self.fstat_search_memory.band_of(frequencies_mhz), edges_mhz,
+            asnumpy(self._window_mhz))
+
+    def _search_kind(self, kind, holder, walker, windows, sources, num_made):
+        """One kind of search over ``windows``, all on one residual of the walker that has every
+        source inside the windows added back, and the log line of the kind.
+
+        ``sources`` are the sampling rows of the walker's interior sources and ``num_made`` the
+        number of windows before the memory's limit chose among them. The windows go to the search
+        in calls of ``WINDOWS_PER_CALL``, each through :meth:`FStatResidualSearch.run_passes`. A
+        call that raises is skipped with a warning (:meth:`_warn_skipped_call`): nothing of it is
+        registered or stored. For the kind "residual plus sources" each call that ran registers
+        its windows and adds its fits to the memory at once (:meth:`_register_call`), so that a
+        kill loses one call at most and the next propose searches a skipped call's sources again.
+        The fits of the kind "raw data" go to the memory after the last call in one change that
+        also sets the flag of that search, whether or not a call gave a fit or ran at all. A fit
+        that the memory refuses is left out with a warning (:meth:`_screen_fits`) and its window
+        counts as searched. The row is written back before the memory takes the raw data fits;
+        an error outside a call passes through.
+        """
+        memory, search = self.fstat_search_memory, self.residual_search
+        raw_data = kind == memory.KIND_RAW_DATA
+        num_windows = len(windows["ids"])
+        if raw_data and num_windows == 0:
+            # A walker without an interior source gives no window; the search is made all the same
+            memory.finish_raw_data_search([])
+            logger.info("[%s %s] search of the kind %s at propose %d: walker %d holds no source "
+                        "in an interior band, no window", self.LOG_TAG, self.name, kind,
+                        int(self.num_proposals), walker)
+            return
+        time_start = time.perf_counter()
+        members = search.window_members(windows, sources[:, self.COL_F0])
+        window_rows = [sources[members == window] for window in range(num_windows)]
+        reach_bins = asnumpy(self._window_mhz)[windows["ids"]] / self._coherent_bin_mhz()
+        raw_data_fits = []
+        num_calls = num_skipped = num_passes = num_stored = num_refused = grid_rows = 0
+        with search.restored_residual(holder, walker) as likelihoods:
+            search.add_sources_back(holder, walker, sources[members >= 0],
+                                    engine=self._likelihood_engine)
+            for first in range(0, num_windows, search.WINDOWS_PER_CALL):
+                chosen = slice(first, first + search.WINDOWS_PER_CALL)
+                call = {name: values[chosen] for name, values in windows.items()}
+                seeds = SeedStartInputs(window_rows[chosen], reach_bins[chosen],
+                                        self._epoch_fraction, self._observation_seconds)
+                num_calls += 1
+                try:
+                    passes = search.run_passes(
+                        holder, walker, call, engine=self._likelihood_engine,
+                        periodic=self.periodic, seeds=seeds,
+                        after_pass=lambda finished: self._finish_pass(kind, finished))
+                    fits = self._fits_of_passes(passes)
+                except Exception as error:
+                    num_skipped += 1
+                    self._warn_skipped_call(kind, call, error)
+                    continue
+                num_passes += len(passes)
+                grid_rows += sum(entry["stage_1"]["seeding"]["grid_rows"] for entry in passes)
+                accepted = self._screen_fits(kind, fits)
+                num_refused += len(fits) - len(accepted)
+                if raw_data:
+                    raw_data_fits += accepted
+                else:
+                    accepted = self._register_call(call, accepted)
+                    num_stored += len(accepted) if memory.add_fits(kind, accepted) else 0
+        if raw_data:
+            num_stored = len(raw_data_fits) if memory.finish_raw_data_search(raw_data_fits) else 0
+        logger.info(
+            "[%s %s] search of the kind %s at propose %d, walker %d: %d windows made, %d allowed, "
+            "%d calls (%d skipped), %d passes, %d fits stored, %d fits refused, %.3e grid rows, "
+            "%.1f s; ln L of the walker before %.6f, after %.6f, difference %.3e", self.LOG_TAG,
+            self.name, kind, int(self.num_proposals), walker, num_made, num_windows, num_calls,
+            num_skipped, num_passes, num_stored, num_refused, grid_rows,
+            time.perf_counter() - time_start,
+            likelihoods["likelihood_before"], likelihoods["likelihood_after"],
+            likelihoods["likelihood_difference"])
+
+    def _screen_fits(self, kind, fits):
+        """The fit descriptions that the memory accepts, with one warning for each it refuses.
+
+        The memory's own check runs on each description alone
+        (:meth:`FStatSearchMemory.screen_fits`), so that one flawed fit does not stop the run or cost
+        the good fits of its call. The warning names the kind, the window's range, the pass and the
+        memory's reason. The window of a refused fit still counts as searched.
+        """
+        accepted, refused = self.fstat_search_memory.screen_fits(kind, fits)
+        for position, reason in refused:
+            fit = fits[position]
+            logger.warning(
+                "[%s %s] kind %s: the fit of the window %.6f to %.6f mHz in pass %d is refused by "
+                "the memory and left out: %s", self.LOG_TAG, self.name, kind, fit["low_mhz"],
+                fit["high_mhz"], fit["pass_number"], reason)
+        return accepted
+
+    def _register_call(self, call, fits):
+        """Count the windows of a call that ran in the memory's limit and return the fits to store.
+
+        The memory counts the windows in order and starts those that the limit allows, which are
+        the windows the dry run of :meth:`_search_windows` allowed, since the memory has not
+        changed in between. If it starts fewer, which means that the memory changed under the
+        move, one warning names the windows and only the fits of the windows it started are kept:
+        the others stay outside every searched range and are searched again at a later propose.
+        """
+        windows = np.column_stack([call["low_mhz"], call["high_mhz"]])
+        started = self.fstat_search_memory.start_window_searches(windows)
+        if started.all():
+            return fits
+        refused = ", ".join(f"{low:.6f} to {high:.6f}" for low, high in windows[~started])
+        logger.warning(
+            "[%s %s] the memory started %d of %d windows that the dry run allowed; the fits of the "
+            "others are not stored. Windows refused (mHz): %s", self.LOG_TAG, self.name,
+            int(started.sum()), len(started), refused)
+        kept = {(float(low), float(high)) for low, high in windows[started]}
+        return [fit for fit in fits if (fit["low_mhz"], fit["high_mhz"]) in kept]
+
+    @staticmethod
+    def _fits_of_passes(passes):
+        """The fit descriptions of the passes of one call, in the order of the passes, as the
+        memory takes them (host arrays)."""
+        return [description for search in passes if search["status"] == "fitted"
+                for description in FStatResidualSearch.fit_descriptions(
+                    search, search["pass_number"])]
+
+    def _finish_pass(self, kind, search):
+        """The run-log line of one pass of a call, written as the pass ends: the line of
+        :meth:`FStatResidualSearch.finish` with the kind and the pass in its outcome. The search
+        hands each pass's dict to this method through its ``after_pass`` keyword."""
+        search["num_proposals"] = int(self.num_proposals)
+        status = search["status"]
+        if status == "fitted":
+            detail = f"{int(search['mixtures']['usable'].sum())} windows fitted"
+        elif status == "no_detection":
+            detail = "no window passes"
+        elif status == "no_usable_fit":
+            detail = "no passing window has a usable stage-2 chain"
+        else:
+            detail = "no window is active"
+        self.residual_search.finish(
+            search, time.perf_counter() - search["seconds"],
+            f"kind {kind}, pass {search['pass_number']}: {detail}", warn=status == "no_usable_fit")
+
+    def _warn_skipped_call(self, kind, call, error):
+        """One warning for a call that raised: the error, the kind and the windows' ranges."""
+        ranges = ", ".join(f"{low:.6f} to {high:.6f}"
+                           for low, high in zip(call["low_mhz"], call["high_mhz"]))
+        logger.warning(
+            "[%s %s] kind %s: a call of %d windows raised %s: %s; it is skipped and nothing of "
+            "it is registered or stored. Windows (mHz): %s", self.LOG_TAG, self.name, kind,
+            len(call["ids"]), type(error).__name__, error, ranges, exc_info=error)
+
+    @classmethod
+    def interior_rows(cls, rows, band_edges_mhz):
+        """The sampling rows (n, 8) whose f0 lies in an interior band, on host arrays.
+
+        The interior bands are the bands 1 to the second last, or band 0 when the layout has one
+        band, as ``GBFStatRJMove._search_bands`` takes them: the two edge bands only serve as
+        neighbours. ``band_edges_mhz`` holds the edges of all bands (bands + 1,) in mHz. A band
+        holds its lower edge and not its upper edge.
+        """
+        edges = np.asarray(band_edges_mhz, dtype=float)
+        rows = np.asarray(rows, dtype=float)
+        first, last = (0, 1) if len(edges) == 2 else (1, len(edges) - 2)
+        frequency = rows[:, cls.COL_F0]
+        return rows[(frequency >= edges[first]) & (frequency < edges[last])]
+
+    # ==============================================================================================
+    # The proposal, in the steps of the recipe
+    # ==============================================================================================
+
+    def _propose(self, band_sorter, buffer_obj, band_temps, picked, tables):
+        """Draw each cell's split or merge and work out its acceptance terms but the likelihood and
+        the count prior, in the order of ``move_recipe.md``. The recipe numbers a split's steps 1 to
+        6 (the anchor, the primary's row, the companion's intrinsic point, the amplitudes, the
+        likelihood change, the acceptance) and a merge's steps 1 to 5 (the merged point and its
+        row, the merged amplitudes, the reverse split's densities at the current pair, the
+        likelihood change, the acceptance); the steps below name them by what they do:
+
+        1. the cells' state and the direction (:meth:`_cell_state`), with the partner kernel of
+           width W / 2 and cutoff W of the cell's band;
+        2. every proposing cell's primary, and a merge's partner drawn first, out of the residual,
+           which is then r_B: the parent-free residual of a split, the pair-free one of a merge;
+        3. one F-statistic row per primary on r_B and its tempered four-amplitude Gaussian (the
+           primary's row, split step 2 and merge step 1 of the recipe);
+        4. each split's dead row and companion, and the window rule (the companion's intrinsic
+           point, split step 3);
+        5. one F-statistic row per companion or partner and four swap rows per cell on r_B, and the
+           pair's tempered eight-amplitude Gaussian (the amplitudes of split step 4; the reverse
+           split's densities at the current pair, merge step 3);
+        6. the draws, the densities and the bookkeeping terms of each direction
+           (:meth:`_split_proposal`, :meth:`_merge_proposal`);
+        7. the residual restored, so that the mixin's likelihood sequence and its restoration of
+           rejected proposals run as for production's moves.
+
+        The terms are those of a split: a merge carries the terms of its reverse split, which its
+        acceptance takes with the opposite sign. The points: ``old_primary`` the primary as it is;
+        ``middle`` child a of a split, the partner of a merge; ``last`` child b of a split, the
+        merged source of a merge. ``tables`` is None, since this class reads no friend tables.
+        """
+        xp = self.xp
+        timer = getattr(self, "_prop_timer", None)
+        num_cells = len(picked["ids"])
+        slots, N_vals = picked["slot_index"], picked["N_vals"]
+        windows = self._window_mhz[picked["band_inds"]]
+        state = self._cell_state(band_sorter, picked, 0.5 * windows, windows)
+        split, merge, old_primary = state["split"], state["merge"], state["old_primary"]
+        beta = band_temps[picked["band_inds"], picked["temp_inds"]]
+
+        proposal = {name: xp.zeros(num_cells) for name in self.TERM_NAMES + ("log_primary_ratio",)}
+        proposal.update({name: xp.zeros(num_cells, dtype=bool) for name in self.OUTCOME_FLAGS})
+        proposal.update(
+            split=split, merge=merge, primary_rows=state["primary_rows"],
+            second_rows=xp.zeros(num_cells, dtype=state["primary_rows"].dtype),
+            old_primary=old_primary, middle=old_primary.copy(), last=old_primary.copy(),
+            no_primary=~state["has_primary"],
+            no_direction=state["has_primary"] & ~state["possible"],
+            # For the counters and the test recorder: the companion's part (PART_*, -1 without a
+            # companion) and rho*^2 of the primary's row
+            companion_part=xp.full(num_cells, -1, dtype=xp.int64),
+            rho_star_squared=xp.zeros(num_cells),
+        )
+
+        # * 2. The residual r_B: the primaries out, then the merges' partners, drawn first by their
+        # * kernel; two templates of one cell go in separate calls, as in every fill of production
+        moving = xp.flatnonzero(split | merge)
+        splits, merges = xp.flatnonzero(split), xp.flatnonzero(merge)
+        partner = self._draw_partners(state, merges)
+        partner_points = self.wrap_periodic(
+            band_sorter.coords[state["cell_rows"][merges, partner]], state["periods"], xp=xp)
+        with _tspan(timer, "fstat_split_merge_fills"):
+            self._fill_cells(buffer_obj, False, old_primary[moving], slots[moving],
+                             None if N_vals is None else N_vals[moving])
+            self._fill_cells(buffer_obj, False, partner_points, slots[merges],
+                             None if N_vals is None else N_vals[merges])
+
+        # 3. The primaries' rows on r_B and their amplitude Gaussians (the primary's row: the
+        # recipe's split step 2 and merge step 1)
+        with _tspan(timer, "fstat_split_merge_rows"):
+            primaries = self._primary_systems(buffer_obj, picked, state, beta, moving)
+        proposal["rho_star_squared"] = primaries["rho_star_squared"]
+        # 4. The splits' dead rows and companions, and the window rule (the companion's intrinsic
+        # point, the recipe's split step 3)
+        companions = self._split_companions(picked, state, beta, primaries, splits)
+        proposal["companion_part"][splits] = companions["part"]
+        kept_splits = splits[companions["kept"]]
+        # 5. The second sources' rows and the swap rows on r_B, the pairs' Gaussians (the
+        # amplitudes of split step 4; the reverse split's densities of merge step 3)
+        pair_cells = xp.concatenate([kept_splits, merges])
+        with _tspan(timer, "fstat_split_merge_rows"):
+            pairs = self._pair_systems(
+                buffer_obj, picked, beta, primaries, pair_cells, old_primary[pair_cells],
+                xp.concatenate([companions["rows"][companions["kept"]], partner_points]))
+        # 6. The draws, the densities and the terms of each direction
+        num_kept = len(kept_splits)
+        self._split_proposal(proposal, picked, state, primaries, companions,
+                             [values[:num_kept] for values in pairs])
+        self._merge_proposal(proposal, picked, state, beta, primaries, merges, partner,
+                             partner_points, [values[num_kept:] for values in pairs])
+
+        # * 7. The residual back as it was, whatever the draws gave. This costs two template fills
+        # * per split attempt and four per merge beyond the recipe's count, since the mixin's
+        # * likelihood sequence takes the same templates out again.
+        # TODO keep r_B for that sequence instead (no restoration and no second removal), a later
+        # TODO optimisation once the move is verified
+        with _tspan(timer, "fstat_split_merge_fills"):
+            self._fill_cells(buffer_obj, True, partner_points, slots[merges],
+                             None if N_vals is None else N_vals[merges])
+            self._fill_cells(buffer_obj, True, old_primary[moving], slots[moving],
+                             None if N_vals is None else N_vals[moving])
+
+        # * The proposals that reach the likelihood: gates passed and every term finite at the
+        # * walker's count now
+        k_now = self._k_walker[picked["temp_inds"] * self.nwalkers + picked["walker_inds"]]
+        proposal["proposed"] = (split | merge) & proposal["usable"]
+        terms_now = self.split_log_acceptance_terms(
+            num_alive_walker=xp.where(split, k_now, k_now - 1), num_slots=band_sorter.nleaves_max,
+            xp=xp, **{name: proposal[name] for name in self.TERM_NAMES})
+        proposal["ok"] = proposal["proposed"] & proposal["gates"] & xp.isfinite(terms_now)
+        return proposal
+
+    def _draw_partners(self, state, merges):
+        """The position of each merge's partner on the member axis, drawn with its kernel
+        probability by the Gumbel-max trick, as the stretched jump's merge draws it."""
+        xp = self.xp
+        if len(merges) == 0:
+            return xp.zeros(0, dtype=xp.int64)
+        with np.errstate(divide="ignore"):
+            gumbel = -xp.log(-xp.log(xp.random.rand(len(merges), state["cell_rows"].shape[1])))
+        return xp.argmax(state["partner_log_lower"][merges] + gumbel, axis=1)
+
+    def _primary_systems(self, buffer_obj, picked, state, beta, moving):
+        """The primary's row (the recipe's split step 2 and merge step 1): the F-statistic row of
+        every proposing cell's primary on r_B, its tempered four-amplitude Gaussian and the prior
+        box's widths of the intrinsic columns there.
+
+        Returns arrays over all cells, set at ``moving``: ``projections`` and ``overlaps`` in the
+        filter basis, ``rho_star_squared`` (2F, the best fit's squared SNR), the Gaussian's ``mean``
+        and ``factor`` in u, ``usable`` and ``widths`` in INTRINSIC_ORDER.
+        """
+        xp = self.xp
+        num_cells = len(picked["ids"])
+        systems = dict(
+            projections=xp.zeros((num_cells, 4)), overlaps=xp.zeros((num_cells, 10)),
+            rho_star_squared=xp.zeros(num_cells), mean=xp.zeros((num_cells, 4)),
+            factor=xp.tile(xp.eye(4), (num_cells, 1, 1)), usable=xp.zeros(num_cells, dtype=bool),
+            widths=xp.ones((num_cells, 4)),
+        )
+        if len(moving) == 0:
+            return systems
+        slots = picked["slot_index"][moving]
+        points = state["old_primary"][moving]
+        projections, overlaps, two_f, kept = buffer_obj.get_fstat_terms(points, slots, slots)
+        mean, factor, usable = self._amplitude_gaussian(
+            projections, self.overlap_matrices(overlaps, xp=xp), beta[moving], kept)
+        # * P of the local width from the prior box at the primary, the frequency's box the cell's
+        # * limits, as production's in-model proposal takes each source's box
+        lower, upper = self._prior_box(
+            points, (buffer_obj.frequency_lims[0][slots], buffer_obj.frequency_lims[1][slots]))
+        widths = (upper - lower)[:, list(self.INTRINSIC_ORDER)]
+        values = dict(projections=projections, overlaps=overlaps, rho_star_squared=two_f, mean=mean,
+                      factor=factor, usable=usable, widths=widths)
+        for name, value in values.items():
+            systems[name][moving] = value
+        return systems
+
+    def _split_companions(self, picked, state, beta, primaries, splits):
+        """The companion's intrinsic point, the recipe's split step 3: the dead row child b takes,
+        its point from the three-part mixture around the anchor, and the rules that end an attempt
+        as no proposal.
+
+        A cell counts under the first rule it fails: the primary's amplitude system not finite,
+        |f2 - f1| > W, f2 outside the band, the band at its cap, the companion outside the prior's
+        box (its prior part density zero, and so its run prior). Returns over ``splits``: the
+        companions' sampling rows (the parent's row with the intrinsic columns drawn), the part
+        each came from (PART_*), the dead rows' positions, the mixture's pieces, the prior part's
+        log density at the companions, the masks of the rules and ``kept``.
+        """
+        xp = self.xp
+        num_splits = len(splits)
+        rules = ("not_finite", "beyond_window", "outside_band", "at_cap", "outside_prior", "kept")
+        if num_splits == 0:
+            empty = {name: xp.zeros(0, dtype=bool) for name in rules}
+            return dict(rows=xp.zeros((0, self.NDIM)), part=xp.zeros(0, dtype=xp.int64), **empty)
+        bands = picked["band_inds"][splits]
+        anchors = state["old_primary"][splits]
+        windows = self._window_mhz[bands]
+        # Child b's dead row, drawn uniformly among the cell's, as the stretched jump draws it
+        num_dead = state["num_dead"][splits]
+        choice = xp.minimum((xp.random.rand(num_splits) * num_dead).astype(xp.int64), num_dead - 1)
+        dead_rank = xp.cumsum(state["is_dead"][splits], axis=1) - 1
+        slot = xp.argmax(state["is_dead"][splits] & (dead_rank == choice[:, None]), axis=1)
+        # * The companion. The prior part reads the run's prior box at f2, which only f2 sets on its
+        # * three columns, so any valid row fills the others.
+        mixture = self._companion_mixture(
+            bands, anchors, primaries["rho_star_squared"][splits], beta[splits],
+            primaries["widths"][splits])
+        filler = anchors[:1]
+        draws, part, _, rejected = self.companion_draw(
+            mixture["anchor"], mixture["local_factor"], mixture["means"], mixture["factors"],
+            mixture["log_weights"], mixture["has_active"], self.COMPANION_WEIGHTS, windows,
+            (self.band_edges[bands] * 1e3, self.band_edges[bands + 1] * 1e3),
+            lambda frequencies, uniforms: self._prior_rest_draw(frequencies, uniforms, filler),
+            xp.random.rand(num_splits), xp.random.rand(num_splits), xp.random.randn(num_splits, 4),
+            xp.random.rand(num_splits, 4), xp=xp)
+        rows = anchors.copy()
+        rows[:, list(self.INTRINSIC_ORDER)] = draws
+        log_prior_part = self._prior_part_log_density(rows, anchors, windows)
+        # * An attempt that fails a rule ends as no proposal and the state stays; a kept draw
+        # * carries the untruncated density
+        if self._band_leaf_cap is not None:
+            over_cap = state["num_alive"][splits] >= xp.asarray(self._band_leaf_cap)[bands]
+        else:
+            over_cap = xp.zeros(num_splits, dtype=bool)
+        frequencies = rows[:, self.COL_F0]
+        not_finite = ~primaries["usable"][splits]
+        open_cells = ~not_finite
+        beyond_window = open_cells & (xp.abs(frequencies - anchors[:, self.COL_F0]) > windows)
+        open_cells = open_cells & ~beyond_window
+        outside_band = open_cells & (rejected | ~self._inside_band(frequencies, bands))
+        open_cells = open_cells & ~outside_band
+        at_cap = open_cells & over_cap
+        open_cells = open_cells & ~at_cap
+        outside_prior = open_cells & ~xp.isfinite(log_prior_part)
+        return dict(
+            rows=rows, part=part, slot=slot, mixture=mixture, log_prior_part=log_prior_part,
+            not_finite=not_finite, beyond_window=beyond_window, outside_band=outside_band,
+            at_cap=at_cap, outside_prior=outside_prior, kept=open_cells & ~outside_prior,
+        )
+
+    def _companion_mixture(self, bands, anchors, rho_star_squared, beta, widths):
+        """The pieces of the companion's mixture around anchors (sampling rows) in their bands: the
+        anchors' intrinsic points, the local part's wrapped factor of (rho_eff^2 g + P)^-1 with
+        rho_eff^2 = min(beta rho*^2, RHO_REF^2) in the ICRS frame, the band's search components with
+        their log weights renormalised over the active set |f_j - f1| <= W, and whether a row has
+        an active component. A function of the anchor, rho*^2, beta and the record only, so a split
+        and its reverse merge form the same mixture."""
+        xp = self.xp
+        intrinsic = anchors[:, list(self.INTRINSIC_ORDER)]
+        log_weights, has_active = self.active_components(
+            intrinsic[:, 0], self._record_centres[bands], self._record_log_weights[bands],
+            self._window_mhz[bands], xp=xp)
+        rho_eff_squared = xp.minimum(beta * rho_star_squared, self.RHO_REF ** 2)
+        covariance = self.local_covariance(
+            intrinsic, rho_eff_squared, widths, self._observation_seconds, self._epoch_fraction,
+            self.LIGHT_TIME_SECONDS, self.ANTENNA_FLOOR, obliquity=self.OBLIQUITY_ICRS_RAD, xp=xp)
+        return dict(
+            anchor=intrinsic, local_factor=self.wrapped_factor(covariance, xp=xp),
+            means=self._record_means[bands], factors=self._record_factors[bands],
+            log_weights=log_weights, has_active=has_active,
+        )
+
+    def _prior_rest_box(self, rows):
+        """Lower and upper bounds (n, 3) of the run's prior box on COMPANION_ORDER at sampling rows
+        (n, ndim): fdot's bounds at each row's f0, the boxes of sin dec and ra. The f0 box is not
+        read, so the cell's limits are left open."""
+        lower, upper = self._prior_box(rows, (-np.inf, np.inf))
+        columns = list(self.COMPANION_ORDER)
+        return lower[:, columns], upper[:, columns]
+
+    def _prior_rest_draw(self, frequencies, uniforms, filler):
+        """The prior part's (fdot, sin dec, ra) at the frequencies f2 (n,): uniform in the run's
+        prior box there, from ``uniforms`` (n, 3); ``filler`` (1, ndim) fills the columns that the
+        box does not read."""
+        xp = self.xp
+        if frequencies.shape[0] == 0:
+            return xp.zeros((0, len(self.COMPANION_ORDER)))
+        rows = xp.repeat(filler, frequencies.shape[0], axis=0)
+        rows[:, self.COL_F0] = frequencies
+        lower, upper = self._prior_rest_box(rows)
+        return lower + uniforms * (upper - lower)
+
+    def _prior_part_log_density(self, rows, anchors, windows):
+        """ln q_p (n,) of companions' sampling rows: ln pi(fdot2 | f2) + ln pi(sin dec2)
+        + ln pi(ra2) - ln(2 W), the run's prior box uniform on each column, and -inf outside that
+        box or beyond the window |f2 - f1| <= W."""
+        xp = self.xp
+        lower, upper = self._prior_rest_box(rows)
+        values = rows[:, list(self.COMPANION_ORDER)]
+        inside = (
+            xp.all((values >= lower) & (values <= upper) & (upper > lower), axis=1)
+            & (xp.abs(rows[:, self.COL_F0] - anchors[:, self.COL_F0]) <= windows)
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_density = -xp.sum(xp.log(upper - lower), axis=1) - xp.log(2.0 * windows)
+        return xp.where(inside, log_density, -xp.inf)
+
+    def _pair_systems(self, buffer_obj, picked, beta, primaries, cells, first_points,
+                      second_points):
+        """The pair's amplitude system (the recipe's split step 4, merge step 3): the F-statistic
+        row of each second source (a split's companion, a merge's partner) and the four swap rows of
+        the pair on r_B, and the pair's tempered eight-amplitude Gaussian. Returns its mean and
+        factor in u and whether the cell is usable: both rows and the swap rows kept and every part
+        finite."""
+        xp = self.xp
+        if len(cells) == 0:
+            return [xp.zeros((0, 8)), xp.zeros((0, 8, 8)), xp.zeros(0, dtype=bool)]
+        slots = picked["slot_index"][cells]
+        projections_second, overlaps_second, _, kept_second = buffer_obj.get_fstat_terms(
+            second_points, slots, slots)
+        products, kept_pairs = self._pair_products(buffer_obj, first_points, second_points, slots)
+        projections, matrix = self.pair_system(
+            primaries["projections"][cells], primaries["overlaps"][cells], projections_second,
+            overlaps_second, products, xp=xp)
+        mean, factor, usable = self._amplitude_gaussian(
+            projections, matrix, beta[cells], kept_second & kept_pairs)
+        return [mean, factor, usable & primaries["usable"][cells]]
+
+    def _pair_products(self, buffer_obj, first_points, second_points, slots):
+        """(T_a(first) | T_b(second)) (n, 2, 2) of each pair, T_0 = T+ and T_1 = Tx, from one swap
+        call that holds the four template pairs of every cell along the batch axis, and whether all
+        four were kept."""
+        xp = self.xp
+        num_rows = first_points.shape[0]
+        plus_first, cross_first = self.filter_rows(first_points)
+        plus_second, cross_second = self.filter_rows(second_points)
+        # * The pairs (T+, T+), (T+, Tx), (Tx, T+) and (Tx, Tx) in this order, so that a reshape to
+        # * (2, 2, n) indexes them by (a, b)
+        first = xp.concatenate([plus_first, plus_first, cross_first, cross_first])
+        second = xp.concatenate([plus_second, cross_second, plus_second, cross_second])
+        index = xp.tile(slots, 4)
+        products = buffer_obj.get_pair_products(first, second, index, index)
+        values = xp.moveaxis(products.first_second.reshape(2, 2, num_rows), -1, 0)
+        kept = xp.all(products.kept.reshape(4, num_rows), axis=0)
+        return values, kept
+
+    def _amplitude_gaussian(self, projections, matrix, beta, kept):
+        """The tempered amplitude Gaussian (:meth:`amplitude_gaussian`) of each row's system in the
+        filter basis, 4 or 8 amplitudes, taken to u: mean, lower Cholesky factor of the precision,
+        and whether the row is usable (kept by the buffer, beta positive, the system finite with a
+        positive trace, the Gaussian finite)."""
+        xp = self.xp
+        projections_circular, matrix_circular = self.circular_system(projections, matrix, xp=xp)
+        dimension = projections_circular.shape[-1]
+        finite = (
+            kept & (beta > 0.0) & xp.all(xp.isfinite(projections_circular), axis=1)
+            & xp.all(xp.isfinite(matrix_circular), axis=(1, 2))
+            & (xp.trace(matrix_circular, axis1=1, axis2=2) > 0.0)
+        )
+        # ! A row that the buffer did not keep holds zeros, whose precision is singular, and one
+        # ! singular matrix makes numpy's batched Cholesky raise (cupy leaves NaN in its row); the
+        # ! identity stands in for it, and the row makes no proposal
+        identity = xp.eye(dimension)
+        matrix_circular = xp.where(finite[:, None, None], matrix_circular, identity[None])
+        projections_circular = xp.where(finite[:, None], projections_circular, 0.0)
+        mean, factor = self.amplitude_gaussian(
+            projections_circular, matrix_circular, xp.where(finite, beta, 1.0), self.RIDGE_FRACTION,
+            xp=xp)
+        usable = (
+            finite & xp.all(xp.isfinite(mean), axis=1)
+            & xp.all(xp.diagonal(factor, axis1=1, axis2=2) > 0.0, axis=1)
+        )
+        return mean, factor, usable
+
+    def _split_proposal(self, proposal, picked, state, primaries, companions, pairs):
+        """The amplitudes, the densities and the acceptance terms of the splits (the recipe's split
+        steps 4 to 6): the outcome masks of every split and, for each kept companion, the eight
+        amplitudes drawn from the pair's Gaussian, each child at a copy drawn uniformly, the
+        densities and the bookkeeping terms as the stretched jump's split forms them. Writes the
+        cells' entries of ``proposal``."""
+        xp = self.xp
+        splits = xp.flatnonzero(state["split"])
+        for name in ("not_finite", "beyond_window", "outside_band", "at_cap", "outside_prior"):
+            proposal[name][splits] = companions[name]
+        kept = companions["kept"]
+        cells = splits[kept]
+        if len(cells) == 0:
+            return
+        mean, factor, usable = pairs
+        star_mean, star_factor = primaries["mean"][cells], primaries["factor"][cells]
+        num, line = len(cells), xp.arange(len(cells))
+        bands, position = picked["band_inds"][cells], state["position"][cells]
+        slot, windows = companions["slot"][kept], self._window_mhz[bands]
+        parents, periods = state["old_primary"][cells], state["periods"]
+        amplitude, intrinsic = list(self.AMPLITUDE_COLUMNS), list(self.INTRINSIC_ORDER)
+
+        # * The draw U = (u_a, u_b) from the pair's Gaussian: child a keeps the parent's intrinsic
+        # * point (the anchor), child b takes the companion's, each at one of its four copies
+        circular = self.amplitude_draw(mean, factor, xp.random.randn(num, 8), xp=xp)
+        copies = xp.floor(xp.random.rand(num, 2) * self.NUM_COPIES).astype(xp.int64)
+        child_a, child_b = parents.copy(), companions["rows"][kept]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            child_a[:, amplitude] = self.amplitude_columns(circular[:, :4], copies[:, 0], xp=xp)
+            child_b[:, amplitude] = self.amplitude_columns(circular[:, 4:], copies[:, 1], xp=xp)
+        child_a = self.wrap_periodic(child_a, periods, xp=xp)
+        child_b = self.wrap_periodic(child_b, periods, xp=xp)
+
+        # * The densities from the stored points, the functions the reverse merge evaluates:
+        # * ln q_split = ln q_c + ln N(U) + V(e_a) + V(e_b) + 2 ln(1/4), and the reverse merge's
+        # * ln q_merge = ln N(u*) + V(e*) + ln(1/4) from the parent's Gaussian of the primary's row
+        mixture = {name: values[kept] for name, values in companions["mixture"].items()}
+        log_companion = self.companion_log_density(
+            child_b[:, intrinsic], mixture["anchor"], mixture["local_factor"], mixture["means"],
+            mixture["factors"], mixture["log_weights"], companions["log_prior_part"][kept],
+            mixture["has_active"], self.COMPANION_WEIGHTS, xp=xp)
+        stored = xp.concatenate([self.amplitude_vectors(child_a, xp=xp),
+                                 self.amplitude_vectors(child_b, xp=xp)], axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_split_density = (
+                log_companion + self.amplitude_log_density(stored, mean, factor, xp=xp)
+                + self.log_volume(child_a, xp=xp) + self.log_volume(child_b, xp=xp)
+                - 2.0 * self.LOG_NUM_COPIES
+            )
+            log_merge_density = (
+                self.amplitude_log_density(self.amplitude_vectors(parents, xp=xp), star_mean,
+                                           star_factor, xp=xp)
+                + self.log_volume(parents, xp=xp) - self.LOG_NUM_COPIES
+            )
+
+        # * The bookkeeping, with the upper state's child a in the primary's row and child b a
+        # * member in the dead row's place
+        upper_frequencies = state["frequencies"][cells].copy()
+        upper_frequencies[line, position] = child_a[:, 1]
+        upper_frequencies[line, slot] = child_b[:, 1]
+        upper_members = state["is_member"][cells].copy()
+        upper_members[line, slot] = True
+        partner_log_upper, has_partner_upper = self.partner_log_probabilities(
+            child_a[:, 1], upper_frequencies, upper_members, position, 0.5 * windows, windows,
+            xp=xp)
+        priors = self._log_prior_of(xp.concatenate([child_a, child_b, parents]))
+        prior_a, prior_b, prior_parent = priors[:num], priors[num:-num], priors[-num:]
+        terms = dict(
+            log_prior_ratio=prior_a + prior_b - prior_parent,
+            log_band_share=self._log_band_shares[bands],
+            num_dead_lower=state["num_dead"][cells],
+            # -inf when child b lies beyond the cutoff: the reverse merge does not exist
+            log_partner_upper=partner_log_upper[line, slot],
+            log_merge_upper=self.direction_log_probabilities(
+                has_partner_upper, state["num_dead"][cells] - 1, xp=xp)[1],
+            log_split_lower=state["log_split"][cells],
+            log_primary_ratio=self._primary_log_ratio(state["num_members"][cells]),
+            log_merge_density=log_merge_density, log_split_density=log_split_density,
+        )
+        for name, values in terms.items():
+            proposal[name][cells] = values
+        gates = (
+            usable & self._inside_band(child_a[:, 1], bands)
+            & self._inside_band(child_b[:, 1], bands) & xp.isfinite(prior_parent)
+        )
+        if self._band_leaf_cap is not None:
+            # A split into a band at its cap is forbidden, as a birth is
+            gates &= state["num_alive"][cells] < xp.asarray(self._band_leaf_cap)[bands]
+        proposal["usable"][cells] = usable
+        proposal["not_finite"][cells] = ~usable
+        proposal["gates"][cells] = gates
+        proposal["second_rows"][cells] = state["cell_rows"][cells, slot]
+        proposal["middle"][cells] = child_a
+        proposal["last"][cells] = child_b
+
+    def _merge_proposal(self, proposal, picked, state, beta, primaries, merges, partner,
+                        partner_points, pairs):
+        """The merged amplitudes, the reverse split's densities and the acceptance terms of the
+        merges (the recipe's merge steps 2, 3 and 5): the merged source at the primary's intrinsic
+        point with its four amplitudes drawn from the primary's Gaussian of merge step 1 (the
+        primary's row on the pair-free residual), the densities, and the bookkeeping terms of the
+        reverse split as the stretched jump's merge forms them. Writes the cells' entries of
+        ``proposal``."""
+        xp = self.xp
+        cells = merges
+        if len(cells) == 0:
+            return
+        mean, factor, usable = pairs
+        star_mean, star_factor = primaries["mean"][cells], primaries["factor"][cells]
+        num, line = len(cells), xp.arange(len(cells))
+        bands, position = picked["band_inds"][cells], state["position"][cells]
+        windows = self._window_mhz[bands]
+        primary_points, periods = state["old_primary"][cells], state["periods"]
+        amplitude, intrinsic = list(self.AMPLITUDE_COLUMNS), list(self.INTRINSIC_ORDER)
+
+        # * The merged amplitudes (the recipe's merge step 2): the merged source keeps the primary's
+        # * intrinsic point; its amplitudes come from the primary's Gaussian on the pair-free
+        # * residual, at one of the four copies
+        circular = self.amplitude_draw(star_mean, star_factor, xp.random.randn(num, 4), xp=xp)
+        copies = xp.floor(xp.random.rand(num) * self.NUM_COPIES).astype(xp.int64)
+        merged = primary_points.copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            merged[:, amplitude] = self.amplitude_columns(circular, copies, xp=xp)
+        merged = self.wrap_periodic(merged, periods, xp=xp)
+
+        # * The densities from the stored points: this draw's ln q_merge, and the reverse split's
+        # * ln q_split at the current pair (the recipe's merge step 3), its companion density at the
+        # * partner with the active set around f1 and the local width from rho*^2 of the primary's
+        # * row (merge step 1)
+        mixture = self._companion_mixture(
+            bands, primary_points, primaries["rho_star_squared"][cells], beta[cells],
+            primaries["widths"][cells])
+        log_companion = self.companion_log_density(
+            partner_points[:, intrinsic], mixture["anchor"], mixture["local_factor"],
+            mixture["means"], mixture["factors"], mixture["log_weights"],
+            self._prior_part_log_density(partner_points, primary_points, windows),
+            mixture["has_active"], self.COMPANION_WEIGHTS, xp=xp)
+        stored = xp.concatenate(
+            [self.amplitude_vectors(primary_points, xp=xp),
+             self.amplitude_vectors(partner_points, xp=xp)], axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_merge_density = (
+                self.amplitude_log_density(self.amplitude_vectors(merged, xp=xp), star_mean,
+                                           star_factor, xp=xp)
+                + self.log_volume(merged, xp=xp) - self.LOG_NUM_COPIES
+            )
+            log_split_density = (
+                log_companion + self.amplitude_log_density(stored, mean, factor, xp=xp)
+                + self.log_volume(primary_points, xp=xp) + self.log_volume(partner_points, xp=xp)
+                - 2.0 * self.LOG_NUM_COPIES
+            )
+
+        # * The bookkeeping of the reverse split, from the lower state: the merged source in the
+        # * primary's row, the partner's row dead
+        lower_frequencies = state["frequencies"][cells].copy()
+        lower_frequencies[line, position] = merged[:, 1]
+        lower_members = state["is_member"][cells].copy()
+        lower_members[line, partner] = False
+        has_partner_merged = self.partner_log_probabilities(
+            merged[:, 1], lower_frequencies, lower_members, position, 0.5 * windows, windows,
+            xp=xp)[1]
+        priors = self._log_prior_of(xp.concatenate([primary_points, partner_points, merged]))
+        prior_a, prior_b, prior_merged = priors[:num], priors[num:-num], priors[-num:]
+        terms = dict(
+            log_prior_ratio=prior_a + prior_b - prior_merged,
+            log_band_share=self._log_band_shares[bands],
+            num_dead_lower=state["num_dead"][cells] + 1,
+            log_partner_upper=state["partner_log_lower"][cells, partner],
+            log_merge_upper=state["log_merge"][cells],
+            log_split_lower=self.direction_log_probabilities(
+                has_partner_merged, state["num_dead"][cells] + 1, xp=xp)[0],
+            log_primary_ratio=self._primary_log_ratio(state["num_members"][cells] - 1),
+            log_merge_density=log_merge_density, log_split_density=log_split_density,
+        )
+        for name, values in terms.items():
+            proposal[name][cells] = values
+        proposal["usable"][cells] = usable
+        proposal["not_finite"][cells] = ~usable
+        proposal["gates"][cells] = (
+            usable & self._inside_band(merged[:, 1], bands) & xp.isfinite(prior_a)
+            & xp.isfinite(prior_b)
+        )
+        proposal["second_rows"][cells] = state["cell_rows"][cells, partner]
+        proposal["middle"][cells] = partner_points
+        proposal["last"][cells] = merged
+
+    def _log_prior_of(self, points):
+        """The run prior's ln density of sampling rows, on the move's array module."""
+        return self.xp.asarray(self.gpu_priors["gb"].logpdf(points))
+
+    def _outcome_masks(self, proposal, accepted):
+        """The cells of each counter of COUNTER_NAMES in its order: the mixin's four, then the cells
+        without a proposal, each under the first rule it failed, then the proposed splits by the
+        part their companion came from."""
+        proposed_split = proposal["proposed"] & proposal["split"]
+        return super()._outcome_masks(proposal, accepted) + [
+            proposal["no_primary"], proposal["no_direction"], proposal["beyond_window"],
+            proposal["outside_band"], proposal["at_cap"], proposal["outside_prior"],
+            proposal["not_finite"],
+        ] + [proposed_split & (proposal["companion_part"] == part)
+             for part in (self.PART_SEARCH, self.PART_LOCAL, self.PART_PRIOR)]
+
+    # ==============================================================================================
+    # Math of the split and the merge: the prototype split_merge_math.py with the array module as an
+    # argument, its formulas unchanged; the components of the companion may also come one set per
+    # row, as the move holds them per band
+    # ==============================================================================================
+
+    # The circular amplitudes u of each point by the prototype's name: the mixin's amplitude_vectors
+    circular_amplitudes = staticmethod(GBSplitMergeCellsMixin.amplitude_vectors)
+
+    @staticmethod
+    def log_sum_exp(values, axis=-1, xp=np):
+        """ln of the sum of exp(values) along ``axis``, on numpy or cupy, by the algorithm of
+        scipy.special.logsumexp (scipy 1.18) for real input without weights, so that numpy gives
+        scipy's values to the last bit.
+
+        The largest term is taken out and counted, the others are summed relative to it and added
+        through log1p; a result that is not finite (every term -inf, or an inf or a NaN among them)
+        is the direct ln of the sum, as in scipy.
+        """
+        values = xp.asarray(values, dtype=xp.float64)
+        if values.shape[axis] == 0:
+            shape = list(values.shape)
+            del shape[axis]
+            return xp.full(tuple(shape), -xp.inf)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            direct = xp.log(xp.sum(xp.exp(values), axis=axis, keepdims=True))
+            largest = xp.max(values, axis=axis, keepdims=True)
+            at_largest = values == largest
+            count = xp.sum(at_largest.astype(values.dtype), axis=axis, keepdims=True)
+            rest = xp.sum(xp.exp(xp.where(at_largest, -xp.inf, values) - largest), axis=axis,
+                          keepdims=True)
+            rest = xp.where(rest == 0, rest, rest / count)
+            result = xp.log1p(rest) + xp.log(count) + largest
+            result = xp.where(xp.isfinite(result), result, direct)
+        return xp.squeeze(result, axis=axis)
+
+    @classmethod
+    def overlap_matrices(cls, overlaps, xp=np):
+        """The 4 by 4 matrices (n, 4, 4) of the kernels' upper triangles (n, 10), as
+        GBFStatRJMove.fstat_amplitudes builds them."""
+        matrices = xp.zeros(overlaps.shape[:-1] + (4, 4))
+        matrices[..., xp.asarray(cls.TRIU[0]), xp.asarray(cls.TRIU[1])] = overlaps
+        matrices = matrices + xp.swapaxes(matrices, -1, -2)
+        # the symmetrisation counted the diagonal twice
+        diagonal = xp.arange(4)
+        matrices[..., diagonal, diagonal] *= 0.5
+        return matrices
+
+    @classmethod
+    def cross_block(cls, products, xp=np):
+        """Re(A_i(source 1) | A_j(source 2)) (n, 4, 4) of the four filters, from the swap rows'
+        complex products (n, 2, 2), products[:, a, b] = (T_a(source 1) | T_b(source 2)) with
+        T_0 = T+ and T_1 = Tx.
+
+        The kernels' inner product is conjugate-linear in its first argument,
+        (c x | d y) = conj(c) d (x|y).
+        """
+        coefficients = xp.asarray(
+            np.conj(cls.FILTER_COEFFICIENTS)[:, None] * cls.FILTER_COEFFICIENTS[None, :])
+        templates = cls.FILTER_TEMPLATES
+        rows, columns = xp.asarray(templates[:, None]), xp.asarray(templates[None, :])
+        return xp.real(coefficients * products[..., rows, columns])
+
+    @classmethod
+    def pair_system(cls, projections_first, overlaps_first, projections_second, overlaps_second,
+                    products, xp=np):
+        """The eight-amplitude system of a pair in the filter basis: the projections (n, 8) and the
+        matrix (n, 8, 8), from the two F-statistic rows (projections (n, 4), upper triangles
+        (n, 10)) and the four swap products (n, 2, 2)."""
+        num_rows = projections_first.shape[0]
+        block = cls.cross_block(products, xp=xp)
+        matrix = xp.zeros((num_rows, 8, 8))
+        matrix[:, :4, :4] = cls.overlap_matrices(overlaps_first, xp=xp)
+        matrix[:, 4:, 4:] = cls.overlap_matrices(overlaps_second, xp=xp)
+        matrix[:, :4, 4:] = block
+        matrix[:, 4:, :4] = xp.swapaxes(block, -1, -2)
+        return xp.concatenate([projections_first, projections_second], axis=-1), matrix
+
+    @classmethod
+    def circular_system(cls, projections, matrix, xp=np):
+        """The system in the circular amplitudes, N_u = L^T N and M_u = L^T M L with
+        L = FILTER_FROM_CIRCULAR per source, for one source (4 amplitudes) or a pair (8)."""
+        num_sources = projections.shape[-1] // 4
+        transform = xp.kron(xp.eye(num_sources), xp.asarray(cls.FILTER_FROM_CIRCULAR))
+        return projections @ transform, transform.T[None] @ matrix @ transform[None]
+
+    @staticmethod
+    def amplitude_gaussian(projections_circular, matrix_circular, beta, ridge_fraction, xp=np):
+        """The tempered amplitude Gaussian of a system in the circular amplitudes.
+
+        Precision beta M_u + epsilon I, epsilon = ``ridge_fraction`` times the mean diagonal of
+        beta M_u, so that the ridge scales with the source's loudness and with beta;
+        mean = precision^-1 beta N_u. Returns the mean (n, d) and the lower Cholesky factor R
+        (n, d, d) of the precision, R R^T = precision.
+        """
+        dimension = projections_circular.shape[-1]
+        tempered = beta[:, None, None] * matrix_circular
+        ridge = ridge_fraction * xp.trace(tempered, axis1=-2, axis2=-1) / dimension
+        precision = tempered + ridge[:, None, None] * xp.eye(dimension)
+        factor = xp.linalg.cholesky(precision)
+        mean = xp.linalg.solve(precision, (beta[:, None] * projections_circular)[..., None])[..., 0]
+        return mean, factor
+
+    @staticmethod
+    def amplitude_draw(mean, factor, standard_normals, xp=np):
+        """u = mean + R^-T z, whose covariance is (R R^T)^-1."""
+        solved = xp.linalg.solve(xp.swapaxes(factor, -1, -2), standard_normals[..., None])
+        return mean + solved[..., 0]
+
+    @classmethod
+    def amplitude_log_density(cls, circular, mean, factor, xp=np):
+        """ln N(u; mean, (R R^T)^-1)."""
+        dimension = circular.shape[-1]
+        # R^T (u - mean), whose squared norm is the quadratic form of the precision
+        whitened = xp.einsum("nji,nj->ni", factor, circular - mean)
+        log_det_factor = xp.sum(xp.log(xp.diagonal(factor, axis1=-2, axis2=-1)), axis=-1)
+        return (-0.5 * dimension * cls.LOG_TWO_PI + log_det_factor
+                - 0.5 * xp.sum(whitened ** 2, axis=-1))
+
+    @classmethod
+    def regularised_covariance(cls, information, prior_widths, beta, xp=np):
+        """(beta F + P)^-1 (n, d, d) with P = diag(12 / w^2), the covariance whose factor
+        production's fisher_proposal_factor returns; solved in correlation form, as there."""
+        identity = xp.eye(information.shape[-1])
+        precision = (beta[:, None, None] * information
+                     + (cls.PRIOR_PRECISION_FACTOR / prior_widths ** 2)[:, :, None] * identity)
+        scale = xp.sqrt(xp.diagonal(precision, axis1=-2, axis2=-1))
+        correlation = precision / scale[:, :, None] / scale[:, None, :]
+        return xp.linalg.inv(correlation) / scale[:, :, None] / scale[:, None, :]
+
+    @classmethod
+    def intrinsic_block(cls, covariance, xp=np):
+        """The intrinsic block (n, 4, 4) of an 8 by 8 covariance, in INTRINSIC_ORDER."""
+        order = xp.asarray(cls.INTRINSIC_ORDER)
+        return covariance[:, order[:, None], order[None, :]]
+
+    @classmethod
+    def wrapped_factor(cls, covariance, xp=np):
+        """The lower Cholesky factor of ``covariance`` (n, d, d) whose last diagonal entry, the
+        conditional standard deviation of right ascension given the other coordinates, is capped at
+        RA_STD_CAP."""
+        factor = xp.linalg.cholesky(covariance)
+        factor[:, -1, -1] = xp.minimum(factor[:, -1, -1], cls.RA_STD_CAP)
+        return factor
+
+    @classmethod
+    def wrapped_draw(cls, mean, factor, standard_normals, xp=np):
+        """mean + factor z, the last coordinate (right ascension) wrapped into [0, 2 pi)."""
+        values = mean + xp.einsum("nij,nj->ni", factor, standard_normals)
+        values[:, -1] = xp.mod(values[:, -1], cls.TWO_PI)
+        return values
+
+    @classmethod
+    def wrapped_log_density(cls, values, mean, factor, xp=np):
+        """ln of the density of wrapped_draw: the Gaussian of the first d - 1 coordinates times the
+        wrapped normal of the last one given them, summed over 2 NUM_IMAGES_PER_SIDE + 1 images
+        around the conditional mean."""
+        leading = values.shape[-1] - 1
+        leading_factor = factor[:, :leading, :leading]
+        offsets = (values[:, :leading] - mean[:, :leading])[..., None]
+        whitened = xp.linalg.solve(leading_factor, offsets)[..., 0]
+        conditional_mean = mean[:, -1] + xp.einsum("ni,ni->n", factor[:, -1, :leading], whitened)
+        deviation = xp.mod(values[:, -1] - conditional_mean + np.pi, cls.TWO_PI) - np.pi
+        shifts = cls.TWO_PI * xp.arange(-cls.NUM_IMAGES_PER_SIDE, cls.NUM_IMAGES_PER_SIDE + 1)
+        deviation_std = factor[:, -1, -1]
+        log_images = (-0.5 * ((deviation[:, None] + shifts[None, :]) / deviation_std[:, None]) ** 2
+                      - xp.log(deviation_std)[:, None] - 0.5 * cls.LOG_TWO_PI)
+        log_leading = (-0.5 * xp.sum(whitened ** 2, axis=-1)
+                       - xp.sum(xp.log(xp.diagonal(leading_factor, axis1=-2, axis2=-1)), axis=-1)
+                       - 0.5 * leading * cls.LOG_TWO_PI)
+        return log_leading + cls.log_sum_exp(log_images, axis=-1, xp=xp)
+
+    @staticmethod
+    def chirp_metric(observation_seconds, midpoint_fraction, xp=np):
+        """The (f0, fdot) block (..., 2, 2) of the metric per unit squared SNR, in Hz and Hz/s.
+
+        f0 and fdot are values at the epoch t_ref, the phase constant is projected out;
+        ``midpoint_fraction`` is the time from t_ref to the data's midpoint over the span
+        ``observation_seconds``. Its inverse is [[180 mu^2 + 3, -180 mu / T], [-180 mu / T,
+        180 / T^2]] / (pi^2 T^2), mu the midpoint fraction and T the span.
+        """
+        span, midpoint = xp.broadcast_arrays(xp.asarray(observation_seconds, dtype=xp.float64),
+                                             xp.asarray(midpoint_fraction, dtype=xp.float64))
+        scale = np.pi ** 2 * span ** 2
+        metric = xp.empty(span.shape + (2, 2))
+        metric[..., 0, 0] = scale / 3.0
+        metric[..., 0, 1] = scale * midpoint * span / 3.0
+        metric[..., 1, 0] = metric[..., 0, 1]
+        metric[..., 1, 1] = scale * (midpoint ** 2 / 3.0 + 1.0 / 180.0) * span ** 2
+        return metric
+
+    @staticmethod
+    def ecliptic_pole_tangent(right_ascension, sin_dec, obliquity, xp=np):
+        """z (..., 2): the components of the unit vector toward the orbit's pole along the tangent
+        vectors of increasing declination and increasing right ascension at the source.
+
+        The pole lies at right ascension 3 pi / 2 and declination pi / 2 - obliquity, so
+        z_dec = sin dec sin ra sin eps + cos dec cos eps and z_ra = -cos ra sin eps. At obliquity 0
+        it is the coordinates' pole and z = (cos dec, 0).
+        """
+        cos_dec = xp.sqrt(1.0 - sin_dec ** 2)
+        sin_obliquity, cos_obliquity = np.sin(obliquity), np.cos(obliquity)
+        z_dec = sin_dec * xp.sin(right_ascension) * sin_obliquity + cos_dec * cos_obliquity
+        z_ra = -xp.cos(right_ascension) * sin_obliquity
+        return xp.stack(xp.broadcast_arrays(z_dec, z_ra), axis=-1)
+
+    @classmethod
+    def sky_metric(cls, frequency_hz, sin_dec, light_time_seconds, antenna_floor,
+                   right_ascension=None, obliquity=0.0, xp=np):
+        """The sky block (n, 2, 2) of the metric per unit squared SNR in the sampling columns
+        (sin dec, ra).
+
+        In the orthonormal tangent basis at the source the orbital Doppler phase gives
+        (2 pi f R)^2 / 2 (I - z z^T), z the tangent components of the orbit's pole
+        (ecliptic_pole_tangent), and the antenna floor adds on both directions; the map to
+        (sin dec, ra) scales the declination direction by 1 / cos dec and the right ascension
+        direction by cos dec, which leaves the cross term as it is. With obliquity 0 (the default,
+        the stand-in's convention) the pole is the coordinates' pole and the block is diagonal;
+        right_ascension is then not needed. The move's ICRS frame takes OBLIQUITY_ICRS_RAD.
+        """
+        doppler = 0.5 * (cls.TWO_PI * frequency_hz * light_time_seconds) ** 2
+        sin_dec = xp.asarray(sin_dec, dtype=xp.float64)
+        cos_squared = 1.0 - sin_dec ** 2
+        if right_ascension is None:
+            if np.any(np.asarray(obliquity) != 0.0):
+                raise ValueError("right_ascension is needed when the obliquity is not zero")
+            right_ascension = xp.zeros_like(sin_dec)
+        pole = cls.ecliptic_pole_tangent(
+            xp.asarray(right_ascension, dtype=xp.float64), sin_dec, obliquity, xp=xp)
+        metric = xp.zeros(sin_dec.shape + (2, 2))
+        metric[..., 0, 0] = (doppler * (1.0 - pole[..., 0] ** 2) + antenna_floor) / cos_squared
+        metric[..., 1, 1] = (doppler * (1.0 - pole[..., 1] ** 2) + antenna_floor) * cos_squared
+        metric[..., 0, 1] = -doppler * pole[..., 0] * pole[..., 1]
+        metric[..., 1, 0] = metric[..., 0, 1]
+        return metric
+
+    @classmethod
+    def intrinsic_metric(cls, intrinsic, observation_seconds, midpoint_fraction, light_time_seconds,
+                         antenna_floor, obliquity=0.0, xp=np):
+        """g (n, 4, 4) in INTRINSIC_ORDER and the sampling units at intrinsic points (n, 4) in
+        INTRINSIC_ORDER: the chirp block scaled to f0 in mHz, the sky block (its pole set by
+        ``obliquity``), no cross terms between them."""
+        conversion = xp.asarray([cls.HZ_PER_MHZ, 1.0])
+        metric = xp.zeros((intrinsic.shape[0], 4, 4))
+        metric[:, :2, :2] = (conversion[:, None]
+                             * cls.chirp_metric(observation_seconds, midpoint_fraction, xp=xp)
+                             * conversion)
+        metric[:, 2:, 2:] = cls.sky_metric(
+            cls.HZ_PER_MHZ * intrinsic[:, 0], intrinsic[:, 2], light_time_seconds, antenna_floor,
+            right_ascension=intrinsic[:, 3], obliquity=obliquity, xp=xp)
+        return metric
+
+    @classmethod
+    def local_covariance(cls, intrinsic, rho_eff_squared, prior_widths, observation_seconds,
+                         midpoint_fraction, light_time_seconds, antenna_floor, obliquity=0.0,
+                         xp=np):
+        """(rho_eff^2 g + P)^-1 (n, 4, 4) of the local part at intrinsic points (n, 4), P from
+        ``prior_widths`` (n, 4), both in INTRINSIC_ORDER; through regularised_covariance at beta 1,
+        so that production's inverse is reused."""
+        # ! the default obliquity 0 is the prototype's stand-in convention; the move passes
+        # ! OBLIQUITY_ICRS_RAD for production's ICRS frame
+        information = rho_eff_squared[:, None, None] * cls.intrinsic_metric(
+            intrinsic, observation_seconds, midpoint_fraction, light_time_seconds, antenna_floor,
+            obliquity=obliquity, xp=xp)
+        return cls.regularised_covariance(information, prior_widths, xp.ones(intrinsic.shape[0]),
+                                          xp=xp)
+
+    @classmethod
+    def record_in_sampling_columns(cls, record, band, xp=np):
+        """The intrinsic marginals of one band of a record in production's stored format.
+
+        The record holds per band the weights, means and covariances in the band's unit box,
+        y = 2 (x - min) / (max - min) - 1. Returns the weights (c,), the means (c, 4), the
+        covariances (c, 4, 4) on the record columns INTRINSIC_ORDER mapped back to the sampling
+        units (mean min + (y + 1) (max - min) / 2, covariance D S D with D = (max - min) / 2), and
+        their wrapped factors (c, 4, 4); c = gmm_counts[band].
+        """
+        if str(record["gmm_layout"]) != cls.RECORD_LAYOUT:
+            raise ValueError(
+                f"record layout {record['gmm_layout']!r}, expected {cls.RECORD_LAYOUT!r}")
+        count = int(record["gmm_counts"][band])
+        order = xp.asarray(cls.INTRINSIC_ORDER)
+        weights = xp.asarray(record["gmm_weights"][band, :count], dtype=xp.float64)
+        unit_means = xp.asarray(record["gmm_means"][band, :count], dtype=xp.float64)[:, order]
+        unit_covariances = xp.asarray(record["gmm_covs"][band, :count], dtype=xp.float64)[
+            :, order[:, None], order[None, :]]
+        lower = xp.asarray(record["gmm_mins"][band], dtype=xp.float64)[order]
+        half_width = 0.5 * (xp.asarray(record["gmm_maxs"][band], dtype=xp.float64)[order] - lower)
+        means = lower + (unit_means + 1.0) * half_width
+        covariances = half_width[:, None] * unit_covariances * half_width[None, :]
+        factors = cls.wrapped_factor(covariances, xp=xp) if count else xp.zeros((0, 4, 4))
+        return weights, means, covariances, factors
+
+    @classmethod
+    def active_components(cls, anchor_frequency, component_frequencies, log_weights, window, xp=np):
+        """The components' log weights (n, c) renormalised over those with |f_j - f1| <= ``window``,
+        -inf elsewhere, and whether a row has an active component (n,).
+
+        The components are shared by the rows, ``component_frequencies`` and ``log_weights`` (c,),
+        or one set per row (n, c), as the move holds them per band; ``window`` is a scalar or one
+        value per row.
+        """
+        component_frequencies = xp.asarray(component_frequencies)
+        log_weights = xp.asarray(log_weights)
+        if component_frequencies.ndim == 1:
+            component_frequencies = component_frequencies[None, :]
+        if log_weights.ndim == 1:
+            log_weights = log_weights[None, :]
+        window = xp.asarray(window)
+        if window.ndim == 1:
+            window = window[:, None]
+        active = xp.abs(component_frequencies - anchor_frequency[:, None]) <= window
+        has_active = xp.any(active, axis=1)
+        masked = xp.where(active, log_weights, -xp.inf)
+        if masked.shape[1] == 0:
+            return masked, has_active
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_norm = xp.where(has_active, cls.log_sum_exp(masked, axis=1, xp=xp), 0.0)
+        return xp.where(active, masked - log_norm[:, None], -xp.inf), has_active
+
+    @staticmethod
+    def companion_weights(has_active, weights, xp=np):
+        """The log weights (n, 3) of the search, local and prior parts from ``weights``
+        (w_s, w_l, w_p); a row without an active component gives w_s to the other two in proportion
+        to their weights."""
+        weight_search, weight_local, weight_prior = weights
+        # ! weights with w_l + w_p = 0 (a check of the search part alone) leave the second row NaN;
+        # ! it must not be used
+        with np.errstate(divide="ignore", invalid="ignore"):
+            active_row = np.log([weight_search, weight_local, weight_prior])
+            inactive_row = (np.log([0.0, weight_local, weight_prior])
+                            - np.log(weight_local + weight_prior))
+        return xp.where(xp.asarray(has_active)[:, None], xp.asarray(active_row)[None, :],
+                        xp.asarray(inactive_row)[None, :])
+
+    @classmethod
+    def companion_draw(cls, anchor, local_factor, component_means, component_factors,
+                       component_log_weights, has_active, weights, window, band_limits,
+                       prior_rest_draw, uniform_part, uniform_component, standard_normals,
+                       uniforms_prior, xp=np):
+        """The companion's intrinsic point (n, 4) in INTRINSIC_ORDER from the three-part mixture.
+
+        ``anchor`` (n, 4) and ``local_factor`` (n, 4, 4) give the local part; ``component_means``
+        (c, 4) or one set per row (n, c, 4), ``component_factors`` (c, 4, 4) or (n, c, 4, 4) and
+        ``component_log_weights`` (n, c) of active_components the search part; the prior part
+        draws f2 = f1 + (2 u - 1) W and (fdot, sin dec, ra) from ``prior_rest_draw(f2, uniforms)``.
+        ``window`` and the two ``band_limits`` are scalars or one value per row. Returns the point,
+        the part drawn (n,), the component (n,) or -1, and ``rejected`` (n,): |f2 - f1| > W or f2
+        outside [band low, band high).
+        """
+        num_rows, num_components = anchor.shape[0], component_means.shape[-2]
+        window = xp.broadcast_to(xp.asarray(window, dtype=xp.float64), (num_rows,))
+        # A part counts as passed when the uniform reaches its cumulative weight, so a zero weight
+        # is never drawn
+        part_log_weights = cls.companion_weights(has_active, weights, xp=xp)
+        part_cumulative = xp.cumsum(xp.exp(part_log_weights), axis=1)
+        part = xp.minimum(xp.sum(part_cumulative <= uniform_part[:, None], axis=1), cls.PART_PRIOR)
+        values = cls.wrapped_draw(anchor, local_factor, standard_normals, xp=xp)
+        component = xp.full(num_rows, -1)
+        if num_components:
+            means = xp.broadcast_to(component_means, (num_rows,) + component_means.shape[-2:])
+            factors = xp.broadcast_to(component_factors, (num_rows,) + component_factors.shape[-3:])
+            component_cumulative = xp.cumsum(xp.exp(component_log_weights), axis=1)
+            drawn = xp.sum(
+                component_cumulative <= uniform_component[:, None] * component_cumulative[:, -1:],
+                axis=1)
+            drawn = xp.minimum(drawn, num_components - 1)
+            from_search = part == cls.PART_SEARCH
+            rows = xp.flatnonzero(from_search)
+            values[rows] = cls.wrapped_draw(
+                means[rows, drawn[rows]], factors[rows, drawn[rows]], standard_normals[rows], xp=xp)
+            component = xp.where(from_search, drawn, -1)
+        # ! Integer rows, not a boolean mask: cupy's ix_ does not turn a mask into row numbers as
+        # ! numpy's does, and a mask next to another index is read differently by the two
+        rows_prior = xp.flatnonzero(part == cls.PART_PRIOR)
+        frequency = (anchor[rows_prior, 0]
+                     + (2.0 * uniforms_prior[rows_prior, 0] - 1.0) * window[rows_prior])
+        values[rows_prior, 0] = frequency
+        values[xp.ix_(rows_prior, xp.asarray(cls.REST_IN_INTRINSIC))] = prior_rest_draw(
+            frequency, uniforms_prior[rows_prior, 1:])
+        offset = xp.abs(values[:, 0] - anchor[:, 0])
+        rejected = ((offset > window) | (values[:, 0] < band_limits[0])
+                    | (values[:, 0] >= band_limits[1]))
+        return values, part, component, rejected
+
+    @classmethod
+    def companion_log_density(cls, companion, anchor, local_factor, component_means,
+                              component_factors, component_log_weights, log_prior_part, has_active,
+                              weights, xp=np):
+        """ln q_c (n,) of companions (n, 4) in INTRINSIC_ORDER: the log-sum of the search part (the
+        active components' wrapped Gaussians), the local wrapped Gaussian at the anchor and
+        ``log_prior_part`` (n,), ln pi(fdot2 | f2) + ln pi(sin dec2) + ln pi(ra2) - ln(2 W), with
+        the weights of companion_weights; untruncated. The components are shared, (c, 4) and
+        (c, 4, 4), or one set per row, (n, c, 4) and (n, c, 4, 4). The search part scores all pairs
+        of row and component in one call of wrapped_log_density."""
+        num_rows, num_components = companion.shape[0], component_means.shape[-2]
+        log_search = xp.full(num_rows, -xp.inf)
+        if num_components:
+            means = xp.broadcast_to(component_means, (num_rows,) + component_means.shape[-2:])
+            factors = xp.broadcast_to(component_factors, (num_rows,) + component_factors.shape[-3:])
+            # * One call over the pairs, in the row-major order of the (rows, components) stack: a
+            # * call costs about 1.2 ms of small kernels whatever its rows, and one per component
+            # * was a fifth of the step
+            repeated = xp.broadcast_to(
+                companion[:, None, :], (num_rows, num_components, companion.shape[-1]))
+            log_components = cls.wrapped_log_density(
+                repeated.reshape(-1, companion.shape[-1]), means.reshape(-1, means.shape[-1]),
+                factors.reshape((-1,) + factors.shape[-2:]), xp=xp,
+            ).reshape(num_rows, num_components)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                log_search = cls.log_sum_exp(component_log_weights + log_components, axis=1, xp=xp)
+        log_local = cls.wrapped_log_density(companion, anchor, local_factor, xp=xp)
+        part_log_weights = cls.companion_weights(has_active, weights, xp=xp)
+        log_parts = xp.stack([log_search, log_local, log_prior_part], axis=1) + part_log_weights
+        return cls.log_sum_exp(log_parts, axis=1, xp=xp)
+
+    @classmethod
+    def filter_rows(cls, rows):
+        """The sampling rows of the templates T+ and Tx at each row's intrinsic point: A = 2,
+        cos iota = 0, phi0 = 0 and psi = 0 (T+) or pi / 4 (Tx)."""
+        plus = rows.copy()
+        plus[:, cls.COL_LN_AMP] = cls.FILTER_LOG_AMPLITUDE
+        plus[:, cls.COL_PHI0] = 0.0
+        plus[:, cls.COL_COS_IOTA] = 0.0
+        plus[:, cls.COL_PSI] = 0.0
+        cross = plus.copy()
+        cross[:, cls.COL_PSI] = cls.FILTER_CROSS_PSI
+        return plus, cross
+
+    @staticmethod
+    def split_log_acceptance(*, beta, delta_log_likelihood, log_prior_ratio, bookkeeping,
+                             log_merge_density, log_split_density):
+        """ln alpha of a split, as the prototype assembles it for the checks: beta Delta ln L
+        + ln pi(a) + ln pi(b) - ln pi(parent) + the bookkeeping (without the prior ratio)
+        + ln q_merge(parent | children) - ln q_split(children | parent). A merge takes minus the
+        terms of its reverse split."""
+        return (beta * delta_log_likelihood + log_prior_ratio + bookkeeping + log_merge_density
+                - log_split_density)
+
+    @classmethod
+    def split_log_acceptance_terms(cls, *, log_prior_ratio, num_alive_walker, num_slots,
+                                   log_band_share, num_dead_lower, log_partner_upper,
+                                   log_merge_upper, log_split_lower, log_merge_density,
+                                   log_split_density, xp=np):
+        """ln alpha of a split without the beta Delta ln L term (the acceptance, the recipe's split
+        step 6): the mixin's prior ratio and bookkeeping, plus ln q_merge - ln q_split. A merge
+        takes minus the terms of its reverse split, with the counts of its lower state."""
+        bookkeeping = cls.rj_bookkeeping_log_terms(
+            log_prior_ratio=log_prior_ratio, num_alive_walker=num_alive_walker, num_slots=num_slots,
+            log_band_share=log_band_share, num_dead_lower=num_dead_lower,
+            log_partner_upper=log_partner_upper, log_merge_upper=log_merge_upper,
+            log_split_lower=log_split_lower, xp=xp)
+        return bookkeeping + log_merge_density - log_split_density
 
 
 class GBSpecialRJSearchMove(GBSpecialBase): #? only needed for mutli GPU usage

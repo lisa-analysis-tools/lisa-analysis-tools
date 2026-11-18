@@ -127,6 +127,21 @@ class StageSpec(_Spec):
         return any(v is not None for v in (self.num_prop_repeats, self.inner_move_weights, self.flow_weight))
 
 
+class MoveStageSpec(_Spec):
+    """What a recipe stage sets on ONE move of a block with several (a gb ``extra_moves`` entry): attribute
+    path -> value, as ``StageSpec.attributes``, set after the block's own ``stages`` and going over them."""
+
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _paths_read(self):
+        from lisatools.utils.utility import attribute_path
+
+        for path in self.attributes:
+            attribute_path(path)
+        return self
+
+
 class AdaptiveRepeatsSpec(_Spec):
     """A source block's proposal repeats follow its inner autocorrelation time (``recipe.RepeatController``).
 
@@ -637,6 +652,17 @@ class SourceBlock(MoveBlock):
         """Builder-filled kwargs of the inner moves, by move class name (e.g. ``SkyMove``)."""
         return {}
 
+    def frequency_ranges(self, ctx: BuildContext, info: dict[str, Any]) -> list[tuple[float, float]]:
+        """The frequency ranges ``SourceMetadata`` records: the analysis band (``info``: the parsed priors, for
+        the blocks whose leaves have bounds of their own)."""
+        return [(ctx.general.start_freq, ctx.general.end_freq)]
+
+    def metadata_comment(self, ctx: BuildContext) -> str:
+        """``SourceMetadata.comment``: the epoch the sampled (and written) waveform quantities are referenced to."""
+        if self.time_reference == "mojito":
+            return "The waveform quantities are referenced to the MOJITO_REFERENCE_TIME (t_init)."
+        return "The waveform quantities are referenced to the data start (t_0)."
+
     def build_source(self, ctx: BuildContext) -> BlockBuild:
         """Build this branch's Setup and metadata (the waveform class is resolved, not constructed)."""
         erebor = importlib.import_module("lisatools.globalfit.stock.erebor")
@@ -683,7 +709,8 @@ class SourceBlock(MoveBlock):
         if self.flow is not None:
             # after the Setup, so a block without inner_moves keeps the Setup's default next to the flow
             setup.inner_moves = [*setup.inner_moves, (make_flow_move(self, ctx, info, nleaves), self.flow.weight)]
-        return BlockBuild(setup, source_metadata(self, init_kwargs, g), waveform_class, resolve_td_generator(self, ctx))
+        metadata = source_metadata(self, ctx, init_kwargs, self.frequency_ranges(ctx, info))
+        return BlockBuild(setup, metadata, waveform_class, resolve_td_generator(self, ctx))
 
 # --- build helpers (heavy imports stay inside functions) ---
 
@@ -781,7 +808,9 @@ TIME_REFERENCE_NAMES = {"mojito": "MOJITO_REFERENCE_TIME", "data_start": "data_s
 def waveform_metadata_config(init_kwargs: dict, time_reference: str) -> dict:
     """What SourceMetadata records: no live objects (data/STFT settings, orbits), CPU backend (as the settings
     files did), and what ``waveform_t0`` is (the sampled times and phases are referenced to it)."""
-    config = {k: v for k, v in init_kwargs.items() if k not in ("data_td_settings", "settings", "orbits")}
+    # * A copy of its own: the waveform is built from init_kwargs later and may write into its nested dicts
+    # * (few puts the trajectory class into inspiral_kwargs["func"]), which must not reach the metadata.
+    config = deepcopy({k: v for k, v in init_kwargs.items() if k not in ("data_td_settings", "settings", "orbits")})
     config["force_backend"] = "cpu"
     config["time_reference"] = TIME_REFERENCE_NAMES[time_reference]
     return config
@@ -907,16 +936,25 @@ def make_proposal_priors(block: SourceBlock, cfg, branch_prior) -> list:
     return leaf_priors
 
 
-def source_metadata(block: SourceBlock, init_kwargs: dict, general):
+def source_metadata(
+    block: SourceBlock, ctx: BuildContext, init_kwargs: dict, frequency_ranges: list[tuple[float, float]],
+):
+    """``t_0`` is the data start, ``t_init`` the epoch the block's waveforms are referenced to (``waveform_t0``);
+    the comment (``block.metadata_comment``) says which epoch the written quantities belong to."""
     from lisatools.globalfit.postprocessing import SourceMetadata
 
     return SourceMetadata(
+        t_0=float(ctx.general.data_t0),
+        t_init=float(block.waveform_t0(ctx)),
+        # stays False: a block whose written quantities are moved to another epoch (sobbh, in the
+        # postprocessing) documents the procedure in the comment instead
+        time_shift_corrected=False,
         source_type=block.SOURCE_TYPE,
-        frequency_ranges=[(general.start_freq, general.end_freq)],
+        frequency_ranges=frequency_ranges,
         waveform_model=block.waveform.class_name,
         waveform_model_code_link=block.links.waveform_model_code_link,
         waveform_model_config=waveform_metadata_config(init_kwargs, block.time_reference),
         prior_model_code_link=block.links.prior_model_code_link,
         prior_model_config_file=block.links.prior_model_config_file,
+        comment=block.metadata_comment(ctx),
     )
-

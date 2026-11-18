@@ -186,7 +186,8 @@ on the ESA orbits that LAT ships, a year of one-day segments from day 10 of the 
 sources: 0.5 and 20 mHz, at each the two ḟ bounds of the global fit's GB prior (1.1e-18 and
 -6.6e-20 Hz/s at 0.5 mHz, 8.2e-13 and -2.3e-11 Hz/s at 20 mHz), each at two sky positions.
 Templates with the production settings but 60 side bins, on data windowed with the periodic Tukey
-window of taper 0.1157 that both responses integrate. Ranges over the four sources of each
+window of taper 0.1157, the window both responses integrated until 2026-11-16 (see the window
+convention below). Ranges over the four sources of each
 frequency; the segment error is max |h - d| / max |d| per segment and channel.
 
 | Frequency | Response | Flat mismatch, template pixels | Median segment error | Largest segment error | Noise-weighted mismatch |
@@ -207,11 +208,18 @@ frequency; the segment error is max |h - d| / max |d| per segment and channel.
   X + Y + Z (2.6e-3 to 3.7e-3 of its size against 3.4e-4 for DFFR), which carries 0.9 % of the
   signal of A there and far less noise, so the likelihood weights it heavily.
 - The window convention. The global fit windows the data with LAT's symmetric Tukey window, which
-  divides by N - 1 and is zero at the last sample; both responses integrate the periodic one. The
-  two data transforms differ by a flat mismatch of 3.6e-8 and a median segment error of 6.3e-5,
-  the same for every source and segment; in ln L at the true parameters it costs SNR² × 3.6e-8.
-  Production keeps its window, since its 10 side bins cost four orders of magnitude more (next
-  point); the validation ran on data with the periodic window.
+  divides by N - 1 and is zero at the first and the last sample. Until 2026-11-16 both responses
+  integrated the periodic one: the two data transforms differ by a flat mismatch of 3.6e-8 and a
+  median segment error of 6.3e-5, the same for every source and segment, which costs
+  SNR² × 3.6e-8 in ln L at the true parameters. Since then both integrate the symmetric window by
+  default. On 30 one-day segments of eight sources (ESA orbits; 3, 20 and 40 mHz and a chirping
+  source at 20 mHz, two sky positions each; 60 side bins; `stft_accuracy.py --model-window`), each
+  window on data of its own window gives the same numbers to four digits: DFFR a flat mismatch of
+  6.5e-10 to 1.2e-9, a median segment error of 3.2e-5 to 4.7e-5 and a noise-weighted mismatch of
+  1.8e-8 to 2.8e-8, the existing response 3.0e-10 to 1.0e-8, 1.4e-5 to 3.0e-5 and 1.8e-8 to
+  8.2e-8. Templates of the other window leave a flat mismatch of 3.5e-8 to 3.8e-8 (DFFR) and
+  3.6e-8 to 4.6e-8 (existing). The validation above ran on data and templates of the periodic
+  window.
 - Side bins. With the 10 side bins of production and the taper 0.1157, 1.3e-3 (20 mHz) to 1.7e-3
   (0.5 mHz) of (d|d) lies outside the template, for both responses: a noise-weighted mismatch of
   6.4e-4 to 8.8e-4, and a loss of 6 to 9 in ln L at the true parameters for a source of SNR 100.
@@ -487,8 +495,13 @@ module for sm_90 with nvcc; no H100 timing was made.
 
 ## Unit tests
 
-- LAT `tests/test_orbit_kinematics.py` (13 tests) and `tests/test_fresnel.py` (9 tests): the
-  tables above; CPU and A100.
+- LAT `tests/test_orbit_kinematics.py` (13 tests) and `tests/test_fresnel.py` (9 tests, 14 since
+  the symmetric window): the tables above; CPU and A100. Since 2026-11-16 `test_fresnel.py` also
+  compares the windowed transform of linear chirps (chirp rates ±4e-13 and 1e-20 Hz/s, 8
+  frequencies from 19 bins below to 18 above a 4.2 mHz carrier) with the direct sum over the
+  17 280 samples of a one-day segment at 5 s: each window within 1e-9 of the peak of its own sum
+  and more than 1e-5 from the other's, on the CPU and the GPU; it checks the arguments N and h and
+  that a group hands its Fresnel objects the symmetric window by default.
 - GBGPU `tests/test_stft_gb_dffr.py` (38 tests on the A100, 27 on the CPU, where the CUDA classes
   are skipped). The six likelihood methods of `STFTGBComputations(response="dffr")` on a fixture
   of 24 six-hour segments: `fill_global` followed by the inner product equals `get_ll` (rtol
@@ -516,6 +529,21 @@ module for sm_90 with nvcc; no H100 timing was made.
   1e-12), on two data and two noise rows and in a window that cuts the bands; 2F against the 4x4
   solve within 1e-12 of max(1, 2F); against the four-filter F-statistic within the rounding of its
   filters' shifted phases; an empty batch, and the other response refused.
+- The same file since the symmetric window (2026-11-16, 87 tests, 31 of them CUDA tests): the
+  fixtures keep the periodic window, for which their bounds were set; the consumer identities,
+  the Fisher matrix and the CUDA tests run again with the symmetric window, and both responses
+  change by the same amount from one window to the other (1.06e-3 of the template peak, the two
+  changes agree to 2.6e-3 of their size). On the CPU all pass. On an A100 MIG slice the two kinds
+  of failure above occur in both windows and are kept as they are: the compact template (383 of
+  1080 elements, at most 3.5e-15, with the symmetric window), and the gradients against host
+  differences, the `get_ll` gradient now included. The host differences resolve ln L to its last
+  bit, 2^-130 on the fixture, so f̈ moves in steps of 3.7e-12, 1e-6 to 1.1e-5 of its value, and ḟ
+  in steps of 3.7e-19; kernel and host differ by 5 to 48 such steps, since they compute ln L in
+  different kernels with their own multiply-add contraction. The periodic `get_ll` gradient
+  landed on the same step before the change and misses by 31 steps after it, with its arithmetic
+  unchanged. On the GPU, `get_ll` and `fill_global` stay within 3.9e-15 and 7.0e-15 of the CPU's
+  peak (bound 1e-12) and the Fisher matrix within 1.0e-8 of sqrt(F_ii F_jj) (bound 1e-7), in both
+  windows.
 - GBGPU `tests/test_stft_gb.py`: the TDI-on-the-fly response with the DFFR setting it must ignore
   gives every output bit for bit; its exact amplitude and phase Fisher entries hold to 1.4e-6.
 - LAT `tests/test_gb_likelihood_engine.py`: the STFT band engine fills, evaluates, swaps and

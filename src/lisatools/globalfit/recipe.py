@@ -54,6 +54,7 @@ from .moves.gbbandstructure import plot_band_layout, stft_store_window_layout
 from .moves.gbspecialmove import (
     GBFStatRJMove,
     GBFStatSettings,
+    GBFStatSplitMergeRJMove,
     GBSpecialRJPriorMove,
     GBSpecialRJRefitMove,
     GBSpecialBase
@@ -274,6 +275,7 @@ class BaseRecipeStep(RecipeStep):
     repeat_controllers: dict = {}
     kept_repeats: tuple = ()
     move_attributes: dict = {}
+    attribute_targets: dict = {}
     name: str | None = None
     backend = None
 
@@ -285,6 +287,7 @@ class BaseRecipeStep(RecipeStep):
         repeat_controllers: dict[str, "RepeatController"] | None = None,
         kept_repeats: typing.Iterable[str] = (),
         move_attributes: dict[str, dict] | None = None,
+        attribute_targets: dict[str, list] | None = None,
     ):
         super().__init__(moves=moves, weights=weights)
         self.move_settings = move_settings or {}
@@ -294,43 +297,66 @@ class BaseRecipeStep(RecipeStep):
         self.kept_repeats = tuple(kept_repeats)
         # branch -> {attribute path: value} set on the branch's moves when the step starts (set_attribute)
         self.move_attributes = move_attributes or {}
+        # target name -> its moves, for move_attributes (a block's moves, one of its moves); see apply_move_attributes
+        self.attribute_targets = attribute_targets or {}
         self.name: str | None = None  # the step's name in the Recipe (set by Recipe._start_current_step)
         self.backend = None  # the Recipe's backend (same)
 
-    def _branch_moves(self) -> dict[str, list]:
-        """The moves of each branch in this step (inside the combined moves too), each once."""
+    def _step_moves(self) -> list:
+        """The moves of this step (those inside the combined moves too), each once."""
         from eryn.moves import CombineMove
 
-        out: dict[str, list] = {}
+        out: list = []
         for move in self.moves:
             move = move[0] if isinstance(move, tuple) else move
             for sub in move.sub_moves if isinstance(move, CombineMove) else [move]:
-                listed = out.setdefault(getattr(sub, "branch_name", None), [])
-                if not any(sub is other for other in listed):
-                    listed.append(sub)
+                if not any(sub is other for other in out):
+                    out.append(sub)
+        return out
+
+    def _branch_moves(self) -> dict[str, list]:
+        """The moves of each branch in this step, by the moves' ``branch_name`` (None for a move without one)."""
+        out: dict[str, list] = {}
+        for move in self._step_moves():
+            out.setdefault(getattr(move, "branch_name", None), []).append(move)
         return out
 
     def apply_move_attributes(self, dry_run: bool = False) -> None:
-        """Set each branch's :attr:`move_attributes` on its moves in this step (:func:`set_attribute`).
+        """Set :attr:`move_attributes`, ``{target: {path: value}}``, on the targets' moves (:func:`set_attribute`).
 
-        A path is set on every move of the branch that has it, and must be there on one at least: an unknown
-        branch or a path that no move of the branch has is an error. ``dry_run`` only checks that.
+        A target's moves are those :attr:`attribute_targets` lists for it (a block, or one move of a block:
+        the move builders know which moves are whose); a target not listed there is a branch name, looked up on
+        the moves' ``branch_name``. Only the moves in this step are set. The targets are taken in order, so a
+        later one (one move) goes over an earlier one (its block).
+
+        A path is set on every move of the target that has it, and must be there on one at least. An unknown
+        target, or a path that no move of the target has, is an error; a target none of whose moves is in this
+        step (a move that takes no turn in this stage) is left. ``dry_run`` only checks.
         """
-        moves = self._branch_moves()
-        for branch, attributes in self.move_attributes.items():
-            if branch not in moves:
-                raise ValueError(f"move attributes for {branch!r}: this step has no move of that branch.")
+        in_step, by_branch = self._step_moves(), self._branch_moves()
+        for target, attributes in self.move_attributes.items():
+            if target in self.attribute_targets:
+                moves = [m for m in self.attribute_targets[target] if any(m is other for other in in_step)]
+                if not moves:
+                    continue
+            elif target in by_branch:
+                moves = by_branch[target]
+            else:
+                raise ValueError(
+                    f"move attributes for {target!r}: no move of that name or branch (known: "
+                    f"{sorted(self.attribute_targets) or sorted(str(b) for b in by_branch)})."
+                )
             for path, value in attributes.items():
                 done, errors = [], []
-                for move in moves[branch]:
+                for move in moves:
                     try:
                         done.append(set_attribute(move, path, value, dry_run=dry_run))
                     except (AttributeError, IndexError) as err:
                         errors.append(f"{type(move).__name__}: {err}")
                 if not done:
-                    raise ValueError(f"{branch} move attribute {path!r} fits no move of the branch: {errors}.")
+                    raise ValueError(f"{target} move attribute {path!r} fits no move of {target}: {errors}.")
                 if not dry_run:
-                    logger.info(f"{branch} move attribute: {done[0]}")
+                    logger.info(f"{target} move attribute ({len(done)} of {len(moves)} moves): {done[0]}")
 
     def _stored_repeats(self, branch: str) -> dict:
         if self.backend is None or not hasattr(self.backend, "recipe_repeats"):
@@ -537,6 +563,37 @@ class RepeatController:
         return self.values()
 
 
+def gating_series(chain, inds, periods_branch: dict | None = None) -> tuple[np.ndarray | None, dict | None, str]:
+    """``(x[nsteps, nwalkers, nseries], periods, note)``: the series of a cold chain ``[nsteps, nwalkers, nleaves,
+    ndim]`` whose ACT counts, for the convergence stop and for the thinning in postprocessing alike. ``x`` is None
+    if there is none.
+
+    Left out: leaf slots not active through the whole stretch (``inds``), and parameters with no variance at all
+    (the same value in every walker and iteration: fixed by construction). A parameter where each walker sits at
+    its own value stays in, and its ACT is not defined. ``periods_branch``: ``{parameter index: period}``;
+    ``periods`` are those of the columns of ``x``.
+    """
+    chain, inds = np.asarray(chain), np.asarray(inds)
+    active = inds.all(axis=(0, 1))
+    ndim = chain.shape[-1]
+    x = chain[:, :, active].reshape(chain.shape[0], chain.shape[1], -1)
+    varies = np.ptp(x, axis=(0, 1)) > 0.0 if x.size else np.zeros(x.shape[-1], dtype=bool)
+    columns = np.flatnonzero(varies)
+    periods = {}
+    for new, old in enumerate(columns):
+        period = (periods_branch or {}).get(int(old % ndim))
+        if period is not None:
+            periods[new] = period
+    note = ""
+    if not active.all():
+        note += f" {int((~active).sum())} inactive leaves left out;"
+    if not varies.all():
+        note += f" {int((~varies).sum())} fixed parameters left out;"
+    if columns.size == 0:
+        return None, None, note + " nothing to monitor;"
+    return x[:, :, columns], periods, note
+
+
 class ChainMonitor:
     """The cold-chain series of one block that gate a :class:`ConvergenceRecipeStep`: its sampled parameters."""
 
@@ -544,36 +601,13 @@ class ChainMonitor:
         self.branch = branch
 
     def series(self, backend, start: int, stop: int, periodic) -> tuple[np.ndarray | None, dict | None, str]:
-        """``(x[nsteps, nwalkers, nseries], periods, note)`` since iteration ``start``; ``x`` None if nothing gates.
-
-        Left out: leaf slots not active through the whole stretch, and parameters with no variance at all (the
-        same value in every walker and iteration: fixed by construction). A parameter where each walker sits at
-        its own value stays in, and reads as not converged.
-        """
+        """:func:`gating_series` of the block's cold chain since iteration ``start``."""
         from lisatools.sampling.utility import branch_periods
 
         kwargs = dict(slice_vals=slice(start, stop), temp_index=0, branch_names=[self.branch])
-        chain = np.asarray(backend.get_chain(**kwargs)[self.branch])  # (nsteps, nwalkers, nleaves, ndim)
-        inds = np.asarray(backend.get_inds(**kwargs)[self.branch])
-        active = inds.all(axis=(0, 1))
-        ndim = chain.shape[-1]
-        x = chain[:, :, active].reshape(chain.shape[0], chain.shape[1], -1)
-        periods_branch = branch_periods(periodic, self.branch)
-        varies = np.ptp(x, axis=(0, 1)) > 0.0
-        columns = np.flatnonzero(varies)
-        periods = {}
-        for new, old in enumerate(columns):
-            period = periods_branch.get(int(old % ndim))
-            if period is not None:
-                periods[new] = period
-        note = ""
-        if not active.all():
-            note += f" {int((~active).sum())} inactive leaves left out;"
-        if not varies.all():
-            note += f" {int((~varies).sum())} fixed parameters left out;"
-        if columns.size == 0:
-            return None, None, note + " nothing to monitor;"
-        return x[:, :, columns], periods, note
+        chain = backend.get_chain(**kwargs)[self.branch]  # (nsteps, nwalkers, nleaves, ndim)
+        inds = backend.get_inds(**kwargs)[self.branch]
+        return gating_series(chain, inds, branch_periods(periodic, self.branch))
 
 
 class GBCountMonitor:
@@ -1703,6 +1737,40 @@ def default_fstat_settings(fstat_settings, artifacts_file_dir: str):
     return dataclasses.replace(settings, output_dir=os.path.join(artifacts_file_dir, "fstat_search", ""))
 
 
+# * The search memory's file in the run's artifacts folder: one name at every start, so that a restart finds it
+FSTAT_SEARCH_MEMORY_FILE = "fstat_search_memory.npz"
+
+
+def run_resumes(curr: CurrentInfoGlobalFit) -> bool:
+    """Whether the run resumes from stored iterations: its main backend file is initialised and holds more than zero
+    of them, the test ``load_info`` of the engine applies. The existence of the file says nothing, since the engine
+    creates and resets it before the builders run."""
+    from .hdfbackend import GFHDFBackend
+
+    backend_path = curr.general_info.main_file_path
+    if not os.path.exists(backend_path):
+        return False
+    backend = GFHDFBackend(backend_path)
+    return bool(backend.initialized and backend.iteration > 0)
+
+
+def make_fstat_search_memory(curr: CurrentInfoGlobalFit):
+    """The search memory that the F-statistic moves of a run share (:class:`FStatSearchMemory`): it saves itself to
+    ``FSTAT_SEARCH_MEMORY_FILE`` in the run's artifacts folder and loads that file when the run resumes (a file that is
+    missing then gives a warning and an empty memory). The split and merge binds it to its layout."""
+    from .moves.gbspecialmove import FStatSearchMemory
+
+    path = os.path.join(curr.general_info.artifacts_file_dir, FSTAT_SEARCH_MEMORY_FILE)
+    resume = run_resumes(curr)
+    logger.info(f"Search memory of the F-statistic moves: {path}, the run resumes: {resume}")
+    if resume and not os.path.exists(path):
+        logger.warning(
+            f"The run resumes, but the search memory file {path} does not exist: the memory starts empty, so the "
+            "split and merge has no search part from the searches before the restart."
+        )
+    return FStatSearchMemory(path, resume=resume)
+
+
 def prepare_gb_moves(
     engine_info: Setup,
     curr: CurrentInfoGlobalFit,
@@ -2209,6 +2277,14 @@ def build_gb_moves(
                 f"does not exist or include_refit is False."
             )
 
+    # * The F-statistic moves share one search memory when the split and merge reads no record files
+    split_merge_settings = getattr(move_settings, "fstat_split_merge_settings", None)
+    search_memory = None
+    if "rj_fstat_split_merge" in search_move_names + pe_move_names and (
+        split_merge_settings is None or split_merge_settings.record_files is None
+    ):
+        search_memory = make_fstat_search_memory(curr)
+
     def _create_move(name: str) -> GBSpecialBase:
         # * the search moves recompute each source's Fisher matrix at every block, since a source
         # * climbing onto its signal needs one at its current position
@@ -2234,6 +2310,7 @@ def build_gb_moves(
                 is_rj_prop=True,
                 run_swaps=False,
                 name="rj_fstat_mcmc_search",
+                fstat_search_memory=search_memory,
                 phase_maximize=False,
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
@@ -2273,6 +2350,7 @@ def build_gb_moves(
                 rj_proposal_distribution=None,
                 run_swaps=True,
                 name="rj_fstat_mcmc",
+                fstat_search_memory=search_memory,
                 phase_maximize=False,
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
@@ -2292,6 +2370,21 @@ def build_gb_moves(
                 ranks_needed=0,
                 num_stationary_fim_steps=fim_interval,
                 **{**gb_move_kwargs, "leaf_cap_update": False},
+            )
+        elif name == "rj_fstat_split_merge":
+            # * Split and merge in place of birth and death; the sorter draws its dead rows as for rj_prior
+            move = GBFStatSplitMergeRJMove(
+                *gb_move_args,
+                rj_proposal_distribution=gpu_priors,
+                name="rj_fstat_split_merge",
+                fstat_search_memory=search_memory,
+                use_prior_removal=False,
+                phase_maximize=False,
+                ranks_needed=0,
+                run_swaps=True,
+                num_stationary_fim_steps=fim_interval,
+                fstat_split_merge_settings=getattr(move_settings, "fstat_split_merge_settings", None),
+                **gb_move_kwargs,
             )
         else:
             raise ValueError(f"Unknown GB move name '{name}'.")

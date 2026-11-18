@@ -41,6 +41,7 @@ from ..searches import MBHBSearchInterface, GBSearchInterface, EMRISearchInterfa
 if typing.TYPE_CHECKING:
     from ..moves.gbspecialmove import GBLeafCapSettings, GBSigHetSettings
     from ..moves.gbspecialmove import GBFStatSettings
+    from ..moves.gbspecialmove import GBFStatSplitMergeSettings
 
 
 # * The GB code reads the sampling columns by position: the amplitude (ln A) first, then these.
@@ -152,6 +153,8 @@ class GBMoveSettings:
     search_kwargs: Optional[dict[str, Any]] = None
     # Read by the F-statistic moves (rj_fstat_mcmc, rj_fstat_mcmc_search) only; None takes their defaults.
     fstat_settings: Optional[GBFStatSettings] = None
+    # Read by the rj_fstat_split_merge move only; None takes its defaults.
+    fstat_split_merge_settings: Optional[GBFStatSplitMergeSettings] = None
 
 
 @dataclasses.dataclass
@@ -425,6 +428,7 @@ class GBSetup(Setup, GBSettings):
         waveform_model_code_link: str = "",
         prior_model_code_link: str = "",
         prior_model_config_file: str = "",
+        data_t0: Optional[float] = None,
     ):
         """The GB branch's :class:`SourceMetadata`: per-band frequency ranges, GBGPU arguments.
 
@@ -447,6 +451,9 @@ class GBSetup(Setup, GBSettings):
             waveform_model_config=dict(
                 init_kwargs=init_kwargs, runtime_kwargs=self.waveform.waveform_kwargs
             ),
+            # both GBGPU's t0, the data start
+            t_0=data_t0 if data_t0 is not None else self.waveform.t0,
+            t_init=self.waveform.t0,
         )
 
     def prior_f0_range_hz(self) -> tuple[float, float]:

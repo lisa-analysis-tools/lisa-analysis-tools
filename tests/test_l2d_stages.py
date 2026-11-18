@@ -887,12 +887,104 @@ class StageAttributesTest(unittest.TestCase):
     def test_a_path_no_move_has_fails_when_the_steps_are_built(self):
         move, _flow = move_with_flow()
         for attributes, msg in [
-            ({"mbh": {"flow_bufer_thin": 10}}, "fits no move of the branch"),
-            ({"mbh": {"moves[-1].trainer.tune": {}}}, "fits no move of the branch"),
-            ({"emri": {"flow_buffer_thin": 10}}, "no move of that branch"),
+            ({"mbh": {"flow_bufer_thin": 10}}, "fits no move of mbh"),
+            ({"mbh": {"moves[-1].trainer.tune": {}}}, "fits no move of mbh"),
+            ({"emri": {"flow_buffer_thin": 10}}, "no move of that name or branch"),
         ]:
             with self.subTest(attributes=attributes), self.assertRaisesRegex(ValueError, msg):
                 self.recipe(move, attributes=lambda stage: attributes if stage == "pe" else {})
+
+
+class SeveralMovesAttributesTest(unittest.TestCase):
+    """A block with several moves (gb: the pe_move and the extra moves), none of which has a ``branch_name``."""
+
+    STAGES = [{"name": "burn-in", "iterations": 3}, {"name": "pe"}]
+
+    def gb(self):
+        def move(name, **more):
+            return types.SimpleNamespace(name=name, stretch_probability=0.3, num_stationary_fim_steps=7, **more)
+
+        fixed = []
+        split = move("gb split_merge move", apply_settings=lambda **kwargs: fixed.append(kwargs))
+        pe, fstat = move("gb pe move"), move("gb fstat move")
+        moves = {
+            "gb": BranchMoves([], [pe], (
+                Alternative(fstat, 0.2, {"burn-in": 0.4}, "fstat"),
+                Alternative(split, 0.3, {"burn-in": 0.0}, "split_merge"),  # takes no turn in the burn-in
+            )),
+            "psd": BranchMoves([], [types.SimpleNamespace(name="psd pe move", num_repeats=50)]),
+        }
+        return moves, pe, fstat, split, fixed
+
+    ATTRIBUTES = {
+        "burn-in": {"gb": {"stretch_probability": 0.5, "num_stationary_fim_steps": 1}},
+        "pe": {
+            "gb": {"stretch_probability": 0.0, "num_stationary_fim_steps": 50},
+            "gb.fstat": {"num_stationary_fim_steps": 5},  # this move alone, over the block's
+            "gb.split_merge": {"apply_settings": {"fix_search_part": True}},
+        },
+    }
+
+    def recipe(self, moves, attributes=None):
+        recipe = gf_recipe.Recipe()
+        StockRecipe(stages=self.STAGES).add_steps(recipe, moves, move_attributes=(attributes or self.ATTRIBUTES).get)
+        recipe.backend = FakeBackend()
+        return recipe
+
+    def test_targets(self):
+        from lisatools.globalfit.stock.l2d.build_recipe import attribute_targets
+
+        moves, pe, fstat, split, _fixed = self.gb()
+        targets = attribute_targets(moves)
+        self.assertEqual(sorted(targets), ["gb", "gb.fstat", "gb.split_merge", "psd"])
+        self.assertEqual([m.name for m in targets["gb"]], ["gb pe move", "gb fstat move", "gb split_merge move"])
+        self.assertEqual(targets["gb.split_merge"], [split])
+
+    def test_block_then_one_move(self):
+        moves, pe, fstat, split, fixed = self.gb()
+        recipe, sampler = self.recipe(moves), FakeSampler()
+        recipe.setup_first_recipe_step(0, None, sampler)
+        # burn-in: the moves in the step; the split and merge takes no turn in it and is left
+        self.assertEqual([(m.stretch_probability, m.num_stationary_fim_steps) for m in (pe, fstat, split)],
+                         [(0.5, 1), (0.5, 1), (0.3, 7)])
+        self.assertEqual(fixed, [])
+        while sampler.iteration < 3:
+            sampler.iteration += 1
+            recipe(sampler.iteration - 1, None, sampler)
+        self.assertEqual(recipe.current_recipe_step["name"], "pe")
+        self.assertEqual([(m.stretch_probability, m.num_stationary_fim_steps) for m in (pe, fstat, split)],
+                         [(0.0, 50), (0.0, 5), (0.0, 50)])
+        self.assertEqual(fixed, [{"fix_search_part": True}])  # called on the one move that has the method
+
+    def test_a_method_only_some_moves_have(self):
+        # on the block: every move that has the path, here the split and merge alone
+        moves, _pe, _fstat, _split, fixed = self.gb()
+        recipe = self.recipe(moves, {"pe": {"gb": {"apply_settings": {"fix_search_part": True}}}})
+        recipe.recipe[0]["status"] = True
+        recipe.setup_first_recipe_step(5, None, FakeSampler(iteration=5))
+        self.assertEqual(fixed, [{"fix_search_part": True}])
+
+    def test_psd_move(self):
+        # the psd move has no branch_name either, and no apply_settings: its repeats are the attribute num_repeats
+        moves, pe, _fstat, _split, _fixed = self.gb()
+        (psd,) = moves["psd"].pe
+        recipe, sampler = self.recipe(moves, {"burn-in": {"psd": {"num_repeats": 200}}, "pe": {"psd": {"num_repeats": 20}}}), FakeSampler()
+        recipe.setup_first_recipe_step(0, None, sampler)
+        self.assertEqual((psd.num_repeats, pe.stretch_probability), (200, 0.3))
+        while sampler.iteration < 3:
+            sampler.iteration += 1
+            recipe(sampler.iteration - 1, None, sampler)
+        self.assertEqual(psd.num_repeats, 20)
+
+    def test_errors_when_the_steps_are_built(self):
+        for attributes, msg in [
+            ({"psd": {"num_prop_repeats": 5}}, "fits no move of psd"),
+            ({"gb": {"stretch_probabilty": 0.0}}, "fits no move of gb"),
+            ({"gb.fstat": {"apply_settings": {}}}, "fits no move of gb.fstat"),
+            ({"gb.refit": {"stretch_probability": 0.0}}, "no move of that name or branch"),
+        ]:
+            with self.subTest(attributes=attributes), self.assertRaisesRegex(ValueError, msg):
+                self.recipe(self.gb()[0], {"pe": attributes})
 
 
 class StageAttributesSchemaTest(BlockStagesTest):
@@ -918,6 +1010,30 @@ class StageAttributesSchemaTest(BlockStagesTest):
         info = types.SimpleNamespace(inner_moves=[("a", 0.35), ("b", 0.05), ("c", 0.05)])
         curr = types.SimpleNamespace(source_info={"mbh": info})
         self.assertEqual(stage_move_settings(cfg, curr, "pe"), {})
+
+    def test_psd_block_stages(self):
+        from lisatools.globalfit.stock.l2d.build_recipe import stage_move_attributes
+
+        from tests.test_l2d_recipe import PSD_BLOCK
+
+        stages = {"tune": {"attributes": {"num_repeats": 200}}, "pe": {"attributes": {"num_repeats": 20}}}
+        cfg = self.config({"psd": {**PSD_BLOCK, "stages": stages}, "mbh": MBH}, self.STAGES3)
+        order = ["warm", "tune", "pe"]
+        self.assertEqual(stage_move_attributes(cfg, "warm", order), {})
+        self.assertEqual(stage_move_attributes(cfg, "tune", order), {"psd": {"num_repeats": 200}})
+        self.assertEqual(stage_move_attributes(cfg, "pe", order), {"psd": {"num_repeats": 20}})
+        # attributes only: the psd move has no apply_settings, so no stage settings for it
+        info = types.SimpleNamespace(inner_moves=[("a", 0.35), ("b", 0.05), ("c", 0.05)])
+        curr = types.SimpleNamespace(source_info={"mbh": info, "psd": None})
+        self.assertEqual(stage_move_settings(cfg, curr, "pe"), {})
+        self.assertEqual(self.config({"psd": PSD_BLOCK}, self.STAGES3).blocks["psd"].stages, {})  # optional
+        for stages, msg in [
+            ({"later": {"attributes": {"num_repeats": 1}}}, "not recipe stages"),
+            ({"pe": {"num_prop_repeats": 5}}, "Extra inputs are not permitted"),
+            ({"pe": {"attributes": {"a..b": 1}}}, "cannot read"),
+        ]:
+            with self.subTest(stages=stages), self.assertRaisesRegex(Exception, msg):
+                self.config({"psd": {**PSD_BLOCK, "stages": stages}}, self.STAGES3)
 
     def test_a_bad_path_fails_at_load(self):
         with self.assertRaisesRegex(Exception, "cannot read"):

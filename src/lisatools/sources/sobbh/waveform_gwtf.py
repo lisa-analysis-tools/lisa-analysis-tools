@@ -7,7 +7,10 @@ The fresnel approximation is applied in a box-car window scenario to model the t
 Using a leading order time-frequency local response function.
 
 """
-import cupy as cp
+try:
+    import cupy as cp # type: ignore
+except (ImportError, ModuleNotFoundError):
+    cp = None   # type: ignore
 import numpy as np
 from pygwtf.models import TaylorT3Spin
 from pygwtf.generator import AnalyticTimeFrequencyWaveform
@@ -33,7 +36,7 @@ class GWTF_generator:
     def __init__(self,
                  settings: STFTSettings,
                  orbits: Orbits,
-                 T_obs,
+                 T_obs: float,
                  fresnel_kernel_width = 10,
                  use_GPU = True,
                  psd_drop_bands = DEFAULT_PSD_DROP_BANDS,

@@ -14,7 +14,9 @@ Usage:
 Comparisons ask for bit identity unless ``--rtol`` is given; differences are then normalised by
 the largest absolute value of each reference array. The exit status is 1 when any array fails.
 ``--without-swap`` leaves out the two swap kernels, in captures and comparisons; they take about
-70 % of a CPU run. ``--response dffr`` evaluates the DFFR response on its configurations
+70 % of a CPU run. ``--window periodic`` gives the templates the periodic Tukey window (scipy's
+``sym=False``) in place of the symmetric one of the data (``sym=True``, the default of
+``STFTComputationGroup``). ``--response dffr`` evaluates the DFFR response on its configurations
 (``stft_fixtures.DFFR_CONFIGS``); its Fisher matrices have no TDI-track variant, since DFFR has
 one chirp model. Fixtures, tolerances and results are recorded in
 ``docs/response/dffr/results.md``.
@@ -179,12 +181,22 @@ def evaluate(fixture, with_swap=True):
     return {key: fixtures.to_host(value) for key, value in outputs.items()}
 
 
-def capture(path, backend, config_names, mojito_l1, with_swap=True, response="tdi_on_the_fly"):
+def capture(
+    path,
+    backend,
+    config_names,
+    mojito_l1,
+    with_swap=True,
+    response="tdi_on_the_fly",
+    use_sym_window=True,
+):
     orbits_cache = {}
     blob = {}
     descriptions = {}
     for name in config_names:
-        fixture = fixtures.build_fixture(name, backend, mojito_l1, orbits_cache, response)
+        fixture = fixtures.build_fixture(
+            name, backend, mojito_l1, orbits_cache, response, use_sym_window
+        )
         fixture.description["backend"] = backend
         outputs = evaluate(fixture, with_swap)
         for key, value in outputs.items():
@@ -198,6 +210,7 @@ def capture(path, backend, config_names, mojito_l1, with_swap=True, response="td
     metadata["configs"] = descriptions
     metadata["with_swap"] = with_swap
     metadata["response"] = response
+    metadata["window"] = "symmetric" if use_sym_window else "periodic"
     blob[METADATA_KEY] = np.array(json.dumps(metadata))
     np.savez(path, **blob)
     print(f"[capture] wrote {path} ({len(blob) - 1} arrays)")
@@ -317,8 +330,15 @@ def main(argv=None):
         help="leave out get_swap_ll_stft and get_swap_ll_grad_stft, in captures and comparisons",
     )
     parser.add_argument("--response", choices=fixtures.RESPONSES, default=fixtures.RESPONSES[0])
+    parser.add_argument(
+        "--window",
+        choices=("symmetric", "periodic"),
+        default="symmetric",
+        help="Tukey window of the templates: the data's symmetric one, or the periodic one",
+    )
     args = parser.parse_args(argv)
     with_swap = not args.without_swap
+    use_sym_window = args.window == "symmetric"
     default_configs = (
         fixtures.ALL_CONFIGS if args.response == fixtures.RESPONSES[0] else fixtures.DFFR_CONFIGS
     )
@@ -329,7 +349,15 @@ def main(argv=None):
 
     if args.capture:
         config_names = args.configs or list(default_configs)
-        capture(args.capture, args.backend, config_names, args.mojito_l1, with_swap, args.response)
+        capture(
+            args.capture,
+            args.backend,
+            config_names,
+            args.mojito_l1,
+            with_swap,
+            args.response,
+            use_sym_window,
+        )
         return 0
     if args.compare_files:
         reference_blob, candidate_blob = (load_blob(path) for path in args.compare_files)
@@ -343,7 +371,7 @@ def main(argv=None):
     orbits_cache = {}
     for name in config_names:
         fixture = fixtures.build_fixture(
-            name, args.backend, args.mojito_l1, orbits_cache, args.response
+            name, args.backend, args.mojito_l1, orbits_cache, args.response, use_sym_window
         )
         fixture.description["backend"] = args.backend
         for key, value in evaluate(fixture, with_swap).items():

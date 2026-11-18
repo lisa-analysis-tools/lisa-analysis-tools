@@ -398,6 +398,7 @@ class STFTComputationGroup(DomainKernelStrategy):
         window_alpha: float = 0.0,
         use_midpoint: bool = False,
         linear_envelope: bool = True,
+        use_sym_window: bool = True,
     ):
         """
         Args:
@@ -417,6 +418,12 @@ class STFTComputationGroup(DomainKernelStrategy):
                 Defaults ``True``; ``False`` gives the const-envelope path, byte for
                 byte the kernel of before. ``STFTGBComputations`` defaults to ``True``
                 as well and checks that the two agree.
+            use_sym_window: If ``True`` (the default), the Fresnel transform models the
+                symmetric Tukey window of LAT's ``tukey()`` (scipy's ``sym=True``), zero on the
+                first and the last of a segment's samples, as ``windowfun`` windows the data; a
+                tapered window then needs the sample spacing ``sample_cadence`` of the STFT
+                settings.
+                ``False`` models the periodic window (scipy's ``sym=False``).
         """
         from .domains import STFTSettings
 
@@ -429,6 +436,7 @@ class STFTComputationGroup(DomainKernelStrategy):
         self.window_alpha = window_alpha
         self.use_midpoint = use_midpoint
         self.linear_envelope = linear_envelope
+        self.use_sym_window = use_sym_window
 
         with self.group_device_context():
             self._create_cpp_domain()
@@ -465,6 +473,23 @@ class STFTComputationGroup(DomainKernelStrategy):
         # The rows hold the full active grid, so the kernels read them at a pixel's active bin.
         return [int(self.noise_row_shape[-1]), True]
 
+    def _fresnel_window_kwargs(self) -> dict:
+        """N and h of the symmetric window for the STFTFresnelWrap; none for the periodic window
+        and the boxcar."""
+        if not getattr(self, "use_sym_window", True) or not self.window_alpha > 0.0:
+            return {}
+        sample_cadence = getattr(self.settings, "sample_cadence", None)
+        if sample_cadence is None:
+            raise ValueError(
+                "The symmetric window needs the sample spacing sample_cadence of the STFT settings "
+                "(get_stft_settings sets it); use use_sym_window=False for the periodic window."
+            )
+        # * get_nperseg checks that the samples fill a segment; the wrap checks N h = dt to 1e-12.
+        return dict(
+            window_samples=self.settings.get_nperseg(sample_cadence),
+            sample_cadence=float(sample_cadence),
+        )
+
     def _create_cpp_domain(self):
         self._cpp_domain = self.backend.STFTDomainWrap(*self.domain_args)
         self._cpp_fresnel = self.backend.STFTFresnelWrap(
@@ -472,6 +497,7 @@ class STFTComputationGroup(DomainKernelStrategy):
             window_alpha=self.window_alpha,
             use_midpoint=self.use_midpoint,
             linear_envelope=self.linear_envelope,
+            **self._fresnel_window_kwargs(),
         )
 
     @property
@@ -511,6 +537,7 @@ class STFTComputationGroup(DomainKernelStrategy):
                     window_alpha=self.window_alpha,
                     use_midpoint=self.use_midpoint,
                     linear_envelope=wanted,
+                    **self._fresnel_window_kwargs(),
                 )
         saved = self._cpp_fresnel
         self._cpp_fresnel = cache[wanted]

@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 import h5py
 import numpy as np
 from eryn.backends import HDFBackend
-from eryn.utils import get_integrated_act
 from scipy.interpolate import CubicSpline
 from tqdm import tqdm
 
@@ -95,7 +94,20 @@ _EMRI_PARAM_INFO: Dict[str, ParameterInfo] = {
     "Phi_r0": ParameterInfo("mean_anomaly_tref", r"$\Phi_{r,0}\,[\mathrm{rad}]$", "rad"),
     "ra": ParameterInfo("right_ascension", r"$\alpha\,[\mathrm{rad}]$", "rad"),
     "dec": ParameterInfo("declination", r"$\delta\,[\mathrm{rad}]$", "rad"),
+}
 
+_SOBBH_PARAM_INFO: Dict[str, ParameterInfo] = {
+    "m1": ParameterInfo("primary_mass_det_frame", r"$m_1\,[M_\odot]$", "solMass"),
+    "m2": ParameterInfo("secondary_mass_det_frame", r"$m_2\,[M_\odot]$", "solMass"),
+    "s1z": ParameterInfo("spin1", r"$s_{1z}$", "dimensionless"),
+    "s2z": ParameterInfo("spin2", r"$s_{2z}$", "dimensionless"),
+    "distance": ParameterInfo("luminosity_distance", r"$d_L\,[\mathrm{Gpc}]$", "Gpc"),
+    "iota": ParameterInfo("inclination", r"$\iota\,[\mathrm{rad}]$", "rad"),
+    "f0": ParameterInfo("frequency_at_reference_time", r"$f_0\,[\mathrm{Hz}]$", "Hz"), 
+    "phi0": ParameterInfo("phase_at_reference_time", r"$\phi_{\mathrm{ref}}\,[\mathrm{rad}]$", "rad"),
+    "psi": ParameterInfo("polarization", r"$\psi\,[\mathrm{rad}]$", "rad"),
+    "ra": ParameterInfo("right_ascension", r"$\alpha\,[\mathrm{rad}]$", "rad"),
+    "dec": ParameterInfo("declination", r"$\delta\,[\mathrm{rad}]$", "rad"),
 }
 
 _NOISE_PARAM_INFO: Dict[str, ParameterInfo] = {
@@ -154,18 +166,26 @@ PARAMETER_INFO_REGISTRY: Dict[str, Dict[str, ParameterInfo]] = {
     "emri": _EMRI_PARAM_INFO,
     "psd": _NOISE_PARAM_INFO,
     "galfor": _GALFOR_PARAM_INFO,
+    "sobbh": _SOBBH_PARAM_INFO,
     # add entries for other source types as needed
 }
 
 _STOCHASTIC_BRANCHES = ["psd", "galfor"]
 
-# Corrections applied after TransformContainer to fix waveform-gen vs L3C unit mismatches.
+# Corrections applied after TransformContainer to fix waveform-gen vs L3C mismatches, keyed by L3C names.
+# A string key maps one parameter (``fn(x) -> x``); a tuple key maps its parameters jointly
+# (``fn(*xs) -> tuple``, one output per name, in the key's order).
 # The MBH transform applies gpc_to_mpc (Gpc→Mpc) for the waveform generator;
 # L3C requires distance in Gpc, so we invert here.
-_OUTPUT_CORRECTIONS_REGISTRY: Dict[str, Dict[str, Callable]] = {
+# Corrections that need the run's info (the SOBBH reference epoch) come from
+# ``SubmissionWriter._run_output_corrections`` instead.
+OutputCorrections = Dict[str | Tuple[str, ...], Callable]
+
+_OUTPUT_CORRECTIONS_REGISTRY: Dict[str, OutputCorrections] = {
     "gb": {},
     "mbh": {"luminosity_distance": lambda x: x * 1e-3},
     "emri": {},
+    "sobbh": {},
     "psd": {},
     "galfor": {},
 }
@@ -190,25 +210,37 @@ source_types_names = dict(
 
 # order of the mojito light mbh sources, sorted by merger time (earliest to latest), for the purpose of assigning `known_injection` labels in the metadata
 _MOJITO_LIGHT_MBH_ORDER = ["source_18", "source_5", "source_16", "source_7", "source_2", "source_12", "source_9", "source_4", "source_0", "source_15", "source_3", "source_10", "source_19", "source_13", "source_6", "source_17", "source_8", "source_1", "source_11", "source_14"] 
+# order of the mojito light emri sources, sorted by initial eccentricity.
 _MOJITO_LIGHT_EMRI_ORDER = ["source_0", "source_1", "source_3", "source_2", "source_5", "source_4", "source_6", "source_7"]
+# catalog order of the mojito light sobbh sources, for the purpose of assigning `known_injection` labels in the metadata
+_MOJITO_LIGHT_SOBHB_ORDER = ["source_0", "source_1", "source_2", "source_3", "source_4", "source_5"]
 
 MAX_SOURCES_PER_BATCH = 500
 
 # comment of the per-branch metadata until its posteriors have been written
 _POSTERIORS_PENDING = "posteriors pending"
 
-def _apply_output_corrections(branch: str, samples_dict: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Apply branch-specific output corrections to a posterior mapping."""
+def _apply_output_corrections(
+    branch: str,
+    samples_dict: dict[str, np.ndarray],
+    extra_corrections: OutputCorrections | None = None,
+) -> dict[str, np.ndarray]:
+    """Apply branch-specific output corrections to a posterior mapping.
+
+    ``extra_corrections`` are applied after the registry's, in the same format (see
+    ``_OUTPUT_CORRECTIONS_REGISTRY``). A correction is skipped unless all its parameters are in the mapping.
+    """
 
     corrected = dict(samples_dict)
-    transform = _OUTPUT_CORRECTIONS_REGISTRY[branch]
+    corrections = {**_OUTPUT_CORRECTIONS_REGISTRY[branch], **(extra_corrections or {})}
 
-    for key, func in transform.items():
-        if key in corrected:
-            corrected[key] = func(corrected[key])
-            logger.info(
-                f"Applied output correction for parameter '{key}' in branch '{branch}'"
-            )
+    for key, func in corrections.items():
+        names = (key,) if isinstance(key, str) else tuple(key)
+        if not all(name in corrected for name in names):
+            continue
+        values = func(*(corrected[name] for name in names))
+        corrected.update(zip(names, (values,) if isinstance(key, str) else values, strict=True))
+        logger.debug(f"Applied output correction for {names} in branch '{branch}'")
 
     return corrected
 
@@ -276,10 +308,10 @@ def _save_metadata_attributes(h5obj: h5py.File | h5py.Group, metadata: MetadataB
         value = getattr(metadata, field.name)
         if isinstance(value, (str, int, float)):
             h5obj.attrs[field.name] = value
-        elif isinstance(value, list):
-            h5obj.attrs[field.name] = json.dumps(value)
-        elif isinstance(value, dict):
-            h5obj.attrs[field.name] = json.dumps(value)
+        elif isinstance(value, (list, dict)):
+            # * sanitised as the JSON file is (to_json): a value json cannot write (a class a waveform put among
+            # * its kwargs, an array) must not cost the branch its metadata
+            h5obj.attrs[field.name] = json.dumps(metadata.json_sanitize(value))
         else:
             logger.warning(
                 f"Unsupported metadata field type for '{field.name}': {type(value)}. Skipping this field."
@@ -303,19 +335,21 @@ def _build_leaf_samples_dict(
     branch: str,
     log_prior: np.ndarray,
     log_likelihood: np.ndarray,
+    extra_corrections: OutputCorrections | None = None,
 ) -> dict[str, np.ndarray]:
     """Build one leaf's posterior mapping and apply corrections/filtering."""
 
     samples_dict = {name: samples_here[..., i] for i, name in enumerate(parameter_names)}
     samples_dict["logprior"] = log_prior
     samples_dict["loglikelihood"] = log_likelihood
-    samples_dict = _apply_output_corrections(branch, samples_dict)
-    samples_dict = _filter_removed_params(branch, samples_dict)
-
-    return {
+    # the leaf first: the corrections then run on this leaf's samples only
+    samples_dict = {
         name: values[:, leaf] if len(values.shape) == 2 else values
         for name, values in samples_dict.items()
     }
+    samples_dict = _apply_output_corrections(branch, samples_dict, extra_corrections)
+
+    return _filter_removed_params(branch, samples_dict)
 
 
 def _build_stochastic_samples_dict(
@@ -417,13 +451,17 @@ class BackendConsumer:
         curr: CurrentInfoGlobalFit = None,
         backend: HDFBackend | str = None,
     ):
+        # * A file is opened with the global fit's backend, which finds the run's group: "global_fit", or "mcmc"
+        # * in files written before the rename (eryn's own HDFBackend only looks under "mcmc").
+        from .hdfbackend import GFHDFBackend
+
         if backend is not None:
             if isinstance(backend, str):
-                self.backend = HDFBackend(filename=backend, read_only=True)
+                self.backend = GFHDFBackend(backend, read_only=True)
             else:
                 self.backend = backend
         elif curr is not None:
-            self.backend = HDFBackend(filename=curr.main_file_path, read_only=True)
+            self.backend = GFHDFBackend(curr.main_file_path, read_only=True)
         else:
             raise ValueError("Must provide either curr or backend.")
 
@@ -471,18 +509,54 @@ class BackendConsumer:
 
         return self._transforms
 
+    def kept_stage_start(self) -> int:
+        """The iteration the last step of the run's recipe started at: the samples from there on are the ones the
+        run keeps, the steps before it (burn-in, tuning, searches) are not posterior samples.
+
+        0, the whole chain, when the file records no recipe or no start of its steps (files written before the
+        recipe stored them). When the last step has not started (a run stopped before it), the whole chain too,
+        with a warning.
+        """
+        with self.backend.open() as f:
+            group = f[self.backend.name]
+            if "recipe" not in group:
+                return 0
+            steps = sorted(group["recipe"].values(), key=lambda step: step.attrs["order num"])
+            if not steps or not any("start iteration" in step.attrs for step in steps):
+                return 0
+            last = steps[-1]
+            if "start iteration" not in last.attrs:
+                logger.warning(
+                    f"The last recipe step ({last.name.rsplit('/', 1)[-1]!r}) has not started in this file: the "
+                    "whole chain is post-processed, the steps before it included."
+                )
+                return 0
+            return int(last.attrs["start iteration"])
+
     def store_cold_chains(self):
-        """Extract cold chains and inds for all branches and cache them."""
+        """Extract the cold chains and inds of all branches from the start of the kept stage, and cache them.
+
+        Only the iterations of the last recipe step are read (:meth:`kept_stage_start`), so the ACT, the thinning
+        and the posterior files hold no sample of the burn-in or tuning stages. ``discard`` of
+        :meth:`store_independent_samples` counts from there.
+        """
+        self.kept_start = start = self.kept_stage_start()
+        stop = int(self.backend.iteration)
+        if start >= stop:
+            raise ValueError(f"the kept stage starts at iteration {start}, and the file holds {stop}: nothing to keep.")
+        if start > 0:
+            logger.info(f"Post-processing the kept stage: iterations {start} to {stop} of the chain.")
+        kept = slice(start, stop)
         self._cold_chains = {}
         self._cold_inds = {}
-        all_chains = self.backend.get_chain()
-        all_inds = self.backend.get_inds()
+        all_chains = self.backend.get_chain(slice_vals=kept)
+        all_inds = self.backend.get_inds(slice_vals=kept)
         for branch in self.branches:
             self._cold_chains[branch] = all_chains[branch][:, :1]
             self._cold_inds[branch] = all_inds[branch][:, :1]
 
-        self._cold_log_prior = self.backend.get_log_prior()[:, :1]
-        self._cold_log_likelihood = self.backend.get_log_like()[:, :1]
+        self._cold_log_prior = self.backend.get_log_prior(slice_vals=kept)[:, :1]
+        self._cold_log_likelihood = self.backend.get_log_like(slice_vals=kept)[:, :1]
 
     @property
     def configured(self) -> bool:
@@ -516,27 +590,55 @@ class BackendConsumer:
             raise ValueError(f"Branch '{branch}' not found in cold chains.")
         return self._cold_inds[branch]
 
+    def _branch_periods(self, branch: str) -> dict:
+        """``{parameter index: period}`` of the branch's periodic parameters (``{}`` without a ``curr``)."""
+        try:
+            info = self._curr.source_info[branch]
+            periodic = info.get("periodic") if isinstance(info, dict) else getattr(info, "periodic", None)
+            if not periodic or branch not in periodic:
+                return {}
+            from .run import _periodic_names_to_indices
+
+            transform = info.get("transform") if isinstance(info, dict) else getattr(info, "transform", None)
+            return _periodic_names_to_indices(periodic[branch], transform)
+        except Exception:
+            return {}
+
     def compute_auto_correlation_time(
         self, branch: str = None, **act_kwargs
     ) -> Dict[str, np.ndarray] | np.ndarray:
-        """Compute the integrated ACT for the specified branch or all branches."""
+        """The integrated ACT, in iterations, of the kept cold chains: per branch, one value per series.
+
+        The estimate and the series are those of the recipe's convergence stop (``recipe.gating_series``,
+        ``sampling.utility.cold_chain_act``), so the two agree: the sampled parameters of the leaves that stay
+        active, periodic ones as sin and cos, with Sokal's automatic window. A branch with no such series (gb,
+        whose leaves come and go) gets 1, and so does a series whose ACT is not defined (a walker that never
+        moved), with a warning.
+        """
+        from lisatools.sampling.utility import cold_chain_act
+
+        from .recipe import gating_series
+
         if not self.configured:
             self.store_cold_chains()
-        if branch is not None:
-            if branch in self.branches:
-                return get_integrated_act(self._cold_chains[branch], **act_kwargs)
+        if branch is not None and branch not in self.branches:
             raise ValueError(f"Branch '{branch}' not found in cold chains.")
-        act: dict = get_integrated_act(self.cold_chains, **act_kwargs)
-
-        # now remove nans if present
-        for branch, value in act.items():
-            if not np.isfinite(value).all():
+        act = {}
+        for name in self.branches if branch is None else [branch]:
+            x, periods, _note = gating_series(
+                self._cold_chains[name][:, 0], self._cold_inds[name][:, 0], self._branch_periods(name)
+            )
+            if x is None:
+                act[name] = np.ones(1)
+                continue
+            tau, _reliable = cold_chain_act(x, periods, **act_kwargs)
+            if not np.isfinite(tau).all():
                 logger.warning(
-                    f"NaN values found in ACT for branch '{branch}'. These will be replaced with 1."
+                    f"NaN values found in ACT for branch '{name}'. These will be replaced with 1."
                 )
-                act[branch] = np.where(np.isfinite(value), value, 1.0)
-
-        return act
+                tau = np.where(np.isfinite(tau), tau, 1.0)
+            act[name] = tau
+        return act if branch is None else act[branch]
 
     def store_independent_samples(self, discard: int | float = 0.0, ess: int = 10000, **act_kwargs):
         """
@@ -963,6 +1065,10 @@ class MetadataBase:
             return obj.isoformat()
         elif isinstance(obj, (str, int, float, bool)) or obj is None:
             return obj
+        elif isinstance(obj, type):
+            return f"{obj.__module__}.{obj.__qualname__}"  # a class: its import path
+        elif isinstance(obj, np.generic):
+            return obj.item()
         else:
             logger.warning(f"Unsupported type {type(obj)} for JSON serialization. Converting to string.")
             return str(obj)
@@ -1296,6 +1402,9 @@ class SourceMetadata(MetadataBase):
     waveform_model: str
     waveform_model_code_link: str
     waveform_model_config: dict  # = dataclasses.field(default_factory=dict)
+    t_0: float
+    t_init: float
+    time_shift_corrected: bool = False
 
     detection_statistic: list[float] = dataclasses.field(default_factory=list)
     quality_flags: list[int] = dataclasses.field(default_factory=list)
@@ -1417,6 +1526,9 @@ class SubmissionWriter(BackendConsumer):
             self.samples[branch], self.inds[branch] = prepare_fn(
                 acs, self.original_samples[branch], self.samples[branch], self.inds[branch]
             )
+            logger.info(f"Finished preparing samples for branch '{branch}'")
+        else:
+            logger.info(f"No preparation function registered for branch '{branch}'. Skipping.")
 
     def _prepare_mbhb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Sort the MBHB samples according to the coalescence time, and cluster them if there are multiple sources in the same block."""
@@ -1439,13 +1551,54 @@ class SubmissionWriter(BackendConsumer):
         inds = inds[:, sorted_indices]
 
         return samples, inds
-    
+
+    def _run_output_corrections(self, branch: str) -> OutputCorrections:
+        """Output corrections of ``branch`` that depend on this run (next to ``_OUTPUT_CORRECTIONS_REGISTRY``)."""
+        if branch == "sobbh":
+            return self._sobbh_output_corrections()
+        return {}
+
+    def _sobbh_output_corrections(self) -> OutputCorrections:
+        """Evolve the SOBBH frequency and phase from the data start to the catalogue reference epoch.
+
+        The gwtf waveform defines the sampled ``f0`` / ``phi0`` at the data start (the inverse of the
+        catalogue seeding of ``SOBHBSearchInterface``); L3C wants them at ``MOJITO_REFERENCE_TIME``.
+        With the block's ``phase_at_coalescence`` the sampled phase is the coalescence phase instead, and
+        the phase at the reference epoch follows from it and the evolved frequency.
+        """
+        from ..sources.utils import evolve_sobhb, sobhb_evolve_frequency_phase, sobhb_reference_phase
+        from .recipe import MOJITO_REFERENCE_TIME
+
+        t_start = float(self.curr.general_info.data_t0)
+        waveform_config = self.curr.source_metadata["sobbh"].waveform_model_config or {}
+        phase_at_coalescence = bool(waveform_config.get("phase_at_coalescence", False))
+
+        names = tuple(_SOBBH_PARAM_INFO[key].l3c_name for key in ("m1", "m2", "s1z", "s2z", "f0", "phi0"))
+
+        def evolve(m1, m2, s1, s2, f0, phase):
+            # unused leaves are NaN: evolve the finite samples only
+            finite = np.all(np.isfinite([m1, m2, s1, s2, f0, phase]), axis=0)
+            f_ref, phi_ref = np.full_like(f0, np.nan), np.full_like(phase, np.nan)
+            if finite.any():
+                intrinsic = (m1[finite], m2[finite], s1[finite], s2[finite])
+                if phase_at_coalescence:
+                    f_ref[finite] = evolve_sobhb(t_start, MOJITO_REFERENCE_TIME, *intrinsic, f0[finite])
+                    phi_ref[finite] = sobhb_reference_phase(*intrinsic, f_ref[finite], phase[finite])
+                else:
+                    f_ref[finite], phi_ref[finite] = sobhb_evolve_frequency_phase(
+                        *intrinsic, f0[finite], phase[finite], t_start=t_start, t_end=MOJITO_REFERENCE_TIME,
+                    )
+            return m1, m2, s1, s2, f_ref, phi_ref
+
+        logger.info(f"SOBBH f0/phi0 are evolved from t={t_start} to MOJITO_REFERENCE_TIME={MOJITO_REFERENCE_TIME}")
+        return {names: evolve}
+
     def _prepare_gb_samples(self, acs: AnalysisContainerArray, original_samples: np.ndarray, samples: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Prepare GB samples for submission running the clustering algorithm.
         """
         try:
-            import cupy as cp
+            import cupy as cp #type: ignore
         except ImportError:
             raise ImportError("cupy is required for GB clustering. Please install cupy to use this feature.")
         
@@ -1573,6 +1726,11 @@ class SubmissionWriter(BackendConsumer):
         yyyyy = f"{mean_initial_eccentricity_scaled}"
 
         return f"{xxxxx}_{yyyyy}"
+
+    def _get_sobbh_label(self, leaf_samples: np.ndarray, leaf_index: int) -> str:
+        """Get a label for a SOBBH source based on its catalog ordering."""
+
+        return f"{leaf_index:05d}"
     
     @property
     def get_source_label_registry(self) -> dict[str, Callable]:
@@ -1584,6 +1742,7 @@ class SubmissionWriter(BackendConsumer):
             "mbh": self._get_mbhb_label,
             "gb": self._get_gb_label,
             "emri": self._get_emri_label,
+            "sobbh": self._get_sobbh_label,
         }
 
     @property
@@ -1594,6 +1753,7 @@ class SubmissionWriter(BackendConsumer):
             'mbh': _MOJITO_LIGHT_MBH_ORDER, 
             'gb': [],
             'emri': _MOJITO_LIGHT_EMRI_ORDER,
+            'sobbh': _MOJITO_LIGHT_SOBHB_ORDER
             }
 
 
@@ -1734,6 +1894,8 @@ class SubmissionWriter(BackendConsumer):
         posterior_files_map: dict[str, str] = {}
         label_to_statistic: dict[str, float] = {}
 
+        extra_corrections = self._run_output_corrections(branch)
+
         num_leaves = samples.shape[1]
         for leaf_count in range(0, num_leaves, MAX_SOURCES_PER_BATCH):
             leaves = slice(leaf_count, min(leaf_count + MAX_SOURCES_PER_BATCH, num_leaves))
@@ -1758,6 +1920,7 @@ class SubmissionWriter(BackendConsumer):
                         branch=branch,
                         log_prior=self.log_prior,
                         log_likelihood=self.log_likelihood,
+                        extra_corrections=extra_corrections,
                     )
                     _save_posterior_dataset(f, source_label, leaf_samples)
 
