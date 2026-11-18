@@ -27,8 +27,11 @@ Preconditions for correct JAX placement via DLPack:
     device before the bridge as a defensive measure.
 """
 from __future__ import annotations
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # avoid preallocating every card's memory
 
 from typing import Any, Tuple, Optional
+import os
 
 import numpy as np
 

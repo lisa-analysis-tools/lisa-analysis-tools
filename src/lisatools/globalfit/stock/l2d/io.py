@@ -115,8 +115,10 @@ def _jax_gpus(gpus: list[int]) -> list:
     devices it started with (e.g. every card, each with its memory preallocated), which the count check reports.
     """
     import jax
-
+    import os
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # avoid preallocating every card's memory
     jax.config.update("jax_cuda_visible_devices", ",".join(str(gpu) for gpu in gpus))
+    
     return _keeping_current_device(lambda: jax.devices("gpu"))
 
 
