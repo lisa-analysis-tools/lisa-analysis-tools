@@ -55,6 +55,10 @@ class Recorder:
         # * as the real PE moves (ResidualAddOneRemoveOneMove): the inner moves they were given, on .moves
         self.moves = list(kwargs.get("inner_moves") or [])
 
+    def release_original_waveform_gen(self):
+        # * the real special moves return their replica on the main device; a recorder makes none
+        return self.kwargs.get("waveform_gen")
+
 
 class _Recipe(_Sources):
     def config(self, blocks, recipe=None, **data_changes):
@@ -794,6 +798,65 @@ class LibraryLadderTest(unittest.TestCase):
         with mock.patch.object(gf_recipe, "build_psd_moves", return_value=("s", "p")) as build:
             gf_recipe.PSDMoveBuilder(betas=ladder).build("ei", "curr", "acs", "priors", "state")
         np.testing.assert_array_equal(build.call_args.kwargs["betas"], ladder)
+
+
+class ReleaseOriginalWaveformTest(unittest.TestCase):
+    """The PE move proposes with one waveform replica per device; the waveform they were made from is let go."""
+
+    class Waveform:
+        pass
+
+    class Move:
+        def __init__(self, original, replicas):
+            self.waveform_gen, self._waveform_generators = original, replicas
+
+        release_original_waveform_gen = gf_moves.addremovemove.MultiGPUResidualAddRemoveMove.release_original_waveform_gen
+
+    def holders(self, td_reuses=True):
+        import weakref
+
+        original, replicas = self.Waveform(), [self.Waveform(), self.Waveform()]
+        handle = WaveformHandle(self.Waveform, {})
+        handle.replace(original)  # as built by the residual rebuild
+        signal_gen = SignalGen(handle, "get_signals_for_residuals", None, {})
+        td_wave = original if td_reuses else self.Waveform()
+        ctx = RecipeContext(mock.Mock(), {"emri": original})
+        ctx.signal_gens["emri"] = signal_gen
+        ctx.td_signal_gens["emri"] = SignalGen(td_wave, "get_td_signals", None, {})
+        info = types.SimpleNamespace(signal_gen=signal_gen)
+        move = self.Move(original, replicas)
+        alive = weakref.ref(original)
+        del original
+        return ctx, info, move, replicas, td_wave, alive
+
+    def test_every_holder_gets_the_main_device_replica(self):
+        import gc
+
+        ctx, info, move, replicas, td_wave, alive = self.holders()
+        del td_wave
+        build_recipe.release_original_waveform(ctx, info, "emri", move)
+        gc.collect()
+        self.assertIsNone(alive())  # nothing holds the first waveform
+        for holder in (ctx.wave_gens["emri"], info.signal_gen.waveform, ctx.td_signal_gens["emri"].waveform,
+                       move.waveform_gen):
+            self.assertIs(holder, replicas[0])
+        self.assertEqual(move._waveform_generators, replicas)  # the replicas are untouched
+
+    def test_a_td_generator_of_its_own_keeps_its_waveform(self):
+        ctx, info, move, replicas, td_wave, _ = self.holders(td_reuses=False)
+        build_recipe.release_original_waveform(ctx, info, "emri", move)
+        self.assertIs(ctx.td_signal_gens["emri"].waveform, td_wave)
+        self.assertIs(info.signal_gen.waveform, replicas[0])
+
+    def test_a_branch_without_generators(self):
+        original, replica = self.Waveform(), self.Waveform()
+        ctx = RecipeContext(mock.Mock(), {"mbh": original})
+        build_recipe.release_original_waveform(ctx, types.SimpleNamespace(signal_gen=None), "mbh", self.Move(original, [replica]))
+        self.assertIs(ctx.wave_gens["mbh"], replica)
+
+    def test_free_main_device_memory_without_devices(self):
+        build_recipe.free_main_device_memory(object())  # a CPU run: nothing to give back
+        build_recipe.free_main_device_memory(types.SimpleNamespace(gpus=None, xp=np))
 
 
 if __name__ == "__main__":
