@@ -31,6 +31,11 @@ class WaveformHandle:
             self._waveform = self.waveform_class(**self.init_kwargs)
         return self._waveform
 
+    def replace(self, waveform) -> None:
+        """Hold ``waveform`` from now on (e.g. the PE move's replica on the main device, so the one built here
+        can be freed)."""
+        self._waveform = waveform
+
     def __deepcopy__(self, memo):
         # copying a built waveform would copy its device arrays: copy only an unbuilt handle
         if self.built:

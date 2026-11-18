@@ -1348,6 +1348,14 @@ class MultiGPUResidualAddRemoveMove(ResidualAddOneRemoveOneMove, MultiGPUMoveBas
                     self.waveform_gen.__class__(**init_kwargs)
                 )
 
+    def release_original_waveform_gen(self):
+        """Let go of the waveform the replicas were made from: the move keeps the replica of the first split in
+        its place. The proposals use the replicas only, so nothing they compute changes; the original would
+        otherwise stay on the main device next to that device's replica."""
+        replica = self._waveform_generators[0]
+        self.waveform_gen = replica
+        return replica
+
     def free_gpu_memory(self):
         self.acs.free_gpu_memory()
 

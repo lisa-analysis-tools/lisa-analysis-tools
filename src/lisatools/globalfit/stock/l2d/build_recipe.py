@@ -24,7 +24,7 @@ import numpy as np
 from .blocks.base import GENERIC_MOVES, MoveBlock, SourceBlock, make_proposal_priors
 from .blocks.gb import GBBlock, gb_move_kwargs
 from .blocks.utility import check_kwargs, find_class
-from .generators import SignalGen
+from .generators import SignalGen, WaveformHandle
 
 from ...loginfo import init_logger
 
@@ -579,7 +579,44 @@ def source_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors,
     logger.debug(f"{name} PE move kwargs: {move.__dict__}")
     logger.info(f"Built {name} PE move {move} with {len(move.moves)} inner moves")
     move.accepted = np.zeros((g.ntemps, g.nwalkers))
+    release_original_waveform(ctx, info, name, move)
+    del wave_gen
+    free_main_device_memory(acs)
     return BranchMoves([], [move])
+
+
+def release_original_waveform(ctx: RecipeContext, info, name: str, move) -> None:
+    """Point every holder of the branch's first waveform at the move's replica on the main device.
+
+    The move makes one replica of the waveform per device, the main device included, and proposes with those. The
+    waveform they were made from (built for the residual rebuild, on the main device) would stay there as a
+    second generator: for EMRIs that is a second set of amplitude tables. Its holders are the context, the
+    branch's ``Settings.signal_gen``, a TD generator that reuses it, and the move.
+    """
+    original = ctx.wave_gens[name]
+    replica = move.release_original_waveform_gen()
+    ctx.wave_gens[name] = replica
+    for gen in (info.signal_gen, ctx.signal_gens.get(name), ctx.td_signal_gens.get(name)):
+        if gen is None:
+            continue
+        if isinstance(gen.source, WaveformHandle):
+            if gen.source.built and gen.source.get() is original:
+                gen.source.replace(replica)
+        elif gen.source is original:
+            gen.source = replica
+
+
+def free_main_device_memory(acs) -> None:
+    """Collect what is no longer referenced and give the main device's pool blocks back (GPU runs)."""
+    import gc
+
+    gc.collect()
+    gpus = getattr(acs, "gpus", None)
+    xp = getattr(acs, "xp", None)
+    if gpus is None or not hasattr(xp, "cuda"):
+        return
+    with xp.cuda.Device(int(gpus[0])):
+        xp.get_default_memory_pool().free_all_blocks()
 
 
 def gb_moves(block, cls, ctx: RecipeContext, engine_info, curr, acs, priors, state) -> BranchMoves:
