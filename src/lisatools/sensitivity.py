@@ -2251,6 +2251,11 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             then interior knots). Without it, ``use_splines`` uses the legacy layout: one
             OMS and one TM curve, shared by all MOSAs, interleaved (amplitude, position)
             knots (see :meth:`build_spline_arrays`).
+        covariance_on_host: Keep each walker's covariance matrix ``sens_mat`` in host
+            memory once its inverse and determinant are computed (the likelihood only
+            reads ``invC`` / ``detC``). Saves one full 3x3 matrix per walker on the GPU
+            (~130 MB per walker for one year of STFT data); reading ``sens_mat`` then
+            returns a NumPy array. Default ``False``.
         fft_batch_size: Number of rows (one row = one PSD component in one time
             segment) per FFT batch in the window convolution. On a CUDA backend an
             integer is an upper bound: the batch is ``min(fft_batch_size,
@@ -2314,6 +2319,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
         galaxy_fmax: Optional[float] = None,
         device_galactic_grids: Optional[dict] = None,
         spline_model: Optional["SplineNoiseModel"] = None,
+        covariance_on_host: bool = False,
     ):
         LISAToolsParallelModule.__init__(self, force_backend=force_backend)
         if noise_symmetry not in NOISE_SYMMETRIES:
@@ -2341,6 +2347,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             spline_order = spline_model.interpolation
         self.spline_model = spline_model
         self.use_splines = use_splines
+        self.covariance_on_host = covariance_on_host
         self.spline_order = spline_order
         self.spline_interpolant = AkimaInterpolant1D(
             use_gpu=_use_gpu, threadsperblock=NUM_SPLINE_THREADS, order=spline_order
@@ -2415,6 +2422,7 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             "galaxy_fmax": self.galaxy_fmax,
             "device_galactic_grids": self.device_galactic_grids,
             "spline_model": self.spline_model,
+            "covariance_on_host": self.covariance_on_host,
         }
 
     @property
@@ -3536,7 +3544,8 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
 
     def _setup_det_and_inv(self):
         """use the c++ backend to compute the log-determinant and inverse of the sensitivity matrix."""
-        c00, c11, c22, c01, c02, c12 = self._extract_matrix_elements(self.sens_mat, flatten=True)
+        # the matrix may already sit in host memory (covariance_on_host)
+        c00, c11, c22, c01, c02, c12 = self._extract_matrix_elements(self.xp.asarray(self.sens_mat), flatten=True)
         invC, detC = self._inverse_det_wrapper(c00, c11, c22, c01, c02, c12)
 
         # Sanitize pixels the noise model / 3x3 inverse cannot represent.
@@ -3559,6 +3568,9 @@ class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
             detC = xp.where(det_bad, xp.ones_like(detC), detC)
 
         self.invC, self.detC = invC, detC
+        if getattr(self, "covariance_on_host", False) and hasattr(self._sens_mat, "get"):
+            # only invC / detC are read from here on: free the GPU copy of the matrix
+            self._sens_mat = self._sens_mat.get()
 
     def _inverse_det_wrapper(
         self,

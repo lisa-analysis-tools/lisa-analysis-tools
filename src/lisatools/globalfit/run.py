@@ -343,6 +343,11 @@ def build_acs(
         # computed, so this walker no longer needs them.
         for key in [k for k in getattr(sens_here, "__dict__", {}) if k.startswith("_wconv_")]:
             delattr(sens_here, key)
+        if getattr(sens_here, "covariance_on_host", False) and hasattr(sens_here.invC, "get"):
+            # Hold this walker's inverse in host memory until the AnalysisContainerArray packs
+            # it into its GPU buffer (reading invC above also moved the matrix itself to the
+            # host), so the GPU never holds a full matrix for every walker at once.
+            sens_here.invC = sens_here.invC.get()
 
         _analysis_tmp = AnalysisContainer(
             data_res_arr,
