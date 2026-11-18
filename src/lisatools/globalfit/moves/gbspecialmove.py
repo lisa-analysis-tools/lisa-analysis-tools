@@ -3786,6 +3786,9 @@ class GBSpecialBase(GlobalFitMove, GroupStretchMove, Move, LISAToolsParallelModu
         # * Nothing reads the incoming state after the propose; kept, it pins a whole sampler state
         # * on the host.
         self.current_state = None
+        
+        # ! ensuring the memory used by the band buffers gets freed on all devices.
+        model.analysis_container_arr.free_gpu_memory()
 
         return new_state, accepted
 
