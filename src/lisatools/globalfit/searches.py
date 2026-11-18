@@ -431,16 +431,22 @@ class BaseSearchInterface(ABC):
         """The entries of the catalogue table at ``filepath`` and their shape.
 
         The file's root holds one dataset per catalogue column (groups, such as a search's own columns, are
-        skipped). The columns share one shape: ``(num_rows,)``, or ``(num_sources, num_samples)`` for samples of
+        skipped). A file with no dataset at its root is read from its ``Binaries`` group, the layout of the mojito
+        catalogue. The columns share one shape: ``(num_rows,)``, or ``(num_sources, num_samples)`` for samples of
         each source. Returns one ``{column: value}`` dict per entry, in C order over that shape, and the shape.
         """
         import h5py
 
         with h5py.File(filepath, "r") as catalog_file:
-            columns = {name: np.atleast_1d(item[()]) for name, item in catalog_file.items()
-                       if isinstance(item, h5py.Dataset)}
+            def datasets(group):
+                return {name: np.atleast_1d(item[()]) for name, item in group.items()
+                        if isinstance(item, h5py.Dataset)}
+
+            columns = datasets(catalog_file)
+            if not columns and isinstance(catalog_file.get("Binaries"), h5py.Group):
+                columns = datasets(catalog_file["Binaries"])
         if not columns:
-            raise ValueError(f"{filepath} holds no catalogue columns at its root")
+            raise ValueError(f"{filepath} holds no catalogue columns at its root or in a Binaries group")
 
         shapes = {name: values.shape for name, values in columns.items()}
         shape = next(iter(shapes.values()))

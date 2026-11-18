@@ -41,6 +41,7 @@ class SOBBHBlock(SourceBlock):
     SETTINGS_NAME: ClassVar[str] = "SOBBHTFSettings"
     SETUP_NAME: ClassVar[str] = "SOBBHTFSetup"
     SEARCH_INTERFACE: ClassVar[str] = "SOBHBSearchInterface"
+    BATCHED_SIGNAL_GEN: ClassVar[bool] = False # the gwtf waveform produced for residuals overflows the gpu memory if batched
     # seeds come from the catalogue's own TimeReferenceSSBFrame, evolved to the data start
     NEEDS_REFERENCE_TIME: ClassVar[bool] = False
     TD_WAVEFORM_METHOD: ClassVar[str | None] = "get_td_signals"

@@ -149,13 +149,21 @@ class GBCandidatesSeedTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must share one shape"):
             self.read(write_table(os.path.join(self.folder.name, "mixed.h5"), mixed))
 
-    def test_file_without_root_columns_is_refused(self):
-        # * The galaxy search writes its columns in a Binaries group; they must sit at the root.
+    def test_columns_in_a_binaries_group_are_read(self):
+        # * The layout of the mojito catalogue, which the galaxy search writes: the columns in a Binaries group.
         grouped_file = os.path.join(self.folder.name, "grouped_candidates.hdf5")
         with h5py.File(grouped_file, "w") as handle:
-            handle.create_dataset("Binaries/Amplitude", data=[1.0e-22])
-        with self.assertRaisesRegex(ValueError, "no catalogue columns at its root"):
-            self.read(grouped_file)
+            for name, values in CANDIDATE_COLUMNS.items():
+                handle.create_dataset(f"Binaries/{name}", data=np.asarray(values))
+            handle.create_dataset("Search/SignalToNoiseRatio", data=[12.0, 8.0])
+        np.testing.assert_array_equal(self.read(grouped_file), self.read(self.candidates_file))
+
+    def test_file_without_columns_is_refused(self):
+        empty_file = os.path.join(self.folder.name, "no_columns.hdf5")
+        with h5py.File(empty_file, "w") as handle:
+            handle.create_dataset("Search/SignalToNoiseRatio", data=[12.0])
+        with self.assertRaisesRegex(ValueError, "no catalogue columns at its root or in a Binaries group"):
+            self.read(empty_file)
 
 
 if __name__ == "__main__":
