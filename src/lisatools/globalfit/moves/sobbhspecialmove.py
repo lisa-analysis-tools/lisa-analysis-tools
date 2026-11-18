@@ -79,7 +79,7 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
         new_state, accepted = super().propose(model, state)
         self._data_gwtf = []
         self._invC_gwtf = []
-        
+        self.free_gpu_memory()
         return new_state, accepted
 
     def setup_likelihood_here(self, coords):
