@@ -5,6 +5,7 @@ import numpy as np
 from ...utils.utility import asnumpy
 from ...utils.constants import MTSUN_SI
 from .addremovemove import MultiGPUResidualAddRemoveMove
+import gc
 
 if TYPE_CHECKING:
     from eryn.prior import ProbDistContainer
@@ -76,10 +77,14 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
 
     def propose(self, model, state):
         """Propose a new state using the SOBBH special move, but release the stored data and invC after the proposal to free GPU memory."""
-        new_state, accepted = super().propose(model, state)
-        self._data_gwtf = []
-        self._invC_gwtf = []
-        self.free_gpu_memory()
+        try:
+            new_state, accepted = super().propose(model, state)
+        finally:
+            self._data_gwtf = []
+            self._invC_gwtf = []
+            gc.collect()  # Force garbage collection to free memory
+            self.free_gpu_memory()
+        
         return new_state, accepted
 
     def setup_likelihood_here(self, coords):
