@@ -544,7 +544,7 @@ class SourceBlock(MoveBlock):
     NEEDS_REFERENCE_TIME: ClassVar[bool] = True
     # the residuals of a seeded state are rebuilt with one waveform call per leaf over the walkers (False: one
     # call per walker)
-    BATCHED_SIGNAL_GEN: ClassVar[bool] = True
+    BATCHED_SIGNAL_GEN: ClassVar[bool] = False
     SUPPORTS_INFO_MATRIX: ClassVar[bool] = True
     # waveform methods the special PE move must be told about (TDMBHSpecialMove sets its own)
     WAVEFORM_METHODS: ClassVar[dict[str, str]] = {}
