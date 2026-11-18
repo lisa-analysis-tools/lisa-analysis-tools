@@ -1,7 +1,14 @@
 """Base mix-in tying ``eryn`` moves to global-fit MPI/GPU bookkeeping."""
 
+import logging
+
 import numpy as np
+import tqdm
 from eryn.moves import CombineMove
+
+from ...utils.device import gpu_memory_report
+
+logger = logging.getLogger(__name__)
 
 
 class GlobalFitMove:
@@ -138,3 +145,26 @@ class GFCombineMove(CombineMove, GlobalFitMove):
     """
 
     update_comm_special = True
+
+    def propose(self, model, state):
+        """Run the moves in turn, as :meth:`eryn.moves.CombineMove.propose` does, and log the GPU memory after each.
+
+        One :func:`~lisatools.utils.device.gpu_memory_report` per move (device, cupy pool, JAX arena, per card),
+        so a growth between two iterations can be traced to the move that left it. Nothing is logged on the CPU.
+        """
+        acs = getattr(model, "analysis_container_arr", None)
+        iterator = enumerate(self.moves)
+        if self.verbose:
+            iterator = tqdm.tqdm(iterator)
+
+        accepted_out = None
+        for i, move in iterator:
+            if isinstance(move, tuple):  # (move, weight)
+                move = move[0]
+            state, accepted = move.propose(model, state)
+            accepted_out = accepted.copy() if accepted_out is None else accepted_out + accepted
+            lines = gpu_memory_report(getattr(acs, "xp", None), getattr(acs, "gpus", None))
+            if lines:
+                label = getattr(move, "name", None) or getattr(move, "branch_name", None) or type(move).__name__
+                logger.info("GPU memory after the propose of '%s':\n  %s", label, "\n  ".join(lines))
+        return state, accepted_out
