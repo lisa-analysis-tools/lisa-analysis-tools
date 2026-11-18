@@ -69,7 +69,19 @@ class SOBBHSpecialMove(MultiGPUResidualAddRemoveMove):
             waveform_like_method,
             **kwargs
         )
-                
+
+    def free_gpu_memory(self):
+        """Free GPU memory used by the likelihood computation."""
+        super().free_gpu_memory()
+
+    def propose(self, model, state):
+        """Propose a new state using the SOBBH special move, but release the stored data and invC after the proposal to free GPU memory."""
+        new_state, accepted = super().propose(model, state)
+        self._data_gwtf = []
+        self._invC_gwtf = []
+        
+        return new_state, accepted
+
     def setup_likelihood_here(self, coords):
         ''''
         Setup the likelihood for the sobbh move.
