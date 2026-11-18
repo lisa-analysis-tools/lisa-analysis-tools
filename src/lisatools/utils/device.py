@@ -199,6 +199,7 @@ def gpu_memory_report(xp, gpus: Union[int, Sequence[int], None], walkers_per_gpu
         if stats:
             line += (
                 f"; JAX {_gib(stats.get('bytes_in_use', 0))} in use, peak {_gib(stats.get('peak_bytes_in_use', 0))}"
+                f", arena {_gib(stats.get('pool_bytes', 0))} held, limit {_gib(stats.get('bytes_limit', 0))}"
                 f", limit {_gib(stats.get('bytes_limit', 0))}"
             )
         count = (walkers_per_gpu or {}).get(gpu)

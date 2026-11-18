@@ -6,6 +6,7 @@ HDF backend, and MPI rank coordination into a runnable end-to-end global fit.
 
 import logging
 import os
+import gc
 import time
 from abc import ABC
 from copy import deepcopy
@@ -222,6 +223,10 @@ def subtract_state_templates(acs: AnalysisContainerArray, state: GFState, signal
     """
     acs_flat = acs.flatten()
     for name, gen in signal_gen_map.items():
+        logger.info(f"subtracting {name} templates from acs residuals (signal_gen path).")
+        # log the memory usage before and after the subtraction to help diagnose memory issues
+        current_memory = gpu_memory_report(acs.xp, acs.gpus)
+        logger.info(f"Memory usage before subtraction: {current_memory}")
         inds0 = state.branches_inds[name][0]  # (nwalkers, nleaves)
         coords0 = state.branches_coords[name][0]
         for leaf in range(inds0.shape[-1]):
@@ -229,14 +234,19 @@ def subtract_state_templates(acs: AnalysisContainerArray, state: GFState, signal
             if walkers.size == 0:
                 continue
             if getattr(gen, "supports_batch", False):
-                for w, template in zip(walkers, gen(*coords0[walkers, leaf].T)):
+                all_templates = gen(*coords0[walkers, leaf].T)
+                for w, template in zip(walkers, all_templates):
                     acs_flat[w].data.add_signal(template, sign=-1)
+                del all_templates
             else:
                 for w in walkers:  # one template on the device at a time
                     template = gen(*coords0[w, leaf])
                     acs_flat[w].data.add_signal(template, sign=-1)
-            del template
+                    del template
+            gc.collect()
             acs.free_gpu_memory()
+        current_memory = gpu_memory_report(acs.xp, acs.gpus)
+        logger.info(f"Memory usage after subtraction: {current_memory}")
         logger.info(f"rebuilt {name} residuals from {int(inds0.sum())} active leaves (cold chain).")
 
 
