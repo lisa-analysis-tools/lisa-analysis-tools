@@ -85,9 +85,11 @@ and builds its search part from the memory at construction and at the start of e
 version changed: per band one mixture, with two thirds of the weight on the fit on the residual and one third shared per
 fit among the other fits (a band without a fit of one side gives its weight to the other). A band whose covariance
 cannot be factored is left without a search part, with a warning. Its `apply_settings(fix_search_part=True)` brings the
-part up to the memory's version and fixes the memory, which then takes no new fit. A recipe file must make that call on
-every GB move that has the method, in its step of the kept iterations: the stock recipe does not, so the YAML builder
-refuses a block that would get a memory on it. The builders make one memory per run, in
+part up to the memory's version and fixes the memory, which then takes no new fit. That call must be made on every GB
+move that has the method when the kept iterations start. In the L2D YAML a stage attribute makes it
+(`stages: {pe: {attributes: {apply_settings: {fix_search_part: true}}}}` on the block or on the extra move), and the
+YAML builder refuses a block that would get a memory without that attribute in the last stage; a recipe file makes the
+call in its step of the kept iterations. The builders make one memory per run, in
 `<run>_artifacts/fstat_search_memory.npz`, and load it when the run resumes.
 
 While the memory is not fixed (the burn-in), the split and merge also makes the searches that fill it, in its `setup()`

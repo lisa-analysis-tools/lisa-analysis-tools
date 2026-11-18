@@ -6572,8 +6572,8 @@ class GBSplitMergeCellsMixin:
     """Production helpers of the GB moves that split one source of a cell into two and merge two
     into one; it comes before :class:`GBSpecialBase` among a move's bases.
 
-    Carved out of ``GBStretchedJumpRJMove`` of the clone stack ``env/stretched_jump``, line for
-    line, with five generalisations: :meth:`_run_rj_step` builds the per-half tables through the
+    It holds what such moves share, whatever their proposal, and leaves five places to the
+    class: :meth:`_run_rj_step` builds the per-half tables through the
     hook :meth:`_half_tables`; :meth:`_run_half` hands the buffer and the band temperatures to the
     class's ``_propose``; the first part of a proposal, from the cells' rows to the direction draw,
     is :meth:`_cell_state`, whose partner kernel takes its width and cutoff per cell;
@@ -6655,8 +6655,8 @@ class GBSplitMergeCellsMixin:
                      ll_change_log, prop_counts, acc_counts, round_i, scheduler):
         """Split or merge at the picked rows, once per walker parity: the even walkers' cells first, then the odd ones'.
 
-        Before each half the class's tables come from :meth:`_half_tables` (the stretched jump's
-        friend tables, built from the live rows of the other parity as they are then; None for a
+        Before each half the class's tables come from :meth:`_half_tables` (for instance friend
+        tables, built from the live rows of the other parity as they are then; None for a
         class that reads none), and the second half reads the outcome of the first. ``round_i``
         and ``scheduler`` serve production's checks of births and deaths.
         """
@@ -6682,8 +6682,8 @@ class GBSplitMergeCellsMixin:
     def _half_tables(self, band_sorter, half):
         """The tables that ``_propose`` reads in the cells of walker parity ``half``: None here.
 
-        The stretched jump returns its friend tables of the other parity, built from the live rows
-        as they are before the half.
+        A class whose proposal reads friend tables returns those of the other parity, built from
+        the live rows as they are before the half.
         """
         return None
 
@@ -7057,7 +7057,7 @@ class GBSplitMergeCellsMixin:
 @dataclass
 class GBFStatSplitMergeSettings:
     """Settings of :class:`GBFStatSplitMergeRJMove`, the options of a production run only: every
-    value of the proposal is a class constant (``move_recipe.md``, section 7)."""
+    value of the proposal is a class constant of the move (``docs/gb/fstat_split_merge``)."""
 
     # The search records whose band mixtures form the companion's search part: paths or glob
     # patterns, several files per band merged with equal weight per file. None runs the move
@@ -7067,7 +7067,8 @@ class GBFStatSplitMergeSettings:
 
 class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
     """Reversible-jump GB move that splits one source of a cell into two and merges two into one,
-    with the amplitudes from the F-statistic on the pair-free residual (``move_recipe.md``).
+    with the amplitudes from the F-statistic on the pair-free residual; the method and its tests
+    are described in ``docs/gb/fstat_split_merge``.
 
     It keeps production's pass (band sorter, cells, scan, in-model repeats, tempering, write-back)
     and replaces the birth and death of :class:`GBSpecialRJPriorMove` by a split and a merge, with
@@ -7081,8 +7082,8 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
     residual. Every density is a function of the lower state and that residual only.
 
     STFT buffers with the DFFR response only, whose kernels give the F-statistic and swap rows. The
-    math sits in static and class methods in one section, ported from the prototype
-    ``split_merge_math.py`` with the array module as an argument. Points are in the GB sampling
+    math sits in static and class methods in one section, with the array module as an
+    argument, so that it runs on numpy arrays as well. Points are in the GB sampling
     basis with the columns ``COL_*``; 6 and 7 hold ICRS right ascension and sine declination.
 
     Given a search memory that is not fixed, the move also makes the searches that fill it, at
@@ -7107,7 +7108,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
             from which the band sorter draws the dead rows.
     """
 
-    # * Sampling columns of the GB branch, named by what they hold (the committed F-statistic move
+    # * Sampling columns of the GB branch, named by what they hold (the F-statistic RJ move
     # * names 6 and 7 COL_LAM and COL_SIN_BETA, after an older frame)
     COL_LN_AMP, COL_F0, COL_FDOT, COL_PHI0, COL_COS_IOTA, COL_PSI, COL_RA, COL_SIN_DEC = range(8)
     NDIM = 8
@@ -7140,10 +7141,10 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
     # Upper-triangle order of the F-statistic overlaps (numpy.triu_indices(4))
     TRIU = np.triu_indices(4)
     # The sampling rows of the two templates: A = 2, cos iota = 0, phi0 = 0, psi = 0 (T+) or pi / 4
-    # (Tx), as the DFFR checks form them
+    # (Tx)
     FILTER_LOG_AMPLITUDE = float(np.log(2.0))
     FILTER_CROSS_PSI = 0.25 * np.pi
-    # * The companion mixture's weights of the search, local and prior parts (plan decision 44);
+    # * The companion mixture's weights of the search, local and prior parts, set by hand;
     # * with no search component active around f1, w_s goes to the other two in proportion
     COMPANION_WEIGHTS = (0.50, 0.35, 0.15)
     PART_SEARCH, PART_LOCAL, PART_PRIOR = range(3)
@@ -7155,9 +7156,9 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
     OTHER_FITS_WEIGHT = 1.0 / 3.0
     # The tempered SNR whose width the local part takes when the parent's own tempered SNR is larger
     RHO_REF = 4.5
-    # * The sky metric's antenna floor c_ant in 1 per rad^2: the user's value of 2026-11-09 from
-    # * check 11, whose synthetic points on the ecliptic plane allow 0.5 to 5 per rad^2 and where 1
-    # * lies closest to production's Fisher widths everywhere
+    # * The sky metric's antenna floor c_ant in 1 per rad^2: against production's Fisher widths,
+    # * synthetic points on the ecliptic plane allow 0.5 to 5 per rad^2, and 1 lies closest to
+    # * those widths everywhere
     ANTENNA_FLOOR = 1.0
     # The ridge of the amplitude Gaussians, epsilon = RIDGE_FRACTION tr(beta M) / d, keeps them
     # regular when two templates nearly coincide; the move evaluates its own densities, so the
@@ -7846,28 +7847,27 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         return rows[(frequency >= edges[first]) & (frequency < edges[last])]
 
     # ==============================================================================================
-    # The proposal, in the steps of the recipe
+    # The proposal, in the order of its steps
     # ==============================================================================================
 
     def _propose(self, band_sorter, buffer_obj, band_temps, picked, tables):
         """Draw each cell's split or merge and work out its acceptance terms but the likelihood and
-        the count prior, in the order of ``move_recipe.md``. The recipe numbers a split's steps 1 to
-        6 (the anchor, the primary's row, the companion's intrinsic point, the amplitudes, the
-        likelihood change, the acceptance) and a merge's steps 1 to 5 (the merged point and its
-        row, the merged amplitudes, the reverse split's densities at the current pair, the
-        likelihood change, the acceptance); the steps below name them by what they do:
+        the count prior. A split has six parts (the anchor, the primary's row, the companion's
+        intrinsic point, the amplitudes, the likelihood change, the acceptance) and a merge five
+        (the merged point and its row, the merged amplitudes, the reverse split's densities at the
+        current pair, the likelihood change, the acceptance); both run through these steps:
 
         1. the cells' state and the direction (:meth:`_cell_state`), with the partner kernel of
            width W / 2 and cutoff W of the cell's band;
         2. every proposing cell's primary, and a merge's partner drawn first, out of the residual,
            which is then r_B: the parent-free residual of a split, the pair-free one of a merge;
         3. one F-statistic row per primary on r_B and its tempered four-amplitude Gaussian (the
-           primary's row, split step 2 and merge step 1 of the recipe);
+           primary's row of a split and of a merge);
         4. each split's dead row and companion, and the window rule (the companion's intrinsic
-           point, split step 3);
+           point);
         5. one F-statistic row per companion or partner and four swap rows per cell on r_B, and the
-           pair's tempered eight-amplitude Gaussian (the amplitudes of split step 4; the reverse
-           split's densities at the current pair, merge step 3);
+           pair's tempered eight-amplitude Gaussian (the amplitudes of a split; for a merge, the
+           reverse split's densities at the current pair);
         6. the draws, the densities and the bookkeeping terms of each direction
            (:meth:`_split_proposal`, :meth:`_merge_proposal`);
         7. the residual restored, so that the mixin's likelihood sequence and its restoration of
@@ -7914,13 +7914,13 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
             self._fill_cells(buffer_obj, False, partner_points, slots[merges],
                              None if N_vals is None else N_vals[merges])
 
-        # 3. The primaries' rows on r_B and their amplitude Gaussians (the primary's row: the
-        # recipe's split step 2 and merge step 1)
+        # 3. The primaries' rows on r_B and their amplitude Gaussians (the primary's row of a
+        # split and of a merge)
         with _tspan(timer, "fstat_split_merge_rows"):
             primaries = self._primary_systems(buffer_obj, picked, state, beta, moving)
         proposal["rho_star_squared"] = primaries["rho_star_squared"]
         # 4. The splits' dead rows and companions, and the window rule (the companion's intrinsic
-        # point, the recipe's split step 3)
+        # point)
         companions = self._split_companions(picked, state, beta, primaries, splits)
         proposal["companion_part"][splits] = companions["part"]
         kept_splits = splits[companions["kept"]]
@@ -7939,7 +7939,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
                              partner_points, [values[num_kept:] for values in pairs])
 
         # * 7. The residual back as it was, whatever the draws gave. This costs two template fills
-        # * per split attempt and four per merge beyond the recipe's count, since the mixin's
+        # * per split attempt and four per merge beyond the minimum, since the mixin's
         # * likelihood sequence takes the same templates out again.
         # TODO keep r_B for that sequence instead (no restoration and no second removal), a later
         # TODO optimisation once the move is verified
@@ -7961,7 +7961,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
 
     def _draw_partners(self, state, merges):
         """The position of each merge's partner on the member axis, drawn with its kernel
-        probability by the Gumbel-max trick, as the stretched jump's merge draws it."""
+        probability by the Gumbel-max trick."""
         xp = self.xp
         if len(merges) == 0:
             return xp.zeros(0, dtype=xp.int64)
@@ -7970,7 +7970,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         return xp.argmax(state["partner_log_lower"][merges] + gumbel, axis=1)
 
     def _primary_systems(self, buffer_obj, picked, state, beta, moving):
-        """The primary's row (the recipe's split step 2 and merge step 1): the F-statistic row of
+        """The primary's row of a split and of a merge: the F-statistic row of
         every proposing cell's primary on r_B, its tempered four-amplitude Gaussian and the prior
         box's widths of the intrinsic columns there.
 
@@ -8005,7 +8005,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         return systems
 
     def _split_companions(self, picked, state, beta, primaries, splits):
-        """The companion's intrinsic point, the recipe's split step 3: the dead row child b takes,
+        """The companion's intrinsic point of a split: the dead row child b takes,
         its point from the three-part mixture around the anchor, and the rules that end an attempt
         as no proposal.
 
@@ -8025,7 +8025,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         bands = picked["band_inds"][splits]
         anchors = state["old_primary"][splits]
         windows = self._window_mhz[bands]
-        # Child b's dead row, drawn uniformly among the cell's, as the stretched jump draws it
+        # Child b's dead row, drawn uniformly among the cell's
         num_dead = state["num_dead"][splits]
         choice = xp.minimum((xp.random.rand(num_splits) * num_dead).astype(xp.int64), num_dead - 1)
         dead_rank = xp.cumsum(state["is_dead"][splits], axis=1) - 1
@@ -8127,7 +8127,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
 
     def _pair_systems(self, buffer_obj, picked, beta, primaries, cells, first_points,
                       second_points):
-        """The pair's amplitude system (the recipe's split step 4, merge step 3): the F-statistic
+        """The pair's amplitude system of a split and of a merge's reverse split: the F-statistic
         row of each second source (a split's companion, a merge's partner) and the four swap rows of
         the pair on r_B, and the pair's tempered eight-amplitude Gaussian. Returns its mean and
         factor in u and whether the cell is usable: both rows and the swap rows kept and every part
@@ -8193,10 +8193,10 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         return mean, factor, usable
 
     def _split_proposal(self, proposal, picked, state, primaries, companions, pairs):
-        """The amplitudes, the densities and the acceptance terms of the splits (the recipe's split
-        steps 4 to 6): the outcome masks of every split and, for each kept companion, the eight
-        amplitudes drawn from the pair's Gaussian, each child at a copy drawn uniformly, the
-        densities and the bookkeeping terms as the stretched jump's split forms them. Writes the
+        """The amplitudes, the densities and the acceptance terms of the splits: the outcome masks
+        of every split and, for each kept companion, the eight amplitudes drawn from the pair's
+        Gaussian, each child at a copy drawn uniformly, the densities and the inputs of the
+        bookkeeping terms (:meth:`rj_bookkeeping_log_terms`). Writes the
         cells' entries of ``proposal``."""
         xp = self.xp
         splits = xp.flatnonzero(state["split"])
@@ -8290,10 +8290,10 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
     def _merge_proposal(self, proposal, picked, state, beta, primaries, merges, partner,
                         partner_points, pairs):
         """The merged amplitudes, the reverse split's densities and the acceptance terms of the
-        merges (the recipe's merge steps 2, 3 and 5): the merged source at the primary's intrinsic
-        point with its four amplitudes drawn from the primary's Gaussian of merge step 1 (the
-        primary's row on the pair-free residual), the densities, and the bookkeeping terms of the
-        reverse split as the stretched jump's merge forms them. Writes the cells' entries of
+        merges: the merged source at the primary's intrinsic point with its four amplitudes drawn
+        from the primary's Gaussian (the primary's row on the pair-free residual), the densities,
+        and the inputs of the bookkeeping terms of the reverse split
+        (:meth:`rj_bookkeeping_log_terms`). Writes the cells' entries of
         ``proposal``."""
         xp = self.xp
         cells = merges
@@ -8307,7 +8307,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         primary_points, periods = state["old_primary"][cells], state["periods"]
         amplitude, intrinsic = list(self.AMPLITUDE_COLUMNS), list(self.INTRINSIC_ORDER)
 
-        # * The merged amplitudes (the recipe's merge step 2): the merged source keeps the primary's
+        # * The merged amplitudes: the merged source keeps the primary's
         # * intrinsic point; its amplitudes come from the primary's Gaussian on the pair-free
         # * residual, at one of the four copies
         circular = self.amplitude_draw(star_mean, star_factor, xp.random.randn(num, 4), xp=xp)
@@ -8318,9 +8318,9 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         merged = self.wrap_periodic(merged, periods, xp=xp)
 
         # * The densities from the stored points: this draw's ln q_merge, and the reverse split's
-        # * ln q_split at the current pair (the recipe's merge step 3), its companion density at the
+        # * ln q_split at the current pair, its companion density at the
         # * partner with the active set around f1 and the local width from rho*^2 of the primary's
-        # * row (merge step 1)
+        # * row
         mixture = self._companion_mixture(
             bands, primary_points, primaries["rho_star_squared"][cells], beta[cells],
             primaries["widths"][cells])
@@ -8395,12 +8395,12 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
              for part in (self.PART_SEARCH, self.PART_LOCAL, self.PART_PRIOR)]
 
     # ==============================================================================================
-    # Math of the split and the merge: the prototype split_merge_math.py with the array module as an
-    # argument, its formulas unchanged; the components of the companion may also come one set per
-    # row, as the move holds them per band
+    # Math of the split and the merge, with the array module as an argument, so that it runs on
+    # numpy arrays as well; the components of the companion may come one set per row, as the move
+    # holds them per band
     # ==============================================================================================
 
-    # The circular amplitudes u of each point by the prototype's name: the mixin's amplitude_vectors
+    # The circular amplitudes u of each point: the mixin's amplitude_vectors under the name of u
     circular_amplitudes = staticmethod(GBSplitMergeCellsMixin.amplitude_vectors)
 
     @staticmethod
@@ -8611,7 +8611,8 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         (ecliptic_pole_tangent), and the antenna floor adds on both directions; the map to
         (sin dec, ra) scales the declination direction by 1 / cos dec and the right ascension
         direction by cos dec, which leaves the cross term as it is. With obliquity 0 (the default,
-        the stand-in's convention) the pole is the coordinates' pole and the block is diagonal;
+        an orbit in the coordinates' equator) the pole is the coordinates' pole and the block is
+        diagonal;
         right_ascension is then not needed. The move's ICRS frame takes OBLIQUITY_ICRS_RAD.
         """
         doppler = 0.5 * (cls.TWO_PI * frequency_hz * light_time_seconds) ** 2
@@ -8653,7 +8654,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         """(rho_eff^2 g + P)^-1 (n, 4, 4) of the local part at intrinsic points (n, 4), P from
         ``prior_widths`` (n, 4), both in INTRINSIC_ORDER; through regularised_covariance at beta 1,
         so that production's inverse is reused."""
-        # ! the default obliquity 0 is the prototype's stand-in convention; the move passes
+        # ! the default obliquity 0 is an orbit in the coordinates' equator; the move passes
         # ! OBLIQUITY_ICRS_RAD for production's ICRS frame
         information = rho_eff_squared[:, None, None] * cls.intrinsic_metric(
             intrinsic, observation_seconds, midpoint_fraction, light_time_seconds, antenna_floor,
@@ -8826,7 +8827,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
     @staticmethod
     def split_log_acceptance(*, beta, delta_log_likelihood, log_prior_ratio, bookkeeping,
                              log_merge_density, log_split_density):
-        """ln alpha of a split, as the prototype assembles it for the checks: beta Delta ln L
+        """ln alpha of a split, assembled in one place for unit tests: beta Delta ln L
         + ln pi(a) + ln pi(b) - ln pi(parent) + the bookkeeping (without the prior ratio)
         + ln q_merge(parent | children) - ln q_split(children | parent). A merge takes minus the
         terms of its reverse split."""
@@ -8838,8 +8839,8 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
                                    log_band_share, num_dead_lower, log_partner_upper,
                                    log_merge_upper, log_split_lower, log_merge_density,
                                    log_split_density, xp=np):
-        """ln alpha of a split without the beta Delta ln L term (the acceptance, the recipe's split
-        step 6): the mixin's prior ratio and bookkeeping, plus ln q_merge - ln q_split. A merge
+        """ln alpha of a split without the beta Delta ln L term: the mixin's prior ratio and
+        bookkeeping, plus ln q_merge - ln q_split. A merge
         takes minus the terms of its reverse split, with the counts of its lower state."""
         bookkeeping = cls.rj_bookkeeping_log_terms(
             log_prior_ratio=log_prior_ratio, num_alive_walker=num_alive_walker, num_slots=num_slots,

@@ -1,0 +1,42 @@
+type: gb
+priors: {class: mojitolight.GBPrior}  # the setup limits its f0 to the proposed bands
+nleaves: 128  # the most sources at once: the 80 start candidates and room for RJ births
+num_prop_repeats: 50
+waveform:
+  class: GBGPU
+  runtime_kwargs: {oversample: 4, tdi_channel_setup: XYZ, tdi2: true}
+# DFFR with first-order delays, as the old high-frequency run and every DFFR run of the GB memory effort
+stft: {n_side_bins: 16, response: dffr, linear_envelope: true, use_midpoint: true, first_order_delays: true}
+# the benchmark's ladder: beta = 1 / 1.2^k for the 11 coldest rungs, the hottest of the 12 at T = 10
+tempering: {ratio: 1.2, Tmax: 10}
+pe_move:
+  class: GBSpecialRJPriorMove
+  # the values of the kept steps: every in-model proposal a Fisher-matrix one, the matrices held for 50 blocks;
+  # the `stages` below set the stretch to 0.5 and the refresh to every block for the burn-in
+  kwargs:
+    stretch_probability: 0.0
+    num_stationary_fim_steps: 50
+    run_swaps: true
+    use_prior_removal: false
+    phase_maximize: false
+    ranks_needed: 0
+# Per recipe stage (the names of recipe.kwargs.stages in global.yaml). The exact group stretch at 0.5 with a new Fisher
+# matrix at every block in the burn-in, where it doubled the share of the missed sources that converge from the search
+# start; no stretch and the matrices held for 50 blocks in the kept steps, where the Fisher jump alone is the cheapest
+# per independent sample (docs/gb/stretch_proposal/).
+stages:
+  burn-in: {attributes: {stretch_probability: 0.5, num_stationary_fim_steps: 1}}
+  pe:      {attributes: {stretch_probability: 0.0, num_stationary_fim_steps: 50}}
+search:
+  search_type: catalog
+  # the galaxy search's candidates inside the sampled f0 range (80 of 6616), the columns at the file's root;
+  # made by global_fit_dev/scripts/gb_stretch/high_freq_config/make_candidate_files.py
+  search_path: ~/projects/erebor/data/gb_candidates_high_freq.hdf5
+  # ln A, f0 [mHz], fdot, phi0, cos iota, psi, alpha, sin delta; hotter chains are wider
+  spread: [1e-3, 1e-9, 1e-19, 1e-3, 1e-3, 1e-3, 1e-4, 1e-4]
+  max_resample_tries: 2000
+  # the STFT computations take the parameters at the catalogue epoch, where the candidates are
+  kwargs: {evolve_to_data_start: false}
+links:
+  waveform_model_code_link: https://github.com/Erebor-L2D/GBGPU/tree/cd1l-run0
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors/blob/fb65c565aea06c62a41ddbe95bb6b40a1a9c04b6/src/ereborpriors/stock/mojitolight/gb.py

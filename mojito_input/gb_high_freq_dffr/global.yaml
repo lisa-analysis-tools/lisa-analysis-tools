@@ -1,0 +1,77 @@
+# High-frequency GB global fit on the STFT domain (DFFR response), GB only with a fixed noise: the YAML successor of
+# mojito_input/gb_high_freq_global_fit_settings.py. The stock recipe runs a burn-in with the exact group stretch, then
+# the kept steps without it: the stages are named at the end of this file, and the GB block sets the stretch and the
+# Fisher refresh per stage (blocks/gb.yaml). Paths are those of SURF Spider.
+schema_version: 1
+run:
+  name: gb_high_freq_stretch_burn_in
+  # ! The run resumes from a backend file of its name in this folder, so every new run needs its own folder.
+  output_dir: ~/projects/erebor/global_fit_runs/gb_high_freq_stretch_burn_in/
+  seed: 5701424  # as the old high-frequency run
+  num_iterations: 500  # 50 burn-in iterations, then 450 kept ones
+  backup_iter: 5
+
+sampler:
+  nwalkers: 32
+  ntemps: 12  # the benchmark's ladder, on which the stretch was judged (gb block: tempering)
+
+compute:
+  gpus: [0]
+  backend: cuda13x
+  head_rank: 1
+  main_rank: 0
+
+data:
+  loader: mojito_l1
+  path: /project/lisa_nlddpc/Data/mojito_light/
+  source_types: [gb, noise]  # as the old high-frequency run; the verification binaries lie below 9.8 mHz
+  # On the host: the setup rebuilds the orbits on the device and never reads this copy's arrays.
+  orbits: {type: l1, frame: icrs, armlength: 2493162305.42235, force_backend: cpu}
+  Tobs: 713 day  # whole one-day segments, so no partial day is left over
+  dt: 5 s
+  highpass: {cutoff: 1e-5, order: 2, zero_phase: true}
+  lowpass: {cutoff: 1e-1, order: 2, zero_phase: true}
+  downsample: {window: [kaiser, 31.0]}
+  trim: {duration: 200 h, trimming_type: from_each_end}
+  alias_correction: true  # the noise model includes the power the decimation folds back, as in the DFFR runs
+
+domain:
+  type: stft
+  # The user's limits (2026-11-05). The band walk from 9.8 mHz samples f0 from 9.944 to 22.067 mHz; its first band,
+  # 9.803 to 9.944 mHz, is a guard band and holds two loud sources that stay unmodelled.
+  min_freq: 9.8e-3
+  max_freq: 29e-3
+  segment_duration: 1 day
+
+window:
+  type: tukey
+  taper_duration: 10000 s  # as the old high-frequency run and the full-band runs (Tukey fraction 0.11574)
+  normalize: true
+
+sensitivity:
+  class: XYZSensitivityBackend
+  kwargs:
+    tdi_generation: 2
+    mask_percentage: 0.02
+    average_transfer_functions: true
+  # No psd block, so the noise is fixed. fixed_psd_kwargs is left out: the engine's default, psd_params
+  # [1.5e-11, 3e-15] with no galfor, is the old high-frequency run's noise. A value given here arrives as a YAML list,
+  # which the sensitivity's split_psd_params cannot slice (psd_params[..., :n]), so the run would stop in setup_acs.
+
+metadata:
+  codename: erebor
+  version: gb_high_freq_dffr
+  contact: ereborl2d@googlegroups.com
+  code_link: https://github.com/Erebor-L2D
+  input_data_link: /project/lisa_nlddpc/Data/mojito_light/
+  input_reference: mojito light
+  noise_model: parametric
+  noise_model_code_link: https://github.com/Erebor-L2D
+  comment: "High-frequency GB fit, DFFR response, from the galaxy search's candidates; the exact stretch in burn-in."
+
+recipe:
+  class: StockRecipe
+  kwargs:
+    stages:
+      - {name: burn-in, iterations: 50}
+      - {name: pe}  # the last stage has no count and runs to run.num_iterations
