@@ -1948,9 +1948,14 @@ class STFTSignal(STFTSettings, DomainBase):
             arr_here = np.log10(arr_here)
         if scale == "log":
             arr_here = np.log(arr_here)
+
+        norm = kwargs.pop("norm", None)
+        if norm is None:
+            from matplotlib.colors import LogNorm
+            norm = LogNorm()
         
         cb = ax.pcolormesh(
-            t_arr, f_arr, arr_here, shading="auto", cmap="cividis", **kwargs
+            t_arr, f_arr, arr_here, shading="auto", cmap="cividis", norm=norm, **kwargs
         )
 
         ax.set_yscale("log")
