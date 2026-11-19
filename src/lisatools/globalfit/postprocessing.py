@@ -992,6 +992,8 @@ def _extract_sensitivity_metadata(gi) -> tuple[dict, dict]:
     kwargs.pop("orbits")
     kwargs.pop("settings")
     kwargs.pop("window_values")
+    kwargs.pop("device_galactic_grids")
+    
     if kwargs["data_td_settings"] is not None:
             kwargs.pop("data_td_settings")
 
