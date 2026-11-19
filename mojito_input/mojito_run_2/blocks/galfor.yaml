@@ -1,0 +1,18 @@
+
+type: galfor  # block type == file stem == branch name (source_info / priors / recipe key)
+
+# The prior: <module>.<Class> of ereborpriors.stock, with the arguments of its prior_factory.
+priors:
+  class: mojitolight.GalacticForegroundPrior
+  kwargs: {}
+  output_file: galfor_prior.yaml  # where to write the prior's YAML; relative paths are relative to the run folder
+
+enabled: true  # false: the block is left out of the run
+
+links:
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors
+  prior_model_config_file: ''
+
+injection: null  # for diagnostic plots, keyed like the prior basis
+
+search: null  # None -> no search interface (see SearchSpec)

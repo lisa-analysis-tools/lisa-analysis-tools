@@ -1,0 +1,231 @@
+# gwtf SOBBH branch. The waveform, TD generator and PE move are the block defaults:
+#   waveform:    GWTF_generator(fresnel_kernel_width=16); the block fills settings, orbits, T_obs, use_GPU, tukey_alpha
+#   td_waveform: SOBBHTaylorT3TDIWaveform(phase_at_coalescence=True), referenced to the data start
+#   pe_move:     SOBBHSpecialMove(permute_every=0, pad_out_of_prior, run_async, run_threaded, randomize_split,
+#                                 tc_min_days=60)
+
+type: sobbh  # block type == file stem == branch name (source_info / priors / recipe key)
+
+# The prior: <module>.<Class> of ereborpriors.stock, with the arguments of its prior_factory.
+priors:
+  class: mojitolight.SOBHBPrior
+  kwargs:
+    # arguments of SOBHBPrior.prior_factory (those not listed are filled in by the builder)
+    f0_min: 1e-4  # Minimum value for f0 (Hz, at data start) for a single source.
+    f0_max: 1e-1  # Maximum value for f0 (Hz, at data start) for a single source.
+    # chirp_mass_min: 5.0  # Minimum value for chirp mass (Msun) for a single source.
+    # chirp_mass_max: 100.0  # Maximum value for chirp mass (Msun) for a single source.
+  output_file: sobbh_prior.yaml  # where to write the prior's YAML; relative paths are relative to the run folder
+
+enabled: true  # false: the block is left out of the run
+
+links:  # adds waveform_model_code_link
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors
+  prior_model_config_file: ''
+  waveform_model_code_link: https://github.com/Erebor-L2D/LISAanalysistools/blob/l2d-dev/src/lisatools/sources/sobbh/waveform_gwtf.py
+
+injection: null  # for diagnostic plots, keyed like the prior basis
+
+search:  # None -> no search interface (see SearchSpec)
+  search_type: point_estimate
+  # samples / point estimates: a file or a folder (one file per source), each a .npy of physical values or an
+  # .h5/.hdf5 catalogue table (one root dataset per catalogue column); catalog reads the injection catalogue, no file
+  search_path: /data/asantini/globalfit/erebor_org_setup/search_results/sobbh/search_seed_parameters_raw.npy
+  parameters_searched: all  # names in the prior's input (sampling) basis
+  # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
+  spread: info_matrix  
+  fallback_spread: [2.0e-5, 1.0e-3, 5.0e-3, 5.0e-3, 0.05, 0.2, 1.0e-9, 0.05, 0.05, 0.01, 0.005]
+  is_eryn_backend: false  # search results are an eryn backend, already in the sampling basis
+  max_resample_tries: 500  # redraws of walkers that land outside the prior around a point value
+  kwargs: {}  # the interface class's own arguments
+    # arguments of SOBHBSearchInterface (those not listed are filled in by the builder); none is set: to set one,
+    # remove the {} above and the # of its line
+    # bool If True, when seeding from the catalog values evolve the source parameters to the start of the data segment
+    # using the provided evolution function.
+    # evolve_to_data_start: true
+    # bool The phase the seeds carry: the coalescence phase (True) or ``phi_0``, the orbital phase at the data start
+    # (False, default).
+    # phase_at_coalescence: false
+
+pe_move:  # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
+  class: SOBBHSpecialMove
+  kwargs:
+    # arguments of SOBBHSpecialMove (those not listed are filled in by the builder)
+    permute_every: 200  # gate for the walker-permuting (fancy) temperature swap: if bool, True enables, False disables.
+    # whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues.
+    pad_out_of_prior: true
+    # whether to run the waveform generation and likelihood computation asynchronously for each GPU. If True, the
+    # synchronization will happen on the python side after the kernel calls.
+    run_async: true
+    # whether to run the waveform generation and likelihood computation in separate threads for each GPU.
+    run_threaded: true
+    randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+    tc_min_days: 60
+    # batch_size_per_gpu: null
+    # flow_burnin: 20  # number of sampler iterations (calls to ``propose``) before flow proposals are used.
+    # Iteration cadence at which the move should cross-check likelihoods between worker ranks.
+    # iters_compare_likelihood: -1
+    # iters_reset_buffers: -1  # Iteration cadence at which auxiliary buffers should be reset.
+    # a: 2.0  # The stretch scale parameter.
+    # return_gpu: false  # Whether the array being returned is in ``Cupy`` (``True``) or ``NumPy`` (``False``).
+    # random_seed: null  # Set the random seed in ``CuPy/NumPy`` if not ``None``.
+    # lift_scale: 2.0  # Width of the lift weights in units of the complements' circular standard deviation.
+    # lift_kmax: 2  # Most extra turns a lift may take.
+    # nsplits: 2  # The number of sub-ensembles to use.
+    # By default, an update will fail with a ``RuntimeError`` if the number of walkers is smaller than twice the
+    # dimension of the problem because the walkers would then be stuck on a low dimensional subspace.
+    # live_dangerously: false
+    # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+    # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+    # List of names (`str`), that can be in any :class:`eryn.state.BranchSupplemental`, to skip when updating states
+    # (:func:`Move.update`).
+    # skip_supp_names_update: []
+    # is_rj: false  # If using RJ, this should be ``True``.
+    # use_gpu: false  # Whether ``Cupy`` (``True``) is used or not (``False``).
+
+# Always a ladder (default: ratio 1.2 over sampler.ntemps, as the reference settings pass). Not None: the Setup's own
+# default is 24 rungs, which cannot seed a state with fewer temperatures.
+tempering:
+  ntemps: null  # None -> sampler.ntemps
+  ratio: 1.2  # geometric ladder: betas = ratio ** -arange(ntemps)
+  Tmax: null  # the hottest rung's temperature: its beta becomes 1 / Tmax, the other rungs stay ratio ** -k
+  betas: null  # the ladder itself, coldest first (strictly decreasing, in (0, 1]); replaces ntemps, ratio and Tmax
+
+nleaves: 5  # source blocks override: "auto" -> len(data.source_ids[SOURCE_IDS_KEY])
+
+num_prop_repeats: 1000  # how many times to repeat the proposal per walker per iteration
+
+inner_moves: null  # None -> the Setup's default (StretchMove)
+
+waveform:
+  class: GWTF_generator
+  kwargs:
+    # arguments of GWTF_generator (those not listed are filled in by the builder)
+    fresnel_kernel_width: 16  # Width of the Fresnel kernel in number of frequency bins (default 10).
+    # List of (f_lo, f_hi) tuples [Hz] where the inverse covariance is set to zero (zero information).
+    # psd_drop_bands: [[0.029, 0.031], [0.059, 0.061], [0.089, 0.091]]
+  runtime_kwargs: {}  # -> Settings.waveform_kwargs
+
+# the injection/residual TD generator: same parameters, referenced to the data start (its phase convention comes from
+# phase_at_coalescence below)
+td_waveform:
+  class: SOBBHTaylorT3TDIWaveform
+  method: null  # None -> the block's TD_WAVEFORM_METHOD
+  kwargs:
+    # arguments of SOBBHTaylorT3TDIWaveform (those not listed are filled in by the builder)
+    order: 25
+    # Time in seconds to add as buffer to the TDI response to ensure proper calculation at the beginning and end of
+    # the signal.
+    buffer_time: 10000
+    # if True, ``phi0`` is the coalescence phase (the pygwtf ``phi_coal`` convention of ``GWTF_generator``) instead of
+    # the orbital phase at ``waveform_t0``.
+    # phase_at_coalescence: false
+    # tdi_generation: 2nd generation
+    # tdi_channels: XYZ
+    # fft_batch_size: 1
+    # signal_duration: null
+    # use_spline: false
+    # run_async: false
+    # Optional :class:`DomainSettingsBase` instance giving the analysis-domain target directly (sprint rule: domains
+    # are communicated by settings objects, not strings).
+    # output_domain_settings: null
+  runtime_kwargs: null
+
+# A normalising-flow proposal among the inner moves, trained on the chain while it runs. null: none. With
+# `parameters`, the flow proposes those and a Gaussian (`gaussian`) the others.; added to the inner moves at
+# flow.weight
+flow:  # added to the inner moves at flow.weight
+  weight: 0.2  # among the block's inner moves
+  parameters: null  # names in the prior's input basis; None -> every column
+  gaussian: null  # FlowGaussianMove kwargs for the columns outside parameters
+  model:  # a Flow from eryn.flows, e.g. ZukoFlow
+    class: ZukoFlow
+    kwargs:
+      # arguments of ZukoFlow (those not listed are filled in by the builder)
+      flow_class: NSF  # Flow architecture.
+      transforms: 8
+      hidden_features: [128, 128, 128, 128]
+      bins: 8
+      # Maximum ``|k|`` per periodic dimension used when summing the coords density over periodic aliases.
+      # periodic_aliases: 1
+  data_transform:  # a DataTransform from eryn.flows; None -> the flow's default
+    class: WhiteningTransform
+    kwargs:
+      # arguments of WhiteningTransform (those not listed are filled in by the builder)
+      shared: false  # Whitening granularity.
+      periodic_in_cholesky: true  # Whitening scheme for the periodic block.
+      # Where :meth:`fit` places the wrap cut (the discontinuity of the circular shift) of each periodic component.
+      # periodic_cut: antimode
+  trainer:  # ProcessExecutor kwargs (incl. fit_kwargs)
+    # arguments of ProcessExecutor (those not listed are filled in by the builder)
+    epochs_per_round: 150  # ``n_epochs`` per fit in the worker.
+    min_train_samples: 1500  # Minimum buffered samples before the worker fits.
+    max_buffer_samples: 4000  # Per-condition ring-buffer cap in the worker.
+    # Drift valve for the data transform: ``None`` (default) fits it once and freezes it; an integer ``K`` re-fits it
+    # every ``K``-th worker round.
+    refit_transform_every: 1
+    torch_num_threads: 2  # ``torch.set_num_threads`` in the worker.
+    # When ``True`` (requires ``diagnostics_dir`` and the optional ``corner`` package), each diagnostics round also
+    # writes one corner plot per condition overlaying that round's training buffer with an equal number of draws...
+    plot_corner: true
+    # Extra keyword arguments forwarded to the worker's ``flow.fit``.
+    fit_kwargs: {batch_size: 1024, lr: 0.001, lr_annealing: true, optimizer: adamw, patience: 30, train_noise: 0.0, val_split: temporal, validation_fraction: 0.15}
+    # train_every: 1
+    # max_pending_batches: 4  # ``maxsize`` of the sample queue.
+    # On a full sample queue, ``"oldest"`` evicts the oldest queued batch to make room for the incoming one;
+    # ``"newest"`` drops the incoming batch.
+    # drop_policy: oldest
+    # save_every: 1  # Checkpoint cadence in trained versions.
+    # diagnostics_every: 1  # Plot cadence in trained versions.
+    # corner_max_samples: 5000  # Cap on points per data set in each corner plot.
+    # start: true  # Start the worker process in ``__init__``.
+
+# what the waveforms (and so the sampled times/phases and the search results) are referenced to: data.reference_time
+# (MOJITO_REFERENCE_TIME) or the start of the preprocessed TD data
+time_reference: data_start
+
+# Per recipe stage; none set here, so the move is the same in every stage (its repeats are tuned).
+stages:   # recipe stage name -> the PE move's settings in that stage (special pe_moves only; see StageSpec)
+  burn-in:
+    num_prop_repeats: 1000
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: 0.0
+    # Anything else of the PE move: attribute path -> value, set when the stage starts (recipe.set_attribute). The
+    # path goes through attributes and integer indices and may end on a method, which is then called with the value (a
+    # dict as keyword arguments): {flow_buffer_thin: 10, "moves[-1].executor.tune": {train_every: 10}}. They stay set
+    # in the later stages (a restart into a later stage sets them again, in the stages' order).
+    attributes: {}
+  tune:
+    num_prop_repeats: null
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: 0.5
+    attributes: {}
+  pe:
+    num_prop_repeats: null
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: 0.5
+    attributes: {'moves[-1].executor.tune': {max_buffer_samples: null, train_every: 10}}
+
+
+# the proposal repeats follow the inner autocorrelation time (special pe_moves with inner_act; see the spec)
+adaptive_repeats:
+  min: 100
+  max: 2000
+  per_act: 2.0  # inner ACTs per iteration
+  every: 10  # iterations of the block's move between updates
+  window: 20  # iterations of the block's move the ACT is measured over
+  max_step: 2.0  # largest factor the repeats change by in one update
+
+# per-leaf priors for the PE move (the branch prior `priors` stays for the transform, seeding and sampler)
+proposal_priors:
+  class: mojitolight.SOBHBPrior
+  factory: per_source_prior_factory
+  kwargs: {num_leaves: 5}  # arguments of SOBHBPrior.per_source_prior_factory (those not listed are filled in by the builder)
+    # arguments of SOBHBPrior.per_source_prior_factory (those not listed are filled in by the builder); none is set:
+    # to set one, remove the {} above and the # of its line
+    # sort_with_chirp_mass: false  # If True, the returned list of priors will be sorted by chirp mass.
+
+# what the phase parameter (waveform-basis column 7) is, for the gwtf waveform, the TD generator and the catalogue
+# seeds alike: False -> phi_0, the orbital phase at the data start; True -> the coalescence phase
+phase_at_coalescence: false
+info_matrix: {'distance_cap': 1}

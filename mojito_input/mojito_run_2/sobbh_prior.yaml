@@ -1,0 +1,92 @@
+branch_name: sobbh
+priors:
+- name:
+  - Mc
+  - eta
+  prior_kwargs:
+    eta_max: 0.249999999
+    eta_min: 1.0e-09
+    m1_max: 100.0
+    m1_min: 5.0
+    m2_max: 80.0
+    m2_min: 1.0
+    mc_max: 100.0
+    mc_min: 5.0
+    names:
+    - Mc
+    - eta
+    num_grid: 100000
+  prior_type: ChirpMassEtaUniformComponentMasses
+- name: s1
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: s1
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: s2
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: s2
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: d_L
+  prior_kwargs:
+    cosmology: Planck15
+    maximum: 1.0
+    minimum: 1.0e-07
+    num_points: 1000
+  prior_type: UniformInComovingVolume
+- name: cos_iota
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: cos inclination
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: f0
+  prior_kwargs:
+    maximum: 0.1
+    minimum: 0.0001
+    name: Starting frequency
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: phi_0
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: Orbital phase at data start
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: psi
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: polarization angle
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: alpha
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: right ascension
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: sin_delta
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: sin declination
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+return_gpu: false
+use_cupy: false

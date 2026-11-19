@@ -1,0 +1,20 @@
+branch_name: psd
+priors:
+- name: logS_oms
+  prior_kwargs:
+    maximum: -10
+    minimum: -12
+    name: oms log-amplitude
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: logS_tm
+  prior_kwargs:
+    maximum: -13
+    minimum: -16
+    name: tm log-amplitude
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+return_gpu: false
+use_cupy: false

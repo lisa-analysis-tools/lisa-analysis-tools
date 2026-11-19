@@ -1,0 +1,150 @@
+# All source blocks in one run: psd, galfor, gb, mbh, emri, sobbh on the local mojito-light data.
+# Put together to exercise, in one config, what the recipe stages now carry:
+#   - stages (burn-in, tune, pe) with per-stage settings of each block (blocks/*.yaml, `stages`);
+#   - adaptive proposal repeats from the inner autocorrelation time (mbh, emri, sobbh: `adaptive_repeats`);
+#   - the convergence stop of the last stage (`target_ess` below);
+#   - stage attributes on any move (gb knobs, psd repeats, the flow trainers' `tune`);
+#   - the gb block's several moves under the stock recipe (extra_moves with their own `stages`).
+# Check it with:  python scripts/run_global.py --config mojito_input/all_sources_dry_run --dry-run
+
+schema_version: 1
+
+# The run: its name (the prefix of every output file), where the outputs go, how long it runs.
+run:
+  name: mojito_run_2  # prefix of the backend file and of the artifacts folder in output_dir
+  # where the backend file (<name>_parameter_estimation_main.h5) and <name>_artifacts go
+  output_dir: /data/asantini/globalfit/erebor_org_setup/mojito_runs/
+  seed: 103209  # random seed; null: not fixed
+  num_iterations: 700  # stored sampler iterations, over all stages: the hard limit of the run
+  backup_iter: 5  # iterations between copies of the backend file to its backup
+  submission_dir: /work/asantini/globalfit/l3c_exchange/mojito_light_results/  # parent folder of the submission written when the sampling ends; null: none written
+  defer_posteriors: ["gb"]  # branches post-processed later by scripts/postprocess_submission.py
+
+# The ensemble: walkers per temperature, and temperatures (the longest ladder of the blocks).
+sampler:
+  nwalkers: 42
+  ntemps: 12
+
+# Where it runs. backend: cpu with gpus: null, or a cuda backend with the list of cards.
+compute:
+  gpus: [0, 1, 2, 3, 4, 5, 6]  # None -> CPU run
+  backend: cuda12x
+  head_rank: 1  # MPI rank of the head process
+  main_rank: 0  # MPI rank that samples and writes the files
+  flow_gpu: null  # where every flow trainer runs; never a sampling GPU (None -> the cpu)
+
+# The data: what is loaded, which injected sources it holds, and how it is preprocessed.
+data:
+  loader: mojito_l1
+  path: /data/asantini/globalfit/MOJITO_DATA/mojito_light_2p5s/
+  source_types: [noise, mbhb, emri, vgb, gb, sobhb]  # the injected components the data is made of
+  # per catalogue, the sources a block with nleaves: auto samples (and is seeded from)
+  source_ids: {emri: [0, 1, 2, 3, 4, 5, 6, 7], mbhb: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], sobhb: [0, 1, 2, 3, 4, 5]}
+  orbits:
+    type: l1
+    frame: icrs
+    armlength: 2493162305.42235  # None -> L1Orbits' own default
+    force_backend: cpu
+  reference_time: 97729089.327664  # absolute SSB time (s) the source waveforms are referenced to
+  Tobs: 713 day
+  dt: 5 s  # seconds: `dt: 5.0` or `dt: 5 s`
+  highpass:
+    cutoff: 1e-5  # Hz
+    order: 2
+    zero_phase: true
+  lowpass:
+    cutoff: 1e-1  # Hz
+    order: 2
+    zero_phase: true
+  aafilter:  # attenuation, freq1, freq2, fs; used only for the downsampling done by L01
+    attenuation: 186.2  # [dB]
+    freq1: 0.09432  # [Hz]
+    freq2: 0.20585  # [Hz]
+    fs: 4.0  # [Hz]
+  downsample:
+    window: [kaiser, 31.0]
+  trim:
+    duration: 200 h  # seconds, or a fraction when is_percent
+    is_percent: false
+    trimming_type: from_each_end
+  alias_correction: true  # whether to apply the alias correction to the data (default: True)
+  # keep a time-domain residual (one shared CPU AnalysisContainer, walker 0) next to the analysis-domain ones; the
+  # seeded signals are subtracted from it through the blocks' TD generators (td_waveform)
+  keep_td: false
+
+# The analysis domain and band. type: stft (with segment_duration) or fd.
+domain:
+  min_freq: 1e-4
+  max_freq: 0.09999
+  type: stft
+  segment_duration: 1 day  # -> STFTSettings.make_factory(big_dt=...)
+
+# What the submission's metadata files say about the run.
+metadata:
+  codename: erebor
+  version: CD1Lrun2_v0  # "<run_type>_<run_id>"
+  contact: ereborl2d@googlegroups.com
+  code_link: https://github.com/Erebor-L2D
+  input_data_link: https://nextcloud-dcc-fi-csc-okd-globalstorage1.2.rahtiapp.fi/apps/files/files/6818?dir=/brickmarket%20%282%29/mojito_light_v1_0_0
+  input_reference: mojito light
+  noise_model: parametric-symmetric
+  noise_model_code_link: https://github.com/Erebor-L2D/LISAanalysistools/blob/l2d-dev/src/lisatools/sensitivity.py
+  comment: All source blocks with staged settings, adaptive repeats, NF proposals, and a convergence stop.
+
+# The window applied to the data (and convolved with the noise model if sensitivity says so).
+window:
+  type: tukey
+  taper_duration: auto #-> 1/domain.min_freq (builder)
+  normalize: true  # pass the window to the sensitivity backend (window_values)
+
+# The noise model: a class of lisatools.sensitivity and its constructor arguments.
+sensitivity:
+  class: XYZSensitivityBackend
+  kwargs:
+    # arguments of XYZSensitivityBackend (those not listed are filled in by the builder)
+    tdi_generation: 2  # 1 for TDI 1.5 or 2 for TDI 2.0.
+    # Fractional bandwidth around transfer-function dips that is masked out (defaults to ``0.05``).
+    mask_percentage: 0.0
+    smoothing_sigma: 0.0  # Sigma for smoothing the sensitivity matrix around the zero dips.
+    # Whether to average the TDI transfer functions over the orbit (``True``) or use the values at a single average
+    # epoch (``False``), in the case of a frequency-domain basis.
+    average_transfer_functions: true
+    noise_symmetry: symmetric  # ``"symmetric"`` (default) uses one OMS and one TM amplitude for all MOSAs.
+    # Whether to convolve the window with the sensitivity matrix components along the main frequency diagonal.
+    convolve_window: true
+    # Optional dictionary of keyword arguments to set up the galactic grid for foreground contributions.
+    galactic_grid_kwargs: {N_beta: 120, N_lambda: 180, R_d: 1.99506849, f_b: 0.64907336, los_center_half_width: 2.5, los_center_sub: 4, r_b: 1.714753, response: analytic, z_d: 0.16776102}
+    psd_batch_size: null  # Maximum number of PSDs (walkers) per backend call in :meth:`compute_log_like`.
+    # data_td_settings: null
+    # If ``True``, use Akima spline interpolation for the noise knots passed in :meth:`set_sensitivity_matrix`.
+    # use_splines: false
+    # spline_order: cubic  # Order of the Akima interpolant (passed through to :class:`cudakima.AkimaInterpolant1D`).
+    # filters_response: null  # Optional array of filter responses to apply to the sensitivity matrix.
+    # Number of rows (one row = one PSD component in one time segment) per FFT batch in the window convolution.
+    # fft_batch_size: auto
+    # Optional signed alias frequencies, shape ``(n_alias, n_freqs)``, to model the aliasing of the downsampling step.
+    # alias_frequencies: null
+    # alias_filters_response: null  # Filter power response ``|H(|f_a|)|^2`` at ``alias_frequencies``, same shape.
+    # How ``convolve_window`` is evaluated in :meth:`compute_log_like` and :meth:`compute_sensitivity_matrix` (see
+    # :mod:`lisatools.convolution_helpers`).
+    # window_convolution_mode: exact
+    # Frequency [Hz] above which the galactic foreground is treated as zero in the exact window convolution (checked
+    # per call against a rigorous bound; falls back to the full band with a warning).
+    # galaxy_fmax: null
+    # Map from device to its galactic grid, handed on by :attr:`kwargs` so that a backend and its copies hold one grid
+    # per device.
+    # device_galactic_grids: null
+  fixed_psd_kwargs: null  # call kwargs; used only without a psd block
+
+# The recipe. `class: StockRecipe` runs the psd search, then the joint PE in `stages`: a list of {name, iterations};
+# the last stage has no iterations and runs to run.num_iterations, or, with target_ess (and check_every), until every
+# block has that many independent samples. Every stage but the last tunes the repeats of the blocks with
+# adaptive_repeats; postprocessing keeps the last stage only. `burn_in_iterations: N` is short for [{name: burn-in,
+# iterations: N}, {name: pe}]. Instead: `recipe: {file: my_recipe.py, function: setup_recipe}` for a recipe written in
+# Python. See docs/globalfit/recipe_stages/README.md.
+recipe:  # absent -> the stock recipe, no kwargs
+  class: StockRecipe
+  kwargs:
+    # arguments of StockRecipe
+    stages: [{iterations: 20, name: burn-in}, {iterations: 50, name: tune}, {check_every: 25, name: pe, target_ess: 20000}]
+    # burn_in_iterations: null

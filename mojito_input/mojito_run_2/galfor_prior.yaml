@@ -1,0 +1,44 @@
+branch_name: galfor
+priors:
+- name: log10_A
+  prior_kwargs:
+    maximum: -40
+    minimum: -48
+    name: log10 amplitude
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: alpha_gal
+  prior_kwargs:
+    maximum: 20.0
+    minimum: 1.0
+    name: spectral index
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: log10_f1
+  prior_kwargs:
+    maximum: -2.0
+    minimum: -4.0
+    name: log10 f1
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: log10_fknee
+  prior_kwargs:
+    maximum: -2.0
+    minimum: -4.0
+    name: log10 fknee
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: log10_f2
+  prior_kwargs:
+    maximum: -1.0
+    minimum: -3.0
+    name: log10 f2
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+return_gpu: false
+use_cupy: false

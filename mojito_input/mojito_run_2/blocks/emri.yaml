@@ -1,0 +1,238 @@
+
+type: emri  # block type == file stem == branch name (source_info / priors / recipe key)
+
+# The prior: <module>.<Class> of ereborpriors.stock, with the arguments of its prior_factory.
+priors:
+  class: mojitolight.EMRIPrior
+  kwargs: {}
+  output_file: emri_prior.yaml  # where to write the prior's YAML; relative paths are relative to the run folder
+
+enabled: true  # false: the block is left out of the run
+
+links:  # adds waveform_model_code_link
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors
+  prior_model_config_file: ''
+  waveform_model_code_link: https://github.com/Erebor-L2D/LISAanalysistools/blob/l2d-dev/src/lisatools/sources/emri/waveform.py
+
+injection: null  # for diagnostic plots, keyed like the prior basis
+
+search:  # None -> no search interface (see SearchSpec)
+  search_type: point_estimate
+  # samples / point estimates: a file or a folder (one file per source), each a .npy of physical values or an
+  # .h5/.hdf5 catalogue table (one root dataset per catalogue column); catalog reads the injection catalogue, no file
+  search_path: /data/asantini/globalfit/erebor_org_setup/search_results/emri/
+  parameters_searched: all  # names in the prior's input (sampling) basis
+  # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
+  spread: [1.0e-05, 1.0e-05, 1.0e-05, 1.0e-05, 1.0e-05, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]
+  is_eryn_backend: false  # search results are an eryn backend, already in the sampling basis
+  max_resample_tries: 200  # redraws of walkers that land outside the prior around a point value
+  kwargs: {}  # the interface class's own arguments
+
+pe_move:  # the branch's PE move (special or generic family) and its knobs; each block type sets the reference default
+  class: EMRISpecialMove
+  kwargs:
+    # arguments of EMRISpecialMove (those not listed are filled in by the builder)
+    # gate for the walker-permuting (fancy) temperature swap: if bool, True enables, False disables.
+    permute_every: 100
+    # whether to pad proposed sources that are out of the prior bounds to avoid JIT compilation issues.
+    pad_out_of_prior: false
+    # whether to run the waveform generation and likelihood computation asynchronously for each GPU. If True, the
+    # synchronization will happen on the python side after the kernel calls.
+    run_async: true
+    # whether to run the waveform generation and likelihood computation in separate threads for each GPU.
+    run_threaded: true
+    flow_burnin: 10  # number of sampler iterations (calls to ``propose``) before flow proposals are used.
+    # batch_size_per_gpu: null
+    # Iteration cadence at which the move should cross-check likelihoods between worker ranks.
+    # iters_compare_likelihood: -1
+    # iters_reset_buffers: -1  # Iteration cadence at which auxiliary buffers should be reset.
+    # a: 2.0  # The stretch scale parameter.
+    # return_gpu: false  # Whether the array being returned is in ``Cupy`` (``True``) or ``NumPy`` (``False``).
+    # random_seed: null  # Set the random seed in ``CuPy/NumPy`` if not ``None``.
+    # lift_scale: 2.0  # Width of the lift weights in units of the complements' circular standard deviation.
+    # lift_kmax: 2  # Most extra turns a lift may take.
+    # nsplits: 2  # The number of sub-ensembles to use.
+    # randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+    # By default, an update will fail with a ``RuntimeError`` if the number of walkers is smaller than twice the
+    # dimension of the problem because the walkers would then be stuck on a low dimensional subspace.
+    # live_dangerously: false
+    # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+    # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+    # List of names (`str`), that can be in any :class:`eryn.state.BranchSupplemental`, to skip when updating states
+    # (:func:`Move.update`).
+    # skip_supp_names_update: []
+    # is_rj: false  # If using RJ, this should be ``True``.
+    # use_gpu: false  # Whether ``Cupy`` (``True``) is used or not (``False``).
+
+# Always a ladder (default: ratio 1.2 over sampler.ntemps, as the reference settings pass). Not None: the Setup's own
+# default is 24 rungs, which cannot seed a state with fewer temperatures.
+tempering:
+  ntemps: 1  # None -> sampler.ntemps
+  ratio: 1.2  # geometric ladder: betas = ratio ** -arange(ntemps)
+  Tmax: null  # the hottest rung's temperature: its beta becomes 1 / Tmax, the other rungs stay ratio ** -k
+  betas: null  # the ladder itself, coldest first (strictly decreasing, in (0, 1]); replaces ntemps, ratio and Tmax
+
+nleaves: auto  # source blocks override: "auto" -> len(data.source_ids[SOURCE_IDS_KEY])
+
+num_prop_repeats: 50  # how many times to repeat the proposal per walker per iteration
+
+inner_moves:  # None -> the Setup's default (StretchMove)
+  - class: StretchMove
+    kwargs: {}
+      # arguments of StretchMove; none is set: to set one, remove the {} above and the # of its line
+      # a: 2.0  # The stretch scale parameter.
+      # return_gpu: false  # Whether the array being returned is in ``Cupy`` (``True``) or ``NumPy`` (``False``).
+      # random_seed: null  # Set the random seed in ``CuPy/NumPy`` if not ``None``.
+      # lift_scale: 2.0  # Width of the lift weights in units of the complements' circular standard deviation.
+      # lift_kmax: 2  # Most extra turns a lift may take.
+      # nsplits: 2  # The number of sub-ensembles to use.
+      # randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+      # By default, an update will fail with a ``RuntimeError`` if the number of walkers is smaller than twice the
+      # dimension of the problem because the walkers would then be stuck on a low dimensional subspace.
+      # live_dangerously: false
+      # temperature_control: null
+      # periodic: null
+      # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+      # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+      # List of names (`str`), that can be in any :class:`eryn.state.BranchSupplemental`, to skip when updating states
+      # (:func:`Move.update`).
+      # skip_supp_names_update: []
+      # is_rj: false  # If using RJ, this should be ``True``.
+      # use_gpu: false  # Whether ``Cupy`` (``True``) is used or not (``False``).
+    weight: 0.5
+  - class: DEMove
+    kwargs: {}
+      # arguments of DEMove; none is set: to set one, remove the {} above and the # of its line
+      # sigma: 1.0e-05  # The standard deviation of the Gaussian used to stretch the proposal vector.
+      # gamma0: null  # The mean stretch factor for the proposal vector.
+      # return_gpu: false
+      # random_seed: null  # Set the random seed in ``CuPy/NumPy`` if not ``None``.
+      # target_acceptance: 0.25
+      # nsplits: 2  # The number of sub-ensembles to use.
+      # randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+      # By default, an update will fail with a ``RuntimeError`` if the number of walkers is smaller than twice the
+      # dimension of the problem because the walkers would then be stuck on a low dimensional subspace.
+      # live_dangerously: false
+      # temperature_control: null
+      # periodic: null
+      # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+      # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+      # List of names (`str`), that can be in any :class:`eryn.state.BranchSupplemental`, to skip when updating states
+      # (:func:`Move.update`).
+      # skip_supp_names_update: []
+      # is_rj: false  # If using RJ, this should be ``True``.
+      # use_gpu: false  # Whether ``Cupy`` (``True``) is used or not (``False``).
+    weight: 0.3
+
+waveform:
+  class: EMRITDIWaveform
+  kwargs:
+    # arguments of EMRITDIWaveform (those not listed are filled in by the builder)
+    # Keyword arguments for :class:`few.waveform.waveform.GenerateEMRIWaveform`.
+    waveform_kwargs: {amplitude_kwargs: {}, inspiral_kwargs: {DENSE_STEPPING: 0, buffer_length: 100, err: 1.0e-08}, sum_kwargs: {pad_output: true}}
+    tdi_generation: 2nd generation
+    tdi_channels: XYZ
+    order: 25
+    # Time in seconds to add as buffer to the TDI response to ensure proper calculation at the beginning and end of
+    # the signal.
+    buffer_time: 15000
+    fft_batch_size: 1
+    run_async: true
+    # waveform_class: FastKerrEccentricEquatorialFlux  # The waveform class to use for generating the EMRI waveform.
+    # signal_duration: null
+    # use_spline: false
+    # Optional :class:`DomainSettingsBase` instance giving the analysis-domain target directly (sprint rule: domains
+    # are communicated by settings objects, not strings).
+    # output_domain_settings: null
+  runtime_kwargs: {mode_selection_threshold: 0.0001}  # -> Settings.waveform_kwargs
+
+td_waveform: null  # None -> TD_WAVEFORM_METHOD of the waveform, if any
+
+# A normalising-flow proposal among the inner moves, trained on the chain while it runs. null: none. With
+# `parameters`, the flow proposes those and a Gaussian (`gaussian`) the others.
+flow:  # added to the inner moves at flow.weight
+  weight: 0.2  # among the block's inner moves
+  parameters: null  # names in the prior's input basis; None -> every column
+  gaussian: null  # FlowGaussianMove kwargs for the columns outside parameters
+  model:  # a Flow from eryn.flows, e.g. ZukoFlow
+    class: ZukoFlow
+    kwargs:
+      # arguments of ZukoFlow (those not listed are filled in by the builder)
+      flow_class: NSF  # Flow architecture.
+      transforms: 8
+      hidden_features: [128, 128, 128, 128]
+      bins: 8
+      # Maximum ``|k|`` per periodic dimension used when summing the coords density over periodic aliases.
+      # periodic_aliases: 1
+  data_transform:  # a DataTransform from eryn.flows; None -> the flow's default
+    class: WhiteningTransform
+    kwargs:
+      # arguments of WhiteningTransform (those not listed are filled in by the builder)
+      shared: false  # Whitening granularity.
+      periodic_in_cholesky: true  # Whitening scheme for the periodic block.
+      # Where :meth:`fit` places the wrap cut (the discontinuity of the circular shift) of each periodic component.
+      # periodic_cut: antimode
+  trainer:  # ProcessExecutor kwargs (incl. fit_kwargs)
+    # arguments of ProcessExecutor (those not listed are filled in by the builder)
+    epochs_per_round: 150  # ``n_epochs`` per fit in the worker.
+    min_train_samples: 1500  # Minimum buffered samples before the worker fits.
+    max_buffer_samples: 4000  # Per-condition ring-buffer cap in the worker.
+    # Drift valve for the data transform: ``None`` (default) fits it once and freezes it; an integer ``K`` re-fits it
+    # every ``K``-th worker round.
+    refit_transform_every: 1
+    torch_num_threads: 2  # ``torch.set_num_threads`` in the worker.
+    # When ``True`` (requires ``diagnostics_dir`` and the optional ``corner`` package), each diagnostics round also
+    # writes one corner plot per condition overlaying that round's training buffer with an equal number of draws...
+    plot_corner: true
+    # Extra keyword arguments forwarded to the worker's ``flow.fit``.
+    fit_kwargs: {batch_size: 1024, lr: 0.001, lr_annealing: true, optimizer: adamw, patience: 30, train_noise: 0.0, val_split: temporal, validation_fraction: 0.15}
+    # train_every: 1
+    # max_pending_batches: 4  # ``maxsize`` of the sample queue.
+    # On a full sample queue, ``"oldest"`` evicts the oldest queued batch to make room for the incoming one;
+    # ``"newest"`` drops the incoming batch.
+    # drop_policy: oldest
+    # save_every: 1  # Checkpoint cadence in trained versions.
+    # diagnostics_every: 1  # Plot cadence in trained versions.
+    # corner_max_samples: 5000  # Cap on points per data set in each corner plot.
+    # start: true  # Start the worker process in ``__init__``.
+
+# what the waveforms (and so the sampled times/phases and the search results) are referenced to: data.reference_time
+# (MOJITO_REFERENCE_TIME) or the start of the preprocessed TD data
+time_reference: mojito
+
+# Per recipe stage. Here: no flow in the burn-in, the flow at half the proposals from `tune` on (it starts after
+# pe_move.kwargs.flow_burnin calls of the move), and in `pe` the trainer set as for mbh. `attributes`: any attribute
+# of the PE move by path; a path ending on a method calls it with the value; moves[-1] is the flow move. Attributes
+# stay set in the later stages.
+stages:  # recipe stage name -> the PE move's settings in that stage (special pe_moves only; see StageSpec)
+  burn-in:
+    num_prop_repeats: 50
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: 0.0
+    # Anything else of the PE move: attribute path -> value, set when the stage starts (recipe.set_attribute). The
+    # path goes through attributes and integer indices and may end on a method, which is then called with the value (a
+    # dict as keyword arguments): {flow_buffer_thin: 10, "moves[-1].executor.tune": {train_every: 10}}. They stay set
+    # in the later stages (a restart into a later stage sets them again, in the stages' order).
+    attributes: {}
+  tune:
+    num_prop_repeats: null
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: 0.5
+    attributes: {}
+  pe:
+    num_prop_repeats: null
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: 0.5
+    attributes: {'moves[-1].executor.tune': {max_buffer_samples: null, train_every: 10}}
+
+# the proposal repeats follow the inner autocorrelation time (special pe_moves with inner_act; see the spec)
+adaptive_repeats:
+  min: 10
+  max: 50
+  per_act: 1.1  # inner ACTs per iteration
+  every: 5  # iterations of the block's move between updates
+  window: 20  # iterations of the block's move the ACT is measured over
+  max_step: 2.0  # largest factor the repeats change by in one update
+
+# per-leaf priors for the PE move (the branch prior `priors` stays for the transform, seeding and sampler)
+proposal_priors: null

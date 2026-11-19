@@ -1,0 +1,378 @@
+
+type: gb  # block type == file stem == branch name (source_info / priors / recipe key)
+
+# The prior: <module>.<Class> of ereborpriors.stock, with the arguments of its prior_factory.
+priors:
+  class: mojitolight.GBPrior
+  kwargs: {}
+    # arguments of GBPrior.prior_factory (those not listed are filled in by the builder); none is set: to set one,
+    # remove the {} above and the # of its line
+    # branch_name: gb  # The name of the branch associated with this prior.
+    # include_fddot: true  # Whether to include the frequency second derivative in the physical space.
+  output_file: gb_prior.yaml  # where to write the prior's YAML; relative paths are relative to the run folder
+
+enabled: true  # false: the block is left out of the run
+
+links:  # adds waveform_model_code_link
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors
+  prior_model_config_file: ''
+  waveform_model_code_link: https://github.com/Erebor-L2D/GBGPU/tree/l2d-dev
+
+injection: null  # for diagnostic plots, keyed like the prior basis
+
+search:  # None -> no search interface (see SearchSpec)
+  search_type: point_estimate
+  # samples / point estimates: a file or a folder (one file per source), each a .npy of physical values or an
+  # .h5/.hdf5 catalogue table (one root dataset per catalogue column); catalog reads the injection catalogue, no file
+  search_path: /data/asantini/globalfit/erebor_org_setup/search_results/gb/gb_candidates_2.hdf5
+  parameters_searched: all  # names in the prior's input (sampling) basis
+  # scalar, per-parameter (1-D), full covariance (2-D) or one covariance per leaf (3-D)
+  spread: [0.001, 1.0e-09, 1.0e-19, 0.001, 0.001, 0.001, 0.0001, 0.0001]
+  is_eryn_backend: false  # search results are an eryn backend, already in the sampling basis
+  max_resample_tries: 2000  # redraws of walkers that land outside the prior around a point value
+  kwargs:  # the interface class's own arguments
+    # arguments of GBSearchInterface (those not listed are filled in by the builder)
+    # bool If True, when seeding from the catalog values evolve the source parameters to the start of the data segment
+    # using the provided evolution function.
+    evolve_to_data_start: false
+    # float or None The epoch of the GB kernels' parameters (``t_ref``); ``None`` takes the mojito catalogue epoch.
+    # reference_time: null
+    # bool If True, the walkers scattered around a point (``catalog``, ``point_estimate``, ``samples``) are spread
+    # over the four copies of (phi0, psi) where the template is the same, (phi0, psi), (phi0, psi + pi), (phi0 + p...
+    # seed_phase_copies: false
+    # search_type: <required>  # Type of search to perform.
+    # parameters_searched: null  # List of parameter names in the sampling basis that are being searched.
+    # search_path: null  # Path to the file or directory containing the search results.
+    # spread: null  # Spread to use for scattering walkers around the starting points.
+    # is_eryn_backend: false  # Whether the search results are from an Eryn backend.
+    # max_resample_tries: 50  # Resample passes for walkers drawn outside the prior around a point value.
+
+# The rj_prior move of recipe.build_gb_moves; stretch_probability 0: every in-model proposal is a Fisher-matrix one.
+pe_move:
+  class: GBSpecialRJPriorMove
+  kwargs:
+    # arguments of GBSpecialRJPriorMove (those not listed are filled in by the builder)
+    stretch_probability: 0.0
+    # Blocks of in-model repeats a source's Fisher matrix serves before it is recomputed at the source's position.
+    num_stationary_fim_steps: 50
+    run_swaps: true  # Whether to run band-temperature swaps.
+    use_prior_removal: false  # If ``True``, draw RJ proposals from the prior.
+    phase_maximize: false  # If ``True``, marginalize over phase in the likelihood.
+    ranks_needed: 0
+    # snr_lim: 1.0e-10  # Optional SNR cut.
+    # is_rj_prop: false  # Marks this move as a reversible-jump proposal.
+    # num_band_preload: null  # Number of bands preloaded per call.
+    # num_bands_preload_temp: null
+    # max_data_store_size: 6000  # Cap on the per-iteration data store size.
+    # search_kwargs: null
+    # band_units: 2
+    # gamma_base: 0.84
+    # debug_settings:  # fields of GBDebugSettings
+      # enabled: false
+      # plot_dir: null
+      # plot_walker: 0
+      # plot_band: null
+      # seq_pick: first
+      # rj_trace: false
+      # prop_timing_sync: false
+      # verify_buffer: false
+      # mem_probe: false
+      # mem_probe_file: null
+      # mem_probe_site_bytes: 1048576
+      # mem_probe_site_depth: 3
+    # sighet_settings:  # fields of GBSigHetSettings
+      # refresh_every: 20
+      # refresh_dphase: 0.5
+      # refresh_min_beta: 0.1
+      # trust_dlna: 1.5
+      # trust_dphase: 0.5
+      # trust_snr_c: 30.0
+      # trust_dlna_min: 0.3
+      # anchor_check: false
+      # drift_check: false
+    # leaf_cap_settings:  # fields of GBLeafCapSettings
+      # start: null
+      # min_iters: 50
+      # ll_nsigma: 3.0
+      # require_occupancy: true
+      # update: true
+    # Iteration cadence at which the move should cross-check likelihoods between worker ranks.
+    # iters_compare_likelihood: -1
+    # iters_reset_buffers: -1  # Iteration cadence at which auxiliary buffers should be reset.
+    # n_iter_update: 100  # Number of iterations to run before updating the stationary distribution.
+    # If given, the friends are no longer updated after this iteration (counted over all calls to the move, including
+    # burn-in), and the move is exact from then on for a fixed number of leaves.
+    # freeze_after: null
+    # live_dangerously: false  # If ``True``, allow for ``n_iter_update == 1``.
+    # a: 2.0  # The stretch scale parameter.
+    # return_gpu: false  # Whether the array being returned is in ``Cupy`` (``True``) or ``NumPy`` (``False``).
+    # lift_scale: 2.0  # Width of the lift weights in units of the complement's circular standard deviation.
+    # lift_kmax: 2  # Most extra turns a lift may take.
+    # nsplits: 2  # The number of sub-ensembles to use.
+    # randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+    # periodic: null
+    # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+    # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+    # is_rj: false  # If using RJ, this should be ``True``.
+    # use_gpu: false  # Whether ``Cupy`` (``True``) is used or not (``False``).
+
+tempering:  # The reference ladder: ratio 1.2, with the hottest rung at T = 1e4.
+  ntemps: null  # None -> sampler.ntemps
+  ratio: 1.2  # geometric ladder: betas = ratio ** -arange(ntemps)
+  Tmax: 10  # the hottest rung's temperature: its beta becomes 1 / Tmax, the other rungs stay ratio ** -k
+  betas: null  # the ladder itself, coldest first (strictly decreasing, in (0, 1]); replaces ntemps, ratio and Tmax
+
+nleaves: 8000  # the most sources at once (nleaves_max); the least is 0
+
+num_prop_repeats: 50  # the move's num_repeat_proposals
+
+inner_moves: null  # None -> the Setup's default (StretchMove)
+
+waveform:
+  class: GBGPU
+  kwargs: {}
+    # arguments of GBGPU (those not listed are filled in by the builder); none is set: to set one, remove the {} above
+    # and the # of its line
+    # t0: null
+    # flip_ref_phase: false
+  runtime_kwargs:  # -> Settings.waveform_kwargs
+    # arguments of GBWaveformSettings (those not listed are filled in by the builder)
+    oversample: 4
+    tdi_channel_setup: XYZ  # The STFT computation in build_gb_moves is fixed to XYZ, second-generation TDI.
+    tdi2: true
+    # use_c_implementation: true
+
+td_waveform: null  # None -> TD_WAVEFORM_METHOD of the waveform, if any
+
+# A normalising-flow proposal among the inner moves, trained on the chain while it runs. null: none. With
+# `parameters`, the flow proposes those and a Gaussian (`gaussian`) the others.; added to the inner moves at
+# flow.weight
+flow: null
+
+# what the waveforms (and so the sampled times/phases and the search results) are referenced to: data.reference_time
+# (MOJITO_REFERENCE_TIME) or the start of the preprocessed TD data
+time_reference: mojito
+
+# Per recipe stage, on every gb move that has the attribute (pe_move and the extra moves). Here: the exact group
+# stretch in the burn-in only, with a new information matrix at every block; none afterwards, the matrices held for 50
+# blocks. The gb moves have no apply_settings, so only `attributes` can be set.
+stages:  # recipe stage name -> the PE move's settings in that stage (special pe_moves only; see StageSpec)
+  burn-in:
+    num_prop_repeats: null
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: null
+    # Anything else of the PE move: attribute path -> value, set when the stage starts (recipe.set_attribute). The
+    # path goes through attributes and integer indices and may end on a method, which is then called with the value (a
+    # dict as keyword arguments): {flow_buffer_thin: 10, "moves[-1].executor.tune": {train_every: 10}}. They stay set
+    # in the later stages (a restart into a later stage sets them again, in the stages' order).
+    attributes: {num_repeat_proposals: 60, num_stationary_fim_steps: 1, stretch_probability: 0.5}
+  tune:
+    num_prop_repeats: null
+    inner_move_weights: null  # in the order of the block's inner_moves
+    flow_weight: null
+    attributes: {num_repeat_proposals: 50, num_stationary_fim_steps: 50, stretch_probability: 0.0}
+
+# the proposal repeats follow the inner autocorrelation time (special pe_moves with inner_act; see the spec)
+adaptive_repeats: null
+
+# per-leaf priors for the PE move (the branch prior `priors` stays for the transform, seeding and sampler)
+proposal_priors: null
+
+stft:  # GBSTFTSettings knobs
+  # arguments of GBSTFTSettings (those not listed are filled in by the builder)
+  n_side_bins: 16
+  response: dffr
+  linear_envelope: true
+  use_midpoint: true
+  first_order_delays: true  # First-order delays, as in every DFFR run of the GB memory effort (user, 2026-10-30).
+  # freq_from_tdi_phase: true  # DFFR does not read it; the TDI-on-the-fly response does.
+  # band_kwargs: null  # Forwarded to stft_band_structure (k_safety_factor, q, floor_correction, convention).
+
+# Moves that take turns with pe_move, keyed by a name that names the move ("gb <name> move"). Each runs in its share
+# of each stage's iterations and pe_move in the rest. Their kwargs go over the pe_move's, so the moves share the
+# in-model knobs unless an entry sets its own.
+extra_moves:
+  fstat:
+    class: GBFStatRJMove
+    kwargs:
+      # arguments of GBFStatRJMove (those not listed are filled in by the builder). An argument not set here takes
+      # pe_move's value where pe_move sets it, the default shown otherwise
+      fstat_settings:  # The search's settings; None takes the defaults of :class:`GBFStatSettings`.
+        # arguments of GBFStatSettings
+        # Proposes of the move from one search to the next; between searches the latest proposal stays
+        search_interval: 1
+        # What each search saves to output_dir: "none", "summary" (per-band values, the mixtures, the times) or "full"
+        # (also the chains, megabytes per search on tens of bands)
+        save_search_records: summary
+        # Searches in a row without a detection after which a band in a shutoff range is shut off
+        shutoff_band_iteration: 5
+        # nwalkers: 32  # Walkers of each band's sampler, in both stages
+        # Stage 1, the F-statistic over f0, fdot and the sky: the start ladder (coldest first; Eryn adapts it per band
+        # with its ends kept), the burn-in and the stored steps
+        # betas_1: [1.0, 0.5, 0.25, 0.12, 0.05, 0.0]
+        # burn_1: 500
+        # nsteps_1: 300
+        # Stage 2, the full likelihood over every column, as stage 1: production's spacing 1.2^-k cut to 12
+        # temperatures with T = 10 on top, a fixed ladder rather than the run's own
+        # betas_2: [1.0, 0.8333333333333334, 0.6944444444444445, 0.5787037037037037, 0.4822530864197532, 0.40187757201646096, 0.3348979766803842, 0.2790816472336535, 0.2325680393613779, 0.19380669946781492, 0.1615055828898458, 0.1]
+        # burn_2: 400
+        # nsteps_2: 500
+        # The gate's effective-SNR target on the settled noise, where a birth under the global f0 prior breaks even
+        # snr_eff_threshold: 7.5
+        # The foreground's inflation of the noise PSD below shutoff_high_frequency_threshold, which lowers a source's
+        # effective SNR by its square root: the median over the population
+        # galfor_inflation_factor: 1.3
+        # Two separate shutoffs (Hz): a band wholly above the high threshold or wholly below the low threshold is shut
+        # off after shutoff_band_iteration searches in a row without a detection; None turns that shutoff off. The
+        # gate also reads the high threshold as the foreground's upper edge, below which its target is lower (None: no
+        # band below)
+        # shutoff_high_frequency_threshold: 0.006
+        # shutoff_low_frequency_threshold: 0.0006
+        # Eryn's progress bar for each stage's band samplers: one bar of its burn-in and stored steps over all bands
+        # progress: true
+        # Folder of the search log (fstat_search.log) and of the saved records; the recipe builders fill
+        # <run>_artifacts/fstat_search/, and None writes neither
+        # output_dir: null
+      # snr_lim: 1.0e-10  # Optional SNR cut.
+      # is_rj_prop: false  # Marks this move as a reversible-jump proposal.
+      # use_prior_removal: false  # If ``True``, draw RJ proposals from the prior.
+      # phase_maximize: false  # If ``True``, marginalize over phase in the likelihood.
+      # ranks_needed: 0
+      # num_band_preload: null  # Number of bands preloaded per call.
+      # num_bands_preload_temp: null
+      # run_swaps: true  # Whether to run band-temperature swaps.
+      # max_data_store_size: 6000  # Cap on the per-iteration data store size.
+      # search_kwargs: null
+      # stretch_probability: 0.5
+      # band_units: 2
+      # gamma_base: 0.84
+      # num_stationary_fim_steps: 1
+      # debug_settings:  # fields of GBDebugSettings
+        # enabled: false
+        # plot_dir: null
+        # plot_walker: 0
+        # plot_band: null
+        # seq_pick: first
+        # rj_trace: false
+        # prop_timing_sync: false
+        # verify_buffer: false
+        # mem_probe: false
+        # mem_probe_file: null
+        # mem_probe_site_bytes: 1048576
+        # mem_probe_site_depth: 3
+      # sighet_settings:  # fields of GBSigHetSettings
+        # refresh_every: 20
+        # refresh_dphase: 0.5
+        # refresh_min_beta: 0.1
+        # trust_dlna: 1.5
+        # trust_dphase: 0.5
+        # trust_snr_c: 30.0
+        # trust_dlna_min: 0.3
+        # anchor_check: false
+        # drift_check: false
+      # leaf_cap_settings:  # fields of GBLeafCapSettings
+        # start: null
+        # min_iters: 50
+        # ll_nsigma: 3.0
+        # require_occupancy: true
+        # update: true
+      # iters_compare_likelihood: -1
+      # iters_reset_buffers: -1  # Iteration cadence at which auxiliary buffers should be reset.
+      # n_iter_update: 100  # Number of iterations to run before updating the stationary distribution.
+      # freeze_after: null
+      # live_dangerously: false  # If ``True``, allow for ``n_iter_update == 1``.
+      # a: 2.0  # The stretch scale parameter.
+      # return_gpu: false  # Whether the array being returned is in ``Cupy`` (``True``) or ``NumPy`` (``False``).
+      # lift_scale: 2.0  # Width of the lift weights in units of the complement's circular standard deviation.
+      # lift_kmax: 2  # Most extra turns a lift may take.
+      # nsplits: 2  # The number of sub-ensembles to use.
+      # randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+      # periodic: null
+      # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+      # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+      # is_rj: false  # If using RJ, this should be ``True``.
+      # use_gpu: false  # Whether ``Cupy`` (``True``) is used or not (``False``).
+    # the share of a stage's iterations in which the block runs this move instead of pe_move; 0: not in the stage
+    weight: 0.2
+    # recipe stage name (recipe.kwargs.stages) -> the share in that stage; left-out stages take weight
+    stage_weights: {burn-in: 0.4}
+    # recipe stage name -> what the stage sets on this move alone (the block's `stages` set every move of the block)
+    stages: {}
+  split_merge:
+    class: GBFStatSplitMergeRJMove
+    kwargs: {}
+      # arguments of GBFStatSplitMergeRJMove (those not listed are filled in by the builder); none is set: to set one,
+      # remove the {} above and the # of its line. An argument not set here takes pe_move's value where pe_move sets
+      # it, the default shown otherwise
+      # The move's settings; None takes the defaults of :class:`GBFStatSplitMergeSettings`.
+      # fstat_split_merge_settings:
+        # The search records whose band mixtures form the companion's search part: paths or glob patterns, several
+        # files per band merged with equal weight per file. None runs the move without a search part, whose weight
+        # then goes to the local and the prior parts.
+        # record_files: null
+      # snr_lim: 1.0e-10  # Optional SNR cut.
+      # is_rj_prop: false  # Marks this move as a reversible-jump proposal.
+      # use_prior_removal: false  # If ``True``, draw RJ proposals from the prior.
+      # phase_maximize: false  # If ``True``, marginalize over phase in the likelihood.
+      # ranks_needed: 0
+      # num_band_preload: null  # Number of bands preloaded per call.
+      # num_bands_preload_temp: null
+      # run_swaps: true  # Whether to run band-temperature swaps.
+      # max_data_store_size: 6000  # Cap on the per-iteration data store size.
+      # search_kwargs: null
+      # stretch_probability: 0.5
+      # band_units: 2
+      # gamma_base: 0.84
+      # num_stationary_fim_steps: 1
+      # debug_settings:  # fields of GBDebugSettings
+        # enabled: false
+        # plot_dir: null
+        # plot_walker: 0
+        # plot_band: null
+        # seq_pick: first
+        # rj_trace: false
+        # prop_timing_sync: false
+        # verify_buffer: false
+        # mem_probe: false
+        # mem_probe_file: null
+        # mem_probe_site_bytes: 1048576
+        # mem_probe_site_depth: 3
+      # sighet_settings:  # fields of GBSigHetSettings
+        # refresh_every: 20
+        # refresh_dphase: 0.5
+        # refresh_min_beta: 0.1
+        # trust_dlna: 1.5
+        # trust_dphase: 0.5
+        # trust_snr_c: 30.0
+        # trust_dlna_min: 0.3
+        # anchor_check: false
+        # drift_check: false
+      # leaf_cap_settings:  # fields of GBLeafCapSettings
+        # start: null
+        # min_iters: 50
+        # ll_nsigma: 3.0
+        # require_occupancy: true
+        # update: true
+      # iters_compare_likelihood: -1
+      # iters_reset_buffers: -1  # Iteration cadence at which auxiliary buffers should be reset.
+      # n_iter_update: 100  # Number of iterations to run before updating the stationary distribution.
+      # freeze_after: null
+      # live_dangerously: false  # If ``True``, allow for ``n_iter_update == 1``.
+      # a: 2.0  # The stretch scale parameter.
+      # return_gpu: false  # Whether the array being returned is in ``Cupy`` (``True``) or ``NumPy`` (``False``).
+      # lift_scale: 2.0  # Width of the lift weights in units of the complement's circular standard deviation.
+      # lift_kmax: 2  # Most extra turns a lift may take.
+      # nsplits: 2  # The number of sub-ensembles to use.
+      # randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+      # periodic: null
+      # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+      # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+      # is_rj: false  # If using RJ, this should be ``True``.
+      # use_gpu: false  # Whether ``Cupy`` (``True``) is used or not (``False``).
+    weight: 0.3
+    stage_weights: {burn-in: 0.4}
+    # On this move alone, after the block's stages: its search part is fixed when the kept iterations start (it reads
+    # the search memory); with this the stock recipe accepts the move.
+    stages:
+      pe:
+        attributes: {apply_settings: {fix_search_part: true}}

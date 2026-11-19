@@ -1,0 +1,99 @@
+branch_name: emri
+priors:
+- name: log_m1
+  prior_kwargs:
+    maximum: 16.808871178856535
+    minimum: 11.512925464970229
+    name: log primary mass
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: m2
+  prior_kwargs:
+    maximum: 200.0
+    minimum: 1.0
+    name: secondary mass
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: a
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: primary spin
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: p0
+  prior_kwargs:
+    maximum: 20.0
+    minimum: 1.0
+    name: initial semi-latus rectum
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: e0
+  prior_kwargs:
+    maximum: 0.8
+    minimum: 0.0
+    name: initial eccentricity
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: d_L
+  prior_kwargs:
+    cosmology: Planck15
+    maximum: 10
+    minimum: 0.1
+    num_points: 1000
+  prior_type: UniformInComovingVolume
+- name: cos_qK
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: cos polar angle
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: phiK
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: azimuthal angle
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: Phi_phi0
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: initial azimuthal phase
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: Phi_r0
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: initial radial phase
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: alpha
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: right ascension
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: sin_delta
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: sin declination
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+return_gpu: false
+use_cupy: false

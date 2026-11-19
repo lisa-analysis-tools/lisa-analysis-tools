@@ -1,0 +1,69 @@
+
+type: psd  # block type == file stem == branch name (source_info / priors / recipe key)
+
+# The prior: <module>.<Class> of ereborpriors.stock, with the arguments of its prior_factory.
+priors:
+  class: mojitolight.NoisePrior
+  kwargs:
+    # arguments of NoisePrior.prior_factory (those not listed are filled in by the builder)
+    model_type: parametric-symmetric  # The type of noise model.
+  output_file: psd_prior.yaml  # where to write the prior's YAML; relative paths are relative to the run folder
+
+enabled: true  # false: the block is left out of the run
+
+links:
+  prior_model_code_link: https://github.com/Erebor-L2D/erebor-priors
+  prior_model_config_file: ''
+
+# for diagnostic plots, keyed like the prior basis
+injection: {logS_oms: -10.823908740944319, logS_tm: -14.522878745280337}
+
+search: {search_type: prior}  # None -> no search interface (see SearchSpec)
+
+pe_move:  # builds both the search (max_logl_mode) and the PE move
+  class: MultiGPUPSDMove
+  kwargs:
+    # arguments of MultiGPUPSDMove (those not listed are filled in by the builder)
+    permute_every: 100  # number of repeats after which to permute the walkers during a temperature swap.
+    # By default, an update will fail with a ``RuntimeError`` if the number of walkers is smaller than twice the
+    # dimension of the problem because the walkers would then be stuck on a low dimensional subspace.
+    live_dangerously: true
+    run_async: true
+    run_threaded: true
+    # psd_kwargs: {}  # additional keyword arguments for the psd_log_like function.
+    # tolerance: 0.0  # minimum allowed distance between spline knot positions in the sensitivity model.
+    # batch_size_per_gpu: null
+    # Iteration cadence at which the move should cross-check likelihoods between worker ranks.
+    # iters_compare_likelihood: -1
+    # iters_reset_buffers: -1  # Iteration cadence at which auxiliary buffers should be reset.
+    # a: 2.0  # The stretch scale parameter.
+    # return_gpu: false  # Whether the array being returned is in ``Cupy`` (``True``) or ``NumPy`` (``False``).
+    # random_seed: null  # Set the random seed in ``CuPy/NumPy`` if not ``None``.
+    # lift_scale: 2.0  # Width of the lift weights in units of the complements' circular standard deviation.
+    # lift_kmax: 2  # Most extra turns a lift may take.
+    # nsplits: 2  # The number of sub-ensembles to use.
+    # randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
+    # gibbs_sampling_setup: null  # All of the Gibbs sampling splits as described above.
+    # prevent_swaps: false  # If ``True``, do not perform temperature swaps in this move.
+    # List of names (`str`), that can be in any :class:`eryn.state.BranchSupplemental`, to skip when updating states
+    # (:func:`Move.update`).
+    # skip_supp_names_update: []
+    # is_rj: false  # If using RJ, this should be ``True``.
+
+tempering: null
+
+nleaves: 1  # source blocks override: "auto" -> len(data.source_ids[SOURCE_IDS_KEY])
+
+num_prop_repeats: 500  # how many times to repeat the proposal per walker per iteration
+
+inner_moves: null  # None -> the Setup's default (StretchMove)
+
+# Per recipe stage, attributes of the psd move (it has no apply_settings; its repeat count is the attribute
+# num_repeats). The galfor parameters are sampled by this move.
+# recipe stage name -> attributes of the PE move set when the stage starts (the move has no apply_settings, so no
+# num_prop_repeats per stage: its own attribute is num_repeats). The galfor parameters ride on this move.
+stages:
+  burn-in:
+    attributes: {num_repeats: 500}
+  tune:
+    attributes: {num_repeats: 500}

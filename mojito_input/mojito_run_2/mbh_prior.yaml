@@ -1,0 +1,91 @@
+branch_name: mbh
+priors:
+- name: logM
+  prior_kwargs:
+    maximum: 18.420680743952367
+    minimum: 11.512925464970229
+    name: log total mass
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: q
+  prior_kwargs:
+    maximum: 10
+    minimum: 1
+    name: mass ratio
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: s1z
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: s1z
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: s2z
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: s2z
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: d_L
+  prior_kwargs:
+    cosmology: Planck15
+    maximum: 150
+    minimum: 1
+    num_points: 1000
+  prior_type: UniformInComovingVolume
+- name: phi_ref
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: reference phase
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: cos_iota
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: cos inclination
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: psi
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: polarization angle
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: alpha
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: right ascension
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: sin_delta
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: sin declination
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: t_c
+  prior_kwargs:
+    maximum: 61603200.0
+    minimum: 0
+    name: coalescence time
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+return_gpu: false
+use_cupy: false

@@ -1,0 +1,79 @@
+branch_name: gb
+priors:
+- name: logA
+  prior_kwargs:
+    maximum: !!python/object/apply:numpy._core.multiarray.scalar
+    - &id001 !!python/object/apply:numpy.dtype
+      args:
+      - f8
+      - false
+      - true
+      state: !!python/tuple
+      - 3
+      - <
+      - null
+      - null
+      - null
+      - -1
+      - -1
+      - 0
+    - !!binary |
+      W6qiKp4GR8A=
+    minimum: !!python/object/apply:numpy._core.multiarray.scalar
+    - *id001
+    - !!binary |
+      +FSyCy0OS8A=
+    name: log amplitude
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name:
+  - f0
+  - fdot
+  prior_kwargs:
+    f0_max: 30
+    f0_min: 0.1
+    f0_units: mHz
+  prior_type: F0FdotPrior
+- name: phi0
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: starting phase
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: cos_iota
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: cos inclination
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: psi
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: polarization angle
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: alpha
+  prior_kwargs:
+    maximum: 6.283185307179586
+    minimum: 0
+    name: right ascension
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+- name: sin_delta
+  prior_kwargs:
+    maximum: 0.999999999
+    minimum: -0.999999999
+    name: sin declination
+    return_gpu: true
+    use_cupy: false
+  prior_type: UniformDistribution
+return_gpu: false
+use_cupy: false
