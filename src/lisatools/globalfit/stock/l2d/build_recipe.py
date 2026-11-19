@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 SETUP_ARGS = ("recipe", "engine_info", "curr", "acs", "priors", "state")
 
-logger = init_logger(__name__, level="DEBUG", name="RecipeBuilder")
+logger = init_logger(level="DEBUG", name="RecipeBuilder")
 
 class Alternative(NamedTuple):
     """A move that takes (random) turns with its branch's ``pe`` moves, in a share of each stage's iterations."""
