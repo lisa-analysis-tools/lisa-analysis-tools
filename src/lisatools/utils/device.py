@@ -28,6 +28,7 @@ __all__ = [
     "jax_device_context",
     "assert_peer_access",
     "gpu_memory_report",
+    "limit_fft_plan_cache",
 ]
 
 
@@ -200,10 +201,29 @@ def gpu_memory_report(xp, gpus: Union[int, Sequence[int], None], walkers_per_gpu
             line += (
                 f"; JAX {_gib(stats.get('bytes_in_use', 0))} in use, peak {_gib(stats.get('peak_bytes_in_use', 0))}"
                 f", arena {_gib(stats.get('pool_bytes', 0))} held, limit {_gib(stats.get('bytes_limit', 0))}"
-                f", limit {_gib(stats.get('bytes_limit', 0))}"
             )
         count = (walkers_per_gpu or {}).get(gpu)
         if count:
             line += f"; {count} walkers, <= {_gib(in_use / count)} cupy per walker"
         lines.append(line)
     return lines
+
+
+def limit_fft_plan_cache(xp, gpus: Union[int, Sequence[int], None]) -> None:
+    """Keep at most one cuFFT plan in the calling thread's cupy plan cache on each of ``gpus``.
+
+    Each cached plan holds a work area about as large as its input in the cupy pool, counted as in use, so
+    ``free_all_blocks`` cannot return it; with the default 16 plans and several transform shapes this pins
+    GiBs per card. The cache is per thread and per device, so every thread that runs FFTs (the main thread
+    and each split worker) must call this for every device it may enter. ``set_memsize`` is not used: a plan
+    above that cap makes the FFT call itself raise ``RuntimeError``, while ``set_size`` cannot fail.
+    No-op on the CPU path.
+    """
+    if gpus is None:
+        return
+    get_plan_cache = getattr(getattr(getattr(xp, "fft", None), "config", None), "get_plan_cache", None)
+    if get_plan_cache is None or not hasattr(xp, "cuda"):
+        return
+    for gpu in [gpus] if isinstance(gpus, int) else gpus:
+        with device_context(xp, gpu):
+            get_plan_cache().set_size(1)

@@ -36,6 +36,7 @@ from .diagnostic import (
 from .sensitivity import SensitivityMatrixBase
 from .utils.constants import *
 from .utils.utility import asnumpy
+from .utils.device import limit_fft_plan_cache
 
 if TYPE_CHECKING:
     from .domaincomputation import DomainComputationGroupArray
@@ -1844,6 +1845,9 @@ class AnalysisContainerArray:
             # and restore the caller's main device so __init__ has no
             # side-effect on global CUDA state.
             self._main_device_at_init = self.xp.cuda.runtime.getDevice()
+            # Main-thread cuFFT plan cache: one plan per device (worker threads set theirs in
+            # :attr:`thread_pool`).
+            limit_fft_plan_cache(self.xp, gpus)
 
         ac_tmp = acs.flatten()[0]
         self.shape_sens = shape_sens = ac_tmp.sens_mat.shape[: -len(ac_tmp.sens_mat.data_shape)]
@@ -2471,9 +2475,13 @@ class AnalysisContainerArray:
         if self._thread_pool is None:
             initializer = None
             if self.gpus is not None:
-                initializer = lambda dev=int(self.gpus[0]): (  # noqa: E731
-                    self.xp.cuda.runtime.setDevice(dev)
-                )
+                gpus = [int(g) for g in self.gpus]
+
+                def initializer():
+                    self.xp.cuda.runtime.setDevice(gpus[0])
+                    # A worker may run any split, so cap its plan cache on every device of the run.
+                    limit_fft_plan_cache(self.xp, gpus)
+
             self._thread_pool = _DaemonThreadPool(
                 max_workers=max(1, len(self.gpu_splits)),
                 initializer=initializer,
