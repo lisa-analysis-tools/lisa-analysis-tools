@@ -436,9 +436,9 @@ class BlockBase(_Spec):
         check_kwargs(self.search.kwargs, interface, SEARCH_INTERFACE_FILLED)
         return self
 
-    def parse_prior_information(self, g: GeneralSetup) -> dict[str, Any]:
+    def parse_prior_information(self, g: GeneralSetup, reference_time: float | None=None) -> dict[str, Any]:
         """Return the prior, transform container, periodicity and basis for this block's priors."""
-        priors_obj = make_priors(self, g)
+        priors_obj = make_priors(self, g, reference_time)
         branch = priors_obj.branch_name
         if branch != self.type:
             raise ValueError(
@@ -756,7 +756,7 @@ class SourceBlock(MoveBlock):
         erebor = importlib.import_module("lisatools.globalfit.stock.erebor")
         g = ctx.general
 
-        info = self.parse_prior_information(g)
+        info = self.parse_prior_information(g, self.waveform_t0(ctx))
         nleaves = self.resolve_nleaves(ctx.cfg)
         init_kwargs = {**deepcopy(self.waveform.kwargs), **self.engine_waveform_kwargs(ctx)}
         waveform_class = find_class(self.waveform.class_name, self.WAVEFORM_MODULES)
@@ -988,7 +988,7 @@ def make_flow_move(block: SourceBlock, ctx: BuildContext, info: dict[str, Any], 
     return flow_move
 
 
-def make_priors(block: BlockBase, general) -> GFBasePrior:
+def make_priors(block: BlockBase, general, reference_time: float | None=None) -> GFBasePrior:
     """``{name: prior}`` for the block's priors, with builder-filled kwargs (e.g. observation_time)."""
     from ereborpriors.base import GFBasePrior
 
@@ -1001,10 +1001,8 @@ def make_priors(block: BlockBase, general) -> GFBasePrior:
         factory = getattr(cls, "prior_factory", cls)
         # the source observation time is defined wrt the reference time, so 
         # in the prior we have to account for the time shift between the reference time and the data start
-        data_start = general.data_t0
-        from lisatools.globalfit.recipe import MOJITO_REFERENCE_TIME
-
-        engine = {"observation_time": general.Tobs + (data_start - MOJITO_REFERENCE_TIME)}
+        shift = 0.0 if reference_time is None else general.data_t0 - reference_time
+        engine = {"observation_time": general.Tobs + shift}
         accepted = accepted_kwargs(factory)
 
         kwargs = deepcopy(block.priors.kwargs)
