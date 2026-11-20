@@ -123,3 +123,12 @@ declination); the lines printed after the first template were buffered and lost 
 **Pattern**: a process killed by a GPU assert loses its buffered output, so the last line in the log is not where
 it died. Before saying where a crash is, reproduce the suspected call alone (it took one script) and flush every
 progress print in harnesses. When the user says a claim contradicts their experience, test the claim first.
+
+## 2026-11-20 — never edit the main checkout before a production resume
+Correction: asked to "make the change" (MBH generator read-backs) minutes before the user resumed the 7-GPU run, I
+edited `waveformbase.py` and `utils/utility.py` in the main checkout, next to the user's own uncommitted edit, and
+tested there. User: "making the changes now was stupid ... make a worktree ... I cannot afford to introduce a new
+untested thing"; they reverted the waveform code to the remote version. Rule: any code change, however small and
+however well it tests on one card, goes in a worktree first, also when the user's own related edit sits uncommitted
+in the main checkout (copy their diff into the worktree instead). The main checkout is what the next submission
+runs. An offer I made ("in a worktree") stays binding when the user says "yes".
