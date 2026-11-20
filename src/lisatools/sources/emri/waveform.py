@@ -376,13 +376,21 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
             the segment is filled from the exact time series.
         max_half_width: Largest band half-width [bins] of a track segment (``None``: no cap).
         sparse_dt: Largest spacing of the sparse response grid [s].
-        stop_taper: Taper [s] of the emission before the end of the inspiral.
+        stop_taper: Taper [s] of the emission before the end of the inspiral, applied by the
+            TDI-on-the-fly fallback (not used with ``fallback_via_polarizations``).
+        fallback_via_polarizations: How the segments the tracks cannot represent are filled.
+            ``False`` (default): the full TDI-on-the-fly response per harmonic
+            (``TDDenseTDIonTheFly.channels``) with the emission ``stop_taper``. ``True``: the
+            holder's modes are summed into h+, hx at every sample and the production response
+            of this waveform (``pyResponseTDI``) is applied, as the dense path does, so those
+            segments are the production template's; about 20x cheaper per sample on the CPU.
         **kwargs: As :class:`EMRITDIWaveform`.
     """
 
     def __init__(self, *args: Any, n_side: int = 30, cubic_tol: float = 0.03,
                  max_half_width: Optional[int] = None, sparse_dt: float = 43200.0,
-                 stop_taper: float = 120.0, **kwargs: Any):
+                 stop_taper: float = 120.0, fallback_via_polarizations: bool = False,
+                 **kwargs: Any):
         super().__init__(*args, **kwargs)
         if self.analysis_domain != "STFT":
             raise ValueError("EMRISparseSTFTWaveform needs an STFT analysis domain (stft_dt).")
@@ -391,6 +399,7 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
         self.max_half_width = max_half_width
         self.sparse_dt = float(sparse_dt)
         self.stop_taper = float(stop_taper)
+        self.fallback_via_polarizations = bool(fallback_via_polarizations)
         self._sparse_response = None
         self._accumulator = None
         #: per-(row, segment) fill of the last call: 0 zero, 1 tracks, 2 exact time series
@@ -400,7 +409,8 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
     def kwargs(self):
         out = super().kwargs
         out.update(n_side=self.n_side, cubic_tol=self.cubic_tol, max_half_width=self.max_half_width,
-                   sparse_dt=self.sparse_dt, stop_taper=self.stop_taper)
+                   sparse_dt=self.sparse_dt, stop_taper=self.stop_taper,
+                   fallback_via_polarizations=self.fallback_via_polarizations)
         return out
 
     def _sparse_setup(self):
@@ -424,6 +434,102 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
                 t_start=float(self.waveform_t0), t_window=(t_lo, t_lo + num_seg * stft_dt),
                 data_dt=self.dt, sparse_dt=self.sparse_dt, force_backend=self.force_backend)
         return self._sparse_response, self._accumulator
+
+    def _production_samples(self, m1, m2, traj_first, traj_last):
+        """``(n_signal, n_prod)`` of production's polarizations of one template.
+
+        ``wave_gen`` returns h+, hx at ``waveform_t0 + k dt`` for ``k < n_prod`` (then the
+        response sees zeros); the first ``n_signal`` samples carry the mode sum, the others are
+        FEW's zero padding. Production's float expressions are reproduced literally, since a
+        rounding moves either end by one sample:
+
+        * ``wave_gen`` passes ``T = int(merger_time / dt) dt / YRSID_SI`` years, with
+          ``merger_time = t_end - waveform_t0`` (``compute_tdi_channels``);
+        * the trajectory ends at ``tmax_dimensionless * Msec`` (few.trajectory.integrate), or
+          where it plunges first: then where the holder's does (``traj_last``);
+        * the summation (``few.summation.base.SummationBase.__call__``) recomputes
+          ``n_pts = int(T YRSID_SI / dt)``, which can lose a sample, sums
+          ``int((min(n_pts dt, t_traj_end) - t0) / dt) + 1`` samples and pads with zeros to
+          ``n_pts dt`` only with ``pad_output`` (and one more zero on an even length with
+          ``odd_len``).
+
+        Args:
+            m1, m2 (float): Masses [Msun], as passed to FEW.
+            traj_first, traj_last (float): First and last time of the holder's trajectory
+                [s since ``waveform_t0``].
+        """
+        from few.utils.constants import MTSUN_SI as FEW_MTSUN_SI
+        from few.utils.constants import YRSID_SI as FEW_YRSID_SI
+
+        dt = float(self.dt)
+        merger_time = float(self.domain_settings.t_end - self.waveform_t0)
+        T = int(merger_time / dt) * dt / YRSID_SI                          # wave_gen [yr]
+        # few.trajectory.integrate.run_inspiral
+        mu = m1 * m2 / (m1 + m2)
+        M = m1 + m2
+        massratio = mu / M
+        tmax_dimensionless = T * FEW_YRSID_SI / (M * FEW_MTSUN_SI) * massratio
+        t_traj_end = min(float(traj_last), tmax_dimensionless * (FEW_MTSUN_SI * M / massratio))
+        # few.summation.base.SummationBase.__call__
+        summation = self.waveform.waveform_generator.create_waveform
+        t0 = float(traj_first)
+        T_s = int(T * FEW_YRSID_SI / dt) * dt
+        if T_s < t_traj_end:
+            n_signal, n_pad = int((T_s - t0) / dt) + 1, 0
+        else:
+            n_signal = int((t_traj_end - t0) / dt) + 1
+            n_pad = int((T_s - t0) / dt) + 1 - n_signal if summation.pad_output else 0
+        if summation.odd_len and (n_signal + n_pad) % 2 == 0:
+            n_pad += 1
+        return n_signal, n_signal + n_pad
+
+    def _fallback_channels(self, item, t, n_signal, n_prod):
+        """Production channels ``(nch, len(t))`` of one template at the data samples ``t``.
+
+        The holder's modes are summed into h+, hx (:func:`.sparse_tracks.polarizations_from_item`)
+        on production's input grid and the production response is applied on windows of the
+        data (:mod:`lisatools.sources.windowed_response`): the samples of ``t`` are sorted into
+        runs, runs closer than the response's margins are merged (computing the gap costs less
+        than a second window), and each run costs its own length plus those margins.
+
+        Args:
+            item: The template item (:meth:`EMRISparseResponse.template_inputs`).
+            t: Data sample times [s] (``data_t0 + j dt``), any order and grouping.
+            n_signal, n_prod (int): Production's polarization samples
+                (:meth:`_production_samples`).
+        """
+        from ..windowed_response import response_margins, response_on_window, window_input_range
+        from .sparse_tracks import polarizations_from_item
+
+        xp = self.xp
+        dt = float(self.dt)
+        t_host = np.asarray(t.get() if hasattr(t, "get") else t, dtype=float).reshape(-1)
+        out = xp.zeros((len(self.tdi_channels), t_host.size), dtype=xp.float64)
+        if t_host.size == 0:
+            return out
+        j = np.rint((t_host - float(self.data_t0)) / dt).astype(np.int64)
+        order = np.argsort(j, kind="stable")
+        js = j[order]
+        left, _back, fwd = response_margins(self)
+        cuts = np.flatnonzero(np.diff(js) > left + fwd + 1) + 1
+        span = (float(self.waveform_t0), int(n_prod))
+        t_end = (int(n_signal) - 1) * dt         # FEW clock of production's last summed sample
+        _psi, lam, beta = item[1]
+        for a, b in zip(np.r_[0, cuts], np.r_[cuts, js.size]):
+            j_lo, j_hi = int(js[a]), int(js[b - 1])
+            t_out = float(self.data_t0) + np.arange(j_lo, j_hi + 1) * dt
+            k0, n_in, n_zero = window_input_range(self, span, t_out[0], t_out[-1])
+            n_sum = min(n_in, int(n_signal) - k0)    # summed samples of the window (then padding)
+            if n_in == 0 or n_sum <= n_zero:
+                continue                             # reads only zeros: production is 0 there
+            hp = xp.zeros(n_in, dtype=xp.float64)
+            hc = xp.zeros(n_in, dtype=xp.float64)
+            # production's FEW clock: input sample k at k dt
+            t_few = xp.arange(k0 + n_zero, k0 + n_sum, dtype=xp.float64) * dt
+            hp[n_zero:n_sum], hc[n_zero:n_sum] = polarizations_from_item(item, t_few, t_end=t_end, xp=xp)
+            run = response_on_window(self, span, k0, hp, hc, lam, beta, t_out)
+            out[:, xp.asarray(order[a:b])] = run[:, xp.asarray(js[a:b] - j_lo)]
+        return out
 
     def __call__(self, *args, ra=None, dec=None, merger_time=None, **kwargs):
         """STFT templates ``(template (B, 3, NT, NF), start_freqs (B,), start_times (B,))``.
@@ -458,7 +564,20 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
                 (m1, m2, a, p0, e0, x0, dist, qS, phiS, qK, phiK, Pp, Pt, Pr), lam=ra_i, beta=dec_i, **kwargs)
             items.append(item)
             holders.append(H)
-        source = EMRITrackSource(response, items, holders, stop_taper=self.stop_taper)
+        channels_fn = None
+        if self.fallback_via_polarizations:
+            samples = []
+            for i, item in enumerate(items):
+                t_k = item[0][0]
+                t_k = np.asarray(t_k.get() if hasattr(t_k, "get") else t_k, dtype=float)
+                samples.append(self._production_samples(
+                    float(params[0][i]), float(params[1][i]), t_k[0], t_k[-1]))
+
+            def channels_fn(row, t):
+                return self._fallback_channels(items[row], t, *samples[row])
+
+        source = EMRITrackSource(response, items, holders, stop_taper=self.stop_taper,
+                                 channels_fn=channels_fn)
         window = tukey(self.nperseg, alpha=self.tukey_alpha, xp=xp) if self.tukey_alpha else xp.ones(self.nperseg)
         num_seg = self.domain_settings.N // self.nperseg
         segment_start = float(self.data_t0) + np.arange(num_seg) * (self.nperseg * self.dt)

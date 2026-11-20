@@ -967,6 +967,136 @@ class EMRISparseResponse:
         return out[0] if sum_subs else out
 
 
+def _phase_powers(phi, u_max, xp):
+    """``exp(-i q phi)`` for ``q = -u_max .. u_max`` (row ``q + u_max``), ``(2 u_max + 1, n)``.
+
+    Powers by repeated multiplication (relative error about ``q eps``, below the ``|q phi| eps``
+    rounding of the phase itself): one complex exponential per fundamental phase."""
+    out = xp.empty((2 * u_max + 1, phi.size), dtype=xp.complex128)
+    out[u_max] = 1.0
+    if u_max:
+        e1 = xp.exp(-1j * phi)
+        out[u_max + 1] = e1
+        for q in range(2, u_max + 1):
+            out[u_max + q] = out[u_max + q - 1] * e1
+        out[:u_max] = xp.conj(out[:u_max:-1])            # q < 0: conjugates, reversed
+    return out
+
+
+#: largest overshoot [s] of ``t_end`` past the trajectory's last knot in
+#: :func:`polarizations_from_item` (float rounding of a sample time, far below a sample)
+T_END_SLACK = 1e-6
+
+
+def polarizations_from_item(item, t_few, *, t_end=None, amp_factor=None, xp=np, chunk=4096):
+    """``(h_plus, h_cross)`` of a template item at FEW-clock times, as production's ``wave_gen``.
+
+    Sums the item's harmonics (the FEW holder's modes, -m partners included) at every sample,
+    the way FEW's dense mode sum does, and projects them as :class:`EMRITDIWaveform.wave_gen`
+    does (``h_+ = Re h``, ``h_x = -Im h`` of FEW's SSB-frame output). Matches it to about 1e-11
+    relative on the same trajectory.
+
+    Mapping: ``TDDenseTDIWaveform`` (lat_spline_tdi_waveform.cu) adds per link
+    ``Re[G (Z(t_em) - Z(t_rec))]`` with ``G = sign pre (xi_p A_p + xi_c A_c)``,
+    ``Z = amp_factor sum_s c_s exp(-i mkn_s . Phi)`` and, at the item's ``inc = 0``,
+    ``A_p = -2 e^{-2 i psi}``, ``A_c = -2 i e^{-2 i psi}``; ``pyResponseTDI`` adds
+    ``pre (xi_p dh_+ + xi_x dh_x)`` with the same ``k, u, v``. So ``h_+ = Re(A_p Z)`` and
+    ``h_x = Re(A_c Z)``; with ``amp_factor = 1/2`` this is FEW's ``e^{-2 i psi} (-sum_s c_s
+    e^{-i Phi_s})`` read as ``h_+ = Re``, ``h_x = -Im``.
+
+    Evaluation follows ``TDDenseTDIWaveform::phases`` / ``strain_term``: DOPR853 dense output of
+    the fundamental phases, monomial cubics of the complex amplitudes in ``t - t_k[g]``, one knot
+    segment at a time and ``chunk`` samples per block; ``exp(-i mkn . Phi)`` is a product of
+    per-phase power tables.
+
+    Args:
+        item: ``((t_k, C, mkn, amp_re, amp_im), (psi, lam, beta))`` from
+            :meth:`EMRISparseResponse.template_inputs`.
+        t_few: Sample times [s] since ``waveform_t0`` (FEW's clock), any shape and order.
+        t_end (float, optional): Last time with signal [s, FEW clock]; ``None``: ``t_k[-1]``.
+            The holder's trajectory runs past the data window, so production's last summed
+            sample is passed here (``EMRISparseSTFTWaveform`` does). It may lie up to
+            ``T_END_SLACK`` past ``t_k[-1]`` (FEW's sample count ``int(t_end / dt) + 1`` can round
+            up onto a sample an ulp past the trajectory end, which FEW's sum still evaluates):
+            such samples are evaluated on the last knot segment.
+        amp_factor (float, optional): The kernel's amplitude factor;
+            default ``EMRITDIonFly.AMP_FACTOR``.
+        xp: Array module (numpy or cupy).
+        chunk (int): Samples per block (temporaries of about ``64 S chunk`` bytes).
+
+    Returns:
+        tuple: ``(h_plus, h_cross)``, real, shaped like ``t_few``, zero outside
+        ``[t_k[0], t_end]``.
+
+    Raises:
+        ValueError: ``t_end`` more than ``T_END_SLACK`` past the trajectory.
+    """
+    if amp_factor is None:
+        from .emritdionfly import EMRITDIonFly
+
+        amp_factor = EMRITDIonFly.AMP_FACTOR
+
+    def host(v):
+        return v.get() if hasattr(v, "get") else np.asarray(v)
+
+    (t_k, C, mkn, amp_re, amp_im), (psi, _lam, _beta) = item
+    t_k = np.asarray(host(t_k), dtype=float)
+    mkn = np.asarray(host(mkn), dtype=np.int64)                          # (S, 3)
+    C = xp.asarray(C, dtype=xp.float64)                                  # (K - 1, 3, 8)
+    are = xp.ascontiguousarray(xp.transpose(xp.asarray(amp_re, dtype=xp.float64), (1, 0, 2)))
+    aim = xp.ascontiguousarray(xp.transpose(xp.asarray(amp_im, dtype=xp.float64), (1, 0, 2)))
+    # power-table rows of every harmonic, for each fundamental phase some harmonic uses
+    cols = [(j, int(np.abs(mkn[:, j]).max())) for j in range(3) if np.any(mkn[:, j])]
+    rows = [xp.asarray(mkn[:, j] + u_max) for j, u_max in cols]
+
+    # the kernel's A_p, A_c at inc = 0 (lat_spline_tdi_waveform.cu), times amp_factor
+    c2p, s2p = np.cos(2.0 * psi), np.sin(2.0 * psi)
+    A_p = complex(-2.0 * c2p, 2.0 * s2p) * amp_factor
+    A_c = complex(-2.0 * s2p, -2.0 * c2p) * amp_factor
+
+    t = xp.asarray(t_few, dtype=xp.float64)
+    shape = t.shape
+    t = t.reshape(-1)
+    order = xp.argsort(t)
+    ts = t[order]
+    # samples of knot segment g: t_k[g] <= t < t_k[g + 1]; the last one also takes its end
+    stop = t_k[-1] if t_end is None else float(t_end)
+    if stop > t_k[-1] + T_END_SLACK:
+        raise ValueError(f"t_end {stop!r} is past the trajectory end {t_k[-1]!r}.")
+    bounds = host(xp.searchsorted(ts, xp.asarray(t_k), side="left")).astype(np.int64)
+    bounds[-1] = int(host(xp.searchsorted(ts, xp.asarray([stop]), side="right"))[0])
+    bounds = np.minimum(bounds, bounds[-1])                              # nothing after stop
+    hp = xp.zeros(t.size, dtype=xp.float64)
+    hc = xp.zeros(t.size, dtype=xp.float64)
+    for g in range(t_k.size - 1):
+        if bounds[g] >= bounds[g + 1]:
+            continue
+        t_g, h_g = t_k[g], t_k[g + 1] - t_k[g]
+        c = C[g][:, :, None]                                             # (3, 8, 1)
+        for lo in range(int(bounds[g]), int(bounds[g + 1]), chunk):
+            hi = min(lo + chunk, int(bounds[g + 1]))
+            dx = ts[lo:hi] - t_g
+            # fundamental phases (3, n): DOPR853 dense output (TDDenseTDIWaveform::phases)
+            s = dx / h_g
+            s1 = 1.0 - s
+            Phi = c[:, 0] + s * (c[:, 1] + s1 * (c[:, 2] + s * (c[:, 3] + s1 * (
+                c[:, 4] + s * (c[:, 5] + s1 * (c[:, 6] + s * c[:, 7]))))))
+            E = None                                                     # exp(-i mkn . Phi), (S, n)
+            for (j, u_max), r in zip(cols, rows):
+                tab = _phase_powers(Phi[j], u_max, xp)[r]
+                E = tab if E is None else E * tab
+            if E is None:
+                E = xp.ones((are.shape[1], hi - lo), dtype=xp.complex128)
+            # complex amplitudes c_s(t), (S, n) (TDDenseTDIWaveform::strain_term)
+            V = xp.stack([xp.ones_like(dx), dx, dx * dx, dx * dx * dx])
+            amp = are[g] @ V + 1j * (aim[g] @ V)
+            Z = xp.einsum("sn,sn->n", amp, E)                            # sum_s c_s e^{-i phase_s}
+            idx = order[lo:hi]
+            hp[idx] = A_p.real * Z.real - A_p.imag * Z.imag              # Re(A_p Z)
+            hc[idx] = A_c.real * Z.real - A_c.imag * Z.imag              # Re(A_c Z)
+    return hp.reshape(shape), hc.reshape(shape)
+
+
 class EMRITrackSource:
     """A batch of EMRI templates as a :class:`lisatools.stft_tracks.SparseTrackSource`.
 
@@ -979,19 +1109,25 @@ class EMRITrackSource:
         items (list): Template items (:meth:`EMRISparseResponse.template_inputs`).
         holders (list): Their host holders, in the same order.
         stop_taper (float, optional): Emission-time taper [s] before the end of a trajectory,
-            applied to the exact time series (:meth:`td_channels`). Default 120.
+            applied to the exact time series of the dense kernel (:meth:`td_channels` without
+            ``channels_fn``). Default 120.
+        channels_fn (callable, optional): ``channels_fn(row, t) -> (nch, len(t))``, the exact
+            channels of template ``row`` at the absolute times ``t``, used by
+            :meth:`td_channels` instead of the dense kernel (``EMRISparseSTFTWaveform`` passes
+            the production sum-then-respond path).
 
     A template whose inspiral ends before the window has no component and an empty signal
     span (its row stays zero). One whose trajectory is too short for the response splines has
     no component either, and its row is evaluated from the exact time series.
     """
 
-    def __init__(self, response, items, holders, stop_taper=120.0):
+    def __init__(self, response, items, holders, stop_taper=120.0, channels_fn=None):
         if len(items) != len(holders):
             raise ValueError("items and holders must have the same length")
         self.response = response
         self.items = list(items)
         self.stop_taper = float(stop_taper)
+        self.channels_fn = channels_fn
         self.num_rows = len(self.items)
         xp = response.xp
         t0 = response.t_start
@@ -1047,6 +1183,10 @@ class EMRITrackSource:
         return tuple(outs)
 
     def td_channels(self, row, t):
-        """Exact summed channels ``(nch, len(t))`` of template ``row``, tapered at its end."""
-        return self.response.td_channels(self.items[int(row)], t, sum_subs=True, stop_taper=self.stop_taper)
+        """Exact summed channels ``(nch, len(t))`` of template ``row``: from ``channels_fn`` when
+        given, else from the dense kernel, tapered at the trajectory's end."""
+        if self.channels_fn is not None:
+            return self.channels_fn(int(row), t)
+        return self.response.td_channels(self.items[int(row)], t, sum_subs=True,
+                                         stop_taper=self.stop_taper)
 
