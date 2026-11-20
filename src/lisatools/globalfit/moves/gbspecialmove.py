@@ -7172,6 +7172,11 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
     # * below exp(-48) of the kept terms
     RA_STD_CAP = 0.5 * np.pi
     NUM_IMAGES_PER_SIDE = 2
+    # * Pairs of row and component of the search record that one call of the companion's mixture
+    # * holds on the device. A call takes about 0.4 kB per pair (measured with numpy), so the
+    # * mixture's working memory stays near 0.1 GiB for any number of cells in a pick and of
+    # * components in the record.
+    COMPANION_PAIRS_PER_CALL = 2 ** 18
     # The window rule: W is half the own-source width at the band's centre, with the chirp drift of
     # a system of this chirp mass over the span in place of the band layout's worst case
     FIDUCIAL_CHIRP_MASS_MSUN = 0.3
@@ -7936,7 +7941,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
                 xp.concatenate([companions["rows"][companions["kept"]], partner_points]))
         # 6. The draws, the densities and the terms of each direction
         num_kept = len(kept_splits)
-        self._split_proposal(proposal, picked, state, primaries, companions,
+        self._split_proposal(proposal, picked, state, beta, primaries, companions,
                              [values[:num_kept] for values in pairs])
         self._merge_proposal(proposal, picked, state, beta, primaries, merges, partner,
                              partner_points, [values[num_kept:] for values in pairs])
@@ -8016,8 +8021,8 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         |f2 - f1| > W, f2 outside the band, the band at its cap, the companion outside the prior's
         box (its prior part density zero, and so its run prior). Returns over ``splits``: the
         companions' sampling rows (the parent's row with the intrinsic columns drawn), the part
-        each came from (PART_*), the dead rows' positions, the mixture's pieces, the prior part's
-        log density at the companions, the masks of the rules and ``kept``.
+        each came from (PART_*), the dead rows' positions, the prior part's log density at the
+        companions, the masks of the rules and ``kept``.
         """
         xp = self.xp
         num_splits = len(splits)
@@ -8035,17 +8040,9 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         slot = xp.argmax(state["is_dead"][splits] & (dead_rank == choice[:, None]), axis=1)
         # * The companion. The prior part reads the run's prior box at f2, which only f2 sets on its
         # * three columns, so any valid row fills the others.
-        mixture = self._companion_mixture(
+        draws, part, rejected = self._companion_draws(
             bands, anchors, primaries["rho_star_squared"][splits], beta[splits],
-            primaries["widths"][splits])
-        filler = anchors[:1]
-        draws, part, _, rejected = self.companion_draw(
-            mixture["anchor"], mixture["local_factor"], mixture["means"], mixture["factors"],
-            mixture["log_weights"], mixture["has_active"], self.COMPANION_WEIGHTS, windows,
-            (self.band_edges[bands] * 1e3, self.band_edges[bands + 1] * 1e3),
-            lambda frequencies, uniforms: self._prior_rest_draw(frequencies, uniforms, filler),
-            xp.random.rand(num_splits), xp.random.rand(num_splits), xp.random.randn(num_splits, 4),
-            xp.random.rand(num_splits, 4), xp=xp)
+            primaries["widths"][splits], windows)
         rows = anchors.copy()
         rows[:, list(self.INTRINSIC_ORDER)] = draws
         log_prior_part = self._prior_part_log_density(rows, anchors, windows)
@@ -8066,7 +8063,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         open_cells = open_cells & ~at_cap
         outside_prior = open_cells & ~xp.isfinite(log_prior_part)
         return dict(
-            rows=rows, part=part, slot=slot, mixture=mixture, log_prior_part=log_prior_part,
+            rows=rows, part=part, slot=slot, log_prior_part=log_prior_part,
             not_finite=not_finite, beyond_window=beyond_window, outside_band=outside_band,
             at_cap=at_cap, outside_prior=outside_prior, kept=open_cells & ~outside_prior,
         )
@@ -8092,6 +8089,76 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
             means=self._record_means[bands], factors=self._record_factors[bands],
             log_weights=log_weights, has_active=has_active,
         )
+
+    def _companion_row_chunks(self, num_rows):
+        """Row slices that hold at most COMPANION_PAIRS_PER_CALL pairs of row and component of the
+        search record, and at least one row."""
+        num_components = max(int(self._record_means.shape[1]), 1)
+        rows_per_call = max(self.COMPANION_PAIRS_PER_CALL // num_components, 1)
+        return [slice(start, start + rows_per_call) for start in range(0, num_rows, rows_per_call)]
+
+    def _companion_draws(self, bands, anchors, rho_star_squared, beta, widths, windows):
+        """The companions' intrinsic points (n, 4), the part each came from and ``rejected`` of
+        :meth:`companion_draw`, at anchors in their bands, in two stages. First the mixture is
+        formed for a chunk of rows at a time (:meth:`_companion_row_chunks`), so its arrays over
+        the pairs of row and component never exceed one chunk, and each row keeps the one
+        component it draws. Then one call of :meth:`companion_draw` draws the points of all rows,
+        each row with its own component alone."""
+        xp = self.xp
+        num_rows, dimension = len(bands), len(self.INTRINSIC_ORDER)
+        num_components = int(self._record_means.shape[1])
+        filler = anchors[:1]
+        uniform_part, uniform_component = xp.random.rand(num_rows), xp.random.rand(num_rows)
+        standard_normals, uniforms_prior = xp.random.randn(num_rows, 4), xp.random.rand(num_rows, 4)
+        anchor = xp.zeros((num_rows, dimension))
+        local_factor = xp.zeros((num_rows, dimension, dimension))
+        has_active = xp.zeros(num_rows, dtype=bool)
+        # A record without components leaves the search part empty, as companion_draw expects it
+        own = min(num_components, 1)
+        own_means = xp.zeros((num_rows, own, dimension))
+        own_factors = xp.zeros((num_rows, own, dimension, dimension))
+        for rows in self._companion_row_chunks(num_rows):
+            mixture = self._companion_mixture(
+                bands[rows], anchors[rows], rho_star_squared[rows], beta[rows], widths[rows])
+            anchor[rows], local_factor[rows] = mixture["anchor"], mixture["local_factor"]
+            has_active[rows] = mixture["has_active"]
+            if num_components:
+                drawn = self.drawn_components(
+                    mixture["log_weights"], uniform_component[rows], xp=xp)
+                line = xp.arange(len(drawn))
+                own_means[rows, 0] = mixture["means"][line, drawn]
+                own_factors[rows, 0] = mixture["factors"][line, drawn]
+            # ! Released before the next chunk is formed, or two chunks would be held at once
+            del mixture
+        # ! The points are drawn in one call over all rows: on cupy the last bits of einsum depend
+        # ! on the number of rows in a call, so a draw chunk by chunk would not repeat this one's
+        draws, part, _, rejected = self.companion_draw(
+            anchor, local_factor, own_means, own_factors, xp.zeros((num_rows, own)), has_active,
+            self.COMPANION_WEIGHTS, windows,
+            (self.band_edges[bands] * 1e3, self.band_edges[bands + 1] * 1e3),
+            lambda frequencies, uniforms: self._prior_rest_draw(frequencies, uniforms, filler),
+            uniform_part, uniform_component, standard_normals, uniforms_prior, xp=xp)
+        return draws, part, rejected
+
+    def _companion_log_densities(self, bands, anchors, rho_star_squared, beta, widths, companions,
+                                 log_prior_part):
+        """ln q_c (n,) of the companions' sampling rows (n, ndim) under the mixture around anchors
+        in their bands (:meth:`companion_log_density`), a chunk of rows at a time as in
+        :meth:`_companion_draws`. The mixture is a function of the anchor, rho*^2, beta and the
+        record only, so it is formed again here and not kept from the draw."""
+        xp = self.xp
+        intrinsic = list(self.INTRINSIC_ORDER)
+        log_density = xp.zeros(len(bands))
+        for rows in self._companion_row_chunks(len(bands)):
+            mixture = self._companion_mixture(
+                bands[rows], anchors[rows], rho_star_squared[rows], beta[rows], widths[rows])
+            log_density[rows] = self.companion_log_density(
+                companions[rows][:, intrinsic], mixture["anchor"], mixture["local_factor"],
+                mixture["means"], mixture["factors"], mixture["log_weights"], log_prior_part[rows],
+                mixture["has_active"], self.COMPANION_WEIGHTS, xp=xp)
+            # ! Released before the next chunk is formed, or two chunks would be held at once
+            del mixture
+        return log_density
 
     def _prior_rest_box(self, rows):
         """Lower and upper bounds (n, 3) of the run's prior box on COMPANION_ORDER at sampling rows
@@ -8195,7 +8262,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         )
         return mean, factor, usable
 
-    def _split_proposal(self, proposal, picked, state, primaries, companions, pairs):
+    def _split_proposal(self, proposal, picked, state, beta, primaries, companions, pairs):
         """The amplitudes, the densities and the acceptance terms of the splits: the outcome masks
         of every split and, for each kept companion, the eight amplitudes drawn from the pair's
         Gaussian, each child at a copy drawn uniformly, the densities and the inputs of the
@@ -8215,7 +8282,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         bands, position = picked["band_inds"][cells], state["position"][cells]
         slot, windows = companions["slot"][kept], self._window_mhz[bands]
         parents, periods = state["old_primary"][cells], state["periods"]
-        amplitude, intrinsic = list(self.AMPLITUDE_COLUMNS), list(self.INTRINSIC_ORDER)
+        amplitude = list(self.AMPLITUDE_COLUMNS)
 
         # * The draw U = (u_a, u_b) from the pair's Gaussian: child a keeps the parent's intrinsic
         # * point (the anchor), child b takes the companion's, each at one of its four copies
@@ -8231,11 +8298,9 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         # * The densities from the stored points, the functions the reverse merge evaluates:
         # * ln q_split = ln q_c + ln N(U) + V(e_a) + V(e_b) + 2 ln(1/4), and the reverse merge's
         # * ln q_merge = ln N(u*) + V(e*) + ln(1/4) from the parent's Gaussian of the primary's row
-        mixture = {name: values[kept] for name, values in companions["mixture"].items()}
-        log_companion = self.companion_log_density(
-            child_b[:, intrinsic], mixture["anchor"], mixture["local_factor"], mixture["means"],
-            mixture["factors"], mixture["log_weights"], companions["log_prior_part"][kept],
-            mixture["has_active"], self.COMPANION_WEIGHTS, xp=xp)
+        log_companion = self._companion_log_densities(
+            bands, parents, primaries["rho_star_squared"][cells], beta[cells],
+            primaries["widths"][cells], child_b, companions["log_prior_part"][kept])
         stored = xp.concatenate([self.amplitude_vectors(child_a, xp=xp),
                                  self.amplitude_vectors(child_b, xp=xp)], axis=1)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -8308,7 +8373,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         bands, position = picked["band_inds"][cells], state["position"][cells]
         windows = self._window_mhz[bands]
         primary_points, periods = state["old_primary"][cells], state["periods"]
-        amplitude, intrinsic = list(self.AMPLITUDE_COLUMNS), list(self.INTRINSIC_ORDER)
+        amplitude = list(self.AMPLITUDE_COLUMNS)
 
         # * The merged amplitudes: the merged source keeps the primary's
         # * intrinsic point; its amplitudes come from the primary's Gaussian on the pair-free
@@ -8324,14 +8389,10 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         # * ln q_split at the current pair, its companion density at the
         # * partner with the active set around f1 and the local width from rho*^2 of the primary's
         # * row
-        mixture = self._companion_mixture(
+        log_companion = self._companion_log_densities(
             bands, primary_points, primaries["rho_star_squared"][cells], beta[cells],
-            primaries["widths"][cells])
-        log_companion = self.companion_log_density(
-            partner_points[:, intrinsic], mixture["anchor"], mixture["local_factor"],
-            mixture["means"], mixture["factors"], mixture["log_weights"],
-            self._prior_part_log_density(partner_points, primary_points, windows),
-            mixture["has_active"], self.COMPANION_WEIGHTS, xp=xp)
+            primaries["widths"][cells], partner_points,
+            self._prior_part_log_density(partner_points, primary_points, windows))
         stored = xp.concatenate(
             [self.amplitude_vectors(primary_points, xp=xp),
              self.amplitude_vectors(partner_points, xp=xp)], axis=1)
@@ -8733,6 +8794,17 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         return xp.where(xp.asarray(has_active)[:, None], xp.asarray(active_row)[None, :],
                         xp.asarray(inactive_row)[None, :])
 
+    @staticmethod
+    def drawn_components(component_log_weights, uniform_component, xp=np):
+        """The component (n,) that each row draws from its log weights (n, c), c at least 1, with
+        its uniform number (n,): the first whose cumulative weight exceeds the uniform number
+        times the row's total weight."""
+        component_cumulative = xp.cumsum(xp.exp(component_log_weights), axis=1)
+        drawn = xp.sum(
+            component_cumulative <= uniform_component[:, None] * component_cumulative[:, -1:],
+            axis=1)
+        return xp.minimum(drawn, component_log_weights.shape[1] - 1)
+
     @classmethod
     def companion_draw(cls, anchor, local_factor, component_means, component_factors,
                        component_log_weights, has_active, weights, window, band_limits,
@@ -8760,11 +8832,7 @@ class GBFStatSplitMergeRJMove(GBSplitMergeCellsMixin, GBSpecialBase):
         if num_components:
             means = xp.broadcast_to(component_means, (num_rows,) + component_means.shape[-2:])
             factors = xp.broadcast_to(component_factors, (num_rows,) + component_factors.shape[-3:])
-            component_cumulative = xp.cumsum(xp.exp(component_log_weights), axis=1)
-            drawn = xp.sum(
-                component_cumulative <= uniform_component[:, None] * component_cumulative[:, -1:],
-                axis=1)
-            drawn = xp.minimum(drawn, num_components - 1)
+            drawn = cls.drawn_components(component_log_weights, uniform_component, xp=xp)
             from_search = part == cls.PART_SEARCH
             rows = xp.flatnonzero(from_search)
             values[rows] = cls.wrapped_draw(
