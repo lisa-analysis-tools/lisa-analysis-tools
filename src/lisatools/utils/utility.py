@@ -184,7 +184,8 @@ def tukey(N, alpha, xp=None):
         xp = np
 
     assert 0.0 < alpha < 1.0
-    n = xp.arange(int(xp.ceil(N / 2.0)))
+    # host arithmetic: with cupy, xp.ceil makes a device scalar and int() of it waits for the device's queued work
+    n = xp.arange(int(np.ceil(N / 2.0)))
     in_window_edge = n < alpha * (N-1) / 2
 
     tmp = (in_window_edge) * 1.0 / 2.0 * (1.0 - xp.cos(2.0 * np.pi * n / (alpha * (N-1)))) + (

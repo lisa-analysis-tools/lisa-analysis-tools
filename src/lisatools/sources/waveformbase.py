@@ -357,6 +357,11 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
 
         raise NotImplementedError(f"Unsupported analysis domain: {self.analysis_domain}")
 
+    #: ``(times shape, left_edges, max_grid_length)`` of the common grid of the times a subclass is about to
+    #: return from ``compute_tdi_channels``, worked out before its kernels are queued; used once by
+    #: :meth:`build_common_grid`.
+    _common_grid_hint = None
+
     def find_bin_edges(
         self, times: NDArrayLike
     ) -> Tuple[NDArrayLike, NDArrayLike]:
@@ -412,9 +417,16 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
             channels = channels[None, :, :]  # add a batch dimension
             times = times[None, :]
 
-        left_edges, grid_length = self.find_bin_edges(times)
+        # The grid a subclass found before it queued its kernels (``_common_grid_hint``), if it is of these
+        # times: finding it here reads the longest grid length back from the device, which waits for those
+        # kernels.
+        hint, self._common_grid_hint = self._common_grid_hint, None
+        if hint is not None and hint[0] == times.shape:
+            _, left_edges, max_grid_length = hint
+        else:
+            left_edges, grid_length = self.find_bin_edges(times)
+            max_grid_length = int(grid_length.max())
         num_bin = left_edges.shape[0]
-        max_grid_length = int(grid_length.max())
 
         # STFT per-source safety mask: #todo not really sure we need this, will come back later
         safe_samples_per_source = None
@@ -651,18 +663,21 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
 
             signal_fd[start:end] = self.xp.fft.rfft(signal_in[start:end], axis=-1) * self.dt
 
-        freqs = self.xp.fft.rfftfreq(n, d=self.dt)
+        # The frequency bounds are found on the host: they depend on n and dt alone, and a device scalar used
+        # as a slice bound is read back, which waits for everything queued on the device (the response
+        # kernels of this call). Same arithmetic as cupy.fft.rfftfreq, so the values are bit-identical.
+        freqs = np.arange(0, n // 2 + 1, dtype=np.float64) / (n * self.dt)
 
         #keep = (freqs >= self.freq_min) & (freqs <= self.freq_max)
 
         # Find the integer indices corresponding to the frequency bounds
-        start_idx = self.xp.searchsorted(freqs, self.freq_min)
-        end_idx = self.xp.searchsorted(freqs, self.freq_max, side='right')
+        start_idx = int(np.searchsorted(freqs, self.freq_min))
+        end_idx = int(np.searchsorted(freqs, self.freq_max, side='right'))
 
         # Slicing creates a view, avoiding the copy
         signal_out = signal_fd[..., start_idx:end_idx]
 
-        start_freqs = self.xp.full(shape=num_binaries, fill_value=freqs[start_idx])
+        start_freqs = self.xp.full(shape=num_binaries, fill_value=float(freqs[start_idx]))
 
         return signal_out, start_freqs
         # signal_out = signal_fd[..., keep] #try to avoid this copy
@@ -704,6 +719,7 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         arguments or as the last N positional arguments; ``compute_tdi_channels``
         on each subclass is responsible for peeling them off ``*args``.
         """
+        self._common_grid_hint = None  # only a hint made by this call is used
         times, channels = self.compute_tdi_channels(*args, **kwargs)
         left_edges, padded = self.build_common_grid(times, channels)
         return self.transform_to_domain(left_edges, padded)
@@ -1060,6 +1076,32 @@ class TDPyResponseWaveformBase(TDWaveformBase):
         # |t0_shift_to_data| is now in (-dt/2, dt/2], satisfying
         # pyResponseTDI's assert(|t0_shift_to_data| < dt).
 
+        first_label = shifted_t_arr[:, 0] + t0_shift_to_data
+        start_inds = self.xp.maximum(
+            0, self.xp.rint((self.data_t0 - first_label) / self.dt).astype(int)
+        )
+        # Per-source leading-sample trim collapsed to ONE shared cut. Use the MIN
+        # across sources, not the max: the max over-trims every source whose own
+        # start_ind is smaller, silently discarding valid in-window signal from
+        # later-starting sources in a heterogeneous batch. The min drops only
+        # samples that are before data_t0 for *every* source; any per-source
+        # remainder before data_t0 is zeroed below (as the single-source trim
+        # would have removed it). For a single source min == max.
+        start_ind = int(start_inds.min())
+
+        # The common grid of the times returned below, found here, before the response kernels are queued:
+        # afterwards the read-back of its longest length would wait for them (see build_common_grid). The
+        # first and last returned labels are shifted_t_arr[:, start_ind] and the last one before the buffer.
+        if self.analysis_domain in ("STFT", "FD"):
+            end_labels = self.xp.stack(
+                (shifted_t_arr[:, start_ind], shifted_t_arr[:, -num_buffer_ponts - 1]), axis=1
+            ) + t0_shift_to_data[:, None]
+            left_edges_hint, grid_length_hint = self.find_bin_edges(end_labels)
+            n_times_out = shifted_t_arr.shape[1] - num_buffer_ponts - start_ind
+            # 2-D shape: build_common_grid adds the batch axis of a single source before it compares
+            times_shape = (shifted_t_arr.shape[0], n_times_out)
+            self._common_grid_hint = (times_shape, left_edges_hint, int(grid_length_hint.max()))
+
         # pyResponseTDI's batched API (array lam/beta/t0 + run_async +
         # t0_shift_to_data) is fully implemented — call it directly.
         self.response.get_projections(
@@ -1094,17 +1136,6 @@ class TDPyResponseWaveformBase(TDWaveformBase):
         # e^{-i 2*pi f dt} phase ramp in FD; fired ~1% of evaluations when data_t0
         # is off-grid). The rint() below already absorbs the sub-ULP residual, so
         # the modulo step is dropped entirely.
-        start_inds = self.xp.maximum(
-            0, self.xp.rint((self.data_t0 - shifted_t_arr[:, 0]) / self.dt).astype(int)
-        )
-        # Per-source leading-sample trim collapsed to ONE shared cut. Use the MIN
-        # across sources, not the max: the max over-trims every source whose own
-        # start_ind is smaller, silently discarding valid in-window signal from
-        # later-starting sources in a heterogeneous batch. The min drops only
-        # samples that are before data_t0 for *every* source; any per-source
-        # remainder before data_t0 is zeroed below (as the single-source trim
-        # would have removed it). For a single source min == max.
-        start_ind = int(start_inds.min())
 
         # Per-source edge zeroing. The response kernels only fill output samples
         # >= tdi_start_ind (= num_buffer_ponts) of the shared array: earlier samples
