@@ -1617,6 +1617,7 @@ class STFTSettings(DomainSettingsBase):
             return get_stft_settings(
                 times=times, big_dt=big_dt,
                 min_freq=min_freq, max_freq=max_freq,
+                dt=dt,
                 force_backend=force_backend,
             )
         return _factory
@@ -1860,33 +1861,48 @@ def get_stft_settings(
     big_dt: float,
     min_freq: Optional[float] = 0.0,
     max_freq: Optional[float] = None,
+    dt: Optional[float] = None,
     **kwargs,
 ) -> STFTSettings:
     """
     Get STFT settings from time array and desired big_dt.
+
+    The segment length is ``big_dt`` fitted down to a whole number of samples: ``nperseg * dt`` with
+    ``nperseg = floor(big_dt / dt)``. The number of segments is ``len(times) // nperseg``.
 
     Args:
         times: Time array.
         big_dt: Desired time resolution for STFT segments.
         min_freq: Minimum frequency to consider.
         max_freq: Maximum frequency to consider.
+        dt: Sample step of ``times`` (seconds). Pass it whenever it is known. If ``None`` it is measured as
+            ``times[1] - times[0]``, which at absolute times of 1e8 s is only good to one float spacing
+            (1.5e-8 s): time stamps that went through a few additions can be that far off a regular grid.
+            The fit of ``big_dt`` tolerates such a step (it does not lose a sample to it), but the segment
+            length is then a multiple of the measured step, not of the true one.
         **kwargs: Additional keyword arguments to pass to STFTSettings.
 
     Returns:
         STFTSettings: The settings for the STFT.
+
+    Raises:
+        ValueError: If ``big_dt`` is shorter than one sample.
     """
 
     t0 = float(times[0])
     N = len(times)
-    dt = float(times[1] - times[0])
+    if dt is None:
+        dt = float(times[1] - times[0])
+    dt = float(dt)
 
-    big_dt = int(big_dt / dt) * dt  # make sure big_dt is an integer multiple of dt
-    # now make sure that Tobs is an integer multiple of big_dt
-
-    # NT = int(np.ceil(N / (big_dt / dt))) # number of segments
-    NT = int(np.floor(N / (big_dt / dt))) # number of segments
+    # Samples per segment: big_dt fitted down to a whole number of samples. The factor keeps a ratio that
+    # is a whole number up to rounding (17279.99995 for 86400 / 5.000000015) from losing a sample.
+    nperseg = int(np.floor(big_dt / dt * (1.0 + 1e-8)))
+    if nperseg < 1:
+        raise ValueError(f"big_dt={big_dt} is shorter than one sample (dt={dt}).")
+    big_dt = nperseg * dt
+    NT = N // nperseg  # number of whole segments
     DF = 1 / big_dt
-    nperseg = int(big_dt / dt)
     NF = nperseg // 2 + 1
 
     return STFTSettings(

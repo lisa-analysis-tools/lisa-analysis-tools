@@ -343,6 +343,7 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
                 big_dt=self.nperseg * self.dt,
                 min_freq=self.freq_min,
                 max_freq=self.freq_max,
+                dt=self.dt,  # the data's sample step: not measured from the time stamps
                 force_backend=self.force_backend,
             )
         elif self.analysis_domain == "FD":
@@ -580,7 +581,7 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
                 out_settings = self.get_output_settings(padded_times)
             else:
                 out_settings = get_stft_settings(
-                    padded_times, **domain_kwargs, force_backend=self.force_backend
+                    padded_times, **{"dt": dt_here, **domain_kwargs}, force_backend=self.force_backend
                 )
 
             nperseg = out_settings.get_nperseg(dt_here)
