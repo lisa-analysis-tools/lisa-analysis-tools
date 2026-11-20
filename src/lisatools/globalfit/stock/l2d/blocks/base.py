@@ -999,7 +999,12 @@ def make_priors(block: BlockBase, general) -> GFBasePrior:
     else:
         cls = prior_class(block.priors.class_name)
         factory = getattr(cls, "prior_factory", cls)
-        engine = {"observation_time": general.Tobs}
+        # the source observation time is defined wrt the reference time, so 
+        # in the prior we have to account for the time shift between the reference time and the data start
+        data_start = general.data_t0
+        from lisatools.globalfit.recipe import MOJITO_REFERENCE_TIME
+
+        engine = {"observation_time": general.Tobs + (data_start - MOJITO_REFERENCE_TIME)}
         accepted = accepted_kwargs(factory)
 
         kwargs = deepcopy(block.priors.kwargs)
