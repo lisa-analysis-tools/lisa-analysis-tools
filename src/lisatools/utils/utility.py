@@ -9,6 +9,7 @@ from typing import Tuple
 import numpy as np
 from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import CubicSpline
+import scipy.signal as sg
 
 try:
     import cupy as cp
@@ -285,7 +286,7 @@ def generate_noise_fd(
 
     if func is None:
         # TODO: make this better
-        from .sensitivity import get_sensitivity
+        from ..sensitivity import get_sensitivity
 
         func = get_sensitivity
 
