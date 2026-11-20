@@ -182,7 +182,7 @@ def estimate_buffer_preload_limits(
 #: two. Measured on the full band with 4 and 12 GiB proposal blocks and 5.9 and 11.7 GiB tempering blocks: a
 #: proposal phase peaks up to 0.65 GiB above its block on the device, a tempering build 0.55 GiB, and scoring
 #: a chunk another 0.25 GiB. The fraction guards larger cards, which have not run yet.
-STFT_BATCH_HEADROOM_BYTES = 1024**3
+STFT_BATCH_HEADROOM_BYTES = 2 * 1024**3
 STFT_BATCH_HEADROOM_FRACTION = 0.05
 
 
