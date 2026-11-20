@@ -81,7 +81,7 @@ priors:
   prior_type: UniformDistribution
 - name: t_c
   prior_kwargs:
-    maximum: 61603200.0
+    maximum: 62324050.5
     minimum: 0
     name: coalescence time
     return_gpu: true

@@ -39,7 +39,7 @@ search:  # None -> no search interface (see SearchSpec)
     # reference_time: null
     # bool If True, the walkers scattered around a point (``catalog``, ``point_estimate``, ``samples``) are spread
     # over the four copies of (phi0, psi) where the template is the same, (phi0, psi), (phi0, psi + pi), (phi0 + p...
-    # seed_phase_copies: false
+    seed_phase_copies: True
     # search_type: <required>  # Type of search to perform.
     # parameters_searched: null  # List of parameter names in the sampling basis that are being searched.
     # search_path: null  # Path to the file or directory containing the search results.

@@ -41,9 +41,9 @@ pe_move:  # the branch's PE move (special or generic family) and its knobs; each
     # synchronization will happen on the python side after the kernel calls.
     run_async: true
     # whether to run the waveform generation and likelihood computation in separate threads for each GPU.
-    run_threaded: true
+    run_threaded: True
     randomize_split: true  # Randomly shuffle walkers between sub-ensembles.
-    batch_size_per_gpu: 64
+    batch_size_per_gpu: 36
     flow_burnin: 10  # number of sampler iterations (calls to ``propose``) before flow proposals are used.
     # Iteration cadence at which the move should cross-check likelihoods between worker ranks.
     # iters_compare_likelihood: -1
@@ -173,7 +173,7 @@ waveform:
     # use_coalescence_time: false
     # signal_duration: null
     # use_spline: false
-    # run_async: false
+    run_async: true
     # Optional :class:`DomainSettingsBase` instance giving the analysis-domain target directly (sprint rule: domains
     # are communicated by settings objects, not strings).
     # output_domain_settings: null
