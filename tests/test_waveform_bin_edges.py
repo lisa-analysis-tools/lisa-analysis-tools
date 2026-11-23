@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 
 from lisatools.domains import STFTSignal
-from lisatools.sources.waveformbase import TDWaveformBase
+from lisatools.sources.waveformbase import TDPyResponseWaveformBase, TDWaveformBase
 
 DT = 5.0
 NPERSEG = 16
@@ -106,6 +106,75 @@ class EmptyTemplateTest(unittest.TestCase):
         self.assertEqual(signal.settings.NT, 1)
         self.assertEqual(signal.settings.dt, SEGMENT)
         self.assertEqual(np.count_nonzero(np.asarray(signal.arr)), 0)
+
+
+class FakeResponse:
+    """Stands in for pyResponseTDI: three channels equal to the real part of the strain."""
+
+    def get_projections(self, strain, **kwargs):
+        self.strain = np.atleast_2d(strain)
+
+    def get_tdi_delays(self, **kwargs):
+        channels = [self.strain.real.copy() for _ in range(3)]
+        return [c[0] for c in channels] if self.strain.shape[0] == 1 else channels
+
+
+class TemplateBeforeDataTest(unittest.TestCase):
+    """Through ``_apply_response`` and both placements: sources that end before the data start."""
+
+    BUFFER = 4  # samples
+    NUM = 2 * NPERSEG
+
+    def waveform(self):
+        waveform = stand_in()
+        waveform.waveform_t0 = T0
+        waveform.buffer_time = self.BUFFER * DT
+        waveform.run_async = False
+        waveform.response = FakeResponse()
+        waveform.stft = types.MethodType(TDWaveformBase.stft, waveform)
+        waveform.fft = types.MethodType(TDWaveformBase.fft, waveform)
+        waveform.fft_batch_size = 8
+        waveform.freq_max = 1.0
+        return waveform
+
+    def respond(self, waveform, merger_times):
+        merger_times = np.asarray(merger_times, dtype=float)
+        t_arr = np.tile((np.arange(self.NUM) - self.NUM) * DT, (merger_times.size, 1))  # ends at the merger
+        h = np.ones_like(t_arr)
+        angles = np.zeros(merger_times.size)
+        return TDPyResponseWaveformBase._apply_response(waveform, t_arr, h, h, angles, angles, merger_times)
+
+    def test_every_row_before_the_data(self):
+        for merger_times in ([-10 * SEGMENT], [-10 * SEGMENT, -3 * SEGMENT], [0.0], [-self.BUFFER * DT / 2]):
+            with self.subTest(merger_times=merger_times):
+                waveform = self.waveform()
+                times, channels = self.respond(waveform, merger_times)
+                self.assertEqual(times.shape, (len(merger_times), 0))
+                self.assertIsNone(waveform._common_grid_hint)
+                # the move's scoring path
+                left_edges, padded = waveform.build_common_grid(times, channels)
+                np.testing.assert_array_equal(left_edges, np.full(len(merger_times), T0))
+                self.assertEqual(padded.shape, (len(merger_times), 3, NPERSEG))
+                self.assertEqual(np.count_nonzero(padded), 0)
+                signal_out, _, starts = waveform.stft(left_edges, padded)
+                self.assertEqual(np.count_nonzero(signal_out), 0)
+                # the residual path
+                signal = TDWaveformBase._td_to_output_domain(waveform, times_in=times[0], signal_in=channels[0])
+                self.assertEqual((signal.settings.t0, signal.settings.NT), (T0, 1))
+                self.assertEqual(np.count_nonzero(np.asarray(signal.arr)), 0)
+
+    def test_one_row_inside_the_data_is_not_changed_by_a_row_before_it(self):
+        inside = 3 * SEGMENT + self.NUM * DT
+        alone = self.waveform()
+        times_alone, channels_alone = self.respond(alone, [inside])
+        _, padded_alone = alone.build_common_grid(times_alone, channels_alone)
+        both = self.waveform()
+        times, channels = self.respond(both, [inside, -10 * SEGMENT])
+        left_edges, padded = both.build_common_grid(times, channels)
+        np.testing.assert_array_equal(left_edges, [T0 + 3 * SEGMENT, T0])
+        self.assertGreater(np.count_nonzero(padded[0]), 0)
+        np.testing.assert_array_equal(padded[0], padded_alone[0])
+        self.assertEqual(np.count_nonzero(padded[1]), 0)
 
 
 if __name__ == "__main__":

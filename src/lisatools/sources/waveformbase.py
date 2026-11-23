@@ -376,6 +376,9 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
             Tuple of (left_edges, grid_length) where left_edges are the edges of the bins containing the times, and grid_length is the number of bins spanned by the times.
         """
         times = self.xp.atleast_2d(times)
+        if times.shape[-1] == 0:
+            # no sample inside the data (the sources end before data_t0): the first segment, with nothing in it
+            times = self.xp.full((times.shape[0], 1), self.data_t0, dtype=float)
 
         start_times = times[:, 0]
         end_times = times[:, -1]
@@ -1108,12 +1111,14 @@ class TDPyResponseWaveformBase(TDWaveformBase):
         # The common grid of the times returned below, found here, before the response kernels are queued:
         # afterwards the read-back of its longest length would wait for them (see build_common_grid). The
         # first and last returned labels are shifted_t_arr[:, start_ind] and the last one before the buffer.
-        if self.analysis_domain in ("STFT", "FD"):
+        # No hint when nothing is returned (every source ends before data_t0): there is no first label, and
+        # build_common_grid finds the grid of the empty times itself.
+        n_times_out = shifted_t_arr.shape[1] - num_buffer_ponts - start_ind
+        if self.analysis_domain in ("STFT", "FD") and n_times_out > 0:
             end_labels = self.xp.stack(
                 (shifted_t_arr[:, start_ind], shifted_t_arr[:, -num_buffer_ponts - 1]), axis=1
             ) + t0_shift_to_data[:, None]
             left_edges_hint, grid_length_hint = self.find_bin_edges(end_labels)
-            n_times_out = shifted_t_arr.shape[1] - num_buffer_ponts - start_ind
             # 2-D shape: build_common_grid adds the batch axis of a single source before it compares
             times_shape = (shifted_t_arr.shape[0], n_times_out)
             self._common_grid_hint = (times_shape, left_edges_hint, int(grid_length_hint.max()))
