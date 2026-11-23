@@ -40,7 +40,9 @@ from lisatools.utils.constants import YRSID_SI
 from tests.test_l2d_blocks import cpu_raw, error_keys
 from tests.test_l2d_load_settings import FakeL1
 
-REFERENCE_TIME = 97729089.327664  # MOJITO_REFERENCE_TIME
+# The start of the fake data (FakeL1 starts at t = 0): the builder gives the priors an observation time of
+# Tobs + (data start - reference time), which must stay positive for the t_c prior.
+REFERENCE_TIME = 0.0
 EMRI_WAVEFORM_MODULE = "lisatools.sources.emri.waveform"
 
 MBH_BLOCK = {
@@ -521,7 +523,7 @@ class SourceSearchBuildTest(_Built):
         self.assertIs(gen.source.init_kwargs, built["mbh"].setup.initialize_kwargs)  # copied together by the engine
         self.assertFalse(gen.source.built)  # built on the first call, after the engine's deep copy
         self.assertIsNone(built["emri"].setup.signal_gen)  # no search: the branch starts empty
-        self.assertTrue(gen.supports_batch)  # one call per leaf over the walkers
+        self.assertFalse(gen.supports_batch)  # not batched: one call per walker (SourceBlock.BATCHED_SIGNAL_GEN)
 
     def test_emri_signal_gen_is_called_per_walker(self):
         point = self.run_dir / "emri_point.npy"
