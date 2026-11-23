@@ -363,8 +363,12 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
     added to the STFT template as a linear chirp per segment
     (:mod:`lisatools.stft_tracks`); segments where a harmonic chirps too fast, or where the
     inspiral ends, are filled from the exact time series. Same call signature and output as
-    :class:`EMRITDIWaveform` in the STFT domain. Everything else (``get_signals_for_residuals``,
-    ``get_td_signals``) is inherited and stays on the dense path.
+    :class:`EMRITDIWaveform` in the STFT domain.
+
+    The other outputs come from the same source, not from the dense production path:
+    ``get_signals_for_residuals`` returns these templates in the analysis domain, and the time
+    series (``compute_tdi_channels``, ``get_td_signals``, the other output domains) is the
+    exact one that fills the dense segments, on every sample.
 
     The sky convention is that of :class:`EMRITDIWaveform`: ``(ra, dec)`` in the orbits' frame
     for the response, converted to the ecliptic for FEW.
@@ -531,19 +535,22 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
             out[:, xp.asarray(order[a:b])] = run[:, xp.asarray(js[a:b] - j_lo)]
         return out
 
-    def __call__(self, *args, ra=None, dec=None, merger_time=None, **kwargs):
-        """STFT templates ``(template (B, 3, NT, NF), start_freqs (B,), start_times (B,))``.
+    def _track_source(self, *args, ra=None, dec=None, **kwargs):
+        """The templates as a track source: what every output of this waveform is built from.
 
-        The templates cover every segment of the data grid, so ``start_times`` is the data
-        start for every source. ``merger_time`` is ignored, as in :class:`EMRITDIWaveform`.
+        FEW's sparse holder of each template through the sparse response; the exact time series
+        of the source (:meth:`EMRITrackSource.td_channels`) is production's with
+        ``fallback_via_polarizations``, the TDI-on-the-fly kernel's otherwise.
+
+        Returns:
+            ``(source, num, batched)``: the :class:`~.sparse_tracks.EMRITrackSource`, its number
+            of templates and whether the sky position was given as arrays.
         """
-        from ...stft_tracks import stft_templates_from_tracks
-        from ...utils.utility import tukey
         from .sparse_tracks import EMRITrackSource
 
         if ra is None or dec is None:
             *args, ra, dec = args
-        xp = self.xp
+        batched = np.ndim(ra) >= 1
 
         def host(v):
             v = v.get() if hasattr(v, "get") else v
@@ -555,7 +562,7 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
         num = max(p.size for p in params)
         params = [np.broadcast_to(p, (num,)) for p in params]
 
-        response, accumulator = self._sparse_setup()
+        response, _ = self._sparse_setup()
         items, holders = [], []
         for i in range(num):
             m1, m2, a, p0, e0, x0, dist, qK, phiK, Pp, Pt, Pr, ra_i, dec_i = (float(p[i]) for p in params)
@@ -578,9 +585,29 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
 
         source = EMRITrackSource(response, items, holders, stop_taper=self.stop_taper,
                                  channels_fn=channels_fn)
+        return source, num, batched
+
+    def _sample_times(self, j):
+        """Times [s] of the data samples ``j``, as the template's dense segments compute them
+        (segment start plus offset), so both evaluate the exact time series at the same floats."""
+        k = j // self.nperseg
+        return (float(self.data_t0) + k * (self.nperseg * self.dt)) + (j - k * self.nperseg) * self.dt
+
+    def __call__(self, *args, ra=None, dec=None, merger_time=None, **kwargs):
+        """STFT templates ``(template (B, 3, NT, NF), start_freqs (B,), start_times (B,))``.
+
+        The templates cover every segment of the data grid, so ``start_times`` is the data
+        start for every source. ``merger_time`` is ignored, as in :class:`EMRITDIWaveform`.
+        """
+        from ...stft_tracks import stft_templates_from_tracks
+        from ...utils.utility import tukey
+
+        xp = self.xp
+        source, num, _ = self._track_source(*args, ra=ra, dec=dec, **kwargs)
+        accumulator = self._accumulator
         window = tukey(self.nperseg, alpha=self.tukey_alpha, xp=xp) if self.tukey_alpha else xp.ones(self.nperseg)
         num_seg = self.domain_settings.N // self.nperseg
-        segment_start = float(self.data_t0) + np.arange(num_seg) * (self.nperseg * self.dt)
+        segment_start = self._sample_times(np.arange(num_seg) * self.nperseg)
         template, info = stft_templates_from_tracks(
             source, accumulator, segment_start, self.dt, n_side=self.n_side, cubic_tol=self.cubic_tol,
             max_half_width=self.max_half_width, window=window, return_info=True)
@@ -588,3 +615,78 @@ class EMRISparseSTFTWaveform(EMRITDIWaveform):
         start_freqs = xp.full(num, accumulator.f_min)
         start_times = xp.full(num, float(self.data_t0))
         return template, start_freqs, start_times
+
+    def compute_tdi_channels(self, *args, ra=None, dec=None, merger_time=None, **kwargs):
+        """Time-domain TDI channels of the templates, from the same source as :meth:`__call__`.
+
+        The exact time series that fills the template's dense segments
+        (:meth:`EMRITrackSource.td_channels`: production's sum-then-respond with
+        ``fallback_via_polarizations``, the TDI-on-the-fly kernel with ``stop_taper`` otherwise),
+        evaluated on every data sample of the segments the signal touches. Unlike
+        :meth:`EMRITDIWaveform.compute_tdi_channels` it has no sample outside the data and does
+        not zero the first ``buffer_time`` after ``waveform_t0``. ``get_td_signals`` and the
+        time-series outputs of ``get_signals_for_residuals`` go through here.
+
+        The windowed FFT of these channels is the template of :meth:`__call__` in its dense
+        segments; in a track segment the template is the linear-chirp model of the same signal
+        (``cubic_tol``).
+
+        Args:
+            *args, ra, dec, merger_time, **kwargs: As :meth:`__call__`.
+
+        Returns:
+            ``(times, channels)``: ``(n,)`` and ``(nch, n)`` for one source, ``(B, n)`` and
+            ``(B, nch, n)`` for a batch (one span for the batch, zero outside a source's own).
+        """
+        xp = self.xp
+        source, num, batched = self._track_source(*args, ra=ra, dec=dec, **kwargs)
+        nper, N = self.nperseg, int(self.domain_settings.N)
+        t0, dt = float(self.data_t0), float(self.dt)
+        s_lo, s_hi = source.signal_span()
+        spans = []
+        for r in range(num):
+            if not s_lo[r] < s_hi[r]:
+                continue                                      # ends before the data: no signal
+            # the whole segments the signal touches, as the template (and the data's tail)
+            lo = max(int(np.floor((s_lo[r] - t0) / (nper * dt))), 0) * nper
+            hi = min(int(np.ceil((s_hi[r] - t0) / (nper * dt))) * nper, N)
+            if lo < hi:
+                spans.append((r, lo, hi))
+        lo_all = min((lo for _, lo, _ in spans), default=0)
+        hi_all = max((hi for _, _, hi in spans), default=min(nper, N))
+        channels = xp.zeros((num, len(self.tdi_channels), hi_all - lo_all), dtype=xp.float64)
+        for r, lo, hi in spans:
+            t = xp.asarray(self._sample_times(np.arange(lo, hi)))
+            channels[r, :, lo - lo_all:hi - lo_all] = xp.asarray(source.td_channels(r, t))
+        times = xp.asarray(t0 + np.arange(lo_all, hi_all) * dt)
+        if batched:
+            return xp.tile(times, (num, 1)), channels
+        return times, channels[0]
+
+    def get_signals_for_residuals(self, *args, output_domain=None, domain_kwargs=None, **kwargs):
+        """Per-source signals for residual operations.
+
+        In the analysis domain (``output_domain=None``) these are the templates of
+        :meth:`__call__` themselves, on the STFT grid of the data: what is subtracted from a
+        residual is what the likelihood scored. Any other output is transformed from the time
+        series of :meth:`compute_tdi_channels`, as in the parent.
+
+        Returns:
+            A :class:`~lisatools.domains.STFTSignal` (or the requested domain's signal), or a
+            :class:`~lisatools.domains.DomainBaseArray` of them for a batch.
+        """
+        if output_domain is not None:
+            return super().get_signals_for_residuals(
+                *args, output_domain=output_domain, domain_kwargs=domain_kwargs, **kwargs)
+        from ...domains import DomainBaseArray, STFTSettings, STFTSignal
+
+        ra = kwargs["ra"] if kwargs.get("ra") is not None else args[-2]
+        template = self(*args, **kwargs)[0]
+        stft_dt = self.nperseg * self.dt
+        settings = STFTSettings(
+            t0=float(self.data_t0), dt=stft_dt, df=1 / stft_dt, NT=template.shape[2],
+            NF=self.nperseg // 2 + 1, min_freq=self.freq_min, max_freq=self.freq_max,
+            sample_cadence=self.dt, force_backend=self.force_backend)
+        if np.ndim(ra) >= 1:
+            return DomainBaseArray([STFTSignal(template[i], settings) for i in range(template.shape[0])])
+        return STFTSignal(template[0], settings)
