@@ -381,13 +381,22 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         end_times = times[:, -1]
 
         if self.analysis_domain == "STFT":
-            # Use integer STFT-segment indices from stft_t_arr.  digitize caps
-            # right_edges_i at len(stft_t_arr)=NT so each source's individual
-            # grid_length is naturally bounded to the data end.
-            left_edges_i = self.xp.digitize(start_times, self.stft_t_arr)
-            right_edges_i = self.xp.digitize(end_times, self.stft_t_arr)
-            left_edges = self.stft_t_arr[left_edges_i - 1]
-            grid_length = (right_edges_i - left_edges_i + 1) * self.nperseg
+            # Segment of the first and last stamp, counted in samples from data_t0 (the stamps sit on the
+            # data grid) and clipped to the data's segments. A source that starts before data_t0, by whole
+            # samples (a batch is cut at the earliest start of its rows) or by the last bit of a float,
+            # belongs to the first segment: build_common_grid drops its samples before that edge. Comparing
+            # the float stamps with the segment edges instead gives index -1 there, i.e. the last segment.
+            stft_t_arr = self.stft_t_arr
+            last_segment = stft_t_arr.shape[0] - 1
+
+            def segment_of(stamps):
+                samples = self.xp.rint((stamps - self.data_t0) / self.dt).astype(int)
+                return self.xp.clip(samples // self.nperseg, 0, last_segment)
+
+            left_segments = segment_of(start_times)
+            right_segments = segment_of(end_times)
+            left_edges = stft_t_arr[left_segments]
+            grid_length = (right_segments - left_segments + 1) * self.nperseg
             
         elif self.analysis_domain == "FD":
             left_edges = self.xp.full(shape=start_times.shape, fill_value=self.data_t0)
@@ -525,6 +534,12 @@ class TDWaveformBase(ABC, LISAToolsParallelModule):
         else:
             output_domain = self.analysis_domain.upper()
             use_default_domain = True
+
+        if times_in.shape[-1] == 0:
+            # no sample of the signal is inside the data (it ends before data_t0): one zero sample at the data
+            # start, which the branches below pad as any other short signal
+            times_in = self.xp.asarray([self.data_t0], dtype=float)
+            signal_in = self.xp.zeros(signal_in.shape[:-1] + (1,), dtype=signal_in.dtype)
 
         t0_here = times_in[0]
         dt_here = self.dt #float(times_in[2] - times_in[0])
