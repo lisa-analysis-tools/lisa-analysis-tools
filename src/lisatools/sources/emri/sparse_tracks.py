@@ -14,12 +14,13 @@ series for the stretches a slowly-chirping model cannot represent
 3. :class:`ExactPhaseTDIOutput` keeps the carrier exact and splines only the amplitude and the
    slow residual phase.
 
-Provenance: the helper functions and the two output classes are lifted verbatim from
+Provenance: the helper functions and the two output classes are lifted from
 ``dev:src/lisatools/sources/emri/wdm_direct.py`` (e25ff72f), where they live next to the
-WDM-specific lookup assembly; :class:`EMRISparseResponse` re-packages the domain-independent
-methods of ``EMRIDirectWDM`` (``_few_knots``, ``_sparse_grid``, ``_dense_kernel``,
-``_dense_response``, ``_dense_td``). Docstrings of the lifted code still say "pixel" for an
-evaluation time.
+WDM-specific lookup assembly, verbatim but for :func:`signed_amplitude_through_nulls` (the
+response nulls, applied where the splines are built); :class:`EMRISparseResponse` re-packages
+the domain-independent methods of ``EMRIDirectWDM`` (``_few_knots``, ``_sparse_grid``,
+``_dense_kernel``, ``_dense_response``, ``_dense_td``). Docstrings of the lifted code still say
+"pixel" for an evaluation time.
 
 Harmonic tracks follow FEW's own conventions (few/waveform/base.py and
 few/summation/directmodesum.py):
@@ -425,6 +426,41 @@ def pad_grid(g, N):
     return g
 
 
+def signed_amplitude_through_nulls(tdi_amp, tdi_phase, xp=np):
+    """The kernel's ``(tdi_amp, tdi_phase)`` made continuous through the nulls of the response.
+
+    Where a channel's response goes through zero (a null of the TDI transfer function as the
+    harmonic sweeps in frequency) the same complex channel ``amp exp(-i phase)`` can be written
+    with a sign change of the amplitude or with a step of pi in the phase. A spline follows the
+    first between two response times and not the second. The kernel chooses from three samples
+    of the modulus, assuming they are evenly spaced
+    (``LISATDIonTheFly::new_extract_amplitude_and_phase``), and on the uneven response grid of
+    an EMRI it leaves many nulls as steps of pi. Here every step of ``tdi_phase`` between
+    neighbouring response times is reduced by its nearest multiple of pi, and an odd multiple
+    changes the sign of the amplitude from there on: the values at the response times describe
+    the same channel as before.
+
+    ``tdi_phase`` is the phase to decide on: the kernel's reference phase is the carrier at the
+    retarded time of spacecraft 1, so the Doppler drift is not in it and it moves by much less
+    than pi / 2 between response times wherever the amplitude is not negligible. (The residual
+    that :class:`ExactPhaseTDIOutput` splines is taken against the carrier without that delay
+    and drifts by radians per response step near a plunge.)
+
+    Not in dev's ``wdm_direct.py``, which has the same splines.
+
+    Args:
+        tdi_amp, tdi_phase: ``(..., N)`` along the response times.
+        xp: Array module of the inputs.
+
+    Returns:
+        ``(amp, phase)`` with the shapes of the inputs.
+    """
+    steps = xp.rint(xp.diff(tdi_phase, axis=-1) / np.pi)
+    steps = xp.where(xp.isfinite(steps), steps, 0.0)     # a time without a phase stays local
+    shift = xp.concatenate([xp.zeros_like(tdi_phase[..., :1]), xp.cumsum(steps, axis=-1)], axis=-1)
+    return tdi_amp * (1.0 - 2.0 * (shift % 2)), tdi_phase - np.pi * shift
+
+
 class SplinedTDIOutput:
     """A dense TDI response's amplitude and phase splined over its output grid, evaluable for
     any SUBSET of harmonics (a mode-batched caller keeps every temporary at a block's size).
@@ -456,13 +492,15 @@ class SplinedTDIOutput:
         self.num_sub = int(out.tdi_amp.shape[0])
         self._temp = np.asarray(sub_temp, dtype=np.int64).reshape(-1)
         self._mkn_host = np.asarray(sub_mkn, dtype=float).reshape(-1, 3)
-        self._amp_spl = out.build_spline(out.x, out.tdi_amp)
-        self._res_spl = out.build_spline(out.x, self._residual(out))
+        # a null of the response is a sign change of the amplitude, not a step of pi in the phase
+        amp, tdi_phase = signed_amplitude_through_nulls(out.tdi_amp, out.tdi_phase, xp=self.xp)
+        self._amp_spl = out.build_spline(out.x, amp)
+        self._res_spl = out.build_spline(out.x, self._residual(out, tdi_phase))
         self._car_spl = self._carrier_spline(out)
 
-    def _residual(self, out):
+    def _residual(self, out, tdi_phase):
         """The splined channel phase: ``tdi_phase`` here (the whole phase minus the carrier)."""
-        return out.tdi_phase
+        return tdi_phase
 
     def _carrier_spline(self, out):
         """Spline of the kernel's ``phase_ref`` (the carrier)."""
@@ -587,7 +625,7 @@ class ExactPhaseTDIOutput(SplinedTDIOutput):
         self._mkn = xp.asarray(np.asarray(sub_mkn, dtype=float).reshape(-1, 3))
         super().__init__(out, sub_mkn, sub_temp)
 
-    def _residual(self, out):
+    def _residual(self, out, tdi_phase):
         """The slow residual ``tdi_phase + phase_ref - Phi_s`` on the response grid."""
         xp = self.xp
         carrier = xp.empty(out.phase_ref.shape)
@@ -595,7 +633,7 @@ class ExactPhaseTDIOutput(SplinedTDIOutput):
         for b in np.unique(self._temp):
             rows = np.flatnonzero(self._temp == b)
             carrier[xp.asarray(rows)] = self._mkn[xp.asarray(rows)] @ self._P3(int(b), x[int(rows[0])]).T
-        return out.tdi_phase + (out.phase_ref - carrier)[:, None, :]
+        return tdi_phase + (out.phase_ref - carrier)[:, None, :]
 
     def _carrier_spline(self, out):
         """No carrier spline: the carrier is exact (:meth:`carrier`)."""

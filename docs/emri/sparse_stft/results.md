@@ -39,26 +39,29 @@ With the periodic window the accumulator used before `bce0201a`, the same compar
 
 ### With a plunge (36 d): the two dense fallbacks
 
-`cubic_tol` 0.03: 10 segments zero (after the plunge), 103 on tracks, 31 dense: segments
-109 - 133 (the last 6 days before the plunge), 100 - 101, and four earlier ones.
+`cubic_tol` 0.03: 10 segments zero (after the plunge), 109 on tracks, 25 dense: segments
+109 - 133 (the last 6 days before the plunge). Before the response nulls were fixed
+(2026-11-23, section "Response nulls in the tracks") six more were dense, 96 - 101, with
+mismatches 1.7e-6 / 7.6e-6 and `SNR^2 x mismatch` 7.3: those segments now carry the linear-chirp
+error of a track segment. The times below were measured before that fix.
 
 | | TDI-on-the-fly fallback (default) | production-response fallback |
 | --- | --- | --- |
-| Mismatch white / noise-weighted | 5.0e-5 / 4.3e-5 | **1.7e-6 / 7.6e-6** |
-| Over the 31 dense segments (white) | 5.7e-5 (worst 5.2e-4, segment 133, the plunge) | **1e-16** |
-| Over the 103 track segments (white / noise-weighted) | 1.2e-5 / 1.4e-5 | 1.2e-5 / 1.4e-5 |
+| Mismatch white / noise-weighted | 5.1e-5 / 4.5e-5 | **2.1e-6 / 9.1e-6** |
+| Over the 25 dense segments (white) | 5.8e-5 (worst 5.2e-4, segment 133, the plunge) | **1e-16** |
+| Over the 109 track segments (white / noise-weighted) | 1.2e-5 / 1.5e-5 | 1.2e-5 / 1.5e-5 |
 | Worst segment (white) | 5.2e-4 at 133 | 3.0e-5 at 108 (a track segment) |
-| Share of `<h|h>` in dense segments (white / noise-weighted) | 0.86 / 0.46 | 0.86 / 0.46 |
+| Share of `<h|h>` in dense segments (white / noise-weighted) | 0.84 / 0.41 | 0.84 / 0.41 |
 | Time (CPU; production 1.5 s) | 6.2 s | **1.0 s** |
 
-SNR of the source about 980; with the production-response fallback `SNR^2 x mismatch` = 7.3,
+SNR of the source about 980; with the production-response fallback `SNR^2 x mismatch` = 8.7,
 the order of the log-likelihood error at the true parameters.
 
 ### `cubic_tol` with the production-response fallback (36 d)
 
 | `cubic_tol` | tracks / dense segments | Time (production 1.55 s) | Mismatch white / noise-weighted | Over track segments (noise-weighted) | `SNR^2 x mismatch` |
 | --- | --- | --- | --- | --- | --- |
-| 0.03 | 103 / 31 | 1.02 s | 1.7e-6 / 7.6e-6 | 1.4e-5 | 7.3 |
+| 0.03 | 109 / 25 | 1.02 s (with 103 / 31) | 2.1e-6 / 9.1e-6 | 1.5e-5 | 8.7 |
 | 0.01 | 89 / 45 | 1.08 s | 4.9e-7 / 3.6e-6 | 8.8e-6 | 3.5 |
 | 0.003 | 53 / 81 | 1.27 s | 9.5e-8 / 1.0e-6 | 5.3e-6 | 1.0 |
 
@@ -156,7 +159,9 @@ tolerate (the proposal's harmonic within 0.1 bin of the reference's, `Delta f = 
 | 6 | 79.4 | 27 s |
 
 The tracks summed densely against the exact channels, in the dense segments of the plunging
-preset (relative windowed L2 error; mismatch at most err^2/2):
+preset (relative windowed L2 error; mismatch at most err^2/2). Measured before the response
+nulls were fixed (section "Response nulls in the tracks" below): every segment is within 7e-5
+now.
 
 | Segment | Fill | Error |
 | --- | --- | --- |
@@ -182,6 +187,53 @@ Conclusions:
   likelihood to about 1e4 - 1e5 multiply-adds plus FEW and the sparse response, but its data sums
   must be rebuilt whenever a walker's residual changes, and it holds only near the reference. To
   be decided with the GPU profile.
+
+## Response nulls in the tracks (2026-11-23)
+
+The track errors of the table above (9e-4 at segment 100, up to 1.4e-3 in the last 1.5 days)
+were nulls of the TDI transfer function. As a harmonic sweeps through one, the channel's complex
+amplitude goes through zero: a sign change of the amplitude, or equally a step of pi in the
+phase. The kernel picks between the two from three samples of the modulus, with second
+differences that assume even spacing (`LISATDIonTheFly::new_extract_amplitude_and_phase`). On
+the response grid of the 36-d plunging preset (118 points, neighbouring intervals differing by
+up to a factor 435) it flags 82 of 180 local minima and misses 62 crossings: 20 only because of
+the even-spacing formula, 24 on the 10% linearity tolerance, 12 not at a strict minimum, 6
+flagged with a step of pi left. Its output is exact at the response times (1e-11); between them
+the splines cannot follow a step of pi.
+
+`signed_amplitude_through_nulls` (`sparse_tracks.py`, in `SplinedTDIOutput.__init__`) reduces
+every step of the kernel's `tdi_phase` by its nearest multiple of pi and moves an odd multiple
+into the sign of the amplitude. `tdi_phase` is the phase to decide on: the kernel's reference
+phase is the carrier at the retarded time of spacecraft 1, so it moves by less than 0.1 rad per
+response step for a harmonic above 5% of its peak amplitude (the residual splined against the
+carrier without that delay moves by up to 3.4 rad per step near the plunge). The steps further
+than 0.5 rad from a multiple of pi (42 of 28080) all lie in the last 40 minutes of the
+trajectory, on harmonics at 1e-5 to 7e-2 of their peak.
+
+Track signal against the exact per-harmonic series, relative error per segment, worst of the 133
+segments the tracks cover (reference and two proposals one step away in `a` and `p0`):
+
+| Orbits, response grid | Before | After | Segments above 1e-4 before / after |
+| --- | --- | --- | --- |
+| equal arms, 8 h | 1.7e-3 - 1.8e-3 | 5.9e-5 - 6.9e-5 | 15 - 22 / 0 |
+| ESA, 8 h | 1.8e-3 - 1.9e-3 | 6.1e-5 - 7.1e-5 | 15 - 24 / 0 |
+| ESA, 1 h | 7.5e-4 - 9.4e-4 | 2.2e-5 - 3.1e-5 | 3 / 0 |
+| equal arms, 1 h | 6.9e-4 - 9.9e-4 | 1.3e-4 - 1.6e-4 | 2 / 1 (segment 131) |
+
+The 8-d preset has no null and is unchanged. Not explained: the one segment left at 1.5e-4 with
+equal arms on the 1 h grid. Rejected: unwrapping the splined residual with the median slope of
+the neighbouring intervals (4e-3 at segment 130 with ESA orbits).
+
+Effect on the template (36 d, `cubic_tol` 0.03, production-response fallback): segments 96 - 101
+were filled from the exact series only because the glitched `fdot` tripped the cubic-phase
+check; they are track segments now (103 / 31 -> 109 / 25 tracks / dense). Where both templates
+use tracks they agree to a mismatch of 1.1e-10. A proposal one step away in `p0` flipped the
+fill of 4 segments before, of none now.
+
+Scripts and logs: `scripts/emri/het_spike_out/` (`diag_null_detection.py`,
+`diag_tdi_phase_steps.py`, `diag_unwrap_fix.py`, `diag_fix_effect_on_template.py`).
+Test: `tests/test_emri_sparse_response.py::NullCrossingSparseResponseTest` (5.6e-2 before, 4e-5
+after, relative to the largest amplitude).
 
 ## Memory
 

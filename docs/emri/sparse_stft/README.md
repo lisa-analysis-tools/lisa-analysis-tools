@@ -27,7 +27,7 @@ The GB path is hand-optimised separately and is not touched.
 | | |
 | --- | --- |
 | Accuracy, no plunge (8 d) | mismatch **2.1e-8** against production, every segment on tracks |
-| Accuracy, plunge in the data (36 d) | mismatch **1.7e-6** white, **7.6e-6** noise-weighted (production-response fallback, `cubic_tol` 0.03); **9.5e-8 / 1.0e-6** with `cubic_tol` 0.003 |
+| Accuracy, plunge in the data (36 d) | mismatch **2.1e-6** white, **9.1e-6** noise-weighted (production-response fallback, `cubic_tol` 0.03); **9.5e-8 / 1.0e-6** with `cubic_tol` 0.003 |
 | Segments filled from the exact series | equal to production to 1e-16 (production-response fallback) |
 | CPU time, 36 d with plunge | 1.0 s (production 1.5 s); 8 d without plunge: 0.12 s (production 0.34 s) |
 | GPU | **never compiled** (no `nvcc` on the laptop); parity tests written and skipped |
@@ -93,8 +93,12 @@ the trajectory's knots plus a point every `sparse_dt` (12 h), kept `DELAY_MARGIN
 the trajectory and the orbit tables. `ExactPhaseTDIOutput` writes the channel of harmonic `s` as
 `amp(t) exp(-i (Phi_s(t) + r(t)))`: the carrier `Phi_s` exact from the DOPR853 coefficients,
 only the amplitude and the slow residual phase `r` (Doppler delay, polarisation, transfer
-function, the mode amplitude's own phase) splined on the sparse grid. A `-m` partner (negative
-frequency) is mirrored. A template whose trajectory is too short for the response splines
+function, the mode amplitude's own phase) splined on the sparse grid. Where a channel's response
+goes through zero (a null of the TDI transfer function as the harmonic sweeps in frequency) the
+splines carry a sign change of the amplitude, not a step of pi in the phase
+(`signed_amplitude_through_nulls`, applied to the kernel's output before the splines are built;
+see "Response nulls in the tracks" in `results.md`). A `-m` partner (negative frequency) is
+mirrored. A template whose trajectory is too short for the response splines
 (fewer than `MIN_RESPONSE_POINTS` = 4) has no tracks; its row is filled from the exact series.
 
 ### 3. Tracks at the segment midpoints (`EMRITrackSource.eval_tracks`)
@@ -314,8 +318,8 @@ In order of what they decide.
    to optimise next: on the CPU the per-pixel Fresnel fill is 97% of the time (2.2 s of 2.3 s for
    180 days), which the GPU parallelises.
 2. **Defaults.** Make `fallback_via_polarizations=True` the default (exact, faster), and lower
-   `cubic_tol` to about 0.003 (mismatch 7.6e-6 -> 1.0e-6 noise-weighted on the 36-d plunging
-   case, SNR^2 x mismatch 7.3 -> 1.0 at SNR 980, +25% CPU time). Both are one-line changes,
+   `cubic_tol` to about 0.003 (mismatch 9.1e-6 -> 1.0e-6 noise-weighted on the 36-d plunging
+   case, SNR^2 x mismatch 8.7 -> 1.0 at SNR 980, +25% CPU time). Both are one-line changes,
    waiting for a decision.
 3. **Likelihood-level validation.** `<d|h>`, `<h|h>` and the log-likelihood through the STFT
    likelihood of the l2d EMRI block on the `gf_dev/interface/emri_mbh_psd` settings (the
@@ -323,17 +327,21 @@ In order of what they decide.
 4. **A realistic 2-year EMRI.** Fraction of dense segments and the cost of the fallback for
    catalogue sources (the presets used so far are 8 and 36 days).
 5. **Accuracy floor of the track segments.** With the exact fallback the remaining error is in
-   the Fresnel segments (1.2e-5 white / 1.4e-5 noise-weighted over them at `cubic_tol` 0.03).
+   the Fresnel segments (1.2e-5 white / 1.5e-5 noise-weighted over them at `cubic_tol` 0.03).
    The tracks themselves are better than the linear-chirp model built on them: summed densely
    they match the exact channels to 6e-6 - 2e-5 in most segments. Candidates: the amplitude
    slope the kernel already accepts (`linear_envelope`), or sampling each track inside the
    segment and taking a small FFT (the het-FFT design of the GB STFT,
    `docs/specs/2026-07-10-stft-gb-fresnel-accuracy-and-het-fft-successor.md`).
-6. **Track accuracy anomalies.** On the 36-d plunging preset the tracks are off by 9e-4 in
-   segment 100 and 1.4e-4 in segment 103 (a track segment), about 8 days before the plunge, far
-   larger than in the segments around them, and by up to 1.4e-3 in the last 1.5 days. Not
-   understood yet (sparse grid spacing, amplitude spline?). It sets the accuracy of the track
-   segments there and of any heterodyne built on tracks.
+6. **Track accuracy anomalies: resolved (2026-11-23).** The tracks were off by up to 1.8e-3 in
+   segments 98 - 100 and in the last 1.5 days of the 36-d plunging preset. Cause: a null of the
+   TDI transfer function left as a step of pi in the splined phase. The kernel's sign-flip
+   detection (`new_extract_amplitude_and_phase`) tests three samples of the modulus assuming
+   even spacing and misses 62 of the nulls on the uneven response grid. Fixed where the splines
+   are built (`signed_amplitude_through_nulls`, `sparse_tracks.py`): every segment is now
+   within 7.1e-5 of the exact per-harmonic series (equal-arm and ESA orbits), the last segments
+   before the plunge at about 5e-5 (interpolation on the 8 h grid). Left open: the same splines
+   in dev's `wdm_direct.py`; one segment at 1.5e-4 with equal arms on a 1 h grid.
 7. **Speed of the track segments.** If the GPU profile shows the Fresnel fill and the full-grid
    inner product dominate: a fused STFT inner product over harmonics (one thread per pixel,
    looping over the harmonics whose band covers it, so `<h|h>` stays local), or an inner-product

@@ -241,5 +241,56 @@ class ChirpSparseResponseTest(unittest.TestCase):
         self.assertGreater(err["naive"], 100 * err["exact"])
 
 
+class NullCrossingSparseResponseTest(unittest.TestCase):
+    """A harmonic sweeping through a null of the TDI transfer function (28 -> 32 mHz across
+    1 / (4 L / c) = 30 mHz, second-generation TDI) on an uneven response grid. At the null the
+    channel amplitude goes through zero: between the knots the amplitude and phase splines must
+    follow a sign change of the amplitude, not a step of pi in the phase."""
+
+    @classmethod
+    def setUpClass(cls):
+        from lisatools.detector import EqualArmlengthOrbits
+        from lisatools.response.tdiconfig import TDIConfig
+        from lisatools.response.tdionfly import TDDenseTDIonTheFly
+        from lisatools.sources.emri.sparse_tracks import ExactPhaseTDIOutput, sparse_response_grid
+
+        orbits = EqualArmlengthOrbits(force_backend="cpu")
+        tdi = TDIConfig("2nd generation", force_backend="cpu")
+        # uneven trajectory knots, as an integrator leaves them: 2 h to 9 h apart over 6 days
+        steps = np.random.default_rng(3).uniform(2.0, 9.0, 60) * 3600.0
+        t_k = 2.0e7 + np.concatenate([[0.0], np.cumsum(steps)])
+        t_k = t_k[t_k <= 2.0e7 + 6 * DAY]
+        C = _chirp_coeffs(t_k, 14e-3, 20 * DAY)             # 2 f_phi: 28 -> 32 mHz
+        mkn = np.array([[2, 0, 0]])
+        K, S = t_k.size, 1
+        are = np.zeros((S, K - 1, 4))
+        are[:, :, 0] = 1.0
+        params = np.array([[0.4, 0.9, 2.0, 0.5]])
+        args = (np.array([0, S]), mkn, t_k[None], np.array([K]), C[None], are, np.zeros_like(are))
+        kw = dict(amp_factor=0.5, tdi_config=tdi, orbits=orbits, force_backend="cpu")
+        g = sparse_response_grid(t_k, t_k[0], t_k[-1], 43200.0, 600.0)
+        dense_s = TDDenseTDIonTheFly(g[None], *args, **kw)
+        cls.sparse = ExactPhaseTDIOutput(dense_s(params, return_spline=False), [t_k], [C], mkn, dense_s.sub_temp_host)
+        cls.t = np.arange(t_k[0] + DAY, t_k[-1] - DAY, 60.0)
+        # the exact channel series of the harmonic at every sample
+        cls.exact = np.real(np.asarray(TDDenseTDIonTheFly(cls.t[None], *args, **kw).channels(params, sum_subs=False)))[0]
+        cls.grid = g
+
+    def test_the_harmonic_goes_through_a_null(self):
+        """The set-up does what it says: the envelope of every channel drops to a small
+        fraction of its largest value inside the window."""
+        n = self.exact.shape[-1] // 10 * 10
+        env = np.abs(self.exact[:, :n]).reshape(self.exact.shape[0], -1, 10).max(axis=-1)   # 10 min maxima
+        self.assertLess((env.min(axis=-1) / env.max(axis=-1)).max(), 0.01)
+
+    def test_track_signal_follows_the_exact_series_through_the_null(self):
+        track = np.asarray(self.sparse.eval_tdi(self.t))[0]
+        err = np.abs(track - self.exact).max(axis=-1) / np.abs(self.exact).max(axis=-1)
+        print(f"[null crossing] {self.grid.size} response points, spacing {np.diff(self.grid).min():.0f} s to "
+              f"{np.diff(self.grid).max():.0f} s; track vs exact, relative to the largest amplitude, per channel: "
+              + ", ".join(f"{e:.1e}" for e in err))
+        self.assertLess(err.max(), 1e-4)
+
+
 if __name__ == "__main__":
     unittest.main()
