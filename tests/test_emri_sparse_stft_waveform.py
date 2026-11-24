@@ -34,6 +34,21 @@ def _mismatch(a, b):
     return 1 - np.vdot(a, b).real / np.sqrt(np.vdot(a, a).real * np.vdot(b, b).real)
 
 
+def _stft_of_td(wf, signal):
+    """The data-side STFT (window, rfft, band) of a ``TDSignal`` placed on the data grid."""
+    from lisatools.utils.utility import tukey
+
+    nper = wf.nperseg
+    nseg = wf.domain_settings.N // nper
+    j0 = int(round((signal.t0 - wf.data_t0) / wf.dt))
+    x = np.zeros((signal.arr.shape[0], wf.domain_settings.N))
+    x[:, j0:j0 + signal.arr.shape[-1]] = np.asarray(signal.arr)
+    spec = wf.dt * np.fft.rfft(
+        x[:, :nseg * nper].reshape(-1, nseg, nper) * tukey(nper, alpha=wf.tukey_alpha, xp=np), axis=-1)
+    freqs = np.fft.rfftfreq(nper, d=wf.dt)
+    return spec[..., np.searchsorted(freqs, wf.freq_min):np.searchsorted(freqs, wf.freq_max, side="right")]
+
+
 class SparseSTFTWaveformTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -86,6 +101,64 @@ class SparseSTFTWaveformTest(unittest.TestCase):
         np.testing.assert_allclose(out[1], self.sparse(*other, **KW)[0][0], rtol=1e-12, atol=1e-12 * np.abs(single).max())
         self.assertGreater(_mismatch(out[0], out[1]), 0.1)
 
+    def test_residual_signals_are_the_scored_templates(self):
+        from lisatools.domains import DomainBaseArray, STFTSignal
+
+        template = self.sparse(*PAR, **KW)[0]
+        signal = self.sparse.get_signals_for_residuals(*PAR, **KW)
+        self.assertIsInstance(signal, STFTSignal)
+        np.testing.assert_array_equal(np.asarray(signal.arr), template[0])
+        # on the STFT grid of the data, as the parent's transform of a full-length series
+        nseg = self.sparse.domain_settings.N // self.sparse.nperseg
+        grid = T0 + np.arange(nseg * self.sparse.nperseg) * DT
+        self.assertEqual(signal.settings, self.sparse.get_output_settings(grid))
+        # subtracting it from data equal to the scored template leaves nothing
+        data = STFTSignal(template[0].copy(), signal.settings)
+        self.assertFalse(np.any(np.asarray(data.subtract_signal(signal, copy=True).arr)))
+
+        other = list(PAR)
+        other[3] = 10.0
+        batch = [np.array([a, b]) for a, b in zip(PAR, other)]
+        signals = self.sparse.get_signals_for_residuals(*batch[:12], ra=batch[12], dec=batch[13], **KW)
+        self.assertIsInstance(signals, DomainBaseArray)
+        templates = self.sparse(*batch[:12], ra=batch[12], dec=batch[13], **KW)[0]
+        for got, want in zip(signals, templates):
+            np.testing.assert_array_equal(np.asarray(got.arr), want)
+
+    def test_time_series_is_the_templates_signal(self):
+        from lisatools.domains import DomainBaseArray, FDSignal, TDSettings, TDSignal
+
+        template = self.sparse(*PAR, **KW)[0][0]
+        td = self.sparse.get_td_signals(*PAR, **KW)
+        self.assertIsInstance(td, TDSignal)
+        self.assertEqual(td.t0, T0)                       # no sample outside the data
+        self.assertEqual(td.arr.shape, (3, self.sparse.domain_settings.N))
+        # all segments are tracks here: the template is their linear-chirp model of this series
+        spec = _stft_of_td(self.sparse, td)
+        self.assertLess(_mismatch(spec, template), 5e-6)
+        # ... and not production's, which zeroes its first buffer_time; elsewhere they agree
+        times, prod = self.dense.compute_tdi_channels(*PAR, **KW)
+        j = np.rint((np.asarray(times) - T0) / DT).astype(int)
+        ok = (j >= 0) & (j < td.arr.shape[-1])
+        self.assertLess(np.abs(np.asarray(td.arr)[:, j[ok]] - np.asarray(prod)[:, ok]).max()
+                        / np.abs(prod).max(), 1e-3)
+
+        sub = TDSettings(N=1000, dt=DT, t0=T0 + 5000 * DT)
+        part = self.sparse.get_td_signals(*PAR, td_settings=sub, **KW)
+        np.testing.assert_array_equal(np.asarray(part.arr), np.asarray(td.arr)[:, 5000:6000])
+        N = self.sparse.domain_settings.N
+        fd = self.sparse.get_signals_for_residuals(
+            *PAR, output_domain="FD", domain_kwargs=dict(N=N // 2 + 1, df=1 / (N * DT)), **KW)
+        self.assertIsInstance(fd, FDSignal)
+        self.assertTrue(np.any(np.asarray(fd.arr)))
+
+        batch = [np.array([a, a]) for a in PAR]
+        both = self.sparse.get_td_signals(*batch[:12], ra=batch[12], dec=batch[13], **KW)
+        self.assertIsInstance(both, DomainBaseArray)
+        for one in both:
+            np.testing.assert_allclose(np.asarray(one.arr), np.asarray(td.arr), rtol=0,
+                                       atol=1e-12 * np.abs(td.arr).max())
+
     def test_kwargs_rebuild_and_inherited_paths(self):
         from lisatools.sources.emri.waveform import EMRISparseSTFTWaveform
 
@@ -96,9 +169,10 @@ class SparseSTFTWaveformTest(unittest.TestCase):
         clone = EMRISparseSTFTWaveform(**kw)
         np.testing.assert_allclose(clone(*PAR, **KW)[0], self.sparse(*PAR, **KW)[0], rtol=1e-12, atol=0)
         self.assertIs(self.sparse.xp, np)
-        # the time-domain and residual paths are the dense ones, untouched
+        # the time domain goes through the parent's get_td_signals, on this class's channels
         self.assertIs(type(self.sparse).get_td_signals, type(self.dense).get_td_signals)
-        self.assertIs(type(self.sparse).get_signals_for_residuals, type(self.dense).get_signals_for_residuals)
+        self.assertIsNot(type(self.sparse).compute_tdi_channels, type(self.dense).compute_tdi_channels)
+        self.assertIsNot(type(self.sparse).get_signals_for_residuals, type(self.dense).get_signals_for_residuals)
 
     def test_needs_stft(self):
         from lisatools.detector import EqualArmlengthOrbits
@@ -242,6 +316,39 @@ class PolarizationFallbackTest(unittest.TestCase):
         for j in np.flatnonzero(mode == 0):
             self.assertFalse(np.any(out[:, j]))
             self.assertFalse(np.any(ref[:, j]))
+
+    def test_time_series_matches_the_template_per_segment(self):
+        scale_ref = np.abs(self.ref).max()
+        for via_polarizations in (True, False):
+            with self.subTest(fallback_via_polarizations=via_polarizations):
+                self.sparse.fallback_via_polarizations = via_polarizations
+                try:
+                    template = self.sparse(*PLUNGE_PAR, **KW)[0][0]
+                    mode = self.sparse.last_segment_mode[0].copy()
+                    td = self.sparse.get_td_signals(*PLUNGE_PAR, **KW)
+                    residual = self.sparse.get_signals_for_residuals(*PLUNGE_PAR, **KW)
+                finally:
+                    self.sparse.fallback_via_polarizations = True
+                np.testing.assert_array_equal(np.asarray(residual.arr), template)
+                self.assertEqual(set(np.unique(mode).tolist()), {0, 1, 2})
+                spec = _stft_of_td(self.sparse, td)
+                scale = np.abs(template).max()
+                for j in np.flatnonzero(mode == 2):       # the same exact series, windowed
+                    self.assertLess(np.abs(spec[:, j] - template[:, j]).max() / scale, 1e-10)
+                for j in np.flatnonzero(mode == 1):       # its linear-chirp model (cubic_tol 0.3)
+                    self.assertLess(_mismatch(spec[:, j], template[:, j]), 2e-3)
+                for j in np.flatnonzero(mode == 0):
+                    self.assertFalse(np.any(spec[:, j]))
+                # the span stops with the signal's last segment
+                nper = self.sparse.nperseg
+                self.assertEqual(td.arr.shape[-1], (np.flatnonzero(mode)[-1] + 1) * nper)
+                got = np.asarray(td.arr)
+                diff = np.abs(got - self.ref[:, :got.shape[-1]]).max() / scale_ref
+                if via_polarizations:                     # production's channels on every sample
+                    self.assertLess(diff, 1e-9)
+                    self.assertFalse(np.any(self.ref[:, got.shape[-1]:]))
+                else:                                     # another response, tapered at the plunge
+                    self.assertGreater(diff, 1e-9)
 
     def test_window_margins_are_enforced(self):
         from lisatools.sources.windowed_response import response_margins, response_on_window
