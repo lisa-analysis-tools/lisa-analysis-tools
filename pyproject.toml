@@ -91,7 +91,7 @@ optional-dependencies.doc = [
 
 optional-dependencies.sampling = [
   "eryn",
-  "ereborpriors",                          # The GB prior of the global-fit setup; from git, see tool.uv.sources
+  # "ereborpriors",                          # The GB prior of the global-fit setup; from git, see tool.uv.sources
   "corner",
   "chainconsumer",
   "mpi4py",
