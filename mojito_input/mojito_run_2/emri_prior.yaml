@@ -18,8 +18,8 @@ priors:
   prior_type: UniformDistribution
 - name: a
   prior_kwargs:
-    maximum: 0.999999999
-    minimum: -0.999999999
+    maximum: 0.998999999
+    minimum: -0.998999999
     name: primary spin
     return_gpu: true
     use_cupy: false
